@@ -13,6 +13,9 @@ class CreateMap(State):
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info("[CreateMap] Calling the service /start_mapping")
+        # self.step_count = 0
+        ctx["map_ready"] = False
+        ctx["error_triggered"] = False
 
         self.client = node.create_client(SetBool, "/start_mapping")
         request = SetBool.Request()
@@ -26,7 +29,14 @@ class CreateMap(State):
         self.future = self.client.call_async(request)
 
     def run(self, ctx):
+        # if self.step_count >= self.MAX_STEPS:
+        #     if not ctx.get("error_triggered"):
+        #         print(f"[{self.name}] ERROR: The maximum time was exceeded.")
+        #         ctx["error_triggered"] = True
+        #     return
+        
         if self.future is None:
+            node.get_logger().info(f"[{self.name}] Future is None.")
             return
         
         node = ctx["node"]

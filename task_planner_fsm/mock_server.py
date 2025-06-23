@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from example_interfaces.srv import SetBool
+import time
 
 class MockServer(Node):
     def __init__(self):
@@ -10,6 +11,9 @@ class MockServer(Node):
 
     def handle_request(self, request, response):
         self.get_logger().info("Solicitud recibida para iniciar mapeo.")
+        delay = 5   # seconds
+        self.get_logger().info(f"Esperando {delay} segundos.")
+        time.sleep(delay)
         response.success = True
         response.message = "Mapa generado exitosamente"
         return response

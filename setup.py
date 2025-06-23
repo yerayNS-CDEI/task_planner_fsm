@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'fsm_node = task_planner_fsm.fsm_node:main',
             'mock_server = task_planner_fsm.mock_server:main',
+            'goal_status_listener = task_planner_fsm.goal_status_listener:main',
         ],
     },
 )

@@ -5,7 +5,8 @@ class Finished(State):
         super().__init__(name)
 
     def on_enter(self, ctx):
-        print(f"Advancing to state [{self.name}].")
+        node = ctx["node"]
+        node.get_logger().info(f"[{self.name}] Entering END state.")
         pass
 
     def run(self, ctx):

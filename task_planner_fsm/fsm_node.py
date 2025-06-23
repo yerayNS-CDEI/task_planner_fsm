@@ -1,9 +1,11 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool
+from nav2_msgs.action import NavigateToPose
+from rclpy.action import ActionClient
 
 from task_planner_fsm.machine import StateMachine
-from task_planner_fsm.states import Initialization, CreateMap, Error
+from task_planner_fsm.states import Initialization, CreateMap, ComputeWallPoints, WallTargetSelection, NavigateToTarget, ScanWall, HomePosition, Finished, Error
 
 class RobotFSMNode(Node):
     def __init__(self):
@@ -22,6 +24,12 @@ class RobotFSMNode(Node):
         self.machine = StateMachine([
             Initialization("Initialization"),
             CreateMap("CreateMap"),
+            ComputeWallPoints("ComputeWallPoints"),
+            WallTargetSelection("WallTargetSelection"),
+            NavigateToTarget("NavigateToTarget"),
+            ScanWall("ScanWall"),
+            HomePosition("HomePosition"),
+            Finished("Finished"),
             Error("Error"),
         ], initial_state="Initialization", ctx=self.ctx)
 
@@ -32,6 +40,12 @@ class RobotFSMNode(Node):
             self.start_callback,
             10
         )
+
+        # Action client
+        self.ctx["nav_client"] = ActionClient(self, NavigateToPose, "/navigate_to_pose")
+        if not self.ctx["nav_client"].wait_for_server(timeout_sec=10.0):
+            self.get_logger().error("NavigateToPose action server not available after 10 seconds.")
+            self.ctx["error_triggered"] = True
 
         # Timer para avanzar la FSM
         self.timer = self.create_timer(1.0, self.machine.step)
