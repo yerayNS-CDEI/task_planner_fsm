@@ -22,7 +22,7 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
         self.current_position = None
 
         node.create_subscription(Odometry, "/odometry/global", self.odometry_callback, 10)
-        node.get_logger().info(f"Advancing to state [{self.name}].")
+        # node.get_logger().info(f"Advancing to state [{self.name}].")
     
     def odometry_callback(self, msg: Odometry):
         pos = msg.pose.pose.position

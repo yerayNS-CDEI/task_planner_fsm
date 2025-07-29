@@ -7,12 +7,12 @@ class MockServer(Node):
     def __init__(self):
         super().__init__('mock_server')
         self.srv = self.create_service(SetBool, '/start_mapping', self.handle_request)
-        self.get_logger().info("Servidor /start_mapping listo.")
+        self.get_logger().info("Server /start_mapping ready.")
 
     def handle_request(self, request, response):
-        self.get_logger().info("Solicitud recibida para iniciar mapeo.")
+        self.get_logger().info("Received request to start mapping.")
         delay = 5   # seconds
-        self.get_logger().info(f"Esperando {delay} segundos.")
+        self.get_logger().info(f"Waiting {delay} seconds.")
         time.sleep(delay)
         response.success = True
         response.message = "Mapa generado exitosamente"

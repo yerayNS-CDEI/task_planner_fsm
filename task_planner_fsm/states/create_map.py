@@ -12,7 +12,7 @@ class CreateMap(State):
 
     def on_enter(self, ctx):
         node = ctx["node"]
-        node.get_logger().info("[CreateMap] Calling the service /start_mapping")
+        node.get_logger().info(f"{self.name} Calling the service /start_mapping")
         # self.step_count = 0
         ctx["map_ready"] = False
         ctx["error_triggered"] = False
