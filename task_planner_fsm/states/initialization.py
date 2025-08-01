@@ -1,5 +1,4 @@
 from ..state import State
-from nav_msgs.msg import Odometry
 
 class Initialization(State):
     def __init__(self, name):
@@ -12,13 +11,6 @@ class Initialization(State):
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Robot resting. Waiting external signal to begin...")
-
-        node.create_subscription(Odometry, "/odometry/global", self.odometry_callback, 10)
-
-    def odometry_callback(self, msg: Odometry):
-        self.home_position = msg.pose.pose.position
-        self.home_orientation = msg.pose.pose.orientation
-        self.odom_received = True
 
     def run(self, ctx):
         node = ctx["node"]

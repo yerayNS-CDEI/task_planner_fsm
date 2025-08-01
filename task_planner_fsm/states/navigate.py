@@ -117,7 +117,7 @@ class NavigateToTarget(State):
 
     def check_transition(self, ctx):
         if self.navigation_done:
-            return "ScanWall"
+            return "ArmUnfolding"
         if ctx.get("error_triggered"):
             return "Error"
         return None
