@@ -9,7 +9,7 @@ class GeometryReconstruction(State):
 
     def on_enter(self, ctx):
         node = ctx["node"]
-        node.get_logger().info(f"{self.name} Calling the service /start_geometry_reconstruction")
+        node.get_logger().info(f"[{self.name}] Calling the service /start_geometry_reconstruction")
         ctx["reconstruction_ready"] = False
         ctx["error_triggered"] = False
 
@@ -25,11 +25,12 @@ class GeometryReconstruction(State):
         self.future = self.client.call_async(request)
 
     def run(self, ctx):        
+        node = ctx["node"]
+        
         if self.future is None:
             node.get_logger().info(f"[{self.name}] Future is None.")
             return
         
-        node = ctx["node"]
         if self.future.done():
             result = self.future.result()
             if result and result.success:

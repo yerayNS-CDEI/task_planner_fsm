@@ -25,11 +25,10 @@ class ComputeWallPoints(State):
                 ctx["error_triggered"] = True
             return
 
-        if not self.started:
-            print(f"[{self.name}] Starting wall points computation...")
-            self.started = True
+        user_input = input(">> Database ready? (yes/no) ").strip().lower()
+        print(f"[{self.name}] Starting wall points computation...")
 
-            user_input = input(">> Database ready? (yes/no) ").strip().lower()
+        if not self.started:
             if user_input == "yes":
                 try:
                     num_walls = int(input(">> Number of walls to scan? ").strip())
@@ -84,6 +83,8 @@ class ComputeWallPoints(State):
                         print(f"[{self.name}] Invalid point format: {e}")
                         ctx["error_triggered"] = True
                         return
+
+                self.started = True
 
                 node.get_logger().info(f"[{self.name}] All scan lines:")
                 for idx, wall in enumerate(walls_data, 1):

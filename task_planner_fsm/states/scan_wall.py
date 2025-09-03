@@ -4,7 +4,9 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.action import ActionClient
 from rclpy.action import GoalResponse, CancelResponse
 from rclpy.task import Future
+import subprocess, os, signal
 from math import atan2, sin, cos
+import time
 
 class ScanWall(State):
     def __init__(self, name):
@@ -23,6 +25,29 @@ class ScanWall(State):
         self.waiting = False
         ctx["error_triggered"] = False
 
+        ## Activacion del nodo de sensors_distance_orientation_sim de ur_arm_control
+        if ctx.get("sensors_proc") and ctx["sensors_proc"].poll() is None:
+            node.get_logger().info(f"[{self.name}] 'sensors_distance_orientation_sim' ya estaba activo.")
+        else:
+            try:
+                ctx["sensors_proc"] = subprocess.Popen(
+                    ["ros2", "run", "ur_arm_control", "sensors_distance_orientation_sim",
+                    #  "--ros-args", "-p", "rate:=20.0"
+                     ],
+                    preexec_fn=os.setsid,  # crea su propio grupo de procesos (para matar como Ctrl+C)
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.STDOUT
+                )
+                node.get_logger().info(
+                    f"[{self.name}] 'sensors_distance_orientation_sim' activado (pid={ctx['sensors_proc'].pid})."
+                )
+            except Exception as e:
+                node.get_logger().error(
+                    f"[{self.name}] No se pudo activar 'sensors_distance_orientation_sim': {e}"
+                )
+                ctx["error_triggered"] = True
+                return
+            
     def run(self, ctx):
         node = ctx["node"]
 
@@ -107,11 +132,27 @@ class ScanWall(State):
             # self.finished = True
             return
 
+    def on_exit(self, ctx):
+        ## Desactivacion del nodo de sensors_distance_orientation_sim de ur_arm_control
+        node = ctx["node"]
+        proc = ctx.get("sensors_proc")
+        if proc and proc.poll() is None:
+            node.get_logger().info(f"[{self.name}] Deteniendo 'sensors_distance_orientation_sim'...")
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)  # equivalente a Ctrl+C
+                proc.wait(timeout=5.0)
+                time.sleep(2)   # 2 second delay to avoid errors in the arm goals
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                node.get_logger().warn(f"[{self.name}] Forzado SIGKILL a 'sensors_distance_orientation_sim'.")
+        ctx["sensors_proc"] = None
+
     def check_transition(self, ctx):
-        if self.finished and not ctx.get("scan_done"):
-            return "WallTargetSelection"
-        if ctx.get("scan_done"):
-            return "HomePosition"
+        if self.finished: # and not ctx.get("scan_done"):
+            # return "WallTargetSelection"
+            return "ArmFolding"
+        # if ctx.get("scan_done"):
+        #     return "HomePosition"
         if ctx.get("error_triggered"):
             return "Error"
         return None

@@ -12,6 +12,8 @@ class NavigateToTarget(State):
         self.goal_sent = False
         self.navigation_done = False
         self.future = None
+        self.verbose = False
+        self.waiting = False
         
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -21,10 +23,11 @@ class NavigateToTarget(State):
         self.goal_sent = False
         self.navigation_done = False
         self.future = None
+        self.waiting = False
 
     def run(self, ctx):
         node = ctx["node"]
-        nav_client: ActionClient = ctx["nav_client"]
+        # nav_client: ActionClient = ctx["nav_client"]
 
         # if self.result_received:
         #     # Check result status
@@ -62,6 +65,9 @@ class NavigateToTarget(State):
             qz = sin(yaw / 2.0)
             qw = cos(yaw / 2.0)
 
+            if ctx.get("scan_phase") == 2:
+                target_point = ctx.get("selected_base")
+
             # Construct PoseStamped goal
             goal_msg = NavigateToPose.Goal()
             goal_msg.pose.header.frame_id = "map"
@@ -72,27 +78,41 @@ class NavigateToTarget(State):
             goal_msg.pose.pose.orientation.z = qz
             goal_msg.pose.pose.orientation.w = qw
 
+            nav_client = ctx.get("nav_client", None)
+            if nav_client is None:
+                node.get_logger().error(f"[{self.name}] Navigation client not found.")
+                ctx["error_triggered"] = True
+                return
+            
             node.get_logger().info(f"[{self.name}] Sending goal ({target_point[0]:.2f}, {target_point[1]:.2f}) with yaw {yaw:.2f} rad.")
-            self.future = nav_client.send_goal_async(goal_msg)
-            # self.future.add_done_callback(lambda future: self.goal_response_callback(future, node))
+            self._send_goal_future = nav_client.send_goal_async(goal_msg)
+            self._send_goal_future.add_done_callback(self.goal_response_callback)
             self.goal_sent = True
+            self.waiting = True
         
-        elif self.future and self.future.done():
-            goal_handle = self.future.result()
+        elif self.waiting and self._send_goal_future.done():
+            goal_handle = self._send_goal_future.result()
             if not goal_handle.accepted:
                 node.get_logger().warn(f"[{self.name}] Navigation goal was rejected!")
                 ctx["error_triggered"] = True
                 return
             node.get_logger().info(f"[{self.name}] Goal accepted. Waiting for result...")
+            self._get_result_future = goal_handle.get_result_async()
+            self._get_result_future.add_done_callback(lambda fut: self.result_callback(fut, ctx))
 
-            result_future = goal_handle.get_result_async()
+            self.waiting = False
 
-            def done_callback(fut):
-                result = fut.result().result
-                node.get_logger().info(f"[{self.name}] Navigation finished.")
-                self.navigation_done = True
+    def goal_response_callback(self, future):
+        pass
 
-            result_future.add_done_callback(done_callback)
+    def result_callback(self, future, ctx):
+        node = ctx["node"]
+        result = future.result().result
+        status = future.result().status
+
+        node.get_logger().info(f"[{self.name}] Navigation finished.")
+        self.navigation_done = True
+        return
 
     # def goal_response_callback(self, future: Future, node):
     #     goal_handle = future.result()

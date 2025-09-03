@@ -3,6 +3,7 @@ from ..state import State
 class Finished(State):
     def __init__(self, name):
         super().__init__(name)
+        self.verbose = False
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -10,8 +11,10 @@ class Finished(State):
         pass
 
     def run(self, ctx):
-        print(f"[{self.name}] All tasks completed.")
-        ctx["finished"] = True
+        if not self.verbose:
+            print(f"[{self.name}] All tasks completed.")
+            self.verbose = True
+            ctx["finished"] = True
 
     def check_transition(self, ctx):
         return None

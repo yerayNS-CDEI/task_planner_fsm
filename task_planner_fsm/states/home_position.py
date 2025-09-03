@@ -8,6 +8,8 @@ class HomePosition(State):
         self.goal_sent = False
         self.navigation_done = False
         self.future = None
+        self.verbose = False
+        self.waiting = False
         
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -17,6 +19,7 @@ class HomePosition(State):
         self.goal_sent = False
         self.navigation_done = False
         self.future = None
+        self.waiting = False
 
     def run(self, ctx):
         node = ctx["node"]        
@@ -40,26 +43,41 @@ class HomePosition(State):
             goal_msg.pose.pose.position.z = target_point.z
             goal_msg.pose.pose.orientation = target_orientation
 
+            nav_client = ctx.get("nav_client", None)
+            if nav_client is None:
+                node.get_logger().error(f"[{self.name}] Navigation client not found.")
+                ctx["error_triggered"] = True
+                return
+            
             node.get_logger().info(f"[{self.name}] Sending goal ({target_point.x:.2f}, {target_point.y:.2f}).")
-            self.future = nav_client.send_goal_async(goal_msg)
+            self._send_goal_future = nav_client.send_goal_async(goal_msg)
+            self._send_goal_future.add_done_callback(self.goal_response_callback)
             self.goal_sent = True
+            self.waiting = True
 
-        elif self.future and self.future.done():
-            goal_handle = self.future.result()
+        elif self.waiting and self._send_goal_future.done():
+            goal_handle = self._send_goal_future.result()
             if not goal_handle.accepted:
                 node.get_logger().warn(f"[{self.name}] Navigation goal was rejected!")
                 ctx["error_triggered"] = True
                 return
             node.get_logger().info(f"[{self.name}] Goal accepted. Waiting for result...")
+            self._get_result_future = goal_handle.get_result_async()
+            self._get_result_future.add_done_callback(lambda fut: self.result_callback(fut, ctx))
 
-            result_future = goal_handle.get_result_async()
+            self.waiting = False
 
-            def done_callback(fut):
-                result = fut.result().result
-                node.get_logger().info(f"[{self.name}] Home pose reached.")
-                self.navigation_done = True
+    def goal_response_callback(self, future):
+        pass
 
-            result_future.add_done_callback(done_callback)
+    def result_callback(self, future, ctx):
+        node = ctx["node"]
+        result = future.result().result
+        status = future.result().status
+
+        node.get_logger().info(f"[{self.name}] Navigation finished.")
+        self.navigation_done = True
+        return
 
     def check_transition(self, ctx):
         if self.navigation_done:

@@ -4,6 +4,11 @@ from .scan_wall import ScanWall
 from .finished import Finished
 from .navigate import NavigateToTarget
 from .arm_unfolding import ArmUnfolding
+from .arm_folding import ArmFolding
+from .areas_of_interest import AreasOfInterest
+from .wall_discretization import WallDiscretization
+from .base_placement import BasePlacement
+from .exhaustive_scan import ExhaustiveScan
 from .error import Error
 from .initialization import Initialization
 from .compute_wall_points import ComputeWallPoints
