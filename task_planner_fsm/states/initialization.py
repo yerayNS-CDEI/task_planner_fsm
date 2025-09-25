@@ -22,7 +22,8 @@ class Initialization(State):
             self.odom_received = False  # one time save
             self.home_saved = True
 
-        if ctx.get("start") and self.home_saved:
+        # if ctx.get("start") and self.home_saved:
+        if ctx.get("start"):
             node.get_logger().info(f"[{self.name}] Signal received. Initializing FSM.")
         else:
             if not self.verbose:
@@ -30,6 +31,7 @@ class Initialization(State):
                 self.verbose = True
 
     def check_transition(self, ctx):
-        if ctx.get("start") and self.home_saved:
+        # if ctx.get("start") and self.home_saved:
+        if ctx.get("start"):
             return "CreateMap"
         return None

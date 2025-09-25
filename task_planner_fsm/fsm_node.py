@@ -23,7 +23,7 @@ class RobotFSMNode(Node):
             "error_triggered": False,
             "last_state": None,
             "scan_phase": 1,
-            "execution_status": False,
+            "execution_status": False,            
         }
 
         # FSM
@@ -51,12 +51,13 @@ class RobotFSMNode(Node):
         self.create_subscription(Odometry, "/rtabmap/odom", self.odometry_callback, 10)        
         self.create_subscription(JointState, "/arm/joint_states", self.joint_state_callback, 10)        # if no namespace is needed, erase "arm/" in both
         self.create_subscription(Bool, "/arm/execution_status", self.execution_status_callback, 10)     # if no namespace is needed, erase "arm/" in both
+        self.create_subscription(Bool, "/map_done", self.mapping_callback, 10)       
 
         # Action clients
-        self.ctx["nav_client"] = ActionClient(self, NavigateToPose, "/navigate_to_pose")
-        if not self.ctx["nav_client"].wait_for_server(timeout_sec=10.0):
-            self.get_logger().error("NavigateToPose action server not available after 10 seconds.")
-            self.ctx["error_triggered"] = True
+        # self.ctx["nav_client"] = ActionClient(self, NavigateToPose, "/navigate_to_pose")
+        # if not self.ctx["nav_client"].wait_for_server(timeout_sec=10.0):
+        #     self.get_logger().error("NavigateToPose action server not available after 10 seconds.")
+        #     self.ctx["error_triggered"] = True
 
         # self.ctx["manipulator_client"] = ActionClient(self, FollowJointTrajectory, "/scaled_joint_trajectory_controller/follow_joint_trajectory")
         # if not self.ctx["manipulator_client"].wait_for_server(timeout_sec=10.0):
@@ -80,6 +81,9 @@ class RobotFSMNode(Node):
 
     def execution_status_callback(self, msg):
         self.ctx["execution_status"] = msg.data
+
+    def mapping_callback(self, msg):
+        self.ctx["map_ready"] = msg.data
 
 def main(args=None):
     rclpy.init(args=args)
