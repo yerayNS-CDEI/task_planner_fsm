@@ -19,7 +19,7 @@ class Initialization(State):
             pos = ctx.get("home_position")
             orn = ctx.get("home_orientation")
             node.get_logger().info(f"[{self.name}] Home pose saved: position={pos}, orientation={orn}")
-            self.odom_received = False  # one time save
+            ctx["odom_received"] = False  # one time save
             self.home_saved = True
 
         # if ctx.get("start") and self.home_saved:

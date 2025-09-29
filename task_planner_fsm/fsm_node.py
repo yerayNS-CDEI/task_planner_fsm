@@ -11,6 +11,8 @@ from task_planner_fsm.machine import StateMachine
 from task_planner_fsm.states import Initialization, CreateMap, GeometryReconstruction, ComputeWallPoints, WallTargetSelection, NavigateToTarget
 from task_planner_fsm.states import ArmUnfolding, ArmFolding, ScanWall, AreasOfInterest, WallDiscretization, BasePlacement, ExhaustiveScan, HomePosition, Finished, Error
 
+from task_planner_fsm.states.proc_utils import stop_all
+
 class RobotFSMNode(Node):
     def __init__(self):
         super().__init__('robot_fsm_node')
@@ -88,6 +90,17 @@ class RobotFSMNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = RobotFSMNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    # rclpy.spin(node)   
+    # node.destroy_node()
+    # rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("[FSM] Ctrl+C recibido, cerrando procesos...")
+    finally:
+        try:
+            stop_all(node.ctx)
+        except Exception as e:
+            node.get_logger().warn(f"[FSM] stop_all falló: {e}")
+        node.destroy_node()
+        rclpy.shutdown()

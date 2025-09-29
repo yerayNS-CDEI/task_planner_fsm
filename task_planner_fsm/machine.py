@@ -1,9 +1,13 @@
+from task_planner_fsm.states.proc_utils import install_global_cleanup
+
 class StateMachine:
     def __init__(self, states, initial_state, ctx):
         self.states = {s.name: s for s in states}
         self.ctx = ctx
         self.current_state = self.states[initial_state]
         self.ctx["last_state"] = None   # initialization
+        self.ctx.setdefault('mapping_cmd', ['ros2', 'launch', 'navi_wall', 'global_exploration.launch.py'])
+        install_global_cleanup(self.ctx)
         self.current_state.on_enter(self.ctx)
 
     def step(self):

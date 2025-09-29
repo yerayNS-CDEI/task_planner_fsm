@@ -1,10 +1,11 @@
 from ..state import State
+import rclpy
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseStamped
 from rclpy.task import Future
 from math import atan2, sin, cos
-import math
+import math, time
 
 class NavigateToTarget(State):
     def __init__(self, name):
@@ -24,6 +25,26 @@ class NavigateToTarget(State):
         self.navigation_done = False
         self.future = None
         self.waiting = False
+
+        try:
+            if not rclpy.ok():
+                node.get_logger().warn(f"[{self.name}] ROS no está OK; abortando on_enter.")
+                ctx["error_triggered"] = True
+                return
+
+            # Action clients
+            ctx["nav_client"] = ActionClient(node, NavigateToPose, "/navigate_to_pose")
+            if not ctx["nav_client"].wait_for_server(timeout_sec=10.0):
+                self.get_logger().error("NavigateToPose action server not available after 10 seconds.")
+                self.ctx["error_triggered"] = True
+                return
+            
+        except Exception as e:
+            node.get_logger().error(f"[{self.name}] Exception in on_enter: {e}")
+            ctx["error_triggered"] = True
+            return
+
+        time.sleep(5)
 
     def run(self, ctx):
         node = ctx["node"]
