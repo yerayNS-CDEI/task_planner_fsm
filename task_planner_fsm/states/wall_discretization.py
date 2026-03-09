@@ -1,6 +1,6 @@
 from ..state import State
 from collections import deque
-from robotic_arm_planner_interfaces.srv import ComputeWallDiscretization
+from arm_control.srv import ComputeWallDiscretization
 
 class WallDiscretization(State):
     def __init__(self, name):
