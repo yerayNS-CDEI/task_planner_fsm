@@ -35,8 +35,8 @@ class NavigateToTarget(State):
             # Action clients
             ctx["nav_client"] = ActionClient(node, NavigateToPose, "/navigate_to_pose")
             if not ctx["nav_client"].wait_for_server(timeout_sec=10.0):
-                self.get_logger().error("NavigateToPose action server not available after 10 seconds.")
-                self.ctx["error_triggered"] = True
+                node.get_logger().error("NavigateToPose action server not available after 10 seconds.")
+                ctx["error_triggered"] = True
                 return
             
         except Exception as e:

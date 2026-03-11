@@ -1,3 +1,6 @@
+import argparse
+import sys
+import subprocess
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool
@@ -14,7 +17,7 @@ from task_planner_fsm.states import ArmUnfolding, ArmFolding, ScanWall, AreasOfI
 from task_planner_fsm.states.proc_utils import stop_all
 
 class RobotFSMNode(Node):
-    def __init__(self):
+    def __init__(self, sim=False):
         super().__init__('robot_fsm_node')
 
         # Shared context for the FSM
@@ -25,7 +28,8 @@ class RobotFSMNode(Node):
             "error_triggered": False,
             "last_state": None,
             "scan_phase": 1,
-            "execution_status": False,            
+            "execution_status": False,
+            "sim": bool(sim),
         }
 
         # FSM
@@ -68,6 +72,7 @@ class RobotFSMNode(Node):
 
         # Timer
         self.timer = self.create_timer(1.0, self.machine.step)
+        self.get_logger().info(f"[FSM] Simulation mode: {self.ctx['sim']}")
 
     def start_callback(self, msg: Bool):
         self.ctx["start"] = msg.data
@@ -88,8 +93,25 @@ class RobotFSMNode(Node):
         self.ctx["map_ready"] = msg.data
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = RobotFSMNode()
+    # Parse custom arguments before initializing rclpy
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--sim",
+        type=str,
+        default="false",
+        choices=["true", "false"],
+        help="Enable simulation mode (true/false).",
+    )
+    
+    # Use sys.argv if args is None
+    argv = args if args is not None else sys.argv[1:]
+    parsed_args, remaining_args = parser.parse_known_args(argv)
+    sim = parsed_args.sim.lower() == "true"
+    
+    # Initialize rclpy with remaining args (ROS-specific arguments)
+    rclpy.init(args=remaining_args)
+
+    node = RobotFSMNode(sim=sim)
     # rclpy.spin(node)   
     # node.destroy_node()
     # rclpy.shutdown()
@@ -97,6 +119,9 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         node.get_logger().info("[FSM] Ctrl+C recibido, cerrando procesos...")
+        processes_to_kill = ['gz sim', 'ign gazebo', 'ruby.*gz', 'gzserver', 'gz-sim']
+        for process in processes_to_kill:
+            subprocess.run(['pkill', '-9', '-f', process], timeout=2, stderr=subprocess.DEVNULL)
     finally:
         try:
             stop_all(node.ctx)

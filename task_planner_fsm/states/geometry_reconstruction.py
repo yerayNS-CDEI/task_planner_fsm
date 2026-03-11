@@ -48,6 +48,7 @@ class GeometryReconstruction(State):
 
     def on_exit(self, ctx): 
         node = ctx["node"]
+        sim_value = "true" if ctx.get("sim", False) else "false"
         ## Activacion de la simulación de navegación
         p = ctx.get("_procs", {}).get("nav_sim")
         if p and p.poll() is None:
@@ -57,19 +58,12 @@ class GeometryReconstruction(State):
                 start_proc(
                     ctx, "nav_sim",
                     ["ros2", "launch", "navi_wall", "move_robot.launch.py",
-                    "sim:=true", "world:=warehouse_v2", "database_name:=rtabmap",
+                    f"sim:={sim_value}", "mode:=full", "controller_type:=omni",
                     "use_sim_time:=true"]
                 )
                 time.sleep(5)
                 node.get_logger().info(f"[{self.name}] Navigation + localization simulation started.")
-                time.sleep(2)
-                start_proc(
-                    ctx, "arm_sim",
-                    ["ros2", "launch", "ur_arm_control", "general.launch.py", "arm_use_sim_time:=true"]
-                )
-                time.sleep(5)
-                node.get_logger().info(f"[{self.name}] Arm manipulator simulation started.")
-                
+                                
             except Exception as e:
                 node.get_logger().error(
                     f"[{self.name}] Could not start the navigation + localization process: {e}"

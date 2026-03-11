@@ -12,23 +12,99 @@ def start_proc(ctx: dict, key: str, cmd: list[str]) -> None:
         close_fds=True,
     )
 
-def stop_proc(ctx: dict, key: str, sig=signal.SIGINT, timeout=5.0) -> None:
+def _force_kill_gazebo():
+    """Force kill all Gazebo/Ignition processes using pkill."""
+    gz_patterns = [
+        'gz sim',
+        'ign gazebo',
+        'ruby.*gz',
+        'gzserver',
+        'gz-sim',
+    ]
+    
+    for pattern in gz_patterns:
+        try:
+            subprocess.run(['pkill', '-9', '-f', pattern], timeout=2, stderr=subprocess.DEVNULL)
+        except:
+            pass
+
+def stop_proc(ctx: dict, key: str, sig=signal.SIGINT, timeout=10.0, force_kill_patterns=None) -> None:
+    """
+    Stop a process gracefully, with force-kill fallback for stubborn processes.
+    
+    Args:
+        ctx: Context dictionary
+        key: Process identifier
+        sig: Initial signal (default: SIGINT)
+        timeout: Timeout for graceful shutdown (default: 10s)
+        force_kill_patterns: List of command patterns to force kill if graceful fails
+    """
     procs = ctx.get("_procs", {})
     p = procs.get(key)
     if not p: return
     if p.poll() is None:
+        node = ctx.get("node")
         try:
-            os.killpg(os.getpgid(p.pid), sig)
+            if node:
+                node.get_logger().info(f"Stopping process '{key}' (pid={p.pid}) with {sig.name}, waiting up to {timeout}s...")
+            p.send_signal(sig)
             p.wait(timeout=timeout)
+            if node:
+                node.get_logger().info(f"Process '{key}' stopped cleanly")
         except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            # Graceful shutdown failed, use force kill
+            if node:
+                node.get_logger().warn(f"Process '{key}' did not respond after {timeout}s, FORCE KILLING NOW...")
+            
+            # If force_kill_patterns provided, use pkill -9 -f
+            if force_kill_patterns:
+                if node:
+                    node.get_logger().warn(f"Executing pkill -9 -f for patterns: {force_kill_patterns}")
+                for pattern in force_kill_patterns:
+                    try:
+                        result = subprocess.run(['pkill', '-9', '-f', pattern], timeout=2, 
+                                              capture_output=True, text=True)
+                        if node:
+                            node.get_logger().info(f"pkill -9 -f '{pattern}' executed (rc={result.returncode})")
+                    except Exception as e:
+                        if node:
+                            node.get_logger().error(f"pkill failed for '{pattern}': {e}")
+            
+            # Also try direct process group kill
+            try:
+                if node:
+                    node.get_logger().warn(f"Sending SIGKILL to process group...")
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                if node:
+                    node.get_logger().error(f"Process group kill failed: {e}")
+            
+            # Final fallback: direct kill
+            try:
+                p.kill()
+            except:
+                pass
+            
+            # Don't wait indefinitely
+            try:
+                p.wait(timeout=2)
+            except:
+                pass
+            
+            if node:
+                node.get_logger().warn(f"Force kill sequence completed for '{key}'")
+                
         except ProcessLookupError:
             pass
     procs.pop(key, None)
 
 def stop_all(ctx: dict) -> None:
+    node = ctx.get("node")
+    node.get_logger().info(f"Stopping all managed processes. Keys:{ctx.get('_procs', {}).keys()}")
     for k in list(ctx.get("_procs", {}).keys()):
-        stop_proc(ctx, k)
+        stop_proc(ctx, k, force_kill_patterns=['gz sim', 'ign gazebo', 'ruby.*gz', 'gzserver', 'gz-sim'])
 
 def install_global_cleanup(ctx: dict):
     # Solo instalar una vez
