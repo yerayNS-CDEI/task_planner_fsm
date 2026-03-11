@@ -1,5 +1,5 @@
 from ..state import State
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, PoseStamped
 
 class ArmUnfolding(State):
     def __init__(self, name):
@@ -15,7 +15,7 @@ class ArmUnfolding(State):
         self.verbose = False
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering unfolding state.")
-        node.publisher_ = node.create_publisher(Pose, '/arm/goal_pose', 10)     # if no namespace is needed, erase "arm/" in both
+        node.publisher_ = node.create_publisher(PoseStamped, '/arm/goal_pose', 10)
         ctx["unfolding_success"] = False
         ctx["error_triggered"] = False
         # ctx["unfolded_position_joints"] = (-1.594, -0.736, -1.974, -0.491, 1.472, 1.595)   # (x,y,z) = -0.189, -0.183, 0.944 / (x,y,z,w) = 0.548, 0.478, -0.511, 0.458
@@ -54,14 +54,16 @@ class ArmUnfolding(State):
                 return
 
             unfolded_position = ctx.get("unfolded_position")
-            msg = Pose()
-            msg.position.x = unfolded_position[0]
-            msg.position.y = unfolded_position[1]
-            msg.position.z = unfolded_position[2]
-            msg.orientation.x = unfolded_position[3]
-            msg.orientation.y = unfolded_position[4]
-            msg.orientation.z = unfolded_position[5]
-            msg.orientation.w = unfolded_position[6]
+            msg = PoseStamped()
+            msg.header.stamp = node.get_clock().now().to_msg()
+            msg.header.frame_id = 'arm_base'
+            msg.pose.position.x = unfolded_position[0]
+            msg.pose.position.y = unfolded_position[1]
+            msg.pose.position.z = unfolded_position[2]
+            msg.pose.orientation.x = unfolded_position[3]
+            msg.pose.orientation.y = unfolded_position[4]
+            msg.pose.orientation.z = unfolded_position[5]
+            msg.pose.orientation.w = unfolded_position[6]
             node.publisher_.publish(msg)
             node.get_logger().info(f"[{self.name}] Sending unfolded configuration as a goal.")
             self.goal_sent = True

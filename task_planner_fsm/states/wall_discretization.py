@@ -96,7 +96,20 @@ class WallDiscretization(State):
                 res_store = ctx["wall_discretization_results"]
                 res_store["wall_panels_centers"].extend(result.wall_panels_centers)
                 res_store["wall_panels_vertices"].extend([result.wall_panels_vertices])
-                res_store["panel_cells_centers"].extend([result.panel_cells_centers])
+
+                # Split flat panel_cells_centers into one list per panel.
+                # wall_panels_vertices has 4 corner vertices per panel, so num_panels = len / 4.
+                num_panels = len(result.wall_panels_vertices) // 4
+                cells = list(result.panel_cells_centers)
+                if num_panels > 0 and len(cells) > 0:
+                    cells_per_panel = len(cells) // num_panels
+                    for i in range(num_panels):
+                        res_store["panel_cells_centers"].append(
+                            cells[i * cells_per_panel : (i + 1) * cells_per_panel]
+                        )
+                else:
+                    res_store["panel_cells_centers"].extend([cells])
+
                 res_store["panel_cells_vertices"].extend(result.panel_cells_vertices)
             else:
                 node.get_logger().error(f"[{self.name}] Request {idx+1}/{self.total} returned error.")
@@ -112,8 +125,8 @@ class WallDiscretization(State):
                 node.get_logger().info(f"[{self.name}] All {self.total} wall discretizations completed successfully.")
                 ctx["discretization_generated"] = True
                 res_store = ctx["wall_discretization_results"]
-                print("Wall panel vertices: ",res_store.get("wall_panels_vertices"))
-                print("Panel cells center: ",res_store.get("panel_cells_centers"))
+                # print("Wall panel vertices: ",res_store.get("wall_panels_vertices"))
+                # print("Panel cells center: ",res_store.get("panel_cells_centers"))
                 ctx["panels_left"] = len(res_store.get("panel_cells_centers"))
 
     def check_transition(self, ctx):

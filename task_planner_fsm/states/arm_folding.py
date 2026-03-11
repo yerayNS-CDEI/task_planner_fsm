@@ -1,5 +1,5 @@
 from ..state import State
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, PoseStamped
 from collections import deque
 
 class ArmFolding(State):
@@ -17,7 +17,7 @@ class ArmFolding(State):
         self.verbose = False
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering folding state.")
-        self.goal_pub = node.create_publisher(Pose, '/arm/goal_pose', 10)     # if no namespace is needed, erase "arm/" in both
+        self.goal_pub = node.create_publisher(PoseStamped, '/arm/goal_pose', 10)     # if no namespace is needed, erase "arm/" in both
         ctx["folding_success"] = False
         ctx["error_triggered"] = False
         ctx["folded_position"] = (0.254, -0.173, 0.401, 0.498, 0.710, 0.286, 0.407)
@@ -29,25 +29,29 @@ class ArmFolding(State):
         self.waiting_for_arrival = False
 
         unfolded_position = ctx.get("unfolded_position")
-        unfolded_pose = Pose()
-        unfolded_pose.position.x = unfolded_position[0]
-        unfolded_pose.position.y = unfolded_position[1]
-        unfolded_pose.position.z = unfolded_position[2]
-        unfolded_pose.orientation.x = unfolded_position[3]
-        unfolded_pose.orientation.y = unfolded_position[4]
-        unfolded_pose.orientation.z = unfolded_position[5]
-        unfolded_pose.orientation.w = unfolded_position[6]
+        unfolded_pose = PoseStamped()
+        unfolded_pose.header.stamp = node.get_clock().now().to_msg()
+        unfolded_pose.header.frame_id = 'arm_base'
+        unfolded_pose.pose.position.x = unfolded_position[0]
+        unfolded_pose.pose.position.y = unfolded_position[1]
+        unfolded_pose.pose.position.z = unfolded_position[2]
+        unfolded_pose.pose.orientation.x = unfolded_position[3]
+        unfolded_pose.pose.orientation.y = unfolded_position[4]
+        unfolded_pose.pose.orientation.z = unfolded_position[5]
+        unfolded_pose.pose.orientation.w = unfolded_position[6]
         self.goals_queue.append(unfolded_pose)
 
         folded_position = ctx.get("folded_position")
-        folded_pose = Pose()
-        folded_pose.position.x = folded_position[0]
-        folded_pose.position.y = folded_position[1]
-        folded_pose.position.z = folded_position[2]
-        folded_pose.orientation.x = folded_position[3]
-        folded_pose.orientation.y = folded_position[4]
-        folded_pose.orientation.z = folded_position[5]
-        folded_pose.orientation.w = folded_position[6]
+        folded_pose = PoseStamped()
+        folded_pose.header.stamp = node.get_clock().now().to_msg()
+        folded_pose.header.frame_id = 'arm_base'
+        folded_pose.pose.position.x = folded_position[0]
+        folded_pose.pose.position.y = folded_position[1]
+        folded_pose.pose.position.z = folded_position[2]
+        folded_pose.pose.orientation.x = folded_position[3]
+        folded_pose.pose.orientation.y = folded_position[4]
+        folded_pose.pose.orientation.z = folded_position[5]
+        folded_pose.pose.orientation.w = folded_position[6]
         self.goals_queue.append(folded_pose)
             
     def _send_next_goal(self, ctx):
@@ -70,8 +74,8 @@ class ArmFolding(State):
         self.waiting_for_arrival = True
         node.get_logger().info(
             f"[{self.name}] Goal sent. "
-            f"pos=({next_goal.position.x:.3f}, {next_goal.position.y:.3f}, {next_goal.position.z:.3f}). "
-            f"orn=({next_goal.orientation.x:.3f}, {next_goal.orientation.y:.3f}, {next_goal.orientation.z:.3f}, {next_goal.orientation.w:.3f})"
+            f"pos=({next_goal.pose.position.x:.3f}, {next_goal.pose.position.y:.3f}, {next_goal.pose.position.z:.3f}). "
+            f"orn=({next_goal.pose.orientation.x:.3f}, {next_goal.pose.orientation.y:.3f}, {next_goal.pose.orientation.z:.3f}, {next_goal.pose.orientation.w:.3f})"
         )
 
     def run(self, ctx):

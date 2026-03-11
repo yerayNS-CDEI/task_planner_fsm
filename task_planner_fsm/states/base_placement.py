@@ -118,7 +118,6 @@ class BasePlacement(State):
 
             # Si ya no quedan pendientes y todas fueron OK, marcamos listo
             if not self.pending_reqs and self.ok_count == self.total:
-                ctx["optimal_base_results"] = list(dict.fromkeys(ctx.get("optimal_base_results")))
                 print("Optimal bases: ",ctx.get("optimal_base_results"))
                 node.get_logger().info(f"[{self.name}] All {self.total} optimal bases completed successfully.")
                 ctx["optimal_bases_computed"] = True

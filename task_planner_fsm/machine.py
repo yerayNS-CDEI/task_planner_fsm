@@ -1,3 +1,4 @@
+import traceback
 from task_planner_fsm.states.proc_utils import install_global_cleanup
 
 class StateMachine:
@@ -11,15 +12,26 @@ class StateMachine:
         self.current_state.on_enter(self.ctx)
 
     def step(self):
-        self.current_state.run(self.ctx)
-        next_state = self.current_state.check_transition(self.ctx)
-
         node = self.ctx["node"]
-        # node.get_logger().info(f"[FSM] Current state: {self.current_state.name}, next state: {next_state}")
+        try:
+            self.current_state.run(self.ctx)
+            next_state = self.current_state.check_transition(self.ctx)
 
-        if next_state and next_state in self.states:
-            # self.get_logger().info(f"Transitioning from {self.current_state.name} to {next_state}")
-            self.current_state.on_exit(self.ctx)
-            self.ctx["last_state"] = self.current_state.name
-            self.current_state = self.states[next_state]
-            self.current_state.on_enter(self.ctx)
+            # node.get_logger().info(f"[FSM] Current state: {self.current_state.name}, next state: {next_state}")
+
+            if next_state and next_state in self.states:
+                # self.get_logger().info(f"Transitioning from {self.current_state.name} to {next_state}")
+                self.current_state.on_exit(self.ctx)
+                self.ctx["last_state"] = self.current_state.name
+                self.current_state = self.states[next_state]
+                self.current_state.on_enter(self.ctx)
+        except Exception as e:
+            node.get_logger().error(
+                f"[FSM] Unhandled exception in state '{self.current_state.name}':\n"
+                + traceback.format_exc()
+            )
+            self.ctx["error_triggered"] = True
+            if "Error" in self.states:
+                self.ctx["last_state"] = self.current_state.name
+                self.current_state = self.states["Error"]
+                self.current_state.on_enter(self.ctx)

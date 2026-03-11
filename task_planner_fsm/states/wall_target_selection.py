@@ -103,11 +103,7 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
             #     return
             
             # Getting data
-            base_positions_all = ctx.get("optimal_base_results", [])
-            base_positions = []         # REVISAR !!
-            for i in range(len(base_positions_all)):
-                if i % 2 != 0:
-                    base_positions.append(base_positions_all[i])
+            base_positions = ctx.get("optimal_base_results", [])
             if not base_positions:
                 node.get_logger().error(f"[{self.name}] No optimal_base_results found in context.")
                 ctx["error_triggered"] = True

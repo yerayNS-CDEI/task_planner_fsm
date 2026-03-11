@@ -56,7 +56,7 @@ class RobotFSMNode(Node):
         self.create_subscription(Bool, "/start_flag", self.start_callback, 10)
         self.create_subscription(Odometry, "/rtabmap/odom", self.odometry_callback, 10)        
         self.create_subscription(JointState, "/arm/joint_states", self.joint_state_callback, 10)        # if no namespace is needed, erase "arm/" in both
-        self.create_subscription(Bool, "/arm/execution_status", self.execution_status_callback, 10)     # if no namespace is needed, erase "arm/" in both
+        self.create_subscription(Bool, "/execution_status", self.execution_status_callback, 10)     # if no namespace is needed, erase "arm/" in both
         self.create_subscription(Bool, "/map_done", self.mapping_callback, 10)       
 
         # Action clients
@@ -118,7 +118,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("[FSM] Ctrl+C recibido, cerrando procesos...")
+        node.get_logger().info("[FSM] Ctrl+C received, killing processes...")
         processes_to_kill = ['gz sim', 'ign gazebo', 'ruby.*gz', 'gzserver', 'gz-sim']
         for process in processes_to_kill:
             subprocess.run(['pkill', '-9', '-f', process], timeout=2, stderr=subprocess.DEVNULL)
