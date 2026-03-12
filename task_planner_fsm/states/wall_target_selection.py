@@ -102,8 +102,8 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
             #     ctx["error_triggered"] = True
             #     return
             
-            # Getting data
-            base_positions = ctx.get("optimal_base_results", [])
+            # Getting data (dict {col_rank: (x,y)})
+            base_positions = ctx.get("optimal_base_results", {})
             if not base_positions:
                 node.get_logger().error(f"[{self.name}] No optimal_base_results found in context.")
                 ctx["error_triggered"] = True
@@ -114,28 +114,28 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
             robot_y = self.current_position.y
             node.get_logger().warn(f"[{self.name}] Robot  current position: ({robot_x},{robot_y})")
             min_dist = float('inf')
-            selected_base_idx = -1
+            selected_col_rank = -1
             selected_point = None
 
-            for idx, base in enumerate(base_positions):
-                if idx not in self.scanned_panels_idx:
+            for col_rank, base in base_positions.items():
+                if col_rank not in self.scanned_panels_idx:
                     dist = ((robot_x - base[0]) ** 2 + (robot_y - base[1]) ** 2) ** 0.5
                     if dist < min_dist:
                         min_dist = dist
-                        selected_base_idx = idx
+                        selected_col_rank = col_rank
                         selected_point = base
 
-            if selected_base_idx == -1:
+            if selected_col_rank == -1:
                 node.get_logger().error(f"[{self.name}] No base point selected.")
                 ctx["error_triggered"] = True
                 return
             
 
-            self.scanned_panels_idx.append(selected_base_idx)
-            node.get_logger().info(f"[{self.name}] Base #{selected_base_idx} selected at point {selected_point}.")
+            self.scanned_panels_idx.append(selected_col_rank)
+            node.get_logger().info(f"[{self.name}] Column {selected_col_rank} selected at point {selected_point}.")
             ctx["selected_base"] = selected_point
             ctx["target_selected"] = True
-            ctx["selected_base_idx"] = selected_base_idx
+            ctx["selected_base_idx"] = selected_col_rank
 
         else:
             print(f"[{self.name}] Scanning phase not selected correctly.")
