@@ -27,7 +27,8 @@ class Initialization(State):
             node.get_logger().info(f"[{self.name}] Signal received. Initializing FSM.")
         else:
             if not self.verbose:
-                node.get_logger().info(f"[{self.name}] Waiting...")
+                node.get_logger().info("[{}] Waiting for /start_flag to be true...\n\033[1;32mUse: ros2 topic pub /start_flag std_msgs/msg/Bool {{data: true}}\033[0m".format(self.name))
+
                 self.verbose = True
 
     def check_transition(self, ctx):
