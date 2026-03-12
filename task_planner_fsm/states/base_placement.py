@@ -37,48 +37,72 @@ class BasePlacement(State):
 
         def chunker(seq, size):
             return (seq[pos:pos + size] for pos in range(0, len(seq), size))
-        
+
+        # xy_key → col_rank: maps each unique (x,y) footprint to a column index
+        seen_xy_keys = {}
+        # col_rank → [global_panel_idx, ...]: all panel_cells_centers indices per column
+        base_to_panel_indices = {}
+        global_panel_idx = 0
+
         for wall, wall_panels in enumerate(walls_results_panels,1):
             wall_vertices = chunker(wall_panels, 4)
             for idx, panel in enumerate(wall_vertices,1):
-                list_vertices = []
+                xy_key = tuple(sorted(
+                    (round(float(v.position.x), 1), round(float(v.position.y), 1))
+                    for v in panel
+                ))
 
-                panel_base_z = 0.0
-                zs_panel = [round(float(v.position.z), 1) for v in panel]
-                z0 = min(zs_panel)
-                z_shift = panel_base_z - z0  # mueve el panel para que z0 → panel_base_z
+                if xy_key not in seen_xy_keys:
+                    col_rank = len(seen_xy_keys)
+                    seen_xy_keys[xy_key] = col_rank
+                    base_to_panel_indices[col_rank] = []
 
-                for v in panel:
-                    x = round(float(v.position.x), 1)
-                    y = round(float(v.position.y), 1)
-                    z = round(float(v.position.z), 1)
-                    z = round(z + z_shift, 3)
+                    list_vertices = []
 
-                    list_vertices.extend([x,y,z,0.0,90.0,0.0])
-                    node.get_logger().debug(f"[{self.name}] Wall {wall} panel {idx} z_raw={v.position.z:.3f} → z_adj={z:.3f} (base={panel_base_z}, z0={z0})")
-                    # print([v.position.x,v.position.y,v.position.z,0.0,90.0,0.0])
-                    # print(list_vertices)
-                
-                req = OptimalBase.Request()
-                req.poses_ee_xyzrpy = list_vertices
-                req.obstacle_rects = []
-                req.obstacle_circles = []
-                req.min_dist = 0.6
-                req.round_decimals = 3
-                req.grid_res = 0.1
-                req.x_limits = [-10.0,10.0]
-                req.y_limits = [-10.0,10.0]
-                req.enable_simulator = False
-                req.enable_robot_viz = False
+                    panel_base_z = 0.0
+                    zs_panel = [round(float(v.position.z), 1) for v in panel]
+                    z0 = min(zs_panel)
+                    z_shift = panel_base_z - z0  # mueve el panel para que z0 → panel_base_z
 
-                self.pending_reqs.append((idx*wall, req))
+                    for v in panel:
+                        x = round(float(v.position.x), 1)
+                        y = round(float(v.position.y), 1)
+                        z = round(float(v.position.z), 1)
+                        z = round(z + z_shift, 3)
+                        list_vertices.extend([x,y,z,0.0,90.0,0.0])
+                        node.get_logger().debug(f"[{self.name}] Wall {wall} panel {idx} z_raw={v.position.z:.3f} → z_adj={z:.3f} (base={panel_base_z}, z0={z0})")
+
+                    req = OptimalBase.Request()
+                    req.poses_ee_xyzrpy = list_vertices
+                    req.obstacle_rects = []
+                    req.obstacle_circles = []
+                    req.min_dist = 0.6
+                    req.round_decimals = 3
+                    req.grid_res = 0.1
+                    req.x_limits = [-10.0,10.0]
+                    req.y_limits = [-10.0,10.0]
+                    req.enable_simulator = False
+                    req.enable_robot_viz = False
+
+                    self.pending_reqs.append((col_rank, req))
+                else:
+                    col_rank = seen_xy_keys[xy_key]
+                    node.get_logger().debug(
+                        f"[{self.name}] Wall {wall} panel {idx} → existing col_rank {col_rank}"
+                    )
+
+                # Track every panel (all rows) under its column
+                base_to_panel_indices[col_rank].append(global_panel_idx)
+                global_panel_idx += 1
+
+        ctx["base_to_panel_indices"] = base_to_panel_indices
 
         self.total = len(self.pending_reqs)
         self.ok_count = 0
         self.current_future = None
         node.get_logger().info(f"[{self.name}] Queued {self.total} optimal-base-computation requests.")
 
-        ctx["optimal_base_results"] = []
+        ctx["optimal_base_results"] = {}
 
     def run(self, ctx):
         node = ctx["node"]
@@ -93,22 +117,22 @@ class BasePlacement(State):
             return
         
         if self.current_future is not None and self.current_future.done():
-            idx, _ = self.pending_reqs.popleft()
+            col_rank, _ = self.pending_reqs.popleft()
             try:
                 result = self.current_future.result()
             except Exception as e:
-                node.get_logger().error(f"[{self.name}] Request {idx+1}/{self.total} failed with exception: {e}")
+                node.get_logger().error(f"[{self.name}] Column {col_rank} request failed with exception: {e}")
                 ctx["error_triggered"] = True
                 self.current_future = None
                 return
 
             if result and getattr(result, "success", False):
                 self.ok_count += 1
-                node.get_logger().info(f"[{self.name}] Request {idx+1}/{self.total} succeeded. ({self.ok_count} OK)")
+                node.get_logger().info(f"[{self.name}] Column {col_rank} request succeeded. ({self.ok_count} OK)")
 
-                ctx["optimal_base_results"].append((round(result.base_x,3),round(result.base_y,3)))
+                ctx["optimal_base_results"][col_rank] = (round(result.base_x,3),round(result.base_y,3))
             else:
-                node.get_logger().error(f"[{self.name}] Request {idx+1}/{self.total} returned error: {getattr(result, 'message', '(no message)')}")
+                node.get_logger().error(f"[{self.name}] Column {col_rank} request returned error: {getattr(result, 'message', '(no message)')}")
                 ctx["error_triggered"] = True
                 self.current_future = None
                 return

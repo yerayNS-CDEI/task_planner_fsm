@@ -56,10 +56,10 @@ class ComputeWallPoints(State):
                         dx /= length
                         dy /= length
 
-                        # Vector perpendicular normalizado
-                        nx = -dy
-                        ny = dx
-                        offset = 0.4
+                        # Vector perpendicular normalizado (CW rotation → interior/right face)
+                        nx = dy
+                        ny = -dx
+                        offset = 0.6
 
                         # Puntos desplazados hacia fuera (scan exterior)
                         scan_start = (

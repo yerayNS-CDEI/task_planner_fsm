@@ -128,7 +128,18 @@ class ExhaustiveScan(State):
             node.get_logger().error(f"[{self.name}] Missing 'selected_base_idx' in ctx.")
             ctx["error_triggered"] = True
             return
-        panel_cells_centers = res.get("panel_cells_centers", [])[selected_base_idx]
+
+        base_to_panel_indices = ctx.get("base_to_panel_indices", {})
+        all_panel_cells = res.get("panel_cells_centers", [])
+        panel_indices = base_to_panel_indices.get(selected_base_idx, [])
+        panel_cells_centers = []
+        for pi in panel_indices:
+            panel_cells_centers.extend(all_panel_cells[pi])
+        node.get_logger().info(
+            f"[{self.name}] Column {selected_base_idx}: merging {len(panel_indices)} panel(s) "
+            f"(indices {panel_indices}) → {len(panel_cells_centers)} total cell(s)."
+        )
+
         if not panel_cells_centers:
             node.get_logger().error(f"[{self.name}] No 'panel_cells_centers' to scan.")
             ctx["error_triggered"] = True
