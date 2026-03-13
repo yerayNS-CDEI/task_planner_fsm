@@ -54,6 +54,7 @@ class ExhaustiveScan(State):
         self.column_settle_time_s = 0.5  # Increased from 0.25 to 0.5 seconds for better stability
         
         # Planner-feedback watchdog and recovery policy
+        self.enable_goal_timeout_fallback = False
         self.goal_wait_timeout_s = 10.0
         self.goal_wait_deadline = None
         self.max_base_recompute_retries = 2
@@ -526,7 +527,10 @@ class ExhaustiveScan(State):
         # Publish transformed goal
         self.goal_pub.publish(ps_arm)
         self.waiting_for_arrival = True
-        self.goal_wait_deadline = node.get_clock().now() + Duration(seconds=self.goal_wait_timeout_s)
+        if self.enable_goal_timeout_fallback:
+            self.goal_wait_deadline = node.get_clock().now() + Duration(seconds=self.goal_wait_timeout_s)
+        else:
+            self.goal_wait_deadline = None
         node.get_logger().info(
             f"[{self.name}] Sent goal {self.current_goal_idx + 1} "
             f"(remaining: {len(self.goals_queue)}). "
@@ -704,7 +708,11 @@ class ExhaustiveScan(State):
             # Opcional: si tu planner no resetea execution_status, hazlo tú
             ctx["execution_status"] = False
         elif exec_status is False or exec_status is None:
-            if self.goal_wait_deadline and node.get_clock().now() > self.goal_wait_deadline:
+            if (
+                self.enable_goal_timeout_fallback
+                and self.goal_wait_deadline
+                and node.get_clock().now() > self.goal_wait_deadline
+            ):
                 self._trigger_recovery_from_stuck_goal(ctx)
                 return
             # Seguimos esperando
