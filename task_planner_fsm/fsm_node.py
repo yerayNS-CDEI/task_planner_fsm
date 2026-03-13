@@ -42,6 +42,7 @@ class RobotFSMNode(Node):
             "last_state": None,
             "scan_phase": 1,
             "execution_status": False,
+            "planner_goal_failed": False,
             "sim": bool(sim),
             "publish_fsm_current": self.publish_fsm_current,
             "publish_fsm_transition": self.publish_fsm_transition,
@@ -72,6 +73,7 @@ class RobotFSMNode(Node):
         self.create_subscription(Odometry, "/rtabmap/odom", self.odometry_callback, 10)        
         self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
         self.create_subscription(Bool, "/execution_status", self.execution_status_callback, 10)
+        self.create_subscription(Bool, "/planner/goal_failed", self.planner_goal_failed_callback, 10)
         self.create_subscription(Bool, "/map_done", self.mapping_callback, 10)       
 
         # Timer
@@ -117,6 +119,9 @@ class RobotFSMNode(Node):
 
     def execution_status_callback(self, msg):
         self.ctx["execution_status"] = msg.data
+
+    def planner_goal_failed_callback(self, msg: Bool):
+        self.ctx["planner_goal_failed"] = msg.data
 
     def mapping_callback(self, msg):
         self.ctx["map_ready"] = msg.data

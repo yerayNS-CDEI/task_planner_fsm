@@ -52,6 +52,11 @@ class ExhaustiveScan(State):
         self.column_action_name = "/column_controller/follow_joint_trajectory"
         self.column_vel_tol = 0.002
         self.column_settle_time_s = 0.5  # Increased from 0.25 to 0.5 seconds for better stability
+        
+        # Planner-feedback watchdog and recovery policy
+        self.goal_wait_timeout_s = 10.0
+        self.goal_wait_deadline = None
+        self.max_base_recompute_retries = 2
 
     def _choose_column_height_for_goal_z(self, goal_z_in_arm_base: float) -> float:
         """
@@ -369,7 +374,10 @@ class ExhaustiveScan(State):
         self.wall_orientation = None
         self._column_stable_since = None
         self.column_target_height = None
+        self.goal_wait_deadline = None
         ctx["error_triggered"] = False
+        ctx["planner_goal_failed"] = False
+        ctx.setdefault("base_recompute_retry_counts", {})
 
         res = ctx.get("wall_discretization_results")
         if not res:
@@ -430,6 +438,49 @@ class ExhaustiveScan(State):
         self._pending_panel_cells = panel_cells_centers
         self._pending_panel_vertices = panel_vertices
         node.get_logger().info(f"[{self.name}] Stored {len(panel_cells_centers)} panel cells and {len(panel_vertices)} vertices. Waiting for TF to be ready...")
+    
+    def _trigger_recovery_from_stuck_goal(self, ctx):
+        """
+        Recover from a planner stall (e.g., IK NaN where /execution_status never becomes True).
+        First retries by recomputing base placement. After N retries on the same base,
+        skip that base to avoid infinite loops.
+        """
+        node = ctx["node"]
+        base_idx = ctx.get("selected_base_idx")
+        completed_base_indices = ctx.setdefault("completed_base_indices", [])
+
+        # Reset per-goal wait state
+        self.waiting_for_arrival = False
+        self.goal_wait_deadline = None
+        ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
+
+        retry_counts = ctx.setdefault("base_recompute_retry_counts", {})
+        retries_for_base = int(retry_counts.get(base_idx, 0)) + 1
+        retry_counts[base_idx] = retries_for_base
+
+        if retries_for_base <= self.max_base_recompute_retries:
+            node.get_logger().error(
+                f"[{self.name}] Planner did not confirm goal completion within "
+                f"{self.goal_wait_timeout_s:.1f}s for base {base_idx}. "
+                f"Requesting base recomputation ({retries_for_base}/{self.max_base_recompute_retries})."
+            )
+            ctx["recompute_base_placement"] = True
+            self.movement_done = True
+            return
+
+        node.get_logger().error(
+            f"[{self.name}] Base {base_idx} exceeded recovery retries "
+            f"({retries_for_base - 1} recomputations). Marking it as skipped."
+        )
+        if ctx.get("panels_left", 0) > 0:
+            ctx["panels_left"] -= 1
+        if ctx.get("panels_left", 0) <= 0:
+            ctx["exhaustive_scan_done"] = True
+        if base_idx is not None and base_idx not in completed_base_indices:
+            completed_base_indices.append(base_idx)
+        ctx["recompute_base_placement"] = False
+        self.movement_done = True
 
     def _send_next_goal(self, ctx):
         """Transform goal to arm_base and publish (must be called AFTER column is at correct height)."""
@@ -470,10 +521,12 @@ class ExhaustiveScan(State):
 
         # Reset execution status
         ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
 
         # Publish transformed goal
         self.goal_pub.publish(ps_arm)
         self.waiting_for_arrival = True
+        self.goal_wait_deadline = node.get_clock().now() + Duration(seconds=self.goal_wait_timeout_s)
         node.get_logger().info(
             f"[{self.name}] Sent goal {self.current_goal_idx + 1} "
             f"(remaining: {len(self.goals_queue)}). "
@@ -598,6 +651,10 @@ class ExhaustiveScan(State):
                     # All heights processed
                     self.movement_done = True
                     node.get_logger().info(f"[{self.name}] All scan goals completed.")
+                    completed_base_indices = ctx.setdefault("completed_base_indices", [])
+                    selected_base_idx = ctx.get("selected_base_idx")
+                    if selected_base_idx is not None and selected_base_idx not in completed_base_indices:
+                        completed_base_indices.append(selected_base_idx)
                     ctx["panels_left"] -= 1
                     if ctx.get("panels_left", 0) <= 0:
                         node.get_logger().info(f"[{self.name}] No panels left to exhaustively scan.")
@@ -631,14 +688,25 @@ class ExhaustiveScan(State):
             self._send_next_goal(ctx)
             return
         
+        if ctx.get("planner_goal_failed"):
+            node.get_logger().error(
+                f"[{self.name}] Planner reported goal failure. Triggering immediate recovery."
+            )
+            self._trigger_recovery_from_stuck_goal(ctx)
+            return
+
         exec_status = ctx.get("execution_status")
         if exec_status is True:
             # Llegamos: liberamos la espera y lanzamos el siguiente
             self.waiting_for_arrival = False
+            self.goal_wait_deadline = None
             node.get_logger().info(f"[{self.name}] Goal {self.current_goal_idx + 1} reached.")
             # Opcional: si tu planner no resetea execution_status, hazlo tú
             ctx["execution_status"] = False
         elif exec_status is False or exec_status is None:
+            if self.goal_wait_deadline and node.get_clock().now() > self.goal_wait_deadline:
+                self._trigger_recovery_from_stuck_goal(ctx)
+                return
             # Seguimos esperando
             node.get_logger().debug(f"[{self.name}] Waiting for arrival confirmation...")
         else:
@@ -646,8 +714,8 @@ class ExhaustiveScan(State):
             pass
 
     def check_transition(self, ctx):
-        if self.movement_done:
-            return "ArmFolding"
         if ctx.get("error_triggered"):
             return "Error"
+        if self.movement_done:
+            return "ArmFolding"
         return None

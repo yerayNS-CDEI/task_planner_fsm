@@ -58,7 +58,7 @@ class GeometryReconstruction(State):
                 start_proc(
                     ctx, "nav_sim",
                     ["ros2", "launch", "navi_wall", "move_robot.launch.py",
-                    f"sim:={sim_value}", "mode:=full", "controller_type:=omni", "database_name:=objects_map",
+                    f"sim:={sim_value}", "mode:=full", "controller_type:=omni", "database_name:=rtabmap",
                     "use_sim_time:=true"]
                 )
                 time.sleep(5)

@@ -139,6 +139,8 @@ class ArmFolding(State):
                 # print("ARM FOLDING - AF2")
                 return "AreasOfInterest"
         if ctx.get("scan_phase") == 2:
+            if self.movement_done and ctx.get("recompute_base_placement"):
+                return "BasePlacement"
             if self.movement_done and not ctx.get("exhaustive_scan_done"):
                 # print("ARM FOLDING - AF3")
                 return "WallTargetSelection"

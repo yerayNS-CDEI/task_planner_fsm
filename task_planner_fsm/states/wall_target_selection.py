@@ -19,6 +19,7 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
         self.step_count = 0
         ctx["target_selected"] = False
         ctx["error_triggered"] = False
+        ctx.setdefault("completed_base_indices", [])
 
     #     node.create_subscription(Odometry, "/rtabmap/odom", self.odometry_callback, 10)
     
@@ -116,22 +117,22 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
             min_dist = float('inf')
             selected_col_rank = -1
             selected_point = None
+            completed_base_indices = set(ctx.get("completed_base_indices", []))
 
             for col_rank, base in base_positions.items():
-                if col_rank not in self.scanned_panels_idx:
-                    dist = ((robot_x - base[0]) ** 2 + (robot_y - base[1]) ** 2) ** 0.5
-                    if dist < min_dist:
-                        min_dist = dist
-                        selected_col_rank = col_rank
-                        selected_point = base
+                if col_rank in completed_base_indices:
+                    continue
+                dist = ((robot_x - base[0]) ** 2 + (robot_y - base[1]) ** 2) ** 0.5
+                if dist < min_dist:
+                    min_dist = dist
+                    selected_col_rank = col_rank
+                    selected_point = base
 
             if selected_col_rank == -1:
                 node.get_logger().error(f"[{self.name}] No base point selected.")
                 ctx["error_triggered"] = True
                 return
             
-
-            self.scanned_panels_idx.append(selected_col_rank)
             node.get_logger().info(f"[{self.name}] Column {selected_col_rank} selected at point {selected_point}.")
             ctx["selected_base"] = selected_point
             ctx["target_selected"] = True

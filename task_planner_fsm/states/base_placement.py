@@ -16,6 +16,10 @@ class BasePlacement(State):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Computing optimal base placement...")
         node.get_logger().info(f"[{self.name}] Calling the service /compute_optimal_base")
+        if ctx.get("recompute_base_placement"):
+            node.get_logger().warn(f"[{self.name}] Recovery mode: recomputing base placement after planner stall.")
+        ctx["recompute_base_placement"] = False
+        ctx.setdefault("completed_base_indices", [])
         
         ctx["optimal_bases_computed"] = False
         ctx["error_triggered"] = False
@@ -144,6 +148,8 @@ class BasePlacement(State):
             if not self.pending_reqs and self.ok_count == self.total:
                 print("Optimal bases: ",ctx.get("optimal_base_results"))
                 node.get_logger().info(f"[{self.name}] All {self.total} optimal bases completed successfully.")
+                completed = set(ctx.get("completed_base_indices", []))
+                ctx["panels_left"] = max(0, self.total - len(completed))
                 ctx["optimal_bases_computed"] = True
 
     def check_transition(self, ctx):
