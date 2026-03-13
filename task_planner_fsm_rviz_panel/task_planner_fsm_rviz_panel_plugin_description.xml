@@ -1,0 +1,10 @@
+<library path="task_planner_fsm_rviz_panel">
+  <class
+    name="task_planner_fsm_rviz_panel/FsmPanel"
+    type="task_planner_fsm_rviz_panel::FsmPanel"
+    base_class_type="rviz_common::Panel">
+    <description>
+      Visualize FSM current state and transitions from /fsm/current_state and /fsm/transition.
+    </description>
+  </class>
+</library>

@@ -1,9 +1,11 @@
 import argparse
+import json
 import sys
 import subprocess
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from std_msgs.msg import Bool, String
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from control_msgs.action import FollowJointTrajectory
@@ -20,6 +22,17 @@ class RobotFSMNode(Node):
     def __init__(self, sim=False):
         super().__init__('robot_fsm_node')
 
+        # FSM telemetry publishers
+        current_qos = QoSProfile(depth=1)
+        current_qos.reliability = ReliabilityPolicy.RELIABLE
+        current_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        transition_qos = QoSProfile(depth=20)
+        transition_qos.reliability = ReliabilityPolicy.RELIABLE
+        transition_qos.durability = DurabilityPolicy.VOLATILE
+
+        self.fsm_current_pub = self.create_publisher(String, "/fsm/current_state", current_qos)
+        self.fsm_transition_pub = self.create_publisher(String, "/fsm/transition", transition_qos)
+
         # Shared context for the FSM
         self.ctx = {
             "node": self,
@@ -30,6 +43,8 @@ class RobotFSMNode(Node):
             "scan_phase": 1,
             "execution_status": False,
             "sim": bool(sim),
+            "publish_fsm_current": self.publish_fsm_current,
+            "publish_fsm_transition": self.publish_fsm_transition,
         }
 
         # FSM
@@ -59,20 +74,24 @@ class RobotFSMNode(Node):
         self.create_subscription(Bool, "/execution_status", self.execution_status_callback, 10)
         self.create_subscription(Bool, "/map_done", self.mapping_callback, 10)       
 
-        # Action clients
-        # self.ctx["nav_client"] = ActionClient(self, NavigateToPose, "/navigate_to_pose")
-        # if not self.ctx["nav_client"].wait_for_server(timeout_sec=10.0):
-        #     self.get_logger().error("NavigateToPose action server not available after 10 seconds.")
-        #     self.ctx["error_triggered"] = True
-
-        # self.ctx["manipulator_client"] = ActionClient(self, FollowJointTrajectory, "/scaled_joint_trajectory_controller/follow_joint_trajectory")
-        # if not self.ctx["manipulator_client"].wait_for_server(timeout_sec=10.0):
-        #     self.get_logger().error("ManipulatorControl action server not available after 10 seconds.")
-        #     self.ctx["error_triggered"] = True
-
         # Timer
         self.timer = self.create_timer(1.0, self.machine.step)
         self.get_logger().info(f"[FSM] Simulation mode: {self.ctx['sim']}")
+
+    def publish_fsm_current(self, state_name: str):
+        msg = String()
+        msg.data = state_name
+        self.fsm_current_pub.publish(msg)
+
+    def publish_fsm_transition(self, from_state: str, to_state: str, reason: str = ""):
+        payload = {
+            "from": from_state,
+            "to": to_state,
+            "reason": reason,
+        }
+        msg = String()
+        msg.data = json.dumps(payload)
+        self.fsm_transition_pub.publish(msg)
 
     def start_callback(self, msg: Bool):
         self.ctx["start"] = msg.data

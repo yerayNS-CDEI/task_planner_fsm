@@ -18,11 +18,9 @@ setup(
     description='TODO: Package description',
     license='Apache-2.0',
     tests_require=['pytest'],
-    entry_points={
-        'console_scripts': [
-            'fsm_node = task_planner_fsm.fsm_node:main',
-            'mock_server = task_planner_fsm.mock_server:main',
-            'goal_status_listener = task_planner_fsm.goal_status_listener:main',
-        ],
-    },
+    scripts=[
+        'scripts/fsm_node',
+        'scripts/mock_server',
+        'scripts/goal_status_listener',
+    ],
 )

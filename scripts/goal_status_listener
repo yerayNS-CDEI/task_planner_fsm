@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+
+from task_planner_fsm.goal_status_listener import main
+
+
+if __name__ == "__main__":
+    main()
