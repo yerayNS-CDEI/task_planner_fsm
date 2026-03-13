@@ -55,8 +55,8 @@ class RobotFSMNode(Node):
         # Subscriptions
         self.create_subscription(Bool, "/start_flag", self.start_callback, 10)
         self.create_subscription(Odometry, "/rtabmap/odom", self.odometry_callback, 10)        
-        self.create_subscription(JointState, "/arm/joint_states", self.joint_state_callback, 10)        # if no namespace is needed, erase "arm/" in both
-        self.create_subscription(Bool, "/execution_status", self.execution_status_callback, 10)     # if no namespace is needed, erase "arm/" in both
+        self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
+        self.create_subscription(Bool, "/execution_status", self.execution_status_callback, 10)
         self.create_subscription(Bool, "/map_done", self.mapping_callback, 10)       
 
         # Action clients
@@ -85,6 +85,16 @@ class RobotFSMNode(Node):
 
     def joint_state_callback(self, msg):
         self.current_joint_state = msg
+        
+        # Track column position in context for ExhaustiveScan state
+        column_joint_name = "column_joint"
+        try:
+            idx = msg.name.index(column_joint_name)
+            if idx < len(msg.position):
+                self.ctx["column_current_height"] = float(msg.position[idx])
+        except (ValueError, IndexError):
+            # Column joint not in this message
+            pass
 
     def execution_status_callback(self, msg):
         self.ctx["execution_status"] = msg.data
