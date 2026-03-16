@@ -25,29 +25,34 @@ class ScanWall(State):
         self.waiting = False
         ctx["error_triggered"] = False
 
-        ## Activacion del nodo de sensors_distance_orientation_sim de ur_arm_control
-        if ctx.get("sensors_proc") and ctx["sensors_proc"].poll() is None:
-            node.get_logger().info(f"[{self.name}] 'sensors_distance_orientation_sim' ya estaba activo.")
-        else:
-            try:
-                ctx["sensors_proc"] = subprocess.Popen(
-                    ["ros2", "run", "ur_arm_control", "sensors_distance_orientation_sim",
-                    #  "--ros-args", "-p", "rate:=20.0"
-                     ],
-                    preexec_fn=os.setsid,  # crea su propio grupo de procesos (para matar como Ctrl+C)
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.STDOUT
-                )
-                node.get_logger().info(
-                    f"[{self.name}] 'sensors_distance_orientation_sim' activado (pid={ctx['sensors_proc'].pid})."
-                )
-            except Exception as e:
-                node.get_logger().error(
-                    f"[{self.name}] No se pudo activar 'sensors_distance_orientation_sim': {e}"
-                )
-                ctx["error_triggered"] = True
-                return
-            
+        ## Activacion de arduino_sensors_sim y align_ee_to_wall de arm_control.
+        ## Launched here so they initialise during the scan line navigation movement.
+        arm_procs = [
+            ("arduino_sensors_proc", ["ros2", "run", "arm_control", "arduino_sensors_sim", "--ros-args", "-p", "autostart:=true"], "arduino_sensors_sim"),
+            ("align_ee_proc",        ["ros2", "run", "arm_control", "align_ee_to_wall"],    "align_ee_to_wall"),
+        ]
+        for proc_key, cmd_args, proc_name in arm_procs:
+            if ctx.get(proc_key) and ctx[proc_key].poll() is None:
+                node.get_logger().info(f"[{self.name}] '{proc_name}' ya estaba activo (pid={ctx[proc_key].pid}).")
+            else:
+                try:
+                    log_file = open(f"/tmp/{proc_name}.log", "w")
+                    ctx[proc_key] = subprocess.Popen(
+                        cmd_args,
+                        preexec_fn=os.setsid,
+                        stdout=log_file,
+                        stderr=log_file
+                    )
+                    node.get_logger().info(
+                        f"[{self.name}] '{proc_name}' activado (pid={ctx[proc_key].pid})."
+                    )
+                except Exception as e:
+                    node.get_logger().error(
+                        f"[{self.name}] No se pudo activar '{proc_name}': {e}"
+                    )
+                    ctx["error_triggered"] = True
+                    return
+
     def run(self, ctx):
         node = ctx["node"]
 
@@ -60,6 +65,9 @@ class ScanWall(State):
         if not self.started:
             node.get_logger().info(f"[{self.name}] Initiating wall scan maneuver...")
             self.started = True
+
+            node.get_logger().info(f"[{self.name}] Waiting 10s for arm processes to stabilise...")
+            time.sleep(10.0)
 
             wall_data = ctx.get("target_scan_wall", None)
             prev_target_point = ctx.get("target_scan_point", None)
@@ -117,35 +125,42 @@ class ScanWall(State):
     def goal_response_callback(self, future):
         pass
 
+    def _stop_arm_processes(self, ctx):
+        node = ctx["node"]
+        for proc_key, proc_name in [
+            ("arduino_sensors_proc", "arduino_sensors_sim"),
+            ("align_ee_proc",        "align_ee_to_wall"),
+        ]:
+            proc = ctx.get(proc_key)
+            if proc and proc.poll() is None:
+                node.get_logger().info(f"[{self.name}] Deteniendo '{proc_name}'...")
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                    proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    node.get_logger().warn(f"[{self.name}] Forzado SIGKILL a '{proc_name}'.")
+            ctx[proc_key] = None
+
     def result_callback(self, future, ctx):
         node = ctx["node"]
         result = future.result().result
         status = future.result().status
 
-        node.get_logger().info(f"[{self.name}] Scanning finished.")
+        node.get_logger().info(f"[{self.name}] Scanning finished. Stopping arm processes for safety...")
+        self._stop_arm_processes(ctx)
+        time.sleep(2)   # delay to avoid errors in the arm goals
         self.finished = True
         ctx["walls_left"] -= 1
     
         if ctx.get("walls_left", 0) <= 0:
             node.get_logger().info(f"[{self.name}] No walls left to scan.")
             ctx["scan_done"] = True
-            # self.finished = True
             return
 
     def on_exit(self, ctx):
-        ## Desactivacion del nodo de sensors_distance_orientation_sim de ur_arm_control
-        node = ctx["node"]
-        proc = ctx.get("sensors_proc")
-        if proc and proc.poll() is None:
-            node.get_logger().info(f"[{self.name}] Deteniendo 'sensors_distance_orientation_sim'...")
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGINT)  # equivalente a Ctrl+C
-                proc.wait(timeout=5.0)
-                time.sleep(2)   # 2 second delay to avoid errors in the arm goals
-            except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                node.get_logger().warn(f"[{self.name}] Forzado SIGKILL a 'sensors_distance_orientation_sim'.")
-        ctx["sensors_proc"] = None
+        ## Desactivacion de arduino_sensors_sim y align_ee_to_wall (safety net)
+        self._stop_arm_processes(ctx)
 
     def check_transition(self, ctx):
         if self.finished: # and not ctx.get("scan_done"):

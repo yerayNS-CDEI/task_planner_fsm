@@ -51,7 +51,6 @@ class ObjectID(State):
                     node.get_logger().info(f"[{self.name}] Object ID completed correctly.")
                     ctx["object_id_ready"] = True
                     ctx["object_id_data"] = ctx.get("walls_data")
-                    ctx["scan_phase"] = 2
                 else:
                     node.get_logger().error(f"[{self.name}] Error while computing object ID.")
                     ctx["error_triggered"] = True
