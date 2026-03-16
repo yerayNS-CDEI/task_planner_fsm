@@ -13,7 +13,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
 
 from task_planner_fsm.machine import StateMachine
-from task_planner_fsm.states import Initialization, CreateMap, GeometryReconstruction, ComputeWallPoints, WallTargetSelection, NavigateToTarget
+from task_planner_fsm.states import Initialization, CreateMap, ObjectID, GeometryReconstruction, ComputeWallPoints, WallTargetSelection, NavigateToTarget
 from task_planner_fsm.states import ArmUnfolding, ArmFolding, ScanWall, AreasOfInterest, WallDiscretization, BasePlacement, ExhaustiveScan, HomePosition, Finished, Error
 
 from task_planner_fsm.states.proc_utils import stop_all
@@ -52,6 +52,7 @@ class RobotFSMNode(Node):
         self.machine = StateMachine([
             Initialization("Initialization"),
             CreateMap("CreateMap"),
+            ObjectID("ObjectID"),
             GeometryReconstruction("GeometryReconstruction"),
             ComputeWallPoints("ComputeWallPoints"),
             WallTargetSelection("WallTargetSelection"),

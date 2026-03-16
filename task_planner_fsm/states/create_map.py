@@ -56,7 +56,7 @@ class CreateMap(State):
 
     def check_transition(self, ctx):
         if ctx.get("map_ready"):
-            return "GeometryReconstruction"
+            return "ObjectID"
         if ctx.get("error_triggered"):
             return "Error"
         return None

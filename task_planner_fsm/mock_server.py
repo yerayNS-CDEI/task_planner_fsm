@@ -18,6 +18,10 @@ class MockServer(Node):
         self.get_logger().info("Server /compute_areas_of_interest ready.")
         self.get_logger().info("\033[1;32mUse: ros2 service call /compute_areas_of_interest example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
 
+        self.srv = self.create_service(SetBool, '/object_id_sim', self.handle_request_object_id_sim)
+        self.get_logger().info("Server /object_id_sim ready.")
+        self.get_logger().info("\033[1;32mUse: ros2 service call /object_id_sim example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
+
     def handle_request_mapping(self, request, response):
         self.get_logger().info("Received request to start mapping.")
         delay = 1   # seconds
@@ -43,6 +47,15 @@ class MockServer(Node):
         time.sleep(delay)
         response.success = True
         response.message = "Areas of interest computed succesfully."
+        return response
+    
+    def handle_request_object_id_sim(self, request, response):
+        self.get_logger().info("Received request to start object ID.")
+        delay = 1   # seconds
+        self.get_logger().info(f"Waiting {delay} seconds.")
+        time.sleep(delay)
+        response.success = True
+        response.message = "Object ID completed succesfully."
         return response
 
 def main(args=None):
