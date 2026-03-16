@@ -9,7 +9,7 @@ RViz custom panel plugin that subscribes to:
 From workspace root:
 
 ```bash
-cd /home/zed/ros2_ws
+cd /home/$USER/ros2_ws
 colcon build --base-paths src/task_planner_fsm/task_planner_fsm_rviz_panel
 source install/setup.bash
 ```
