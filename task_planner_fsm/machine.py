@@ -8,7 +8,7 @@ class StateMachine:
         self.current_state = self.states[initial_state]
         self.ctx["last_state"] = None   # initialization
         self._retried_current_state = False
-        self.ctx.setdefault('mapping_cmd', ['ros2', 'launch', 'navi_wall', 'global_exploration.launch.py'])
+        self.ctx.setdefault('mapping_cmd', ['ros2', 'launch', 'navi_wall', 'global_exploration.launch.py', 'headless:=true'])
         install_global_cleanup(self.ctx)
         self.current_state.on_enter(self.ctx)
         self._publish_current_state(self.current_state.name)
