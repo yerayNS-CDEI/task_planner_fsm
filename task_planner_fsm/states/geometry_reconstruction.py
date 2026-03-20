@@ -50,7 +50,10 @@ class GeometryReconstruction(State):
 
     def on_exit(self, ctx): 
         node = ctx["node"]
-        sim_value = "true" if ctx.get("sim", False) else "false"
+        requested_sim = bool(ctx.get("sim", False))
+        if not requested_sim:
+            node.get_logger().warn(f"[{self.name}] FSM was started with sim=false, but hybrid_sim=true requires sim=true. Forcing sim:=true for move_robot.launch.py.")
+        sim_value = "true"
         ## Activacion de la simulación de navegación
         p = ctx.get("_procs", {}).get("nav_sim")
         if p and p.poll() is None:
@@ -115,7 +118,8 @@ class GeometryReconstruction(State):
                         ('map', 'odom', 'Localizer'),
                         ('odom', 'base_footprint', 'Base odometry'),
                         ('base_footprint', 'column_link', 'Base robot_state_publisher'),
-                        ('column_link', 'arm_base_link', 'Static TF bridge'),
+                        ('column_link', 'world', 'Static TF bridge'),
+                        ('world', 'arm_base_link', 'Arm root frame'),
                         ('arm_base_link', 'arm_base', 'Arm robot_state_publisher'),
                         ('map', 'arm_base', 'Complete chain'),
                     ]

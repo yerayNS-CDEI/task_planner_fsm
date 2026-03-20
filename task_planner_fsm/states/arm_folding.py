@@ -1,5 +1,6 @@
 from ..state import State
 from arm_control.srv import SendPosition
+from control.remote_DASHBOARD import send_dashboard_play_command
 from collections import deque
 
 class ArmFolding(State):
@@ -11,10 +12,12 @@ class ArmFolding(State):
         self.verbose = False
         self.goals_queue = deque()
         self.current_goal = None
+        self.dashboard_sent = False
         
     def on_enter(self, ctx):
         self.movement_done = False
         self.verbose = False
+        self.dashboard_sent = False
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering folding state.")
         
@@ -63,7 +66,20 @@ class ArmFolding(State):
 
         if ctx.get("error_triggered") or self.movement_done:
             return
-        
+
+        # Send dashboard command first (before any service request)
+        if not self.dashboard_sent:
+            node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
+            success, message = send_dashboard_play_command()
+
+            if success:
+                node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
+                self.dashboard_sent = True
+            else:
+                node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
+                ctx["error_triggered"] = True
+                return
+
         # If no future, send next goal
         if self.future is None:
             self._send_next_goal(ctx)

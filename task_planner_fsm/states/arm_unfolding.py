@@ -1,5 +1,6 @@
 from ..state import State
 from arm_control.srv import SendPosition
+from control.remote_DASHBOARD import send_dashboard_play_command
 
 class ArmUnfolding(State):
     def __init__(self, name):
@@ -9,17 +10,19 @@ class ArmUnfolding(State):
         self.movement_done = False
         self.future = None
         self.verbose = False
+        self.dashboard_sent = False
         
     def on_enter(self, ctx):
         self.goal_sent = False
         self.movement_done = False
         self.verbose = False
+        self.dashboard_sent = False
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering unfolding state.")
-        
+
         # Create service client for position_sender_node
         self.service_client = node.create_client(SendPosition, '/arm/send_position')
-        
+
         ctx["unfolding_success"] = False
         ctx["error_triggered"] = False
         self.future = None
@@ -29,7 +32,20 @@ class ArmUnfolding(State):
 
         if ctx.get("error_triggered") or self.movement_done:
             return
-        
+
+        # Send dashboard command first (before service request)
+        if not self.dashboard_sent:
+            node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
+            success, message = send_dashboard_play_command()
+
+            if success:
+                node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
+                self.dashboard_sent = True
+            else:
+                node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
+                ctx["error_triggered"] = True
+                return
+
         # Send service request if not already sent
         if not self.goal_sent:
             # Wait for service to be available
