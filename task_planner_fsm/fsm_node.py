@@ -11,6 +11,8 @@ from rclpy.action import ActionClient
 from control_msgs.action import FollowJointTrajectory
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
+import tf2_ros
+from rclpy.duration import Duration
 
 from task_planner_fsm.machine import StateMachine
 from task_planner_fsm.states import Initialization, CreateMap, ObjectID, GeometryReconstruction, ComputeWallPoints, WallTargetSelection, NavigateToTarget
@@ -21,6 +23,16 @@ from task_planner_fsm.states.proc_utils import stop_all
 class RobotFSMNode(Node):
     def __init__(self, sim=False):
         super().__init__('robot_fsm_node')
+
+        # NOTE: Do NOT set use_sim_time=True here!
+        # The FSM timer must run on wall time even in simulation mode,
+        # otherwise it blocks waiting for /clock before simulation starts.
+        # TF checks will still work correctly by using rclpy.time.Time() which
+        # automatically gets the latest available transform regardless of time source.
+        
+        # TF2 buffer and listener for transform checks
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # FSM telemetry publishers
         current_qos = QoSProfile(depth=1)
@@ -46,6 +58,7 @@ class RobotFSMNode(Node):
             "sim": bool(sim),
             "publish_fsm_current": self.publish_fsm_current,
             "publish_fsm_transition": self.publish_fsm_transition,
+            "tf_buffer": self.tf_buffer,
         }
 
         # FSM
@@ -73,7 +86,7 @@ class RobotFSMNode(Node):
         self.create_subscription(Bool, "/start_flag", self.start_callback, 10)
         self.create_subscription(Odometry, "/rtabmap/odom", self.odometry_callback, 10)        
         self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
-        self.create_subscription(Bool, "/execution_status", self.execution_status_callback, 10)
+        self.create_subscription(Bool, "/arm/execution_status", self.execution_status_callback, 10)
         self.create_subscription(Bool, "/planner/goal_failed", self.planner_goal_failed_callback, 10)
         self.create_subscription(Bool, "/map_done", self.mapping_callback, 10)       
 

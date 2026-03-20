@@ -1,136 +1,106 @@
 from ..state import State
-from geometry_msgs.msg import Pose, PoseStamped
+from arm_control.srv import SendPosition
 from collections import deque
 
 class ArmFolding(State):
     def __init__(self, name):
         super().__init__(name)
-        self.goal_pub = None
+        self.service_client = None
         self.movement_done = False
         self.future = None
         self.verbose = False
-        self.waiting_for_arrival = False
         self.goals_queue = deque()
+        self.current_goal = None
         
     def on_enter(self, ctx):
         self.movement_done = False
         self.verbose = False
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering folding state.")
-        self.goal_pub = node.create_publisher(PoseStamped, '/arm/goal_pose', 10)     # if no namespace is needed, erase "arm/" in both
+        
+        # Create service client for position_sender_node
+        self.service_client = node.create_client(SendPosition, '/arm/send_position')
+        
         ctx["folding_success"] = False
         ctx["error_triggered"] = False
-        ctx["folded_position"] = (0.254, -0.173, 0.401, 0.498, 0.710, 0.286, 0.407)
-        ctx["folded_position_joints"] = (0.0, -0.859, -2.812, 0.0, 1.57, 2.80)       # (x,y,z) = -0.182, 0.085, 0.499 / (x,y,z,w) = 0.274, 0.200, -0.677, 0.653
-        ctx["unfolded_position_joints"] = (0.0, -1.104, -2.034, 0.0, 1.57, 2.8)   # (x,y,z) = -0.189, -0.183, 0.944 / (x,y,z,w) = 0.548, 0.478, -0.511, 0.458
-        ctx["unfolded_position"] = (0.411, -0.173, 0.850, 0.406, 0.577, 0.408, 0.580)
 
+        # Define the sequence of movements: unfold first, then fold
         self.goals_queue.clear()
-        self.waiting_for_arrival = False
-
-        unfolded_position = ctx.get("unfolded_position")
-        unfolded_pose = PoseStamped()
-        unfolded_pose.header.stamp = node.get_clock().now().to_msg()
-        unfolded_pose.header.frame_id = 'arm_base'
-        unfolded_pose.pose.position.x = unfolded_position[0]
-        unfolded_pose.pose.position.y = unfolded_position[1]
-        unfolded_pose.pose.position.z = unfolded_position[2]
-        unfolded_pose.pose.orientation.x = unfolded_position[3]
-        unfolded_pose.pose.orientation.y = unfolded_position[4]
-        unfolded_pose.pose.orientation.z = unfolded_position[5]
-        unfolded_pose.pose.orientation.w = unfolded_position[6]
-        self.goals_queue.append(unfolded_pose)
-
-        folded_position = ctx.get("folded_position")
-        folded_pose = PoseStamped()
-        folded_pose.header.stamp = node.get_clock().now().to_msg()
-        folded_pose.header.frame_id = 'arm_base'
-        folded_pose.pose.position.x = folded_position[0]
-        folded_pose.pose.position.y = folded_position[1]
-        folded_pose.pose.position.z = folded_position[2]
-        folded_pose.pose.orientation.x = folded_position[3]
-        folded_pose.pose.orientation.y = folded_position[4]
-        folded_pose.pose.orientation.z = folded_position[5]
-        folded_pose.pose.orientation.w = folded_position[6]
-        self.goals_queue.append(folded_pose)
+        self.goals_queue.append('unfolded_fsm')
+        self.goals_queue.append('folded_fsm')
+        
+        self.current_goal = None
+        self.future = None
             
     def _send_next_goal(self, ctx):
-        """Publica el siguiente goal de la cola y pone el sistema en espera de llegada."""
+        """Sends the next goal via service call."""
         node = ctx["node"]
 
         if not self.goals_queue:
-            # No quedan objetivos → terminar
+            # No goals left → done
             self.movement_done = True
             return
 
-        # Tomamos el siguiente sin perderlo para log; luego lo extraemos
-        next_goal = self.goals_queue.popleft()
-
-        # Importante para evitar arrastres: el planner debe poner esto a True cuando llegue
-        ctx["execution_status"] = False
-
-        # Publicamos el Pose directamente
-        self.goal_pub.publish(next_goal)
-        self.waiting_for_arrival = True
-        node.get_logger().info(
-            f"[{self.name}] Goal sent. "
-            f"pos=({next_goal.pose.position.x:.3f}, {next_goal.pose.position.y:.3f}, {next_goal.pose.position.z:.3f}). "
-            f"orn=({next_goal.pose.orientation.x:.3f}, {next_goal.pose.orientation.y:.3f}, {next_goal.pose.orientation.z:.3f}, {next_goal.pose.orientation.w:.3f})"
-        )
+        # Get next position name
+        self.current_goal = self.goals_queue.popleft()
+        
+        # Wait for service to be available
+        if not self.service_client.wait_for_service(timeout_sec=1.0):
+            node.get_logger().warn(f"[{self.name}] Service /arm/send_position not available")
+            ctx["error_triggered"] = True
+            return
+        
+        # Create service request
+        request = SendPosition.Request()
+        request.position_name = self.current_goal
+        
+        # Send async service call
+        self.future = self.service_client.call_async(request)
+        node.get_logger().info(f"[{self.name}] Sending service request for position: {self.current_goal}")
 
     def run(self, ctx):
         node = ctx["node"]
 
-        ## In this section the wall approximation algorithm should be deactivated first
-        ## Then, the arm should retreat from the wall to the defined distance (NEEDS TO BE PARAMETRIZED)
-
-        # ###
-        # ### Using Action Client
-        # ###
-        # arm_client: ActionClient = ctx["manipulator_client"]
-        # ###
-        # ###
-        # ###
-
-        ###
-        ### Using /goal_pose and planner_node
-        ###
         if ctx.get("error_triggered") or self.movement_done:
             return
         
-        if not self.waiting_for_arrival:
+        # If no future, send next goal
+        if self.future is None:
             self._send_next_goal(ctx)
+            self.verbose = False  # Reset verbose flag for new goal
             return
         
+        # Check if service call is complete
+        if not self.future.done():
+            return
+        
+        # Get service response (only once per goal)
+        try:
+            response = self.future.result()
+            if not response.success:
+                node.get_logger().error(f"[{self.name}] Service call failed: {response.message}")
+                ctx["error_triggered"] = True
+                return
+            
+            node.get_logger().info(f"[{self.name}] Service call successful: {response.message}")
+            self.future = None  # Clear future so we don't process it again
+            self.verbose = False  # Reset verbose for waiting message
+            
+        except Exception as e:
+            node.get_logger().error(f"[{self.name}] Service call exception: {str(e)}")
+            ctx["error_triggered"] = True
+            return
+        
+        # Wait for execution to complete
         exec_status = ctx.get("execution_status")
         if exec_status is True:
-            # Llegamos: liberamos la espera y lanzamos el siguiente
-            self.waiting_for_arrival = False
-            node.get_logger().info(f"[{self.name}] Goal reached.")
-            # Opcional: si tu planner no resetea execution_status, hazlo tú
-            ctx["execution_status"] = False
-        elif exec_status is False or exec_status is None:
-            # Seguimos esperando
-            node.get_logger().debug(f"[{self.name}] Waiting for arrival confirmation...")
-        else:
-            # Si tu pipeline usa otros estados/valores, puedes gestionarlos aquí
-            pass
+            # Movement completed
+            node.get_logger().info(f"[{self.name}] Position {self.current_goal} reached.")
+            # Don't reset execution_status here - let the system propagate it naturally
+            node.get_logger().info(f"[{self.name}] Waiting for arm to reach {self.current_goal}...")
+            self.verbose = True
 
-        ###
-        ###
-        ###
-
-    def check_transition(self, ctx):
-        # if self.movement_done and not ctx.get("scan_done"):
-        #     return "WallTargetSelection"
-        # if self.movement_done and ctx.get("scan_done"):
-        #     if ctx.get("scan_phase") == 1:
-        #         return "AreasOfInterest"
-        #     if ctx.get("scan_phase") == 2:
-        #         return "HomePosition"
-        # if ctx.get("error_triggered"):
-        #     return "Error"
-        
+    def check_transition(self, ctx):        
         if ctx.get("scan_phase") == 1:
             if self.movement_done and not ctx.get("scan_done"):
                 # print("ARM FOLDING - AF1")

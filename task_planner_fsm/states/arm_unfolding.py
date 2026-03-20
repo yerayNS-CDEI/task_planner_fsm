@@ -1,9 +1,10 @@
 from ..state import State
-from geometry_msgs.msg import Pose, PoseStamped
+from arm_control.srv import SendPosition
 
 class ArmUnfolding(State):
     def __init__(self, name):
         super().__init__(name)
+        self.service_client = None
         self.goal_sent = False
         self.movement_done = False
         self.future = None
@@ -15,72 +16,73 @@ class ArmUnfolding(State):
         self.verbose = False
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering unfolding state.")
-        node.publisher_ = node.create_publisher(PoseStamped, '/arm/goal_pose', 10)
+        
+        # Create service client for position_sender_node
+        self.service_client = node.create_client(SendPosition, '/arm/send_position')
+        
         ctx["unfolding_success"] = False
         ctx["error_triggered"] = False
-        # ctx["unfolded_position_joints"] = (-1.594, -0.736, -1.974, -0.491, 1.472, 1.595)   # (x,y,z) = -0.189, -0.183, 0.944 / (x,y,z,w) = 0.548, 0.478, -0.511, 0.458
-        # ctx["folded_position_joints"] = (-1.594, 0.000, -2.872, 0.613, 1.472, 1.595)       # (x,y,z) = -0.182, 0.085, 0.499 / (x,y,z,w) = 0.274, 0.200, -0.677, 0.653
-        # ctx["unfolded_position"] = (-0.189, -0.183, 0.944, 0.548, 0.478, -0.511, 0.458)
-        # ctx["folded_position"] = (-0.182, 0.085, 0.499, 0.274, 0.200, -0.677, 0.653)
-        ctx["unfolded_position_joints"] = (0.0, -1.104, -2.034, 0.0, 1.57, 2.8)   # (x,y,z) = -0.189, -0.183, 0.944 / (x,y,z,w) = 0.548, 0.478, -0.511, 0.458
-        ctx["folded_position_joints"] = (-1.594, 0.000, -2.872, 0.613, 1.472, 1.595)       # (x,y,z) = -0.182, 0.085, 0.499 / (x,y,z,w) = 0.274, 0.200, -0.677, 0.653
-        ctx["unfolded_position"] = (0.411, -0.173, 0.850, 0.406, 0.577, 0.408, 0.580)
-        ctx["folded_position"] = (0.0, -0.173, 0.517, 0.334, 0.476, 0.468, 0.666)
+        self.future = None
 
     def run(self, ctx):
         node = ctx["node"]
-        # ###
-        # ### Using Action Client
-        # ###
-        # arm_client: ActionClient = ctx["manipulator_client"]
-        # ###
-        # ###
-        # ###
 
-        ###
-        ### Using /goal_pose and planner_node
-        ###
+        if ctx.get("error_triggered") or self.movement_done:
+            return
+        
+        # Send service request if not already sent
         if not self.goal_sent:
-            unfolded_safe_joint_state = ctx.get("unfolded_position_joints")
-
-            if not unfolded_safe_joint_state:
-                node.get_logger().error(f"[{self.name}] Missing unfolded configuration in context.")
+            # Wait for service to be available
+            if not self.service_client.wait_for_service(timeout_sec=1.0):
+                node.get_logger().warn(f"[{self.name}] Service /arm/send_position not available")
                 ctx["error_triggered"] = True
                 return
             
-            if len(unfolded_safe_joint_state) != 6:
-                node.get_logger().error(f"[{self.name}] Invalid unfolded_safe_joint_state: expected 6 values.")
+            # Create service request
+            request = SendPosition.Request()
+            request.position_name = 'unfolded_fsm'
+            
+            # Reset execution status before sending
+            ctx["execution_status"] = False
+            
+            # Send async service call
+            self.future = self.service_client.call_async(request)
+            node.get_logger().info(f"[{self.name}] Sending service request for position: unfolded_fsm")
+            self.goal_sent = True
+            return
+        
+        # Check if service call is complete
+        if self.future is not None and not self.future.done():
+            return
+        
+        # Get service response (only once)
+        if self.future is not None:
+            try:
+                response = self.future.result()
+                if not response.success:
+                    node.get_logger().error(f"[{self.name}] Service call failed: {response.message}")
+                    ctx["error_triggered"] = True
+                    return
+                
+                node.get_logger().info(f"[{self.name}] Service call successful: {response.message}")
+                self.future = None  # Clear future after processing
+                
+            except Exception as e:
+                node.get_logger().error(f"[{self.name}] Service call exception: {str(e)}")
                 ctx["error_triggered"] = True
                 return
-
-            unfolded_position = ctx.get("unfolded_position")
-            msg = PoseStamped()
-            msg.header.stamp = node.get_clock().now().to_msg()
-            msg.header.frame_id = 'arm_base'
-            msg.pose.position.x = unfolded_position[0]
-            msg.pose.position.y = unfolded_position[1]
-            msg.pose.position.z = unfolded_position[2]
-            msg.pose.orientation.x = unfolded_position[3]
-            msg.pose.orientation.y = unfolded_position[4]
-            msg.pose.orientation.z = unfolded_position[5]
-            msg.pose.orientation.w = unfolded_position[6]
-            node.publisher_.publish(msg)
-            node.get_logger().info(f"[{self.name}] Sending unfolded configuration as a goal.")
-            self.goal_sent = True
         
-        else:
-            if ctx.get("execution_status") == False and not self.verbose:
-                node.get_logger().info(f"[{self.name}] Waiting to arrive to goal...")
+        # Wait for execution to complete
+        exec_status = ctx.get("execution_status")
+        if exec_status is True:
+            # Movement completed
+            self.movement_done = True
+            node.get_logger().info(f"[{self.name}] Position unfolded_fsm reached.")
+        elif exec_status is False or exec_status is None:
+            # Still waiting for arrival
+            if not self.verbose:
+                node.get_logger().info(f"[{self.name}] Waiting for arm to reach unfolded_fsm...")
                 self.verbose = True
-            if ctx.get("execution_status") == True:
-                self.movement_done = True
-                node.get_logger().info(f"[{self.name}] Goal reached.")
-        ###
-        ###
-        ###
-
-        ## In this section the wall approximation algorithm should be activated (after ensuring the sensors readings are available)
-        ## Then, the arm should approach the wall to the defined distance (NEEDS TO BE PARAMETRIZED)
 
     def check_transition(self, ctx):
         if self.movement_done and ctx.get("scan_phase") == 1:
