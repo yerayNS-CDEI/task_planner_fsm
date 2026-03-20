@@ -4,6 +4,7 @@ from typing import List, Tuple, Dict
 from collections import deque
 import numpy as np
 import rclpy.time
+import math
 
 from geometry_msgs.msg import Pose, PoseStamped
 from rclpy.duration import Duration
@@ -13,6 +14,7 @@ from tf2_geometry_msgs import do_transform_pose_stamped
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration as DurationMsg
+from arm_control.srv import ScriptCommand
 
 class ExhaustiveScan(State):
     def __init__(self, name):
@@ -28,6 +30,11 @@ class ExhaustiveScan(State):
         self._pending_panel_cells = None
         self._pending_panel_vertices = None
         self.wall_orientation = None  # Store computed orientation
+        
+        # Script command service client
+        self.script_command_client = None
+        self.pending_service_future = None
+        self.total_goals_count = 0  # Track total number of goals
         
         # Column extension tracking
         self.column_client = None
@@ -53,11 +60,10 @@ class ExhaustiveScan(State):
         self.column_vel_tol = 0.002
         self.column_settle_time_s = 0.5  # Increased from 0.25 to 0.5 seconds for better stability
         
-        # Planner-feedback watchdog and recovery policy
-        self.enable_goal_timeout_fallback = False
-        self.goal_wait_timeout_s = 10.0
-        self.goal_wait_deadline = None
-        self.max_base_recompute_retries = 2
+        # Movement parameters for movel command
+        self.movel_acceleration = 1.2  # m/s²
+        self.movel_velocity = 0.25  # m/s
+        self.movel_blend_radius = 0.0  # Stop at each point
 
     def _choose_column_height_for_goal_z(self, goal_z_in_arm_base: float) -> float:
         """
@@ -178,6 +184,41 @@ class ExhaustiveScan(State):
             y = (R[1, 2] + R[2, 1]) / s
             z = 0.25 * s
         return (x, y, z, w)
+    
+    def _quaternion_to_rotation_vector(self, qx: float, qy: float, qz: float, qw: float) -> Tuple[float, float, float]:
+        """
+        Convert quaternion to rotation vector (axis-angle representation).
+        Returns (rx, ry, rz) in radians.
+        """
+        # Normalize quaternion
+        norm = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        if norm < 1e-6:
+            return (0.0, 0.0, 0.0)
+        
+        qx, qy, qz, qw = qx/norm, qy/norm, qz/norm, qw/norm
+        
+        # Handle numerical issues
+        if qw > 1.0:
+            qw = 1.0
+        elif qw < -1.0:
+            qw = -1.0
+        
+        # Compute angle
+        angle = 2.0 * math.acos(qw)
+        
+        # Compute axis
+        sin_half_angle = math.sqrt(1.0 - qw*qw)
+        
+        if sin_half_angle < 1e-6:
+            # Angle is close to 0, return zero rotation
+            return (0.0, 0.0, 0.0)
+        
+        axis_x = qx / sin_half_angle
+        axis_y = qy / sin_half_angle
+        axis_z = qz / sin_half_angle
+        
+        # Rotation vector = axis * angle
+        return (axis_x * angle, axis_y * angle, axis_z * angle)
 
     def _compute_wall_normal_from_vertices(self, node, tf_buffer, panel_vertices: List, resolution: float = None) -> np.ndarray:
         """
@@ -189,13 +230,18 @@ class ExhaustiveScan(State):
             node.get_logger().error(f"[{self.name}] Not enough vertices to compute wall normal.")
             return None
         
+        # Check if transform is available before attempting lookup
+        if not tf_buffer.can_transform('arm_base', 'map', rclpy.time.Time(), Duration(seconds=0.1)):
+            node.get_logger().debug(f"[{self.name}] Transform map->arm_base not yet available, waiting...")
+            return None
+        
         # Transform first panel's vertices from map to arm_base
         try:
             tf = tf_buffer.lookup_transform(
                 'arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0)
             )
         except Exception as e:
-            node.get_logger().error(f"[{self.name}] TF lookup map->arm_base failed: {e}")
+            node.get_logger().warn(f"[{self.name}] TF lookup map->arm_base failed: {e}")
             return None
         
         # Take first 4 vertices (first panel)
@@ -292,12 +338,17 @@ class ExhaustiveScan(State):
         if not panel_cells_centers:
             return []
 
+        # Check if transform is available before attempting lookup
+        if not tf_buffer.can_transform('arm_base', 'map', rclpy.time.Time(), Duration(seconds=0.1)):
+            node.get_logger().debug(f"[{self.name}] Transform map->arm_base not yet available for ordering, waiting...")
+            return []
+
         try:
             tf = tf_buffer.lookup_transform(
                 'arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0)
             )
         except Exception as e:
-            node.get_logger().error(f"[{self.name}] TF lookup map->arm_base failed: {e}")
+            node.get_logger().warn(f"[{self.name}] TF lookup map->arm_base failed: {e}")
             return []
 
         # Transform temporarily to get ordering, but return original poses in map frame
@@ -359,6 +410,13 @@ class ExhaustiveScan(State):
         
         if self.column_client is None:
             self.column_client = ActionClient(node, FollowJointTrajectory, self.column_action_name)
+        
+        if self.script_command_client is None:
+            self.script_command_client = node.create_client(ScriptCommand, '/send_script_command')
+            if not self.script_command_client.wait_for_service(timeout_sec=5.0):
+                node.get_logger().error(f"[{self.name}] Script command service not available!")
+                ctx["error_triggered"] = True
+                return
 
         self.goal_pub = node.create_publisher(PoseStamped, '/arm/goal_pose', 10)
         self.goals_queue.clear()
@@ -375,9 +433,9 @@ class ExhaustiveScan(State):
         self.wall_orientation = None
         self._column_stable_since = None
         self.column_target_height = None
-        self.goal_wait_deadline = None
+        self.pending_service_future = None
+        self.total_goals_count = 0
         ctx["error_triggered"] = False
-        ctx["planner_goal_failed"] = False
         ctx.setdefault("base_recompute_retry_counts", {})
 
         res = ctx.get("wall_discretization_results")
@@ -440,51 +498,19 @@ class ExhaustiveScan(State):
         self._pending_panel_vertices = panel_vertices
         node.get_logger().info(f"[{self.name}] Stored {len(panel_cells_centers)} panel cells and {len(panel_vertices)} vertices. Waiting for TF to be ready...")
     
-    def _trigger_recovery_from_stuck_goal(self, ctx):
+    def _handle_service_failure(self, ctx, error_message: str):
         """
-        Recover from a planner stall (e.g., IK NaN where /execution_status never becomes True).
-        First retries by recomputing base placement. After N retries on the same base,
-        skip that base to avoid infinite loops.
+        Handle script command service failure.
+        Logs error and triggers state transition to error handling.
         """
         node = ctx["node"]
-        base_idx = ctx.get("selected_base_idx")
-        completed_base_indices = ctx.setdefault("completed_base_indices", [])
-
-        # Reset per-goal wait state
+        node.get_logger().error(f"[{self.name}] Script command failed: {error_message}")
+        ctx["error_triggered"] = True
         self.waiting_for_arrival = False
-        self.goal_wait_deadline = None
-        ctx["execution_status"] = False
-        ctx["planner_goal_failed"] = False
-
-        retry_counts = ctx.setdefault("base_recompute_retry_counts", {})
-        retries_for_base = int(retry_counts.get(base_idx, 0)) + 1
-        retry_counts[base_idx] = retries_for_base
-
-        if retries_for_base <= self.max_base_recompute_retries:
-            node.get_logger().error(
-                f"[{self.name}] Planner did not confirm goal completion within "
-                f"{self.goal_wait_timeout_s:.1f}s for base {base_idx}. "
-                f"Requesting base recomputation ({retries_for_base}/{self.max_base_recompute_retries})."
-            )
-            ctx["recompute_base_placement"] = True
-            self.movement_done = True
-            return
-
-        node.get_logger().error(
-            f"[{self.name}] Base {base_idx} exceeded recovery retries "
-            f"({retries_for_base - 1} recomputations). Marking it as skipped."
-        )
-        if ctx.get("panels_left", 0) > 0:
-            ctx["panels_left"] -= 1
-        if ctx.get("panels_left", 0) <= 0:
-            ctx["exhaustive_scan_done"] = True
-        if base_idx is not None and base_idx not in completed_base_indices:
-            completed_base_indices.append(base_idx)
-        ctx["recompute_base_placement"] = False
-        self.movement_done = True
+        self.pending_service_future = None
 
     def _send_next_goal(self, ctx):
-        """Transform goal to arm_base and publish (must be called AFTER column is at correct height)."""
+        """Send goal to robot via script command service (must be called AFTER column is at correct height)."""
         node = ctx["node"]
 
         if not self.goals_queue:
@@ -500,6 +526,12 @@ class ExhaustiveScan(State):
         ps_map.header.frame_id = 'map'
         ps_map.header.stamp = node.get_clock().now().to_msg()
         ps_map.pose = next_goal_map
+        
+        # Verify transform is available
+        if not self.tf_buffer.can_transform('arm_base', 'map', rclpy.time.Time(), Duration(seconds=0.5)):
+            node.get_logger().error(f"[{self.name}] Transform map->arm_base not available when sending goal")
+            ctx["error_triggered"] = True
+            return
         
         try:
             tf = self.tf_buffer.lookup_transform(
@@ -519,23 +551,55 @@ class ExhaustiveScan(State):
             ps_arm.pose.orientation.y = qy
             ps_arm.pose.orientation.z = qz
             ps_arm.pose.orientation.w = qw
-
-        # Reset execution status
-        ctx["execution_status"] = False
-        ctx["planner_goal_failed"] = False
-
-        # Publish transformed goal
-        self.goal_pub.publish(ps_arm)
-        self.waiting_for_arrival = True
-        if self.enable_goal_timeout_fallback:
-            self.goal_wait_deadline = node.get_clock().now() + Duration(seconds=self.goal_wait_timeout_s)
         else:
-            self.goal_wait_deadline = None
+            qx = ps_arm.pose.orientation.x
+            qy = ps_arm.pose.orientation.y
+            qz = ps_arm.pose.orientation.z
+            qw = ps_arm.pose.orientation.w
+        
+        # Convert quaternion to rotation vector for movel command
+        rx, ry, rz = self._quaternion_to_rotation_vector(qx, qy, qz, qw)
+        
+        # Determine if this is first or last goal
+        is_first_goal = (self.current_goal_idx == 0)
+        # Calculate remaining goals across all heights
+        remaining_in_current_queue = len(self.goals_queue)
+        remaining_heights = len(self.height_sequence) - self.current_height_idx - 1
+        remaining_in_future_heights = sum(
+            len(self.goals_by_height[self.height_sequence[i]]) 
+            for i in range(self.current_height_idx + 1, len(self.height_sequence))
+        )
+        total_remaining = remaining_in_current_queue + remaining_in_future_heights
+        is_last_goal = (total_remaining == 0)
+        
+        # Prepare service request
+        request = ScriptCommand.Request()
+        request.command_name = 'movel'
+        request.numeric_params = [
+            float(ps_arm.pose.position.x),
+            float(ps_arm.pose.position.y),
+            float(ps_arm.pose.position.z),
+            float(rx),
+            float(ry),
+            float(rz),
+            float(self.movel_acceleration),
+            float(self.movel_velocity),
+            0.0,  # time parameter (0 = use velocity control)
+            float(self.movel_blend_radius)
+        ]
+        request.string_params = []
+        request.stop_program = is_first_goal
+        request.restart_program = is_last_goal
+        
+        # Call service asynchronously
+        self.pending_service_future = self.script_command_client.call_async(request)
+        self.waiting_for_arrival = True
+        
         node.get_logger().info(
-            f"[{self.name}] Sent goal {self.current_goal_idx + 1} "
-            f"(remaining: {len(self.goals_queue)}). "
-            f"pos=({ps_arm.pose.position.x:.3f}, {ps_arm.pose.position.y:.3f}, {ps_arm.pose.position.z:.3f}). "
-            f"orn=({ps_arm.pose.orientation.x:.3f}, {ps_arm.pose.orientation.y:.3f}, {ps_arm.pose.orientation.z:.3f}, {ps_arm.pose.orientation.w:.3f})"
+            f"[{self.name}] Sending goal {self.current_goal_idx + 1}/{self.total_goals_count} via script command. "
+            f"pos=({ps_arm.pose.position.x:.3f}, {ps_arm.pose.position.y:.3f}, {ps_arm.pose.position.z:.3f}), "
+            f"rot_vec=({rx:.3f}, {ry:.3f}, {rz:.3f}). "
+            f"stop_program={is_first_goal}, restart_program={is_last_goal}"
         )
 
     def run(self, ctx):
@@ -549,9 +613,14 @@ class ExhaustiveScan(State):
         if ctx.get("error_triggered") or self.movement_done:
             return
 
-        # Populate queue via TF lookup on first run() tick (buffer is ready by now)
+        # Populate queue via TF lookup on first run() tick (wait for TF to be ready)
         if not self.goals_initialized:
             if self._pending_panel_cells is None or self._pending_panel_vertices is None:
+                return
+            
+            # Wait for TF to be available before proceeding
+            if not self.tf_buffer.can_transform('arm_base', 'map', rclpy.time.Time(), Duration(seconds=0.1)):
+                node.get_logger().info(f"[{self.name}] Waiting for TF map->arm_base to become available...")
                 return
             
             # Compute wall normal from vertices first
@@ -589,11 +658,16 @@ class ExhaustiveScan(State):
                 ps_map.pose = p
                 
                 try:
-                    tf = self.tf_buffer.lookup_transform(
-                        'arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0)
-                    )
-                    ps_arm = do_transform_pose_stamped(ps_map, tf)
-                    goal_z = ps_arm.pose.position.z
+                    # Double-check transform is still available
+                    if not self.tf_buffer.can_transform('arm_base', 'map', rclpy.time.Time(), Duration(seconds=0.1)):
+                        node.get_logger().warn(f"[{self.name}] TF temporarily unavailable during grouping")
+                        goal_z = 0.5  # Default fallback
+                    else:
+                        tf = self.tf_buffer.lookup_transform(
+                            'arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0)
+                        )
+                        ps_arm = do_transform_pose_stamped(ps_map, tf)
+                        goal_z = ps_arm.pose.position.z
                 except Exception as e:
                     node.get_logger().warn(f"[{self.name}] TF lookup failed during grouping: {e}")
                     goal_z = 0.5  # Default fallback
@@ -609,9 +683,9 @@ class ExhaustiveScan(State):
             self.height_sequence = sorted(self.goals_by_height.keys(), reverse=True)
             
             # Log grouping summary
-            total_goals = sum(len(q) for q in self.goals_by_height.values())
+            self.total_goals_count = sum(len(q) for q in self.goals_by_height.values())
             node.get_logger().info(
-                f"[{self.name}] Grouped {total_goals} goals into {len(self.height_sequence)} "
+                f"[{self.name}] Grouped {self.total_goals_count} goals into {len(self.height_sequence)} "
                 f"column heights (highest first): {[f'{h:.2f}m' for h in self.height_sequence]}"
             )
             for h in self.height_sequence:
@@ -692,34 +766,26 @@ class ExhaustiveScan(State):
             self._send_next_goal(ctx)
             return
         
-        if ctx.get("planner_goal_failed"):
-            node.get_logger().error(
-                f"[{self.name}] Planner reported goal failure. Triggering immediate recovery."
-            )
-            self._trigger_recovery_from_stuck_goal(ctx)
-            return
-
-        exec_status = ctx.get("execution_status")
-        if exec_status is True:
-            # Llegamos: liberamos la espera y lanzamos el siguiente
-            self.waiting_for_arrival = False
-            self.goal_wait_deadline = None
-            node.get_logger().info(f"[{self.name}] Goal {self.current_goal_idx + 1} reached.")
-            # Opcional: si tu planner no resetea execution_status, hazlo tú
-            ctx["execution_status"] = False
-        elif exec_status is False or exec_status is None:
-            if (
-                self.enable_goal_timeout_fallback
-                and self.goal_wait_deadline
-                and node.get_clock().now() > self.goal_wait_deadline
-            ):
-                self._trigger_recovery_from_stuck_goal(ctx)
+        # Check if service call is pending
+        if self.pending_service_future is not None:
+            if self.pending_service_future.done():
+                try:
+                    response = self.pending_service_future.result()
+                    if response.success:
+                        node.get_logger().info(
+                            f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully: {response.message}"
+                        )
+                        self.waiting_for_arrival = False
+                        self.pending_service_future = None
+                    else:
+                        self._handle_service_failure(ctx, response.message)
+                        return
+                except Exception as e:
+                    self._handle_service_failure(ctx, str(e))
+                    return
+            else:
+                # Still waiting for service response
                 return
-            # Seguimos esperando
-            node.get_logger().debug(f"[{self.name}] Waiting for arrival confirmation...")
-        else:
-            # Si tu pipeline usa otros estados/valores, puedes gestionarlos aquí
-            pass
 
     def check_transition(self, ctx):
         if ctx.get("error_triggered"):
