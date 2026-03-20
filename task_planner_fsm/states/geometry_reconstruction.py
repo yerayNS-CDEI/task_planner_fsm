@@ -59,7 +59,7 @@ class GeometryReconstruction(State):
                     ctx, "nav_sim",
                     ["ros2", "launch", "navi_wall", "move_robot.launch.py",
                     f"sim:={sim_value}", "mode:=full", "controller_type:=omni", "database_name:=rtabmap", "headless:=true",
-                    "use_sim_time:=true"]
+                    "use_sim_time:=true", "hybrid_sim:=true"]
                 )
                 time.sleep(5)
                 node.get_logger().info(f"[{self.name}] Navigation + localization simulation started.")
