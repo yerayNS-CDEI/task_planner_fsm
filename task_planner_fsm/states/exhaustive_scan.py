@@ -250,10 +250,11 @@ class ExhaustiveScan(State):
         for i in range(min(4, len(panel_vertices))):
             v = panel_vertices[i]
             ps_map = PoseStamped()
-            ps_map.header.frame_id = 'map'
+            ps_map.header.frame_id = "map"
             ps_map.header.stamp = now
             ps_map.pose = v
             ps_arm = do_transform_pose_stamped(ps_map, tf)
+            ps_arm.header.frame_id = "arm_base"
             vertices_arm_base.append(np.array([
                 ps_arm.pose.position.x,
                 ps_arm.pose.position.y,
@@ -356,11 +357,11 @@ class ExhaustiveScan(State):
         now = node.get_clock().now().to_msg()
         for p in panel_cells_centers:
             ps_map = PoseStamped()
-            ps_map.header.frame_id = 'map'
+            ps_map.header.frame_id = "map"
             ps_map.header.stamp = now
             ps_map.pose = p
             ps_arm = do_transform_pose_stamped(ps_map, tf)
-            ps_arm.header.frame_id = 'arm_base'
+            ps_arm.header.frame_id = "arm_base"
             transformed.append(ps_arm)
 
         X = np.array([p.pose.position.x for p in transformed], dtype=float)
@@ -540,7 +541,7 @@ class ExhaustiveScan(State):
             ps_arm = do_transform_pose_stamped(ps_map, tf)
             ps_arm.header.frame_id = 'arm_base'
         except Exception as e:
-            node.get_logger().error(f"[{self.name}] Failed to transform goal to arm_base: {e}")
+            node.get_logger().error(f"[{self.name}] Failed to transform goal to arm base frame: {e}")
             ctx["error_triggered"] = True
             return
         
@@ -651,9 +652,9 @@ class ExhaustiveScan(State):
             # Group goals by required column height
             # Goals are still in MAP frame at this point
             for p in ordered_goals:
-                # Transform to arm_base temporarily to determine required height
+                # Transform to arm-base frame temporarily to determine required height
                 ps_map = PoseStamped()
-                ps_map.header.frame_id = 'map'
+                ps_map.header.frame_id = "map"
                 ps_map.header.stamp = node.get_clock().now().to_msg()
                 ps_map.pose = p
                 

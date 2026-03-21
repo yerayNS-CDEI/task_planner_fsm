@@ -6,11 +6,14 @@ class StateMachine:
         self.states = {s.name: s for s in states}
         self.ctx = ctx
         self.current_state = self.states[initial_state]
+        self.ctx["fsm_initial_state"] = initial_state
+        self.ctx["is_initial_entry"] = True
         self.ctx["last_state"] = None   # initialization
         self._retried_current_state = False
         self.ctx.setdefault('mapping_cmd', ['ros2', 'launch', 'navi_wall', 'global_exploration.launch.py', 'headless:=true'])
         install_global_cleanup(self.ctx)
         self.current_state.on_enter(self.ctx)
+        self.ctx["is_initial_entry"] = False
         self._publish_current_state(self.current_state.name)
 
     def _publish_current_state(self, state_name: str):
@@ -58,6 +61,7 @@ class StateMachine:
         self.current_state = self.states[next_state]
         if next_state != previous_state:
             self._retried_current_state = False
+        self.ctx["is_initial_entry"] = False
         self.current_state.on_enter(self.ctx)
         self._publish_current_state(self.current_state.name)
 

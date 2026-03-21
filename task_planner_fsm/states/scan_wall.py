@@ -25,6 +25,14 @@ class ScanWall(State):
         self.waiting = False
         ctx["error_triggered"] = False
 
+        if ctx.get("nav_client") is None:
+            node.get_logger().info(f"[{self.name}] Navigation client missing. Creating one for scan trajectory.")
+            ctx["nav_client"] = ActionClient(node, NavigateToPose, "/navigate_to_pose")
+            if not ctx["nav_client"].wait_for_server(timeout_sec=10.0):
+                node.get_logger().error(f"[{self.name}] NavigateToPose action server not available.")
+                ctx["error_triggered"] = True
+                return
+
         ## Activacion de arduino_sensors_sim y align_ee_to_wall de arm_control.
         ## Launched here so they initialise during the scan line navigation movement.
         arm_procs = [
