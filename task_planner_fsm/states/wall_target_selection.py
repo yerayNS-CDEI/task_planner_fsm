@@ -27,6 +27,24 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
     #     pos = msg.pose.pose.position
     #     self.current_position = (pos.x, pos.y)
 
+    def _closest_scan_line(self, walls_data, x, y):
+        min_dist = float("inf")
+        selected_line = None
+        selected_point = None
+
+        for wall in walls_data:
+            scan_line = wall.get("scan_line")
+            if not scan_line or len(scan_line) != 2:
+                continue
+            for pt in scan_line:
+                dist = ((x - pt[0]) ** 2 + (y - pt[1]) ** 2) ** 0.5
+                if dist < min_dist:
+                    min_dist = dist
+                    selected_line = scan_line
+                    selected_point = pt
+
+        return selected_line, selected_point
+
     def run(self, ctx):
         node = ctx["node"]
 
@@ -137,6 +155,18 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
             ctx["selected_base"] = selected_point
             ctx["target_selected"] = True
             ctx["selected_base_idx"] = selected_col_rank
+
+            # NavigateToTarget expects target_scan_wall/target_scan_point for orientation.
+            walls_data = ctx.get("walls_data", [])
+            scan_line, scan_point = self._closest_scan_line(walls_data, selected_point[0], selected_point[1])
+            if scan_line and scan_point:
+                ctx["target_scan_wall"] = scan_line
+                ctx["target_scan_point"] = scan_point
+            else:
+                node.get_logger().warn(
+                    f"[{self.name}] Could not infer target_scan_wall from walls_data; "
+                    "navigation yaw may not be wall-aligned."
+                )
 
         else:
             print(f"[{self.name}] Scanning phase not selected correctly.")

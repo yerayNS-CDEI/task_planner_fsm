@@ -21,9 +21,20 @@ class HomePosition(State):
         self.future = None
         self.waiting = False
 
+        if ctx.get("nav_client") is None:
+            node.get_logger().info(f"[{self.name}] Navigation client missing. Creating one for home navigation.")
+            ctx["nav_client"] = ActionClient(node, NavigateToPose, "/navigate_to_pose")
+            if not ctx["nav_client"].wait_for_server(timeout_sec=10.0):
+                node.get_logger().error(f"[{self.name}] NavigateToPose action server not available.")
+                ctx["error_triggered"] = True
+
     def run(self, ctx):
         node = ctx["node"]        
-        nav_client: ActionClient = ctx["nav_client"]
+        nav_client = ctx.get("nav_client")
+        if nav_client is None:
+            node.get_logger().error(f"[{self.name}] Navigation client not found in context.")
+            ctx["error_triggered"] = True
+            return
         
         if not self.goal_sent:
             target_point = ctx.get("home_position", None)

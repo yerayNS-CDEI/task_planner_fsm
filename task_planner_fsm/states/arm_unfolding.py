@@ -93,7 +93,8 @@ class ArmUnfolding(State):
         if exec_status is True:
             # Movement completed
             self.movement_done = True
-            node.get_logger().info(f"[{self.name}] Position unfolded_fsm reached.")
+            ctx["execution_status"] = False  # Reset for next state
+            node.get_logger().info(f"[{self.name}] Position unfolded_fsm reached. Movement complete.")
         elif exec_status is False or exec_status is None:
             # Still waiting for arrival
             if not self.verbose:
