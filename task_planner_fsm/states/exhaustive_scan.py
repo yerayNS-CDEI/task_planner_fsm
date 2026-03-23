@@ -53,16 +53,17 @@ class ExhaustiveScan(State):
         self.arm_reachable_z_min = 0.0
         self.arm_reachable_z_max = 1.1
         self.column_tolerance_m = 0.01  # Increased from 0.005 to 0.01 (10mm tolerance)
-        self.column_wait_timeout_s = 12.0  # Increased from 8.0 to 12.0 seconds
+        self.column_wait_timeout_s = 18.0  # Increased to 18.0 seconds for better stability with small movements
         self.column_move_time_s = 3.0
         self.column_joint_name = "column_joint"
         self.column_action_name = "/column_controller/follow_joint_trajectory"
         self.column_vel_tol = 0.002
         self.column_settle_time_s = 0.5  # Increased from 0.25 to 0.5 seconds for better stability
+        self.column_skip_movement_threshold_m = 0.025  # Skip movements smaller than 25mm to avoid oscillation issues
         
         # Movement parameters for movel command
         self.movel_acceleration = 1.2  # m/s²
-        self.movel_velocity = 0.25  # m/s
+        self.movel_velocity = 0.1  # m/s
         self.movel_blend_radius = 0.0  # Stop at each point
 
     def _choose_column_height_for_goal_z(self, goal_z_in_arm_base: float) -> float:
@@ -751,7 +752,9 @@ class ExhaustiveScan(State):
                 )
                 
                 # Command column to move to this height
-                if abs(next_height - column_current) > self.column_tolerance_m:
+                # Use threshold to avoid commanding tiny movements that may oscillate
+                height_diff = abs(next_height - column_current)
+                if height_diff > self.column_skip_movement_threshold_m:
                     if not self._command_column(node, ctx, next_height):
                         node.get_logger().error(f"[{self.name}] Failed to command column movement.")
                         ctx["error_triggered"] = True
@@ -759,8 +762,13 @@ class ExhaustiveScan(State):
                     # Wait for column before sending arm goals
                     return
                 else:
+                    # Column is close enough - clear any pending column wait state
+                    self.waiting_for_column = False
+                    self.column_target_height = None
+                    self._column_stable_since = None
                     node.get_logger().info(
-                        f"[{self.name}] Column already at target height {next_height:.2f}m"
+                        f"[{self.name}] Column already at target height {next_height:.2f}m "
+                        f"(diff={height_diff*1000:.1f}mm, skipping movement)"
                     )
             
             # Send next arm goal from current queue

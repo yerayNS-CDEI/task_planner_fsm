@@ -13,11 +13,16 @@ class ArmFolding(State):
         self.goals_queue = deque()
         self.current_goal = None
         self.dashboard_sent = False
+        self.goals_sent = 0  # Track how many goals have been sent
+        self.goals_completed = 0  # Track how many movements have completed
+        self.total_goals = 2  # Total goals in the sequence
         
     def on_enter(self, ctx):
         self.movement_done = False
         self.verbose = False
         self.dashboard_sent = False
+        self.goals_sent = 0
+        self.goals_completed = 0
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering folding state.")
         
@@ -40,12 +45,12 @@ class ArmFolding(State):
         node = ctx["node"]
 
         if not self.goals_queue:
-            # No goals left → done
-            self.movement_done = True
+            # No more goals to send
             return
 
         # Get next position name
         self.current_goal = self.goals_queue.popleft()
+        self.goals_sent += 1
         
         # Wait for service to be available
         if not self.service_client.wait_for_service(timeout_sec=1.0):
@@ -59,7 +64,10 @@ class ArmFolding(State):
         
         # Send async service call
         self.future = self.service_client.call_async(request)
-        node.get_logger().info(f"[{self.name}] Sending service request for position: {self.current_goal}")
+        node.get_logger().info(
+            f"[{self.name}] Sending service request for position: {self.current_goal} "
+            f"(goal {self.goals_sent}/{self.total_goals})"
+        )
 
     def run(self, ctx):
         node = ctx["node"]
@@ -91,30 +99,51 @@ class ArmFolding(State):
             return
         
         # Get service response (only once per goal)
-        try:
-            response = self.future.result()
-            if not response.success:
-                node.get_logger().error(f"[{self.name}] Service call failed: {response.message}")
+        if self.future is not None and not hasattr(self, '_service_response_processed'):
+            try:
+                response = self.future.result()
+                if not response.success:
+                    node.get_logger().error(f"[{self.name}] Service call failed: {response.message}")
+                    ctx["error_triggered"] = True
+                    return
+                
+                node.get_logger().info(f"[{self.name}] Service call successful: {response.message}")
+                self._service_response_processed = True
+                
+            except Exception as e:
+                node.get_logger().error(f"[{self.name}] Service call exception: {str(e)}")
                 ctx["error_triggered"] = True
                 return
-            
-            node.get_logger().info(f"[{self.name}] Service call successful: {response.message}")
-            self.future = None  # Clear future so we don't process it again
-            self.verbose = False  # Reset verbose for waiting message
-            
-        except Exception as e:
-            node.get_logger().error(f"[{self.name}] Service call exception: {str(e)}")
-            ctx["error_triggered"] = True
-            return
         
         # Wait for execution to complete
         exec_status = ctx.get("execution_status")
         if exec_status is True:
             # Movement completed
-            node.get_logger().info(f"[{self.name}] Position {self.current_goal} reached.")
-            # Don't reset execution_status here - let the system propagate it naturally
-            node.get_logger().info(f"[{self.name}] Waiting for arm to reach {self.current_goal}...")
-            self.verbose = True
+            self.goals_completed += 1
+            node.get_logger().info(
+                f"[{self.name}] Position {self.current_goal} reached "
+                f"(completed {self.goals_completed}/{self.total_goals})."
+            )
+            
+            # Clear future and flags now that movement is complete
+            self.future = None
+            if hasattr(self, '_service_response_processed'):
+                delattr(self, '_service_response_processed')
+            self.verbose = False
+            
+            # Reset execution status for next goal
+            ctx["execution_status"] = False
+            
+            # Check if all goals are completed
+            if self.goals_completed >= self.total_goals:
+                self.movement_done = True
+                node.get_logger().info(f"[{self.name}] All folding movements completed.")
+            # Note: do NOT call _send_next_goal() here, let next run() cycle handle it
+        elif exec_status is False or exec_status is None:
+            # Still waiting for arrival
+            if not self.verbose:
+                node.get_logger().info(f"[{self.name}] Waiting for arm to reach {self.current_goal}...")
+                self.verbose = True
 
     def check_transition(self, ctx):        
         if ctx.get("scan_phase") == 1:
