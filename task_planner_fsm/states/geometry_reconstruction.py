@@ -99,98 +99,10 @@ class GeometryReconstruction(State):
                     "use_sim_time:=true"]
                 )
                 
-                # Increased initial wait to allow processes to start
+                # Wait for processes to initialize
                 node.get_logger().info(f"[{self.name}] Waiting 10 seconds for processes to initialize...")
-                time.sleep(10)  # Increased from 7 to 10 seconds
+                time.sleep(10)
                 node.get_logger().info(f"[{self.name}] Navigation + localization simulation started.")
-                
-                # Wait for TF tree to be established (map -> arm_base)
-                # This is critical in hybrid mode to ensure arm TFs are ready
-                node.get_logger().info(f"[{self.name}] Waiting for TF tree (map -> arm_base) to be available...")
-                tf_buffer = ctx.get("tf_buffer")
-                if tf_buffer:
-                    max_wait_time = 45.0  # Maximum 45 seconds (increased for URSim connection)
-                    start_time = time.time()
-                    tf_available = False
-                    
-                    # Intermediate frames to check for diagnostic purposes
-                    check_frames = [
-                        ('map', 'odom', 'Localizer'),
-                        ('odom', 'base_footprint', 'Base odometry'),
-                        ('base_footprint', 'column_link', 'Base robot_state_publisher'),
-                        ('column_link', 'world', 'Static TF bridge'),
-                        ('world', 'arm_base_link', 'Arm root frame'),
-                        ('arm_base_link', 'arm_base', 'Arm robot_state_publisher'),
-                        ('map', 'arm_base', 'Complete chain'),
-                    ]
-                    
-                    last_report_time = start_time
-                    while (time.time() - start_time) < max_wait_time:
-                        # Check main transform
-                        # Use rclpy.time.Time() to get latest available transform (works with both sim and real time)
-                        try:
-                            transform_available = tf_buffer.can_transform(
-                                'map', 'arm_base', 
-                                rclpy.time.Time(), 
-                                timeout=Duration(seconds=0.5)
-                            )
-                            if transform_available:
-                                tf_available = True
-                                elapsed = time.time() - start_time
-                                node.get_logger().info(
-                                    f"[{self.name}] TF tree ready after {elapsed:.1f}s. Transform map->arm_base is available."
-                                )
-                                break
-                        except Exception as e:
-                            node.get_logger().debug(f"[{self.name}] TF check exception: {e}")
-                        
-                        # Report diagnostic every 5 seconds
-                        current_time = time.time()
-                        if current_time - last_report_time >= 5.0:
-                            node.get_logger().info(
-                                f"[{self.name}] Still waiting... ({current_time - start_time:.1f}s elapsed). Checking TF chain:"
-                            )
-                            for parent, child, description in check_frames:
-                                try:
-                                    # Use Time() for latest available, with timeout for proper checking
-                                    available = tf_buffer.can_transform(
-                                        parent, child, 
-                                        rclpy.time.Time(), 
-                                        timeout=Duration(seconds=0.1)
-                                    )
-                                    status = "✓" if available else "✗"
-                                    node.get_logger().info(f"  {status} {parent} -> {child} ({description})")
-                                except Exception as e:
-                                    node.get_logger().info(f"  ✗ {parent} -> {child} ({description}) - Error: {e}")
-                            last_report_time = current_time
-                        
-                        time.sleep(0.5)
-                    
-                    if not tf_available:
-                        node.get_logger().error(
-                            f"[{self.name}] TF tree (map->arm_base) not available after {max_wait_time}s!"
-                        )
-                        node.get_logger().error(f"[{self.name}] Final TF chain status:")
-                        for parent, child, description in check_frames:
-                            try:
-                                # Use Time() for latest available transform
-                                available = tf_buffer.can_transform(
-                                    parent, child, 
-                                    rclpy.time.Time(), 
-                                    timeout=Duration(seconds=0.1)
-                                )
-                                status = "✓" if available else "✗"
-                                node.get_logger().error(f"  {status} {parent} -> {child} ({description})")
-                            except Exception as e:
-                                node.get_logger().error(f"  ✗ {parent} -> {child} ({description}) - Error: {e}")
-                        
-                        node.get_logger().warn(
-                            f"[{self.name}] Check: 1) URSim is running (terminal 1), "
-                            "2) Arm driver connected, 3) Static TF publisher active. "
-                            "Proceeding anyway, but arm WILL NOT appear in RViz correctly."
-                        )
-                else:
-                    node.get_logger().warn(f"[{self.name}] TF buffer not available in context, skipping TF check.")
                                 
             except Exception as e:
                 node.get_logger().error(
