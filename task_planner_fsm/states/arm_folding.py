@@ -15,7 +15,7 @@ class ArmFolding(State):
         self.dashboard_sent = False
         self.goals_sent = 0  # Track how many goals have been sent
         self.goals_completed = 0  # Track how many movements have completed
-        self.total_goals = 2  # Total goals in the sequence
+        self.total_goals = 1  # Total goals in the sequence
         
     def on_enter(self, ctx):
         self.movement_done = False
@@ -32,9 +32,8 @@ class ArmFolding(State):
         ctx["folding_success"] = False
         ctx["error_triggered"] = False
 
-        # Define the sequence of movements: unfold first, then fold
+        # Define the sequence of movements: only fold
         self.goals_queue.clear()
-        self.goals_queue.append('unfolded_fsm')
         self.goals_queue.append('folded_fsm')
         
         self.current_goal = None
