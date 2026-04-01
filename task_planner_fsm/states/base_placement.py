@@ -2,6 +2,8 @@ from ..state import State
 from collections import deque
 from arm_control.srv import OptimalBase
 import numpy as np
+from geometry_msgs.msg import TransformStamped
+import tf2_ros
 
 class BasePlacement(State):
     def __init__(self, name):
@@ -23,6 +25,34 @@ class BasePlacement(State):
         
         ctx["optimal_bases_computed"] = False
         ctx["error_triggered"] = False
+
+        # Get TF transform from base_link to arm_base (static transform)
+        tf_buffer = ctx.get("tf_buffer")
+        if tf_buffer is None:
+            node.get_logger().error(f"[{self.name}] TF buffer not found in context.")
+            ctx["error_triggered"] = True
+            return
+        
+        try:
+            # Look up the static transform: base_link -> arm_base
+            # Use rclpy.time.Time() to get latest available transform (works with both sim and wall time)
+            from rclpy.time import Time
+            transform = tf_buffer.lookup_transform(
+                "base_link", 
+                "arm_base", 
+                Time(),
+                timeout=tf2_ros.Duration(seconds=2.0)
+            )
+            self.arm_base_offset_x = transform.transform.translation.x
+            self.arm_base_offset_y = transform.transform.translation.y
+            node.get_logger().info(
+                f"[{self.name}] arm_base offset from base_link: "
+                f"dx={self.arm_base_offset_x:.3f}, dy={self.arm_base_offset_y:.3f}"
+            )
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            node.get_logger().error(f"[{self.name}] Failed to get base_link -> arm_base transform: {e}")
+            ctx["error_triggered"] = True
+            return
 
         self.client = node.create_client(OptimalBase, 'compute_optimal_base')
         if not self.client.wait_for_service(timeout_sec=2.0):
@@ -80,13 +110,23 @@ class BasePlacement(State):
                     req.poses_ee_xyzrpy = list_vertices
                     req.obstacle_rects = []
                     req.obstacle_circles = []
-                    req.min_dist = 0.6
+                    req.min_dist = 0.6  # Close wall distance enabled by pre-approach step preventing singularities
                     req.round_decimals = 3
                     req.grid_res = 0.1
                     req.x_limits = [-10.0,10.0]
                     req.y_limits = [-10.0,10.0]
                     req.enable_simulator = False
                     req.enable_robot_viz = False
+
+                    # Log the actual request for debugging
+                    node.get_logger().info(
+                        f"[{self.name}] OptimalBase request #{col_rank}: "
+                        f"min_dist={req.min_dist}, {len(list_vertices)//6} poses"
+                    )
+                    node.get_logger().info(
+                        f"[{self.name}] poses_ee_xyzrpy sample (first 3): "
+                        f"{list_vertices[:18] if len(list_vertices) >= 18 else list_vertices}"
+                    )
 
                     self.pending_reqs.append((col_rank, req))
                 else:
@@ -134,7 +174,18 @@ class BasePlacement(State):
                 self.ok_count += 1
                 node.get_logger().info(f"[{self.name}] Column {col_rank} request succeeded. ({self.ok_count} OK)")
 
-                ctx["optimal_base_results"][col_rank] = (round(result.base_x,3),round(result.base_y,3))
+                # Transform arm_base position to base_link position
+                arm_base_x = result.base_x
+                arm_base_y = result.base_y
+                base_link_x = round(arm_base_x - self.arm_base_offset_x, 3)
+                base_link_y = round(arm_base_y - self.arm_base_offset_y, 3)
+                
+                node.get_logger().info(
+                    f"[{self.name}] Column {col_rank}: arm_base=({arm_base_x:.3f}, {arm_base_y:.3f}) "
+                    f"→ base_link=({base_link_x:.3f}, {base_link_y:.3f})"
+                )
+                
+                ctx["optimal_base_results"][col_rank] = (base_link_x, base_link_y)
             else:
                 node.get_logger().error(f"[{self.name}] Column {col_rank} request returned error: {getattr(result, 'message', '(no message)')}")
                 ctx["error_triggered"] = True
