@@ -1,7 +1,7 @@
 import argparse
 import json
 import math
-import subprocess
+import shlex
 import sys
 import time
 from typing import Dict, List, Optional, Tuple
@@ -696,6 +696,121 @@ class RobotFSMNode(Node):
         self.ctx["map_ready"] = msg.data
 
 
+class RobotBTRuntimeNode(Node):
+    def __init__(
+        self,
+        sim: bool = False,
+        bt_cpp_cmd: Optional[List[str]] = None,
+        autostart: bool = False,
+    ):
+        super().__init__("robot_bt_runtime_node")
+        self._start_requested = bool(autostart)
+        self._retry_used = False
+        self._active_state = "BTWaitingStart"
+
+        current_qos = QoSProfile(depth=1)
+        current_qos.reliability = ReliabilityPolicy.RELIABLE
+        current_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        transition_qos = QoSProfile(depth=20)
+        transition_qos.reliability = ReliabilityPolicy.RELIABLE
+        transition_qos.durability = DurabilityPolicy.VOLATILE
+
+        self.fsm_current_pub = self.create_publisher(String, "/fsm/current_state", current_qos)
+        self.fsm_transition_pub = self.create_publisher(String, "/fsm/transition", transition_qos)
+
+        self.ctx = {
+            "node": self,
+            "sim": bool(sim),
+            "_procs": {},
+            "start": bool(autostart),
+            "finished": False,
+            "error_triggered": False,
+            "bt_cpp_cmd": bt_cpp_cmd
+            or ["ros2", "run", "task_planner_bt", "bt_executor"],
+        }
+
+        self.create_subscription(Bool, "/start_flag", self.start_callback, 10)
+        self.timer = self.create_timer(1.0, self._tick)
+        self._publish_current_state(self._active_state)
+        self.get_logger().info(f"[BT] Runtime mode enabled. sim={self.ctx['sim']}")
+        self.get_logger().info(f"[BT] Command: {' '.join(self.ctx['bt_cpp_cmd'])}")
+
+    def _publish_current_state(self, state_name: str):
+        msg = String()
+        msg.data = state_name
+        self.fsm_current_pub.publish(msg)
+
+    def _publish_transition(self, from_state: str, to_state: str, reason: str = ""):
+        msg = String()
+        msg.data = json.dumps({"from": from_state, "to": to_state, "reason": reason})
+        self.fsm_transition_pub.publish(msg)
+
+    def _set_active_state(self, new_state: str, reason: str):
+        if self._active_state == new_state:
+            self._publish_current_state(new_state)
+            return
+        prev = self._active_state
+        self._active_state = new_state
+        self._publish_transition(prev, new_state, reason)
+        self._publish_current_state(new_state)
+
+    def _runtime_proc(self):
+        return self.ctx.get("_procs", {}).get("bt_cpp_runtime")
+
+    def _start_runtime(self):
+        cmd = self.ctx.get("bt_cpp_cmd", [])
+        if not cmd:
+            self.ctx["error_triggered"] = True
+            self._set_active_state("BTError", "missing_bt_cpp_cmd")
+            return
+        try:
+            start_proc(self.ctx, "bt_cpp_runtime", cmd)
+            self.ctx["error_triggered"] = False
+            self._set_active_state("BTRunning", "bt_cpp_started")
+        except Exception as exc:
+            self.get_logger().error(f"[BT] Failed to start BT C++ runtime: {exc}")
+            if not self._retry_used:
+                self._retry_used = True
+                self._set_active_state("BTStarting", "retry_once:start_failure")
+                return
+            self.ctx["error_triggered"] = True
+            self._set_active_state("BTError", "start_failure_after_retry")
+
+    def _tick(self):
+        proc = self._runtime_proc()
+        if self._start_requested and (not proc or proc.poll() is not None):
+            self._start_runtime()
+            proc = self._runtime_proc()
+
+        if not self._start_requested:
+            self._set_active_state("BTWaitingStart", "awaiting_start_flag")
+            return
+
+        if not proc:
+            self._set_active_state("BTError", "runtime_process_unavailable")
+            return
+
+        rc = proc.poll()
+        if rc is None:
+            self._set_active_state("BTRunning", "heartbeat")
+            return
+
+        self.ctx["finished"] = rc == 0
+        self.ctx["error_triggered"] = rc != 0
+        if rc == 0:
+            self._set_active_state("Finished", "bt_cpp_exit_0")
+        else:
+            self._set_active_state("BTError", f"bt_cpp_exit_{rc}")
+
+    def start_callback(self, msg: Bool):
+        self._start_requested = bool(msg.data)
+        self.ctx["start"] = self._start_requested
+        if self._start_requested:
+            self._set_active_state("BTStarting", "start_flag_true")
+        else:
+            self._set_active_state("BTWaitingStart", "start_flag_false")
+
+
 def main(args=None):
     # Parse custom arguments before initializing rclpy
     parser = argparse.ArgumentParser(add_help=False)
@@ -720,27 +835,55 @@ def main(args=None):
         choices=[1, 2],
         help="Force scan phase when bootstrapping from a non-default initial state.",
     )
+    parser.add_argument(
+        "--runtime",
+        type=str,
+        default="fsm",
+        choices=["fsm", "bt_cpp"],
+        help="Runtime backend: classic FSM or ROS-native C++ BT runtime proxy.",
+    )
+    parser.add_argument(
+        "--bt-cpp-cmd",
+        type=str,
+        default="",
+        help="Command string used to start the BT C++ runtime (only for --runtime bt_cpp).",
+    )
+    parser.add_argument(
+        "--bt-autostart",
+        type=str,
+        default="false",
+        choices=["true", "false"],
+        help="Autostart BT runtime without waiting for /start_flag.",
+    )
 
     # Use sys.argv if args is None
     argv = args if args is not None else sys.argv[1:]
     parsed_args, remaining_args = parser.parse_known_args(argv)
     sim = parsed_args.sim.lower() == "true"
+    bt_autostart = parsed_args.bt_autostart.lower() == "true"
+    bt_cpp_cmd = shlex.split(parsed_args.bt_cpp_cmd) if parsed_args.bt_cpp_cmd.strip() else None
 
     # Initialize rclpy with remaining args (ROS-specific arguments)
     rclpy.init(args=remaining_args)
 
-    node = RobotFSMNode(
-        sim=sim,
-        initial_state=parsed_args.initial_state,
-        scan_phase=parsed_args.scan_phase,
-    )
+    if parsed_args.runtime == "bt_cpp":
+        if parsed_args.initial_state != "Initialization":
+            print(
+                "[BT] --initial-state is ignored in bt_cpp mode; BT bootstrap from arbitrary FSM state is disabled."
+            )
+        if parsed_args.scan_phase is not None:
+            print("[BT] --scan-phase is ignored in bt_cpp mode.")
+        node = RobotBTRuntimeNode(sim=sim, bt_cpp_cmd=bt_cpp_cmd, autostart=bt_autostart)
+    else:
+        node = RobotFSMNode(
+            sim=sim,
+            initial_state=parsed_args.initial_state,
+            scan_phase=parsed_args.scan_phase,
+        )
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("[FSM] Ctrl+C received, killing processes...")
-        processes_to_kill = ["gz sim", "ign gazebo", "ruby.*gz", "gzserver", "gz-sim"]
-        for process in processes_to_kill:
-            subprocess.run(["pkill", "-9", "-f", process], timeout=2, stderr=subprocess.DEVNULL)
+        node.get_logger().info("[Runtime] Ctrl+C received, stopping processes...")
     finally:
         try:
             stop_all(node.ctx)
