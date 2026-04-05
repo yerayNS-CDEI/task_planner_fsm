@@ -5,7 +5,7 @@ import subprocess, os, time, socket
 import rclpy.time
 from rclpy.duration import Duration
 
-from task_planner_fsm.states.proc_utils import start_proc
+from task_planner_fsm.proc_utils import start_proc
 
 class GeometryReconstruction(State):
     def __init__(self, name):

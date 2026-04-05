@@ -12,6 +12,7 @@ class BtStateAdapter(py_trees.behaviour.Behaviour):
         self._entered = False
 
     def initialise(self):
+        # py_trees uses British spelling for lifecycle hooks; keep API name as-is.
         if not self._entered:
             self._state.on_enter(self._ctx)
             self._entered = True
@@ -26,6 +27,11 @@ class BtStateAdapter(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.RUNNING
 
     def terminate(self, new_status):
+        """Map py_trees termination to legacy state cleanup.
+
+        Called whenever the behavior leaves RUNNING state (success, failure, or interruption).
+        It ensures the wrapped FSM state's on_exit hook is invoked exactly once per entry.
+        """
         if self._entered:
             self._state.on_exit(self._ctx)
             self._entered = False

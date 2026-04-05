@@ -39,7 +39,7 @@ from task_planner_fsm.states import (
     WallDiscretization,
     WallTargetSelection,
 )
-from task_planner_fsm.states.proc_utils import start_proc, stop_all
+from task_planner_fsm.proc_utils import start_proc, stop_all
 from task_planner_fsm.utils.wall_utils import PREDEFINED_WALLS, build_wall_data
 
 FSM_STATE_ORDER = [

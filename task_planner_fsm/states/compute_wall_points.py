@@ -34,6 +34,9 @@ class ComputeWallPoints(State):
 
             try:
                 max_walls = len(self.predefined_walls)
+                # Optional context configuration:
+                #   wall_indices: List[int] with 1-based wall indices (e.g. [1, 3]).
+                # If missing, all predefined walls are selected by default.
                 configured_indices = ctx.get("wall_indices", list(range(1, max_walls + 1)))
                 if not isinstance(configured_indices, list) or not configured_indices:
                     raise ValueError("wall_indices must be a non-empty list of 1-based wall indices.")

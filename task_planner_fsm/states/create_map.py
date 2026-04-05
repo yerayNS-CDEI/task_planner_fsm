@@ -4,7 +4,7 @@ from example_interfaces.srv import SetBool
 import subprocess, os, signal, shlex
 import time
 
-from task_planner_fsm.states.proc_utils import start_proc, stop_proc
+from task_planner_fsm.proc_utils import start_proc, stop_proc
 
 class CreateMap(State):
     def __init__(self, name):

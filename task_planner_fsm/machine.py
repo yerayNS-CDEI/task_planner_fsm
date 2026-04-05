@@ -1,6 +1,6 @@
 import traceback
-from task_planner_fsm.states.proc_utils import install_global_cleanup
 from task_planner_fsm.context import FsmContext
+from task_planner_fsm.proc_utils import install_global_cleanup
 
 class StateMachine:
     def __init__(self, states, initial_state, ctx: FsmContext):

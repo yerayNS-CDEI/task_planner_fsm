@@ -1,7 +1,5 @@
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
-from geometry_msgs.msg import Point, Quaternion
-
 
 class FsmContext(TypedDict, total=False):
     node: Any
@@ -20,10 +18,10 @@ class FsmContext(TypedDict, total=False):
     _procs: Dict[str, Any]
     fsm_initial_state: str
     is_initial_entry: bool
-    home_position: Point
-    home_orientation: Quaternion
-    base_position: Point
-    base_orientation: Quaternion
+    home_position: Any
+    home_orientation: Any
+    base_position: Any
+    base_orientation: Any
     odom_received: bool
     walls_data: List[Dict[str, Tuple]]
     target_scan_wall: Tuple

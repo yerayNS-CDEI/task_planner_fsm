@@ -47,7 +47,8 @@ class RobotBTNode(Node):
 
     def tick(self):
         self.tree.tick()
-        current = getattr(self.tree.root.tip(), "name", None)
+        tip = self.tree.root.tip()
+        current = getattr(tip, "name", None) if tip is not None else None
         if current:
             self.publish_fsm_current(current)
         if self.tree.root.status in (

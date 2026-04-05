@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Any, List
 
-from task_planner_fsm.states.proc_utils import start_proc, stop_proc
+from task_planner_fsm.proc_utils import start_proc, stop_proc
 
 
 @dataclass
