@@ -1,5 +1,5 @@
 from ..state import State
-import math
+from task_planner_fsm.utils.wall_utils import PREDEFINED_WALLS, build_wall_data
 
 class ComputeWallPoints(State):
     def __init__(self, name):
@@ -7,11 +7,7 @@ class ComputeWallPoints(State):
         self.started = False
         self.step_count = 0
         self.MAX_STEPS = 5
-        self.predefined_walls = [
-            ((3.0, 0.0, 2.0), (3.0, -3.0, 3.0)),
-            ((9.0, 0.0, 0.19), (9.0, -4.5, 2.0)),
-            ((10.0, 0.0, 0.2), (10.0, -4.5, 3.0)),
-        ]
+        self.predefined_walls = PREDEFINED_WALLS
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -23,40 +19,6 @@ class ComputeWallPoints(State):
         ctx["error_triggered"] = False
         ctx["walls_left"] = 0
     
-    def _build_wall_data(self, p1, p2, offset=0.6):
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        length = math.hypot(dx, dy)
-        if length == 0:
-            raise ValueError("Wall points must be different.")
-        dx /= length
-        dy /= length
-
-        # Vector perpendicular normalizado (CW rotation → interior/right face)
-        nx = dy
-        ny = -dx
-
-        # Puntos desplazados hacia fuera (scan exterior)
-        scan_start = (
-            p1[0] + offset * dx + nx * offset,
-            p1[1] + offset * dy + ny * offset,
-            p1[2]
-        )
-        scan_end = (
-            p2[0] - offset * dx + nx * offset,
-            p2[1] - offset * dy + ny * offset,
-            p2[2]
-        )
-
-        return {
-            "original": (tuple(p1), tuple(p2)),
-            "scan_line": (scan_start, scan_end),
-        }
-
-    def _parse_indices(self, raw_text):
-        tokens = raw_text.replace(",", " ").split()
-        return [int(tok) for tok in tokens]
-
     def run(self, ctx):
         node = ctx["node"]
         if self.step_count >= self.MAX_STEPS:
@@ -72,27 +34,20 @@ class ComputeWallPoints(State):
 
             try:
                 max_walls = len(self.predefined_walls)
-                num_walls = int(input(f">> Number of walls to scan? (1-{max_walls}) ").strip())
-                if num_walls <= 0 or num_walls > max_walls:
-                    raise ValueError(f"Number must be between 1 and {max_walls}.")
-
-                indices_raw = input(">> Enter wall indices to scan (e.g. 1 3): ").strip()
-                selected_indices = self._parse_indices(indices_raw)
-
-                if len(selected_indices) != num_walls:
-                    raise ValueError(
-                        f"You requested {num_walls} wall(s), but provided {len(selected_indices)} indices."
-                    )
-
+                configured_indices = ctx.get("wall_indices", list(range(1, max_walls + 1)))
+                if not isinstance(configured_indices, list) or not configured_indices:
+                    raise ValueError("wall_indices must be a non-empty list of 1-based wall indices.")
+                selected_indices = [int(idx) for idx in configured_indices]
                 if len(set(selected_indices)) != len(selected_indices):
                     raise ValueError("Duplicate wall indices are not allowed.")
+                num_walls = len(selected_indices)
 
                 walls_data = []
                 for idx in selected_indices:
                     if idx < 1 or idx > max_walls:
                         raise ValueError(f"Wall index {idx} out of range (1-{max_walls}).")
                     p1, p2 = self.predefined_walls[idx - 1]
-                    walls_data.append(self._build_wall_data(p1, p2))
+                    walls_data.append(build_wall_data(p1, p2))
 
             except ValueError as e:
                 print(f"[{self.name}] Invalid input: {e}")

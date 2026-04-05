@@ -19,6 +19,7 @@ from rclpy.duration import Duration
 from std_msgs.msg import Bool, String
 
 from task_planner_fsm.machine import StateMachine
+from task_planner_fsm.context import FsmContext
 from task_planner_fsm.states import (
     AreasOfInterest,
     ArmFolding,
@@ -39,6 +40,7 @@ from task_planner_fsm.states import (
     WallTargetSelection,
 )
 from task_planner_fsm.states.proc_utils import start_proc, stop_all
+from task_planner_fsm.utils.wall_utils import PREDEFINED_WALLS, build_wall_data
 
 FSM_STATE_ORDER = [
     "Initialization",
@@ -124,13 +126,6 @@ NAV_SIM_REQUIRED_START_STATES = {
     if s not in {"Finished", "Error"}
 }
 
-PREDEFINED_WALLS = [
-    ((3.0, 0.0, 2.0), (3.0, -3.0, 3.0)),
-    ((9.0, 0.0, 0.19), (9.0, -4.5, 2.0)),
-    ((10.0, 0.0, 0.2), (10.0, -4.5, 3.0)),
-]
-
-
 class RobotFSMNode(Node):
     def __init__(self, sim: bool = False, initial_state: str = "Initialization", scan_phase: Optional[int] = None):
         super().__init__("robot_fsm_node")
@@ -159,7 +154,7 @@ class RobotFSMNode(Node):
         self.fsm_transition_pub = self.create_publisher(String, "/fsm/transition", transition_qos)
 
         # Shared context for the FSM
-        self.ctx = {
+        self.ctx: FsmContext = {
             "node": self,
             "start": False,
             "map_ready": False,
@@ -244,38 +239,6 @@ class RobotFSMNode(Node):
                 continue
             return value
 
-    def _build_wall_data(
-        self, p1: Tuple[float, float, float], p2: Tuple[float, float, float], offset: float = 0.6
-    ) -> Dict[str, Tuple]:
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        length = math.hypot(dx, dy)
-        if length == 0:
-            raise ValueError("Wall points must be different.")
-
-        dx /= length
-        dy /= length
-
-        # Clock-wise normal for the exterior scan side.
-        nx = dy
-        ny = -dx
-
-        scan_start = (
-            p1[0] + offset * dx + nx * offset,
-            p1[1] + offset * dy + ny * offset,
-            p1[2],
-        )
-        scan_end = (
-            p2[0] - offset * dx + nx * offset,
-            p2[1] - offset * dy + ny * offset,
-            p2[2],
-        )
-
-        return {
-            "original": (tuple(p1), tuple(p2)),
-            "scan_line": (scan_start, scan_end),
-        }
-
     def _prompt_walls_data(self) -> List[Dict[str, Tuple]]:
         print("[FSM Bootstrap] Available predefined walls:")
         for i, (p1, p2) in enumerate(PREDEFINED_WALLS, start=1):
@@ -315,7 +278,7 @@ class RobotFSMNode(Node):
             walls_data = []
             for idx in selected_indices:
                 p1, p2 = PREDEFINED_WALLS[idx - 1]
-                walls_data.append(self._build_wall_data(p1, p2))
+                walls_data.append(build_wall_data(p1, p2))
             return walls_data
 
     def _make_pose(self, x: float, y: float, z: float) -> Pose:

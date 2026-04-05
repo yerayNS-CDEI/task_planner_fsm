@@ -1,8 +1,9 @@
 import traceback
 from task_planner_fsm.states.proc_utils import install_global_cleanup
+from task_planner_fsm.context import FsmContext
 
 class StateMachine:
-    def __init__(self, states, initial_state, ctx):
+    def __init__(self, states, initial_state, ctx: FsmContext):
         self.states = {s.name: s for s in states}
         self.ctx = ctx
         self.current_state = self.states[initial_state]

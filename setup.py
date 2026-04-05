@@ -11,7 +11,10 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
-    install_requires=['setuptools'],
+    install_requires=[
+        'setuptools',
+        'py_trees',
+    ],
     zip_safe=True,
     maintainer='yeray',
     maintainer_email='yeray.navarro@upc.edu',
@@ -20,7 +23,7 @@ setup(
     tests_require=['pytest'],
     scripts=[
         'scripts/fsm_node',
+        'scripts/bt_node',
         'scripts/mock_server',
-        'scripts/goal_status_listener',
     ],
 )
