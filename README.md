@@ -2,7 +2,7 @@
 
 ## Check the PR locally (BT path)
 
-From the repository root:
+From the repository root (or first `cd` into your clone):
 
 ```bash
 cd task_planner_fsm
@@ -33,6 +33,8 @@ In another terminal (after `source install/setup.bash`), inspect topics:
 ros2 topic echo /fsm/current_state
 ros2 topic echo /fsm/transition
 ```
+
+Note: BT currently publishes on `/fsm/*` topics for compatibility during the migration.
 
 Trigger start flag once:
 
