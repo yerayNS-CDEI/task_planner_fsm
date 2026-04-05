@@ -37,8 +37,11 @@ class ComputeWallPoints(State):
                 # Optional context configuration:
                 #   wall_indices: List[int] with 1-based wall indices (e.g. [1, 3]).
                 # If missing, all predefined walls are selected by default.
+                has_configured_indices = "wall_indices" in ctx
                 configured_indices = ctx.get("wall_indices", list(range(1, max_walls + 1)))
-                if not isinstance(configured_indices, list) or not configured_indices:
+                if has_configured_indices and (
+                    not isinstance(configured_indices, list) or not configured_indices
+                ):
                     raise ValueError("wall_indices must be a non-empty list of 1-based wall indices.")
                 selected_indices = [int(idx) for idx in configured_indices]
                 if len(set(selected_indices)) != len(selected_indices):
@@ -53,7 +56,7 @@ class ComputeWallPoints(State):
                     walls_data.append(build_wall_data(p1, p2))
 
             except ValueError as e:
-                print(f"[{self.name}] Invalid input: {e}")
+                node.get_logger().error(f"[{self.name}] Invalid input: {e}")
                 return
 
             self.started = True
