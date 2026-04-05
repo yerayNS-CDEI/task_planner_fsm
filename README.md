@@ -5,7 +5,7 @@
 From the repository root:
 
 ```bash
-cd <path-to-your-clone>/task_planner_fsm
+cd task_planner_fsm
 ```
 
 Build and source:
@@ -18,7 +18,7 @@ source install/setup.bash
 Run unit tests:
 
 ```bash
-python -m pytest -q
+python -m pytest -q test/
 ```
 
 Run the BT node:
