@@ -5,7 +5,7 @@
 From the repository root:
 
 ```bash
-cd /home/runner/work/task_planner_fsm/task_planner_fsm
+cd <path-to-your-clone>/task_planner_fsm
 ```
 
 Build and source:
