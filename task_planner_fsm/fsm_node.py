@@ -132,10 +132,17 @@ PREDEFINED_WALLS = [
 
 
 class RobotFSMNode(Node):
-    def __init__(self, sim: bool = False, initial_state: str = "Initialization", scan_phase: Optional[int] = None):
+    def __init__(
+        self,
+        sim: bool = False,
+        initial_state: str = "Initialization",
+        scan_phase: Optional[int] = None,
+        planner_backend: str = "legacy",
+    ):
         super().__init__("robot_fsm_node")
         self.initial_state = initial_state
         self._stdin_warned = False
+        self.planner_backend = str(planner_backend).strip().lower()
 
         # NOTE: Do NOT set use_sim_time=True here!
         # The FSM timer must run on wall time even in simulation mode,
@@ -169,6 +176,7 @@ class RobotFSMNode(Node):
             "execution_status": False,
             "planner_goal_failed": False,
             "sim": bool(sim),
+            "planner_backend": self.planner_backend,
             "publish_fsm_current": self.publish_fsm_current,
             "publish_fsm_transition": self.publish_fsm_transition,
             "tf_buffer": self.tf_buffer,
@@ -214,6 +222,7 @@ class RobotFSMNode(Node):
         # Timer
         self.timer = self.create_timer(1.0, self.machine.step)
         self.get_logger().info(f"[FSM] Simulation mode: {self.ctx['sim']}")
+        self.get_logger().info(f"[FSM] Planner backend: {self.ctx['planner_backend']}")
         self.get_logger().info(
             f"[FSM] Initial state: {initial_state}, scan_phase={self.ctx.get('scan_phase')}"
         )
@@ -537,6 +546,7 @@ class RobotFSMNode(Node):
             return
 
         sim_value = "true" if self.ctx.get("sim", False) else "false"
+        planner_backend = str(self.ctx.get("planner_backend", "legacy")).strip().lower()
         try:
             start_proc(
                 self.ctx,
@@ -549,10 +559,11 @@ class RobotFSMNode(Node):
                     f"sim:={sim_value}",
                     "mode:=full",
                     "controller_type:=omni",
-                    "database_name:=rtabmap",
+                    "database_name:=rtabmap_fsm",
                     "headless:=true",
                     "use_sim_time:=true",
                     "hybrid_sim:=true",
+                    f"planner_backend:={planner_backend}",
                 ],
             )
             time.sleep(2.0)
@@ -720,6 +731,13 @@ def main(args=None):
         choices=[1, 2],
         help="Force scan phase when bootstrapping from a non-default initial state.",
     )
+    parser.add_argument(
+        "--planner-backend",
+        type=str,
+        default="legacy",
+        choices=["legacy", "moveit"],
+        help="Planner backend to use when the FSM launches move_robot.launch.py.",
+    )
 
     # Use sys.argv if args is None
     argv = args if args is not None else sys.argv[1:]
@@ -733,6 +751,7 @@ def main(args=None):
         sim=sim,
         initial_state=parsed_args.initial_state,
         scan_phase=parsed_args.scan_phase,
+        planner_backend=parsed_args.planner_backend,
     )
     try:
         rclpy.spin(node)

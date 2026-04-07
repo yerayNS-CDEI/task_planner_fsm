@@ -11,6 +11,7 @@ from rclpy.duration import Duration
 from rclpy.action import ActionClient
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_pose_stamped
+from visualization_msgs.msg import Marker
 from control_msgs.action import FollowJointTrajectory
 from control_msgs.msg import JointTolerance
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -21,6 +22,10 @@ class ExhaustiveScan(State):
     def __init__(self, name):
         super().__init__(name)
         self.goal_pub = None
+        self.goal_pub_ptp = None
+        self.goal_pub_lin = None
+        self.goal_pub_ompl = None
+        self.goal_marker_pub = None
         self.goals_queue = deque()
         self.current_goal_idx = -1
         self.waiting_for_arrival = False
@@ -32,6 +37,9 @@ class ExhaustiveScan(State):
         self._pending_panel_vertices = None
         self.wall_orientation = None  # Store computed orientation
         self.pre_approach_goal = None
+        self.pre_approach_goals = deque()
+        self.pre_approach_total_stages = 0
+        self.pre_approach_stage_idx = 0
         self.pre_approach_sent = False
         self.pre_approach_done = False
         self.waiting_for_pre_approach = False
@@ -49,6 +57,8 @@ class ExhaustiveScan(State):
         self.service_call_deadline = None
         self.service_timeout_s = 45.0  # Timeout for movel service calls
         self.total_goals_count = 0  # Track total number of goals
+        self.scan_motion_backend = "auto"
+        self.active_goal_backend = None
         
         # Column extension tracking
         self.column_client = None
@@ -80,8 +90,85 @@ class ExhaustiveScan(State):
         self.movel_velocity = 0.1  # m/s
         self.movel_blend_radius = 0.0  # Stop at each point
         self.pre_approach_retract_distance_m = 0.12
+        self.pre_approach_max_step_xy_m = 0.15
+        self.pre_approach_max_step_z_m = 0.12
+        self.pre_approach_max_rotation_step_rad = 0.25
+        self.scan_goal_stride = 1
+        self.skipped_lin_goals = 0
         self.post_scan_delay_s = 4.0  # Delay before final retraction
         self.post_scan_retract_distance_m = 0.15  # Final retraction distance from wall
+
+    def _normalize_quaternion(self, quat: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+        q = np.array(quat, dtype=float)
+        norm = np.linalg.norm(q)
+        if norm < 1e-9:
+            return (0.0, 0.0, 0.0, 1.0)
+        q /= norm
+        return (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+
+    def _nlerp_quaternion(
+        self,
+        q_start: Tuple[float, float, float, float],
+        q_end: Tuple[float, float, float, float],
+        alpha: float,
+    ) -> Tuple[float, float, float, float]:
+        q0 = np.array(self._normalize_quaternion(q_start), dtype=float)
+        q1 = np.array(self._normalize_quaternion(q_end), dtype=float)
+        if float(np.dot(q0, q1)) < 0.0:
+            q1 = -q1
+        q = (1.0 - alpha) * q0 + alpha * q1
+        return self._normalize_quaternion((q[0], q[1], q[2], q[3]))
+
+    def _quaternion_angular_distance(
+        self,
+        q_start: Tuple[float, float, float, float],
+        q_end: Tuple[float, float, float, float],
+    ) -> float:
+        q0 = np.array(self._normalize_quaternion(q_start), dtype=float)
+        q1 = np.array(self._normalize_quaternion(q_end), dtype=float)
+        dot = float(np.dot(q0, q1))
+        dot = max(-1.0, min(1.0, abs(dot)))
+        return 2.0 * math.acos(dot)
+
+    def _resolve_scan_motion_backend(self) -> str:
+        backend = str(self.scan_motion_backend).strip().lower()
+        if backend in {"moveit_lin", "urscript_movel"}:
+            return backend
+        if self.goal_pub_lin is not None and self.goal_pub_lin.get_subscription_count() > 0:
+            return "moveit_lin"
+        return "urscript_movel"
+
+    def _sample_scan_goals(self, ordered_goals: List[Pose]) -> List[Pose]:
+        stride = max(1, int(self.scan_goal_stride))
+        if stride <= 1:
+            return ordered_goals
+        return ordered_goals[::stride]
+
+    def _publish_lin_goal_marker(self, node, pose_stamped: PoseStamped):
+        if self.goal_marker_pub is None:
+            return
+
+        marker = Marker()
+        marker.header.frame_id = pose_stamped.header.frame_id or "map"
+        # Use the latest available TF in RViz instead of requiring an exact-time
+        # transform for this marker message.
+        marker.header.stamp.sec = 0
+        marker.header.stamp.nanosec = 0
+        marker.ns = "exhaustive_scan_goal"
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose = pose_stamped.pose
+        marker.scale.x = 0.07
+        marker.scale.y = 0.07
+        marker.scale.z = 0.07
+        marker.color.r = 1.0
+        marker.color.g = 0.2
+        marker.color.b = 0.1
+        marker.color.a = 0.95
+        marker.lifetime = DurationMsg(sec=0, nanosec=0)
+        marker.frame_locked = True
+        self.goal_marker_pub.publish(marker)
 
     def _choose_column_height_for_goal_z(self, goal_z_in_arm_base: float) -> float:
         """
@@ -113,6 +200,16 @@ class ExhaustiveScan(State):
         target_h = float(height_m)
         
         column_current = ctx.get("column_current_height", 0.0)
+
+        if abs(target_h - column_current) <= self.column_skip_movement_threshold_m:
+            self.waiting_for_column = False
+            self.column_target_height = None
+            self.column_move_deadline = None
+            node.get_logger().info(
+                f"[{self.name}] Column already close to target {target_h:.3f}m "
+                f"(current={column_current:.3f}m, skipping command)."
+            )
+            return True
         
         if not self.column_client.wait_for_server(timeout_sec=1.0):
             node.get_logger().error(
@@ -350,24 +447,29 @@ class ExhaustiveScan(State):
         # Convert to quaternion
         return self._rotation_matrix_to_quaternion(R)
 
-    def _build_pre_approach_goal(
+    def _build_pre_approach_goals(
         self,
         node,
         tf_buffer,
         first_scan_goal_map: Pose,
-        wall_normal: np.ndarray
-    ) -> PoseStamped:
+        wall_normal: np.ndarray,
+        planner_backend: str,
+    ) -> List[PoseStamped]:
         """
-        Build a pre-approach goal in arm_base frame:
-        - At the current arm Z height (from TF)
-        - Positioned between current arm position and first scan goal
-        - Retracted from the first scan goal by retract_distance along wall normal
-        - With wall-facing orientation
+        Build pre-approach goals in arm_base frame.
+
+        For MoveIt:
+        - Retract from the first scan goal by retract_distance along wall normal
+        - Send a single LIN-compatible pre-approach goal at the retracted scan-start pose
+
+        For legacy:
+        - Keep a single simpler staging pose using the generic goal topic
         """
         # Get current end-effector position from TF
         # Try common UR robot end-effector frame names (with arm_ prefix)
         ee_frame_candidates = ["arm_tool0", "arm_wrist_3_link", "arm_ee_link", "arm_flange", "tool0", "wrist_3_link", "ee_link", "flange"]
         current_ee_pos = None
+        current_ee_orientation = None
         used_ee_frame = None
         
         for ee_frame in ee_frame_candidates:
@@ -381,6 +483,12 @@ class ExhaustiveScan(State):
                         tf_ee.transform.translation.y,
                         tf_ee.transform.translation.z
                     ])
+                    current_ee_orientation = (
+                        tf_ee.transform.rotation.x,
+                        tf_ee.transform.rotation.y,
+                        tf_ee.transform.rotation.z,
+                        tf_ee.transform.rotation.w,
+                    )
                     used_ee_frame = ee_frame
                     node.get_logger().info(
                         f"[{self.name}] Current EE position from TF ({ee_frame}): "
@@ -397,6 +505,7 @@ class ExhaustiveScan(State):
             )
             # Fallback: use a safe default Z height
             current_ee_pos = np.array([0.0, 0.0, 0.5])  # Safe assumed height
+            current_ee_orientation = self.wall_orientation
         
         # Transform first scan goal to arm_base frame
         ps_map = PoseStamped()
@@ -421,59 +530,150 @@ class ExhaustiveScan(State):
         # Pre-approach position: first_goal retracted along wall normal
         retracted_pos = first_goal_pos - retreat_dir * retreat
         
-        # Use current EE Z height, but XY from retracted position
-        pre_approach_pos = np.array([
-            retracted_pos[0],
-            retracted_pos[1],
-            current_ee_pos[2]  # Keep current Z height
-        ])
-        
-        # Build result pose
-        ps_arm = PoseStamped()
-        ps_arm.header.frame_id = 'arm_base'
-        ps_arm.header.stamp = node.get_clock().now().to_msg()
-        ps_arm.pose.position.x = float(pre_approach_pos[0])
-        ps_arm.pose.position.y = float(pre_approach_pos[1])
-        ps_arm.pose.position.z = float(pre_approach_pos[2])
-        
-        # Apply wall-facing orientation
-        if self.wall_orientation:
+        # Preserve the current EE orientation for the staging move to avoid an
+        # unnecessary IK jump before the first scan segment.
+        if current_ee_orientation:
+            qx, qy, qz, qw = current_ee_orientation
+        elif self.wall_orientation:
             qx, qy, qz, qw = self.wall_orientation
+        else:
+            qx, qy, qz, qw = (0.0, 0.0, 0.0, 1.0)
+
+        staged_goals: List[PoseStamped] = []
+        now = node.get_clock().now().to_msg()
+
+        if planner_backend == "moveit":
+            target_orientation = self.wall_orientation if self.wall_orientation else (qx, qy, qz, qw)
+            ps_arm = PoseStamped()
+            ps_arm.header.frame_id = 'arm_base'
+            ps_arm.header.stamp = now
+            ps_arm.pose.position.x = float(retracted_pos[0])
+            ps_arm.pose.position.y = float(retracted_pos[1])
+            ps_arm.pose.position.z = float(retracted_pos[2])
+            ps_arm.pose.orientation.x = target_orientation[0]
+            ps_arm.pose.orientation.y = target_orientation[1]
+            ps_arm.pose.orientation.z = target_orientation[2]
+            ps_arm.pose.orientation.w = target_orientation[3]
+            staged_goals.append(ps_arm)
+
+            node.get_logger().info(
+                f"[{self.name}] MoveIt pre-approach goal computed: "
+                f"pos=({retracted_pos[0]:.3f}, {retracted_pos[1]:.3f}, {retracted_pos[2]:.3f}), "
+                f"ee_frame={used_ee_frame}, retract={retreat:.3f}m"
+            )
+        else:
+            pre_approach_pos = np.array([
+                retracted_pos[0],
+                retracted_pos[1],
+                current_ee_pos[2],
+            ])
+            ps_arm = PoseStamped()
+            ps_arm.header.frame_id = 'arm_base'
+            ps_arm.header.stamp = now
+            ps_arm.pose.position.x = float(pre_approach_pos[0])
+            ps_arm.pose.position.y = float(pre_approach_pos[1])
+            ps_arm.pose.position.z = float(pre_approach_pos[2])
             ps_arm.pose.orientation.x = qx
             ps_arm.pose.orientation.y = qy
             ps_arm.pose.orientation.z = qz
             ps_arm.pose.orientation.w = qw
+            staged_goals.append(ps_arm)
 
-        node.get_logger().info(
-            f"[{self.name}] Pre-approach goal computed: "
-            f"pos=({pre_approach_pos[0]:.3f}, {pre_approach_pos[1]:.3f}, {pre_approach_pos[2]:.3f}), "
-            f"ee_frame={used_ee_frame}, retract={retreat:.3f}m"
-        )
+            node.get_logger().info(
+                f"[{self.name}] Legacy pre-approach goal computed: "
+                f"pos=({pre_approach_pos[0]:.3f}, {pre_approach_pos[1]:.3f}, {pre_approach_pos[2]:.3f}), "
+                f"ee_frame={used_ee_frame}, retract={retreat:.3f}m"
+            )
 
-        return ps_arm
+        return staged_goals
 
     def _send_pre_approach_goal(self, ctx):
         """Send pre-approach arm goal using the same execution-status handshake used by fold/unfold."""
         node = ctx["node"]
 
-        if self.pre_approach_goal is None:
-            node.get_logger().error(f"[{self.name}] Pre-approach goal was not initialized.")
+        if not self.pre_approach_goals:
+            node.get_logger().error(f"[{self.name}] Pre-approach goals were not initialized.")
             ctx["error_triggered"] = True
             return
 
+        self.pre_approach_goal = self.pre_approach_goals[0]
+
+        planner_backend = str(ctx.get("planner_backend", "legacy")).strip().lower()
+        if planner_backend == "moveit":
+            pre_approach_pub = self.goal_pub_ompl
+            goal_topic = "/arm/goal_pose_ompl"
+            goal_label = "MoveIt OMPL"
+        else:
+            pre_approach_pub = self.goal_pub
+            goal_topic = "/arm/goal_pose"
+            goal_label = "legacy planner"
+
         # Reset execution status before publishing a new goal.
         ctx["execution_status"] = False
-        self.goal_pub.publish(self.pre_approach_goal)
+        ctx["planner_goal_failed"] = False
+        if pre_approach_pub is None or pre_approach_pub.get_subscription_count() == 0:
+            node.get_logger().error(
+                f"[{self.name}] No subscriber detected on {goal_topic} for the pre-approach goal."
+            )
+            ctx["error_triggered"] = True
+            return
+
+        pre_approach_pub.publish(self.pre_approach_goal)
         self.pre_approach_sent = True
         self.waiting_for_pre_approach = True
         self.pre_approach_verbose = False
 
         p = self.pre_approach_goal.pose.position
         node.get_logger().info(
-            f"[{self.name}] Sent pre-approach goal via /arm/goal_pose: "
+            f"[{self.name}] Sent pre-approach stage {self.pre_approach_stage_idx + 1}/{self.pre_approach_total_stages} "
+            f"via {goal_topic} using {goal_label}: "
             f"pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
             f"retract={self.pre_approach_retract_distance_m:.3f}m"
         )
+
+    def _prepare_pre_approach_sequence(self, ctx) -> bool:
+        node = ctx["node"]
+
+        if self.pre_approach_goals:
+            return True
+        if not self.goals_queue:
+            node.get_logger().error(f"[{self.name}] Cannot prepare pre-approach without scan goals.")
+            ctx["error_triggered"] = True
+            return False
+        if self.wall_orientation_normal is None:
+            node.get_logger().error(f"[{self.name}] Missing wall normal for pre-approach planning.")
+            ctx["error_triggered"] = True
+            return False
+
+        planner_backend = str(ctx.get("planner_backend", "legacy")).strip().lower()
+
+        try:
+            staged_pre_approach_goals = self._build_pre_approach_goals(
+                node,
+                self.tf_buffer,
+                self.goals_queue[0],
+                self.wall_orientation_normal,
+                planner_backend,
+            )
+            self.pre_approach_goals = deque(staged_pre_approach_goals)
+            self.pre_approach_total_stages = len(staged_pre_approach_goals)
+            self.pre_approach_stage_idx = 0
+
+            if not self.pre_approach_goals:
+                raise RuntimeError("No pre-approach goals were generated")
+
+            self.pre_approach_goal = self.pre_approach_goals[0]
+            p = self.pre_approach_goals[-1].pose.position
+            node.get_logger().info(
+                f"[{self.name}] Pre-approach sequence prepared: "
+                f"{self.pre_approach_total_stages} stage(s), final_pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
+                f"retract={self.pre_approach_retract_distance_m:.3f}m"
+            )
+            return True
+        except Exception as exc:
+            node.get_logger().error(f"[{self.name}] Failed to build pre-approach goal: {exc}")
+            ctx["error_triggered"] = True
+            return False
 
     def _estimate_step_threshold(self, sorted_vals: List[float], resolution: float = None) -> float:
         if len(sorted_vals) < 2:
@@ -568,12 +768,12 @@ class ExhaustiveScan(State):
         
         if self.script_command_client is None:
             self.script_command_client = node.create_client(ScriptCommand, '/send_script_command')
-            if not self.script_command_client.wait_for_service(timeout_sec=5.0):
-                node.get_logger().error(f"[{self.name}] Script command service not available!")
-                ctx["error_triggered"] = True
-                return
 
         self.goal_pub = node.create_publisher(PoseStamped, '/arm/goal_pose', 10)
+        self.goal_pub_ptp = node.create_publisher(PoseStamped, '/arm/goal_pose_ptp', 10)
+        self.goal_pub_lin = node.create_publisher(PoseStamped, '/arm/goal_pose_lin', 10)
+        self.goal_pub_ompl = node.create_publisher(PoseStamped, '/arm/goal_pose_ompl', 10)
+        self.goal_marker_pub = node.create_publisher(Marker, '/scan_goal_marker', 10)
         self.goals_queue.clear()
         self.goals_by_height.clear()
         self.height_sequence.clear()
@@ -588,6 +788,9 @@ class ExhaustiveScan(State):
         self.wall_orientation = None
         self.wall_orientation_normal = None  # Store wall normal for post-scan retraction
         self.pre_approach_goal = None
+        self.pre_approach_goals.clear()
+        self.pre_approach_total_stages = 0
+        self.pre_approach_stage_idx = 0
         self.pre_approach_sent = False
         self.pre_approach_done = False
         self.waiting_for_pre_approach = False
@@ -601,7 +804,13 @@ class ExhaustiveScan(State):
         self.pending_service_future = None
         self.service_call_deadline = None
         self.total_goals_count = 0
+        self.skipped_lin_goals = 0
+        self.scan_motion_backend = str(ctx.get("scan_motion_backend", "auto")).strip().lower()
+        self.active_goal_backend = None
+        planner_backend = str(ctx.get("planner_backend", "legacy")).strip().lower()
         ctx["error_triggered"] = False
+        ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
         ctx.setdefault("base_recompute_retry_counts", {})
 
         res = ctx.get("wall_discretization_results")
@@ -675,9 +884,10 @@ class ExhaustiveScan(State):
         self.waiting_for_arrival = False
         self.pending_service_future = None
         self.service_call_deadline = None
+        self.active_goal_backend = None
 
     def _send_next_goal(self, ctx):
-        """Send goal to robot via script command service (must be called AFTER column is at correct height)."""
+        """Send the next goal after the column reaches the required height."""
         node = ctx["node"]
 
         if not self.goals_queue:
@@ -726,8 +936,32 @@ class ExhaustiveScan(State):
         
         # Convert quaternion to rotation vector for movel command
         rx, ry, rz = self._quaternion_to_rotation_vector(qx, qy, qz, qw)
-        
-        # Determine if this is first goal
+
+        backend = self._resolve_scan_motion_backend()
+        self.active_goal_backend = backend
+
+        if backend == "moveit_lin":
+            if self.goal_pub_lin is None or self.goal_pub_lin.get_subscription_count() == 0:
+                node.get_logger().warn(
+                    f"[{self.name}] MoveIt LIN publisher has no subscribers; falling back to URScript movel."
+                )
+                backend = "urscript_movel"
+                self.active_goal_backend = backend
+            else:
+                ctx["execution_status"] = False
+                ctx["planner_goal_failed"] = False
+                self.pending_service_future = None
+                self.waiting_for_arrival = True
+                self._publish_lin_goal_marker(node, ps_map)
+                self.goal_pub_lin.publish(ps_arm)
+                node.get_logger().info(
+                    f"[{self.name}] Sending goal {self.current_goal_idx + 1}/{self.total_goals_count} via MoveIt LIN. "
+                    f"pos=({ps_arm.pose.position.x:.3f}, {ps_arm.pose.position.y:.3f}, {ps_arm.pose.position.z:.3f}), "
+                    f"q=({qx:.3f}, {qy:.3f}, {qz:.3f}, {qw:.3f})."
+                )
+                return
+
+        # Determine if this is first or last goal
         is_first_goal = (self.current_goal_idx == 0)
         # Panel goals are never the last command - the post-scan retraction comes after
         # So all panel goals should have restart_program=False
@@ -751,6 +985,12 @@ class ExhaustiveScan(State):
         request.string_params = []
         request.stop_program = is_first_goal
         request.restart_program = is_last_goal
+
+        if not self.script_command_client.wait_for_service(timeout_sec=1.0):
+            node.get_logger().error(f"[{self.name}] Script command service not available!")
+            ctx["error_triggered"] = True
+            self.active_goal_backend = None
+            return
         
         # Call service asynchronously
         self.pending_service_future = self.script_command_client.call_async(request)
@@ -846,6 +1086,8 @@ class ExhaustiveScan(State):
         if ctx.get("error_triggered") or self.movement_done:
             return
 
+        planner_backend = str(ctx.get("planner_backend", "legacy")).strip().lower()
+
         # Populate queue via TF lookup on first run() tick (wait for TF to be ready)
         if not self.goals_initialized:
             if self._pending_panel_cells is None or self._pending_panel_vertices is None:
@@ -870,6 +1112,18 @@ class ExhaustiveScan(State):
                 # TF not ready yet — retry next tick silently
                 node.get_logger().debug(f"[{self.name}] TF not ready yet, retrying...")
                 return
+
+            sampled_goals = self._sample_scan_goals(ordered_goals)
+            if not sampled_goals:
+                node.get_logger().error(f"[{self.name}] Scan goal sampling removed all goals.")
+                ctx["error_triggered"] = True
+                return
+            if len(sampled_goals) != len(ordered_goals):
+                node.get_logger().info(
+                    f"[{self.name}] Sampling scan goals with stride {self.scan_goal_stride}: "
+                    f"{len(ordered_goals)} -> {len(sampled_goals)} goal(s)."
+                )
+            ordered_goals = sampled_goals
             
             # Compute orientation where z-axis points towards the wall using vertex-based normal
             qx, qy, qz, qw = self._compute_orientation_towards_wall(wall_normal)
@@ -882,25 +1136,6 @@ class ExhaustiveScan(State):
             self.wall_orientation = (qx, qy, qz, qw)
             self.wall_orientation_normal = wall_normal  # Store for post-scan retraction
 
-            # Build pre-approach goal from first scan target with a small wall retraction.
-            try:
-                self.pre_approach_goal = self._build_pre_approach_goal(
-                    node,
-                    self.tf_buffer,
-                    ordered_goals[0],
-                    wall_normal,
-                )
-                p = self.pre_approach_goal.pose.position
-                node.get_logger().info(
-                    f"[{self.name}] Pre-approach goal prepared: "
-                    f"pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
-                    f"retract={self.pre_approach_retract_distance_m:.3f}m"
-                )
-            except Exception as e:
-                node.get_logger().error(f"[{self.name}] Failed to build pre-approach goal: {e}")
-                ctx["error_triggered"] = True
-                return
-            
             # Group goals by required column height
             # Goals are still in MAP frame at this point
             for p in ordered_goals:
@@ -948,25 +1183,6 @@ class ExhaustiveScan(State):
             
             self.goals_initialized = True
             return  # Next tick will start processing first height group
-
-        # Send and wait for the one-time pre-approach goal before starting movel scan sequence.
-        if not self.pre_approach_done:
-            if not self.pre_approach_sent:
-                self._send_pre_approach_goal(ctx)
-                return
-
-            if self.waiting_for_pre_approach:
-                exec_status = ctx.get("execution_status")
-                if exec_status is True:
-                    self.pre_approach_done = True
-                    self.waiting_for_pre_approach = False
-                    ctx["execution_status"] = False
-                    node.get_logger().info(f"[{self.name}] Pre-approach goal reached. Starting exhaustive scan movel sequence.")
-                else:
-                    if not self.pre_approach_verbose:
-                        node.get_logger().info(f"[{self.name}] Waiting for pre-approach goal completion...")
-                        self.pre_approach_verbose = True
-                    return
 
         # Handle column movement if waiting
         if self.waiting_for_column:
@@ -1066,11 +1282,59 @@ class ExhaustiveScan(State):
                         # Column is close enough - clear any pending column wait state
                         self.waiting_for_column = False
                         self.column_target_height = None
+                        self.column_move_deadline = None
                         self._column_stable_since = None
                         node.get_logger().info(
                             f"[{self.name}] Column already at target height {next_height:.2f}m "
                             f"(diff={height_diff*1000:.1f}mm, skipping movement)"
                         )
+
+            if not self.pre_approach_done:
+                if not self._prepare_pre_approach_sequence(ctx):
+                    return
+
+                if not self.pre_approach_sent:
+                    self._send_pre_approach_goal(ctx)
+                    return
+
+                if self.waiting_for_pre_approach:
+                    if ctx.get("planner_goal_failed"):
+                        node.get_logger().error(
+                            f"[{self.name}] Pre-approach stage {self.pre_approach_stage_idx + 1}/{self.pre_approach_total_stages} failed."
+                        )
+                        ctx["planner_goal_failed"] = False
+                        self.waiting_for_pre_approach = False
+                        ctx["error_triggered"] = True
+                        return
+
+                    exec_status = ctx.get("execution_status")
+                    if exec_status is True:
+                        self.pre_approach_sent = False
+                        self.waiting_for_pre_approach = False
+                        self.pre_approach_verbose = False
+                        ctx["execution_status"] = False
+                        self.pre_approach_stage_idx += 1
+                        if self.pre_approach_goals:
+                            self.pre_approach_goals.popleft()
+
+                        if not self.pre_approach_goals:
+                            self.pre_approach_done = True
+                            node.get_logger().info(
+                                f"[{self.name}] Final pre-approach stage reached. Starting exhaustive scan sequence."
+                            )
+                        else:
+                            node.get_logger().info(
+                                f"[{self.name}] Pre-approach stage {self.pre_approach_stage_idx}/{self.pre_approach_total_stages} reached. "
+                                f"Continuing staged approach."
+                            )
+                        return
+
+                    if not self.pre_approach_verbose:
+                        node.get_logger().info(
+                            f"[{self.name}] Waiting for pre-approach stage {self.pre_approach_stage_idx + 1}/{self.pre_approach_total_stages} completion..."
+                        )
+                        self.pre_approach_verbose = True
+                    return
             else:
                 # Current height still has goals - send next one
                 self._send_next_goal(ctx)
@@ -1079,6 +1343,31 @@ class ExhaustiveScan(State):
             if not (self.post_scan_retraction_sent and self.waiting_for_post_scan_retraction):
                 return
         
+        if self.active_goal_backend == "moveit_lin":
+            if ctx.get("planner_goal_failed"):
+                self.skipped_lin_goals += 1
+                node.get_logger().warn(
+                    f"[{self.name}] MoveIt LIN goal {self.current_goal_idx + 1}/{self.total_goals_count} failed. "
+                    f"Skipping this scan point and continuing "
+                    f"(skipped {self.skipped_lin_goals} total)."
+                )
+                ctx["planner_goal_failed"] = False
+                self.waiting_for_arrival = False
+                self.active_goal_backend = None
+                return
+
+            if ctx.get("execution_status") is True:
+                node.get_logger().info(
+                    f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully via MoveIt LIN."
+                )
+                ctx["execution_status"] = False
+                ctx["planner_goal_failed"] = False
+                self.waiting_for_arrival = False
+                self.active_goal_backend = None
+                return
+
+            return
+
         # Check if service call is pending
         if self.pending_service_future is not None:
             # Check for timeout
@@ -1109,6 +1398,12 @@ class ExhaustiveScan(State):
                             self.waiting_for_arrival = False
                             self.pending_service_future = None
                             self.service_call_deadline = None
+                        node.get_logger().info(
+                            f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully: {response.message}"
+                        )
+                        self.waiting_for_arrival = False
+                        self.pending_service_future = None
+                        self.active_goal_backend = None
                     else:
                         self._handle_service_failure(ctx, response.message)
                         return

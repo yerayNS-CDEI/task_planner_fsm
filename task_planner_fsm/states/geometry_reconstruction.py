@@ -51,6 +51,7 @@ class GeometryReconstruction(State):
     def on_exit(self, ctx): 
         node = ctx["node"]
         requested_sim = bool(ctx.get("sim", False))
+        planner_backend = str(ctx.get("planner_backend", "legacy")).strip().lower()
         if not requested_sim:
             node.get_logger().warn(f"[{self.name}] FSM was started with sim=false, but hybrid_sim=true requires sim=true. Forcing sim:=true for move_robot.launch.py.")
         sim_value = "true"
@@ -94,9 +95,9 @@ class GeometryReconstruction(State):
                 start_proc(
                     ctx, "nav_sim",
                     ["ros2", "launch", "navi_wall", "move_robot.launch.py",
-                    f"sim:={sim_value}", "mode:=full", "controller_type:=omni", "hybrid_sim:=true",
-                    "planner_backend:=legacy", 
+                    f"sim:={sim_value}", "mode:=full", "controller_type:=omni", "hybrid_sim:=true", 
                     f"robot_ip:={ursim_ip}", "database_name:=rtabmap_fsm", "headless:=true",
+                    f"planner_backend:={planner_backend}",
                     "use_sim_time:=true"]
                 )
                 
