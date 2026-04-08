@@ -12,6 +12,7 @@ from rclpy.action import ActionClient
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_pose_stamped
 from control_msgs.action import FollowJointTrajectory
+from control_msgs.msg import JointTolerance
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration as DurationMsg
 from arm_control.srv import ScriptCommand
@@ -30,10 +31,23 @@ class ExhaustiveScan(State):
         self._pending_panel_cells = None
         self._pending_panel_vertices = None
         self.wall_orientation = None  # Store computed orientation
+        self.pre_approach_goal = None
+        self.pre_approach_sent = False
+        self.pre_approach_done = False
+        self.waiting_for_pre_approach = False
+        self.pre_approach_verbose = False
+        
+        # Post-scan retraction
+        self.post_scan_delay_start = None
+        self.waiting_for_post_scan_delay = False
+        self.post_scan_retraction_sent = False
+        self.waiting_for_post_scan_retraction = False
         
         # Script command service client
         self.script_command_client = None
         self.pending_service_future = None
+        self.service_call_deadline = None
+        self.service_timeout_s = 45.0  # Timeout for movel service calls
         self.total_goals_count = 0  # Track total number of goals
         
         # Column extension tracking
@@ -53,8 +67,8 @@ class ExhaustiveScan(State):
         self.arm_reachable_z_min = 0.0
         self.arm_reachable_z_max = 1.1
         self.column_tolerance_m = 0.01  # Increased from 0.005 to 0.01 (10mm tolerance)
-        self.column_wait_timeout_s = 18.0  # Increased to 18.0 seconds for better stability with small movements
-        self.column_move_time_s = 3.0
+        self.column_wait_timeout_s = 40.0  # Increased to 40.0 seconds to accommodate simulation timing
+        self.column_move_time_s = 7.0  # Increased to 7.0 seconds (real column does 0.7m in ~5s, added margin for simulation)
         self.column_joint_name = "column_joint"
         self.column_action_name = "/column_controller/follow_joint_trajectory"
         self.column_vel_tol = 0.002
@@ -65,6 +79,9 @@ class ExhaustiveScan(State):
         self.movel_acceleration = 1.2  # m/s²
         self.movel_velocity = 0.1  # m/s
         self.movel_blend_radius = 0.0  # Stop at each point
+        self.pre_approach_retract_distance_m = 0.12
+        self.post_scan_delay_s = 4.0  # Delay before final retraction
+        self.post_scan_retract_distance_m = 0.15  # Final retraction distance from wall
 
     def _choose_column_height_for_goal_z(self, goal_z_in_arm_base: float) -> float:
         """
@@ -115,6 +132,17 @@ class ExhaustiveScan(State):
         pt.time_from_start = DurationMsg(sec=sec, nanosec=nanosec)
         
         goal.trajectory.points = [pt]
+        
+        # Set goal tolerances to override controller defaults
+        # This prevents aborts due to tight default tolerances (e.g., 0.1m)
+        goal_tol = JointTolerance()
+        goal_tol.name = self.column_joint_name
+        goal_tol.position = 0.015  # 15mm position tolerance at goal
+        goal_tol.velocity = self.column_vel_tol  # Velocity must be small at goal
+        goal.goal_tolerance = [goal_tol]
+        
+        # Set goal time tolerance (allow extra time to settle)
+        goal.goal_time_tolerance = DurationMsg(sec=2, nanosec=0)
         
         self.column_target_height = target_h
         self.column_move_deadline = node.get_clock().now() + Duration(seconds=self.column_wait_timeout_s)
@@ -322,6 +350,131 @@ class ExhaustiveScan(State):
         # Convert to quaternion
         return self._rotation_matrix_to_quaternion(R)
 
+    def _build_pre_approach_goal(
+        self,
+        node,
+        tf_buffer,
+        first_scan_goal_map: Pose,
+        wall_normal: np.ndarray
+    ) -> PoseStamped:
+        """
+        Build a pre-approach goal in arm_base frame:
+        - At the current arm Z height (from TF)
+        - Positioned between current arm position and first scan goal
+        - Retracted from the first scan goal by retract_distance along wall normal
+        - With wall-facing orientation
+        """
+        # Get current end-effector position from TF
+        # Try common UR robot end-effector frame names (with arm_ prefix)
+        ee_frame_candidates = ["arm_tool0", "arm_wrist_3_link", "arm_ee_link", "arm_flange", "tool0", "wrist_3_link", "ee_link", "flange"]
+        current_ee_pos = None
+        used_ee_frame = None
+        
+        for ee_frame in ee_frame_candidates:
+            try:
+                if tf_buffer.can_transform('arm_base', ee_frame, rclpy.time.Time(), Duration(seconds=0.1)):
+                    tf_ee = tf_buffer.lookup_transform(
+                        'arm_base', ee_frame, rclpy.time.Time(), Duration(seconds=1.0)
+                    )
+                    current_ee_pos = np.array([
+                        tf_ee.transform.translation.x,
+                        tf_ee.transform.translation.y,
+                        tf_ee.transform.translation.z
+                    ])
+                    used_ee_frame = ee_frame
+                    node.get_logger().info(
+                        f"[{self.name}] Current EE position from TF ({ee_frame}): "
+                        f"({current_ee_pos[0]:.3f}, {current_ee_pos[1]:.3f}, {current_ee_pos[2]:.3f})"
+                    )
+                    break
+            except Exception as e:
+                continue
+        
+        if current_ee_pos is None:
+            node.get_logger().warn(
+                f"[{self.name}] Could not get current EE position from TF. "
+                f"Tried frames: {ee_frame_candidates}. Using fallback approach."
+            )
+            # Fallback: use a safe default Z height
+            current_ee_pos = np.array([0.0, 0.0, 0.5])  # Safe assumed height
+        
+        # Transform first scan goal to arm_base frame
+        ps_map = PoseStamped()
+        ps_map.header.frame_id = "map"
+        ps_map.header.stamp = node.get_clock().now().to_msg()
+        ps_map.pose = first_scan_goal_map
+
+        tf = tf_buffer.lookup_transform(
+            'arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0)
+        )
+        first_goal_arm = do_transform_pose_stamped(ps_map, tf)
+        first_goal_pos = np.array([
+            first_goal_arm.pose.position.x,
+            first_goal_arm.pose.position.y,
+            first_goal_arm.pose.position.z
+        ])
+        
+        # Compute retreat direction (normalized wall normal pointing away from wall)
+        retreat_dir = wall_normal / np.linalg.norm(wall_normal)
+        retreat = float(self.pre_approach_retract_distance_m)
+        
+        # Pre-approach position: first_goal retracted along wall normal
+        retracted_pos = first_goal_pos - retreat_dir * retreat
+        
+        # Use current EE Z height, but XY from retracted position
+        pre_approach_pos = np.array([
+            retracted_pos[0],
+            retracted_pos[1],
+            current_ee_pos[2]  # Keep current Z height
+        ])
+        
+        # Build result pose
+        ps_arm = PoseStamped()
+        ps_arm.header.frame_id = 'arm_base'
+        ps_arm.header.stamp = node.get_clock().now().to_msg()
+        ps_arm.pose.position.x = float(pre_approach_pos[0])
+        ps_arm.pose.position.y = float(pre_approach_pos[1])
+        ps_arm.pose.position.z = float(pre_approach_pos[2])
+        
+        # Apply wall-facing orientation
+        if self.wall_orientation:
+            qx, qy, qz, qw = self.wall_orientation
+            ps_arm.pose.orientation.x = qx
+            ps_arm.pose.orientation.y = qy
+            ps_arm.pose.orientation.z = qz
+            ps_arm.pose.orientation.w = qw
+
+        node.get_logger().info(
+            f"[{self.name}] Pre-approach goal computed: "
+            f"pos=({pre_approach_pos[0]:.3f}, {pre_approach_pos[1]:.3f}, {pre_approach_pos[2]:.3f}), "
+            f"ee_frame={used_ee_frame}, retract={retreat:.3f}m"
+        )
+
+        return ps_arm
+
+    def _send_pre_approach_goal(self, ctx):
+        """Send pre-approach arm goal using the same execution-status handshake used by fold/unfold."""
+        node = ctx["node"]
+
+        if self.pre_approach_goal is None:
+            node.get_logger().error(f"[{self.name}] Pre-approach goal was not initialized.")
+            ctx["error_triggered"] = True
+            return
+
+        # Reset execution status before publishing a new goal.
+        ctx["execution_status"] = False
+        self.goal_pub.publish(self.pre_approach_goal)
+        self.pre_approach_sent = True
+        self.waiting_for_pre_approach = True
+        self.pre_approach_verbose = False
+
+        p = self.pre_approach_goal.pose.position
+        node.get_logger().info(
+            f"[{self.name}] Sent pre-approach goal via /arm/goal_pose: "
+            f"pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
+            f"retract={self.pre_approach_retract_distance_m:.3f}m"
+        )
+
     def _estimate_step_threshold(self, sorted_vals: List[float], resolution: float = None) -> float:
         if len(sorted_vals) < 2:
             return float('inf')
@@ -433,9 +586,20 @@ class ExhaustiveScan(State):
         self._pending_panel_cells = None
         self._pending_panel_vertices = None
         self.wall_orientation = None
+        self.wall_orientation_normal = None  # Store wall normal for post-scan retraction
+        self.pre_approach_goal = None
+        self.pre_approach_sent = False
+        self.pre_approach_done = False
+        self.waiting_for_pre_approach = False
+        self.pre_approach_verbose = False
+        self.post_scan_delay_start = None
+        self.waiting_for_post_scan_delay = False
+        self.post_scan_retraction_sent = False
+        self.waiting_for_post_scan_retraction = False
         self._column_stable_since = None
         self.column_target_height = None
         self.pending_service_future = None
+        self.service_call_deadline = None
         self.total_goals_count = 0
         ctx["error_triggered"] = False
         ctx.setdefault("base_recompute_retry_counts", {})
@@ -510,6 +674,7 @@ class ExhaustiveScan(State):
         ctx["error_triggered"] = True
         self.waiting_for_arrival = False
         self.pending_service_future = None
+        self.service_call_deadline = None
 
     def _send_next_goal(self, ctx):
         """Send goal to robot via script command service (must be called AFTER column is at correct height)."""
@@ -562,17 +727,11 @@ class ExhaustiveScan(State):
         # Convert quaternion to rotation vector for movel command
         rx, ry, rz = self._quaternion_to_rotation_vector(qx, qy, qz, qw)
         
-        # Determine if this is first or last goal
+        # Determine if this is first goal
         is_first_goal = (self.current_goal_idx == 0)
-        # Calculate remaining goals across all heights
-        remaining_in_current_queue = len(self.goals_queue)
-        remaining_heights = len(self.height_sequence) - self.current_height_idx - 1
-        remaining_in_future_heights = sum(
-            len(self.goals_by_height[self.height_sequence[i]]) 
-            for i in range(self.current_height_idx + 1, len(self.height_sequence))
-        )
-        total_remaining = remaining_in_current_queue + remaining_in_future_heights
-        is_last_goal = (total_remaining == 0)
+        # Panel goals are never the last command - the post-scan retraction comes after
+        # So all panel goals should have restart_program=False
+        is_last_goal = False
         
         # Prepare service request
         request = ScriptCommand.Request()
@@ -595,6 +754,7 @@ class ExhaustiveScan(State):
         
         # Call service asynchronously
         self.pending_service_future = self.script_command_client.call_async(request)
+        self.service_call_deadline = node.get_clock().now() + Duration(seconds=self.service_timeout_s)
         self.waiting_for_arrival = True
         
         node.get_logger().info(
@@ -602,6 +762,77 @@ class ExhaustiveScan(State):
             f"pos=({ps_arm.pose.position.x:.3f}, {ps_arm.pose.position.y:.3f}, {ps_arm.pose.position.z:.3f}), "
             f"rot_vec=({rx:.3f}, {ry:.3f}, {rz:.3f}). "
             f"stop_program={is_first_goal}, restart_program={is_last_goal}"
+        )
+
+    def _send_post_scan_retraction(self, ctx):
+        """Send final wall retraction movel command after completing all scan goals."""
+        node = ctx["node"]
+        
+        # Get current end-effector position from TF
+        ee_frame_candidates = ["arm_tool0", "arm_wrist_3_link", "arm_ee_link", "arm_flange"]
+        current_ee_pos = None
+        
+        for ee_frame in ee_frame_candidates:
+            try:
+                if self.tf_buffer.can_transform('arm_base', ee_frame, rclpy.time.Time(), Duration(seconds=0.1)):
+                    tf_ee = self.tf_buffer.lookup_transform(
+                        'arm_base', ee_frame, rclpy.time.Time(), Duration(seconds=1.0)
+                    )
+                    current_ee_pos = np.array([
+                        tf_ee.transform.translation.x,
+                        tf_ee.transform.translation.y,
+                        tf_ee.transform.translation.z
+                    ])
+                    break
+            except Exception:
+                continue
+        
+        if current_ee_pos is None:
+            node.get_logger().error(f"[{self.name}] Could not get current EE position for post-scan retraction.")
+            ctx["error_triggered"] = True
+            return
+        
+        # Compute retracted position along wall normal
+        retreat_dir = self.wall_orientation_normal / np.linalg.norm(self.wall_orientation_normal)
+        retreat = float(self.post_scan_retract_distance_m)
+        
+        retracted_pos = current_ee_pos - retreat_dir * retreat
+        
+        # Build movel command
+        if self.wall_orientation:
+            qx, qy, qz, qw = self.wall_orientation
+        else:
+            qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+        
+        rx, ry, rz = self._quaternion_to_rotation_vector(qx, qy, qz, qw)
+        
+        request = ScriptCommand.Request()
+        request.command_name = 'movel'
+        request.numeric_params = [
+            float(retracted_pos[0]),
+            float(retracted_pos[1]),
+            float(retracted_pos[2]),
+            float(rx),
+            float(ry),
+            float(rz),
+            float(self.movel_acceleration),
+            float(self.movel_velocity),
+            0.0,
+            float(self.movel_blend_radius)
+        ]
+        request.string_params = []
+        request.stop_program = False
+        request.restart_program = True  # Final command, restart program
+        
+        self.pending_service_future = self.script_command_client.call_async(request)
+        self.service_call_deadline = node.get_clock().now() + Duration(seconds=self.service_timeout_s)
+        self.waiting_for_post_scan_retraction = True
+        self.post_scan_retraction_sent = True
+        
+        node.get_logger().info(
+            f"[{self.name}] Sending post-scan retraction movel: "
+            f"pos=({retracted_pos[0]:.3f}, {retracted_pos[1]:.3f}, {retracted_pos[2]:.3f}), "
+            f"retract={retreat:.3f}m"
         )
 
     def run(self, ctx):
@@ -647,8 +878,28 @@ class ExhaustiveScan(State):
                 f"q=({qx:.3f}, {qy:.3f}, {qz:.3f}, {qw:.3f})"
             )
             
-            # Store orientation for later use
+            # Store orientation and wall normal for later use
             self.wall_orientation = (qx, qy, qz, qw)
+            self.wall_orientation_normal = wall_normal  # Store for post-scan retraction
+
+            # Build pre-approach goal from first scan target with a small wall retraction.
+            try:
+                self.pre_approach_goal = self._build_pre_approach_goal(
+                    node,
+                    self.tf_buffer,
+                    ordered_goals[0],
+                    wall_normal,
+                )
+                p = self.pre_approach_goal.pose.position
+                node.get_logger().info(
+                    f"[{self.name}] Pre-approach goal prepared: "
+                    f"pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
+                    f"retract={self.pre_approach_retract_distance_m:.3f}m"
+                )
+            except Exception as e:
+                node.get_logger().error(f"[{self.name}] Failed to build pre-approach goal: {e}")
+                ctx["error_triggered"] = True
+                return
             
             # Group goals by required column height
             # Goals are still in MAP frame at this point
@@ -698,6 +949,25 @@ class ExhaustiveScan(State):
             self.goals_initialized = True
             return  # Next tick will start processing first height group
 
+        # Send and wait for the one-time pre-approach goal before starting movel scan sequence.
+        if not self.pre_approach_done:
+            if not self.pre_approach_sent:
+                self._send_pre_approach_goal(ctx)
+                return
+
+            if self.waiting_for_pre_approach:
+                exec_status = ctx.get("execution_status")
+                if exec_status is True:
+                    self.pre_approach_done = True
+                    self.waiting_for_pre_approach = False
+                    ctx["execution_status"] = False
+                    node.get_logger().info(f"[{self.name}] Pre-approach goal reached. Starting exhaustive scan movel sequence.")
+                else:
+                    if not self.pre_approach_verbose:
+                        node.get_logger().info(f"[{self.name}] Waiting for pre-approach goal completion...")
+                        self.pre_approach_verbose = True
+                    return
+
         # Handle column movement if waiting
         if self.waiting_for_column:
             column_current = ctx.get("column_current_height", 0.0)
@@ -728,64 +998,117 @@ class ExhaustiveScan(State):
                 self.current_height_idx += 1
                 
                 if self.current_height_idx >= len(self.height_sequence):
-                    # All heights processed
-                    self.movement_done = True
-                    node.get_logger().info(f"[{self.name}] All scan goals completed.")
-                    completed_base_indices = ctx.setdefault("completed_base_indices", [])
-                    selected_base_idx = ctx.get("selected_base_idx")
-                    if selected_base_idx is not None and selected_base_idx not in completed_base_indices:
-                        completed_base_indices.append(selected_base_idx)
-                    ctx["panels_left"] -= 1
-                    if ctx.get("panels_left", 0) <= 0:
-                        node.get_logger().info(f"[{self.name}] No panels left to exhaustively scan.")
-                        ctx["exhaustive_scan_done"] = True
-                    return
-                
-                # Load next height's goals
-                next_height = self.height_sequence[self.current_height_idx]
-                self.goals_queue = self.goals_by_height[next_height].copy()
-                
-                column_current = ctx.get("column_current_height", 0.0)
-                node.get_logger().info(
-                    f"[{self.name}] Starting height group {self.current_height_idx + 1}/{len(self.height_sequence)}: "
-                    f"{next_height:.2f}m with {len(self.goals_queue)} goals"
-                )
-                
-                # Command column to move to this height
-                # Use threshold to avoid commanding tiny movements that may oscillate
-                height_diff = abs(next_height - column_current)
-                if height_diff > self.column_skip_movement_threshold_m:
-                    if not self._command_column(node, ctx, next_height):
-                        node.get_logger().error(f"[{self.name}] Failed to command column movement.")
-                        ctx["error_triggered"] = True
+                    # All heights processed - start post-scan delay before retraction
+                    if not self.waiting_for_post_scan_delay and not self.post_scan_retraction_sent:
+                        self.post_scan_delay_start = node.get_clock().now()
+                        self.waiting_for_post_scan_delay = True
+                        node.get_logger().info(
+                            f"[{self.name}] All scan goals completed. "
+                            f"Waiting {self.post_scan_delay_s:.1f}s before final retraction..."
+                        )
                         return
-                    # Wait for column before sending arm goals
-                    return
+                    
+                    # Check if delay has elapsed
+                    if self.waiting_for_post_scan_delay:
+                        elapsed = (node.get_clock().now() - self.post_scan_delay_start).nanoseconds / 1e9
+                        if elapsed >= self.post_scan_delay_s:
+                            self.waiting_for_post_scan_delay = False
+                            node.get_logger().info(f"[{self.name}] Post-scan delay complete. Sending retraction movel...")
+                            self._send_post_scan_retraction(ctx)
+                            # Fall through to service call check below
+                        else:
+                            # Still waiting for delay
+                            return
+                    
+                    # If retraction sent, skip rest of goal processing and check service response below
+                    if self.post_scan_retraction_sent and self.waiting_for_post_scan_retraction:
+                        # Fall through to service call check at the end of run()
+                        pass
+                    
+                    # Retraction complete - mark panel as done
+                    elif self.post_scan_retraction_sent and not self.waiting_for_post_scan_retraction:
+                        self.movement_done = True
+                        node.get_logger().info(f"[{self.name}] Panel scan and retraction completed.")
+                        completed_base_indices = ctx.setdefault("completed_base_indices", [])
+                        selected_base_idx = ctx.get("selected_base_idx")
+                        if selected_base_idx is not None and selected_base_idx not in completed_base_indices:
+                            completed_base_indices.append(selected_base_idx)
+                        ctx["panels_left"] -= 1
+                        if ctx.get("panels_left", 0) <= 0:
+                            node.get_logger().info(f"[{self.name}] No panels left to exhaustively scan.")
+                            ctx["exhaustive_scan_done"] = True
+                        return
+                    
+                    # If we reach here, we're in an unexpected state in post-scan phase
+                    # Just fall through to service check
                 else:
-                    # Column is close enough - clear any pending column wait state
-                    self.waiting_for_column = False
-                    self.column_target_height = None
-                    self._column_stable_since = None
+                    # Not yet beyond all heights - load next height's goals
+                    next_height = self.height_sequence[self.current_height_idx]
+                    self.goals_queue = self.goals_by_height[next_height].copy()
+                    
+                    column_current = ctx.get("column_current_height", 0.0)
                     node.get_logger().info(
-                        f"[{self.name}] Column already at target height {next_height:.2f}m "
-                        f"(diff={height_diff*1000:.1f}mm, skipping movement)"
+                        f"[{self.name}] Starting height group {self.current_height_idx + 1}/{len(self.height_sequence)}: "
+                        f"{next_height:.2f}m with {len(self.goals_queue)} goals"
                     )
+                    
+                    # Command column to move to this height
+                    # Use threshold to avoid commanding tiny movements that may oscillate
+                    height_diff = abs(next_height - column_current)
+                    if height_diff > self.column_skip_movement_threshold_m:
+                        if not self._command_column(node, ctx, next_height):
+                            node.get_logger().error(f"[{self.name}] Failed to command column movement.")
+                            ctx["error_triggered"] = True
+                            return
+                        # Wait for column before sending arm goals
+                        return
+                    else:
+                        # Column is close enough - clear any pending column wait state
+                        self.waiting_for_column = False
+                        self.column_target_height = None
+                        self._column_stable_since = None
+                        node.get_logger().info(
+                            f"[{self.name}] Column already at target height {next_height:.2f}m "
+                            f"(diff={height_diff*1000:.1f}mm, skipping movement)"
+                        )
+            else:
+                # Current height still has goals - send next one
+                self._send_next_goal(ctx)
             
-            # Send next arm goal from current queue
-            self._send_next_goal(ctx)
-            return
+            # Don't return if waiting for retraction - let it fall through to service check
+            if not (self.post_scan_retraction_sent and self.waiting_for_post_scan_retraction):
+                return
         
         # Check if service call is pending
         if self.pending_service_future is not None:
+            # Check for timeout
+            if self.service_call_deadline and node.get_clock().now() > self.service_call_deadline:
+                node.get_logger().error(
+                    f"[{self.name}] Service call timeout! No response received within {self.service_timeout_s}s"
+                )
+                self.pending_service_future = None
+                self.service_call_deadline = None
+                ctx["error_triggered"] = True
+                return
+            
             if self.pending_service_future.done():
                 try:
                     response = self.pending_service_future.result()
                     if response.success:
-                        node.get_logger().info(
-                            f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully: {response.message}"
-                        )
-                        self.waiting_for_arrival = False
-                        self.pending_service_future = None
+                        if self.waiting_for_post_scan_retraction:
+                            node.get_logger().info(
+                                f"[{self.name}] Post-scan retraction completed successfully: {response.message}"
+                            )
+                            self.waiting_for_post_scan_retraction = False
+                            self.pending_service_future = None
+                            self.service_call_deadline = None
+                        else:
+                            node.get_logger().info(
+                                f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully: {response.message}"
+                            )
+                            self.waiting_for_arrival = False
+                            self.pending_service_future = None
+                            self.service_call_deadline = None
                     else:
                         self._handle_service_failure(ctx, response.message)
                         return

@@ -94,8 +94,9 @@ class GeometryReconstruction(State):
                 start_proc(
                     ctx, "nav_sim",
                     ["ros2", "launch", "navi_wall", "move_robot.launch.py",
-                    f"sim:={sim_value}", "mode:=full", "controller_type:=omni", "hybrid_sim:=true", 
-                    f"robot_ip:={ursim_ip}", "database_name:=rtabmap", "headless:=true",
+                    f"sim:={sim_value}", "mode:=full", "controller_type:=omni", "hybrid_sim:=true",
+                    "planner_backend:=legacy", 
+                    f"robot_ip:={ursim_ip}", "database_name:=rtabmap_fsm", "headless:=true",
                     "use_sim_time:=true"]
                 )
                 
