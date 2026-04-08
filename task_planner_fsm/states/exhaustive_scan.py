@@ -98,6 +98,62 @@ class ExhaustiveScan(State):
         self.post_scan_delay_s = 4.0  # Delay before final retraction
         self.post_scan_retract_distance_m = 0.15  # Final retraction distance from wall
 
+    def _status_data(self, ctx, **extra) -> Dict:
+        data = {
+            "selected_base_idx": ctx.get("selected_base_idx"),
+            "panels_left": ctx.get("panels_left"),
+            "goals_initialized": self.goals_initialized,
+            "current_goal": self.current_goal_idx + 1 if self.current_goal_idx >= 0 else 0,
+            "total_goals": self.total_goals_count,
+            "height_group": self.current_height_idx + 1 if self.current_height_idx >= 0 else 0,
+            "height_groups": len(self.height_sequence),
+            "column_target_height": self.column_target_height,
+            "column_current_height": ctx.get("column_current_height"),
+            "waiting_for_pre_approach": self.waiting_for_pre_approach,
+            "waiting_for_column": self.waiting_for_column,
+            "waiting_for_arrival": self.waiting_for_arrival,
+            "waiting_for_post_scan_delay": self.waiting_for_post_scan_delay,
+            "waiting_for_post_scan_retraction": self.waiting_for_post_scan_retraction,
+            "scan_backend": self.active_goal_backend or self.scan_motion_backend,
+            "planner_backend": ctx.get("planner_backend"),
+        }
+        data.update(extra)
+        return {key: value for key, value in data.items() if value is not None}
+
+    def _set_status(
+        self,
+        ctx,
+        summary: str,
+        *,
+        phase: str = "running",
+        data: Dict = None,
+        progress_current: int = None,
+        progress_total: int = None,
+        level: str = "info",
+    ):
+        setter = ctx.get("set_fsm_status")
+        if callable(setter):
+            setter(
+                self.name,
+                phase=phase,
+                summary=summary,
+                data=self._status_data(ctx, **(data or {})),
+                progress_current=progress_current,
+                progress_total=progress_total,
+                level=level,
+            )
+
+    def _publish_event(self, ctx, event_type: str, summary: str, *, details: Dict = None, level: str = "info"):
+        publisher = ctx.get("publish_fsm_event")
+        if callable(publisher):
+            publisher(
+                event_type,
+                state_name=self.name,
+                summary=summary,
+                details=self._status_data(ctx, **(details or {})),
+                level=level,
+            )
+
     def _normalize_quaternion(self, quat: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
         q = np.array(quat, dtype=float)
         norm = np.linalg.norm(q)
@@ -812,6 +868,15 @@ class ExhaustiveScan(State):
         ctx["execution_status"] = False
         ctx["planner_goal_failed"] = False
         ctx.setdefault("base_recompute_retry_counts", {})
+        self._set_status(
+            ctx,
+            "Preparing exhaustive scan inputs",
+            phase="running",
+            data={
+                "planner_backend": planner_backend,
+                "scan_motion_backend": self.scan_motion_backend,
+            },
+        )
 
         res = ctx.get("wall_discretization_results")
         if not res:
@@ -872,6 +937,16 @@ class ExhaustiveScan(State):
         self._pending_panel_cells = panel_cells_centers
         self._pending_panel_vertices = panel_vertices
         node.get_logger().info(f"[{self.name}] Stored {len(panel_cells_centers)} panel cells and {len(panel_vertices)} vertices. Waiting for TF to be ready...")
+        self._set_status(
+            ctx,
+            "Waiting for TF to initialize exhaustive scan goals",
+            phase="waiting",
+            data={
+                "panel_indices": panel_indices,
+                "panel_cells": len(panel_cells_centers),
+                "panel_vertices": len(panel_vertices),
+            },
+        )
     
     def _handle_service_failure(self, ctx, error_message: str):
         """
@@ -885,6 +960,20 @@ class ExhaustiveScan(State):
         self.pending_service_future = None
         self.service_call_deadline = None
         self.active_goal_backend = None
+        self._set_status(
+            ctx,
+            f"Goal execution failed: {error_message}",
+            phase="error",
+            data={"error_message": error_message},
+            level="error",
+        )
+        self._publish_event(
+            ctx,
+            "goal_failed",
+            "Exhaustive scan goal failed",
+            details={"error_message": error_message},
+            level="error",
+        )
 
     def _send_next_goal(self, ctx):
         """Send the next goal after the column reaches the required height."""
@@ -959,6 +1048,14 @@ class ExhaustiveScan(State):
                     f"pos=({ps_arm.pose.position.x:.3f}, {ps_arm.pose.position.y:.3f}, {ps_arm.pose.position.z:.3f}), "
                     f"q=({qx:.3f}, {qy:.3f}, {qz:.3f}, {qw:.3f})."
                 )
+                self._set_status(
+                    ctx,
+                    "Executing scan goal via MoveIt LIN",
+                    phase="running",
+                    progress_current=self.current_goal_idx + 1,
+                    progress_total=self.total_goals_count,
+                    data={"goal_backend": backend},
+                )
                 return
 
         # Determine if this is first or last goal
@@ -1002,6 +1099,14 @@ class ExhaustiveScan(State):
             f"pos=({ps_arm.pose.position.x:.3f}, {ps_arm.pose.position.y:.3f}, {ps_arm.pose.position.z:.3f}), "
             f"rot_vec=({rx:.3f}, {ry:.3f}, {rz:.3f}). "
             f"stop_program={is_first_goal}, restart_program={is_last_goal}"
+        )
+        self._set_status(
+            ctx,
+            "Executing scan goal via URScript movel",
+            phase="running",
+            progress_current=self.current_goal_idx + 1,
+            progress_total=self.total_goals_count,
+            data={"goal_backend": self.active_goal_backend},
         )
 
     def _send_post_scan_retraction(self, ctx):
@@ -1074,6 +1179,12 @@ class ExhaustiveScan(State):
             f"pos=({retracted_pos[0]:.3f}, {retracted_pos[1]:.3f}, {retracted_pos[2]:.3f}), "
             f"retract={retreat:.3f}m"
         )
+        self._set_status(
+            ctx,
+            "Retracting end effector after exhaustive scan",
+            phase="running",
+            data={"post_scan_retract_distance_m": retreat},
+        )
 
     def run(self, ctx):
         node = ctx["node"]
@@ -1081,6 +1192,7 @@ class ExhaustiveScan(State):
         if ctx.get("panels_left", 0) <= 0:
             node.get_logger().info(f"[{self.name}] No panels left to exhaustively scan.")
             ctx["exhaustive_scan_done"] = True
+            self._set_status(ctx, "No panels left to scan", phase="completed")
             return
 
         if ctx.get("error_triggered") or self.movement_done:
@@ -1091,11 +1203,13 @@ class ExhaustiveScan(State):
         # Populate queue via TF lookup on first run() tick (wait for TF to be ready)
         if not self.goals_initialized:
             if self._pending_panel_cells is None or self._pending_panel_vertices is None:
+                self._set_status(ctx, "Waiting for panel geometry from discretization", phase="waiting")
                 return
             
             # Wait for TF to be available before proceeding
             if not self.tf_buffer.can_transform('arm_base', 'map', rclpy.time.Time(), Duration(seconds=0.1)):
                 node.get_logger().info(f"[{self.name}] Waiting for TF map->arm_base to become available...")
+                self._set_status(ctx, "Waiting for TF map->arm_base", phase="waiting")
                 return
             
             # Compute wall normal from vertices first
@@ -1105,12 +1219,14 @@ class ExhaustiveScan(State):
             if wall_normal is None:
                 # TF not ready yet or error — retry next tick
                 node.get_logger().debug(f"[{self.name}] Wall normal computation failed, retrying...")
+                self._set_status(ctx, "Waiting for stable TF to compute wall normal", phase="waiting")
                 return
             
             ordered_goals = self._serpentine_order_vertical_z(node, self.tf_buffer, self._pending_panel_cells, resolution=0.1)
             if not ordered_goals:
                 # TF not ready yet — retry next tick silently
                 node.get_logger().debug(f"[{self.name}] TF not ready yet, retrying...")
+                self._set_status(ctx, "Waiting for TF to order scan goals", phase="waiting")
                 return
 
             sampled_goals = self._sample_scan_goals(ordered_goals)
@@ -1182,6 +1298,23 @@ class ExhaustiveScan(State):
                 )
             
             self.goals_initialized = True
+            self._set_status(
+                ctx,
+                "Prepared exhaustive scan goal groups",
+                phase="running",
+                progress_current=0,
+                progress_total=self.total_goals_count,
+                data={
+                    "goal_groups": len(self.height_sequence),
+                    "sampled_goals": self.total_goals_count,
+                },
+            )
+            self._publish_event(
+                ctx,
+                "goals_initialized",
+                "Prepared exhaustive scan goal groups",
+                details={"goal_groups": len(self.height_sequence), "sampled_goals": self.total_goals_count},
+            )
             return  # Next tick will start processing first height group
 
         # Handle column movement if waiting
@@ -1193,6 +1326,13 @@ class ExhaustiveScan(State):
                     f"Target={self.column_target_height:.3f}m, Current={column_current:.3f}m"
                 )
                 ctx["error_triggered"] = True
+                self._set_status(
+                    ctx,
+                    "Column movement timed out",
+                    phase="error",
+                    data={"column_current_height": column_current},
+                    level="error",
+                )
                 return
             
             if self._column_reached_target(node, ctx):
@@ -1202,8 +1342,15 @@ class ExhaustiveScan(State):
                 self.waiting_for_column = False
                 self.column_target_height = None
                 self._column_stable_since = None
+                self._set_status(ctx, "Column reached target height", phase="running")
             else:
                 # Still waiting for column
+                self._set_status(
+                    ctx,
+                    "Waiting for column to reach target height",
+                    phase="waiting",
+                    data={"column_current_height": column_current},
+                )
                 return
         
         # Check if we need to move to next height group
@@ -1222,6 +1369,13 @@ class ExhaustiveScan(State):
                             f"[{self.name}] All scan goals completed. "
                             f"Waiting {self.post_scan_delay_s:.1f}s before final retraction..."
                         )
+                        self._set_status(
+                            ctx,
+                            "Waiting before post-scan retraction",
+                            phase="waiting",
+                            progress_current=self.total_goals_count,
+                            progress_total=self.total_goals_count,
+                        )
                         return
                     
                     # Check if delay has elapsed
@@ -1234,6 +1388,12 @@ class ExhaustiveScan(State):
                             # Fall through to service call check below
                         else:
                             # Still waiting for delay
+                            self._set_status(
+                                ctx,
+                                "Waiting before post-scan retraction",
+                                phase="waiting",
+                                data={"delay_elapsed_s": round(elapsed, 2), "delay_total_s": self.post_scan_delay_s},
+                            )
                             return
                     
                     # If retraction sent, skip rest of goal processing and check service response below
@@ -1253,6 +1413,19 @@ class ExhaustiveScan(State):
                         if ctx.get("panels_left", 0) <= 0:
                             node.get_logger().info(f"[{self.name}] No panels left to exhaustively scan.")
                             ctx["exhaustive_scan_done"] = True
+                        self._set_status(
+                            ctx,
+                            "Completed exhaustive scan for selected base",
+                            phase="completed",
+                            progress_current=self.total_goals_count,
+                            progress_total=self.total_goals_count,
+                        )
+                        self._publish_event(
+                            ctx,
+                            "panel_completed",
+                            "Completed exhaustive scan for selected base",
+                            details={"remaining_panels": ctx.get("panels_left", 0)},
+                        )
                         return
                     
                     # If we reach here, we're in an unexpected state in post-scan phase
@@ -1276,6 +1449,12 @@ class ExhaustiveScan(State):
                             node.get_logger().error(f"[{self.name}] Failed to command column movement.")
                             ctx["error_triggered"] = True
                             return
+                        self._set_status(
+                            ctx,
+                            "Commanded column movement for next goal group",
+                            phase="running",
+                            data={"next_height": next_height, "goals_in_group": len(self.goals_queue)},
+                        )
                         # Wait for column before sending arm goals
                         return
                     else:
@@ -1288,12 +1467,19 @@ class ExhaustiveScan(State):
                             f"[{self.name}] Column already at target height {next_height:.2f}m "
                             f"(diff={height_diff*1000:.1f}mm, skipping movement)"
                         )
+                        self._set_status(
+                            ctx,
+                            "Starting next height group",
+                            phase="running",
+                            data={"next_height": next_height, "goals_in_group": len(self.goals_queue)},
+                        )
 
             if not self.pre_approach_done:
                 if not self._prepare_pre_approach_sequence(ctx):
                     return
 
                 if not self.pre_approach_sent:
+                    self._set_status(ctx, "Sending pre-approach sequence", phase="running")
                     self._send_pre_approach_goal(ctx)
                     return
 
@@ -1305,6 +1491,12 @@ class ExhaustiveScan(State):
                         ctx["planner_goal_failed"] = False
                         self.waiting_for_pre_approach = False
                         ctx["error_triggered"] = True
+                        self._set_status(
+                            ctx,
+                            "Pre-approach stage failed",
+                            phase="error",
+                            level="error",
+                        )
                         return
 
                     exec_status = ctx.get("execution_status")
@@ -1322,10 +1514,18 @@ class ExhaustiveScan(State):
                             node.get_logger().info(
                                 f"[{self.name}] Final pre-approach stage reached. Starting exhaustive scan sequence."
                             )
+                            self._set_status(ctx, "Pre-approach complete", phase="running")
                         else:
                             node.get_logger().info(
                                 f"[{self.name}] Pre-approach stage {self.pre_approach_stage_idx}/{self.pre_approach_total_stages} reached. "
                                 f"Continuing staged approach."
+                            )
+                            self._set_status(
+                                ctx,
+                                "Continuing staged pre-approach",
+                                phase="running",
+                                progress_current=self.pre_approach_stage_idx,
+                                progress_total=self.pre_approach_total_stages,
                             )
                         return
 
@@ -1334,6 +1534,13 @@ class ExhaustiveScan(State):
                             f"[{self.name}] Waiting for pre-approach stage {self.pre_approach_stage_idx + 1}/{self.pre_approach_total_stages} completion..."
                         )
                         self.pre_approach_verbose = True
+                    self._set_status(
+                        ctx,
+                        "Waiting for pre-approach completion",
+                        phase="waiting",
+                        progress_current=self.pre_approach_stage_idx + 1,
+                        progress_total=self.pre_approach_total_stages,
+                    )
                     return
             else:
                 # Current height still has goals - send next one
@@ -1354,6 +1561,15 @@ class ExhaustiveScan(State):
                 ctx["planner_goal_failed"] = False
                 self.waiting_for_arrival = False
                 self.active_goal_backend = None
+                self._set_status(
+                    ctx,
+                    "MoveIt LIN goal failed, skipping scan point",
+                    phase="warning",
+                    progress_current=self.current_goal_idx + 1,
+                    progress_total=self.total_goals_count,
+                    data={"skipped_lin_goals": self.skipped_lin_goals},
+                    level="warn",
+                )
                 return
 
             if ctx.get("execution_status") is True:
@@ -1364,8 +1580,22 @@ class ExhaustiveScan(State):
                 ctx["planner_goal_failed"] = False
                 self.waiting_for_arrival = False
                 self.active_goal_backend = None
+                self._set_status(
+                    ctx,
+                    "Scan goal completed successfully via MoveIt LIN",
+                    phase="running",
+                    progress_current=self.current_goal_idx + 1,
+                    progress_total=self.total_goals_count,
+                )
                 return
 
+            self._set_status(
+                ctx,
+                "Waiting for MoveIt LIN goal completion",
+                phase="waiting",
+                progress_current=self.current_goal_idx + 1,
+                progress_total=self.total_goals_count,
+            )
             return
 
         # Check if service call is pending
@@ -1378,6 +1608,13 @@ class ExhaustiveScan(State):
                 self.pending_service_future = None
                 self.service_call_deadline = None
                 ctx["error_triggered"] = True
+                self._set_status(
+                    ctx,
+                    "Service call timed out",
+                    phase="error",
+                    data={"service_timeout_s": self.service_timeout_s},
+                    level="error",
+                )
                 return
             
             if self.pending_service_future.done():
@@ -1391,6 +1628,7 @@ class ExhaustiveScan(State):
                             self.waiting_for_post_scan_retraction = False
                             self.pending_service_future = None
                             self.service_call_deadline = None
+                            self._set_status(ctx, "Post-scan retraction complete", phase="running")
                         else:
                             node.get_logger().info(
                                 f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully: {response.message}"
@@ -1398,6 +1636,14 @@ class ExhaustiveScan(State):
                             self.waiting_for_arrival = False
                             self.pending_service_future = None
                             self.service_call_deadline = None
+                            self._set_status(
+                                ctx,
+                                "Scan goal completed successfully",
+                                phase="running",
+                                progress_current=self.current_goal_idx + 1,
+                                progress_total=self.total_goals_count,
+                                data={"response_message": response.message},
+                            )
                         node.get_logger().info(
                             f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully: {response.message}"
                         )
@@ -1412,6 +1658,13 @@ class ExhaustiveScan(State):
                     return
             else:
                 # Still waiting for service response
+                self._set_status(
+                    ctx,
+                    "Waiting for goal service response",
+                    phase="waiting",
+                    progress_current=self.current_goal_idx + 1,
+                    progress_total=self.total_goals_count,
+                )
                 return
 
     def check_transition(self, ctx):

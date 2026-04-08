@@ -39,6 +39,7 @@ from task_planner_fsm.states import (
     WallTargetSelection,
 )
 from task_planner_fsm.states.proc_utils import start_proc, stop_all
+from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
 
 FSM_STATE_ORDER = [
     "Initialization",
@@ -161,9 +162,15 @@ class RobotFSMNode(Node):
         transition_qos = QoSProfile(depth=20)
         transition_qos.reliability = ReliabilityPolicy.RELIABLE
         transition_qos.durability = DurabilityPolicy.VOLATILE
+        event_qos = QoSProfile(depth=100)
+        event_qos.reliability = ReliabilityPolicy.RELIABLE
+        event_qos.durability = DurabilityPolicy.VOLATILE
 
         self.fsm_current_pub = self.create_publisher(String, "/fsm/current_state", current_qos)
         self.fsm_transition_pub = self.create_publisher(String, "/fsm/transition", transition_qos)
+        self.fsm_graph_pub = self.create_publisher(String, "/fsm/graph", current_qos)
+        self.fsm_status_pub = self.create_publisher(String, "/fsm/status", current_qos)
+        self.fsm_event_pub = self.create_publisher(String, "/fsm/event", event_qos)
 
         # Shared context for the FSM
         self.ctx = {
@@ -177,8 +184,13 @@ class RobotFSMNode(Node):
             "planner_goal_failed": False,
             "sim": bool(sim),
             "planner_backend": self.planner_backend,
+            "_fsm_status": {},
             "publish_fsm_current": self.publish_fsm_current,
             "publish_fsm_transition": self.publish_fsm_transition,
+            "publish_fsm_graph": self.publish_fsm_graph,
+            "set_fsm_status": self.set_fsm_status,
+            "publish_fsm_status": self.publish_fsm_status,
+            "publish_fsm_event": self.publish_fsm_event,
             "tf_buffer": self.tf_buffer,
         }
 
@@ -209,6 +221,7 @@ class RobotFSMNode(Node):
             initial_state=initial_state,
             ctx=self.ctx,
         )
+        self.publish_fsm_graph()
 
         # Subscriptions
         self.create_subscription(Bool, "/start_flag", self.start_callback, 10)
@@ -665,15 +678,88 @@ class RobotFSMNode(Node):
         msg.data = state_name
         self.fsm_current_pub.publish(msg)
 
+    def _publish_json(self, publisher, payload: Dict):
+        msg = String()
+        msg.data = json.dumps(make_json_safe(payload), sort_keys=True)
+        publisher.publish(msg)
+
     def publish_fsm_transition(self, from_state: str, to_state: str, reason: str = ""):
         payload = {
             "from": from_state,
             "to": to_state,
             "reason": reason,
         }
-        msg = String()
-        msg.data = json.dumps(payload)
-        self.fsm_transition_pub.publish(msg)
+        self._publish_json(self.fsm_transition_pub, payload)
+
+    def publish_fsm_graph(self):
+        payload = build_fsm_graph_payload(FSM_STATE_ORDER)
+        payload["initial_state"] = self.initial_state
+        self._publish_json(self.fsm_graph_pub, payload)
+
+    def set_fsm_status(
+        self,
+        state_name: Optional[str] = None,
+        *,
+        phase: Optional[str] = None,
+        summary: Optional[str] = None,
+        data: Optional[Dict] = None,
+        progress_current: Optional[int] = None,
+        progress_total: Optional[int] = None,
+        level: Optional[str] = None,
+    ) -> Dict:
+        snapshot = self.ctx.setdefault("_fsm_status", {})
+
+        if state_name is None:
+            if hasattr(self, "machine") and getattr(self.machine, "current_state", None):
+                state_name = self.machine.current_state.name
+            else:
+                state_name = self.initial_state
+
+        snapshot["state"] = state_name
+        if phase is not None:
+            snapshot["phase"] = phase
+        if summary is not None:
+            snapshot["summary"] = summary
+        if level is not None:
+            snapshot["level"] = level
+        if data is not None:
+            snapshot["data"] = make_json_safe(data)
+        if progress_current is not None or progress_total is not None:
+            snapshot["progress"] = {
+                "current": make_json_safe(progress_current),
+                "total": make_json_safe(progress_total),
+            }
+
+        return snapshot
+
+    def publish_fsm_status(self, snapshot: Dict):
+        self._publish_json(self.fsm_status_pub, snapshot)
+
+    def publish_fsm_event(
+        self,
+        event_type: str,
+        *,
+        state_name: Optional[str] = None,
+        summary: str = "",
+        details: Optional[Dict] = None,
+        level: str = "info",
+    ):
+        if state_name is None:
+            if hasattr(self, "machine") and getattr(self.machine, "current_state", None):
+                state_name = self.machine.current_state.name
+            else:
+                state_name = self.initial_state
+
+        stamp = self.get_clock().now().nanoseconds / 1e9
+        payload = {
+            "state": state_name,
+            "event": event_type,
+            "summary": summary,
+            "details": make_json_safe(details or {}),
+            "level": level,
+            "stamp": stamp,
+        }
+        self._publish_json(self.fsm_event_pub, payload)
 
     def start_callback(self, msg: Bool):
         self.ctx["start"] = msg.data
