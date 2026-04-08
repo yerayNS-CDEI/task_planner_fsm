@@ -24,6 +24,7 @@
 #include <QPainter>
 #include <QPen>
 #include <QPushButton>
+#include <QSizePolicy>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWidget>
@@ -174,7 +175,6 @@ void FsmPanel::createUi()
   status_form->addRow("Progress:", progress_value_);
 
   auto * graph_group = new QGroupBox("FSM Graph");
-  graph_group->setMaximumWidth(560);
   auto * graph_layout = new QVBoxLayout(graph_group);
   graph_scene_ = new QGraphicsScene(this);
   auto * zoom_row = new QHBoxLayout();
@@ -185,7 +185,9 @@ void FsmPanel::createUi()
   graph_view_ = new ZoomableGraphicsView(graph_scene_);
   graph_view_->setRenderHint(QPainter::Antialiasing, true);
   graph_view_->setDragMode(QGraphicsView::ScrollHandDrag);
-  graph_view_->setFixedSize(500, 560);
+  graph_view_->setMinimumSize(360, 420);
+  graph_view_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+  graph_group->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
   zoom_row->addWidget(zoom_hint);
   zoom_row->addStretch(1);
   zoom_row->addWidget(zoom_out_button);
@@ -193,15 +195,9 @@ void FsmPanel::createUi()
   zoom_row->addWidget(zoom_in_button);
   graph_layout->addLayout(zoom_row);
   graph_layout->addWidget(graph_view_);
-  auto * graph_row = new QWidget();
-  auto * graph_row_layout = new QHBoxLayout(graph_row);
-  graph_row_layout->setContentsMargins(0, 0, 0, 0);
-  graph_row_layout->addWidget(graph_group, 0, Qt::AlignLeft | Qt::AlignTop);
-  graph_row_layout->addStretch(1);
 
   root_layout->addWidget(status_group);
-  root_layout->addWidget(graph_row);
-  root_layout->addStretch(1);
+  root_layout->addWidget(graph_group, 1);
   setLayout(root_layout);
 
   connect(zoom_in_button, &QPushButton::clicked, this, [this]() {
