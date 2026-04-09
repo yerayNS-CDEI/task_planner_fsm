@@ -16,6 +16,7 @@ from control_msgs.action import FollowJointTrajectory
 from control_msgs.msg import JointTolerance
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration as DurationMsg
+from std_msgs.msg import Float64MultiArray
 from arm_control.srv import ScriptCommand
 
 class ExhaustiveScan(State):
@@ -62,10 +63,12 @@ class ExhaustiveScan(State):
         
         # Column extension tracking
         self.column_client = None
+        self.column_command_pub = None
         self.column_target_height = None
         self.column_move_deadline = None
         self.waiting_for_column = False
         self._column_stable_since = None
+        self.column_control_mode = None
         
         # Goals grouped by column height
         self.goals_by_height: Dict[float, deque] = {}
@@ -81,6 +84,7 @@ class ExhaustiveScan(State):
         self.column_move_time_s = 7.0  # Increased to 7.0 seconds (real column does 0.7m in ~5s, added margin for simulation)
         self.column_joint_name = "column_joint"
         self.column_action_name = "/column_controller/follow_joint_trajectory"
+        self.column_command_topic = "/column_position_controller/commands"
         self.column_vel_tol = 0.002
         self.column_settle_time_s = 0.5  # Increased from 0.25 to 0.5 seconds for better stability
         self.column_skip_movement_threshold_m = 0.025  # Skip movements smaller than 25mm to avoid oscillation issues
@@ -109,6 +113,7 @@ class ExhaustiveScan(State):
             "height_groups": len(self.height_sequence),
             "column_target_height": self.column_target_height,
             "column_current_height": ctx.get("column_current_height"),
+            "column_control_mode": self.column_control_mode,
             "waiting_for_pre_approach": self.waiting_for_pre_approach,
             "waiting_for_column": self.waiting_for_column,
             "waiting_for_arrival": self.waiting_for_arrival,
@@ -250,7 +255,7 @@ class ExhaustiveScan(State):
     
     def _command_column(self, node, ctx, height_m: float):
         """
-        Send column extension command (similar to goal_router's command_column).
+        Send column extension command using the controller configured for sim or real mode.
         """
         self._column_stable_since = None
         target_h = float(height_m)
@@ -266,26 +271,43 @@ class ExhaustiveScan(State):
                 f"(current={column_current:.3f}m, skipping command)."
             )
             return True
-        
+
+        if self.column_control_mode == "trajectory_action":
+            return self._command_column_via_action(node, target_h, column_current)
+
+        if self.column_control_mode == "position_topic":
+            return self._command_column_via_topic(node, target_h, column_current)
+
+        node.get_logger().error(
+            f"[{self.name}] Column control mode not configured. Expected 'trajectory_action' or "
+            f"'position_topic', got '{self.column_control_mode}'."
+        )
+        return False
+
+    def _command_column_via_action(self, node, target_h: float, column_current: float) -> bool:
+        if self.column_client is None:
+            node.get_logger().error(f"[{self.name}] Column action client is not initialized.")
+            return False
+
         if not self.column_client.wait_for_server(timeout_sec=1.0):
             node.get_logger().error(
                 f"[{self.name}] Column action server {self.column_action_name} not available."
             )
             return False
-        
+
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = [self.column_joint_name]
-        
+
         pt = JointTrajectoryPoint()
         pt.positions = [target_h]
-        
+
         move_time_s = float(self.column_move_time_s)
         sec = int(move_time_s)
         nanosec = int((move_time_s - sec) * 1e9)
         pt.time_from_start = DurationMsg(sec=sec, nanosec=nanosec)
-        
+
         goal.trajectory.points = [pt]
-        
+
         # Set goal tolerances to override controller defaults
         # This prevents aborts due to tight default tolerances (e.g., 0.1m)
         goal_tol = JointTolerance()
@@ -293,24 +315,68 @@ class ExhaustiveScan(State):
         goal_tol.position = 0.015  # 15mm position tolerance at goal
         goal_tol.velocity = self.column_vel_tol  # Velocity must be small at goal
         goal.goal_tolerance = [goal_tol]
-        
+
         # Set goal time tolerance (allow extra time to settle)
         goal.goal_time_tolerance = DurationMsg(sec=2, nanosec=0)
-        
+
         self.column_target_height = target_h
         self.column_move_deadline = node.get_clock().now() + Duration(seconds=self.column_wait_timeout_s)
         self.waiting_for_column = True
-        
+
         try:
             send_future = self.column_client.send_goal_async(goal)
             node.get_logger().info(
-                f"[{self.name}] Column extension command sent: target={target_h:.3f}m "
-                f"(current={column_current:.3f}m)"
+                f"[{self.name}] Column JTC goal sent: target={target_h:.3f}m "
+                f"(current={column_current:.3f}m, action={self.column_action_name})"
             )
             return True
         except Exception as e:
             node.get_logger().error(f"[{self.name}] Failed to send column goal: {e}")
             return False
+
+    def _command_column_via_topic(self, node, target_h: float, column_current: float) -> bool:
+        if self.column_command_pub is None:
+            node.get_logger().error(f"[{self.name}] Column command publisher is not initialized.")
+            return False
+
+        cmd = Float64MultiArray()
+        cmd.data = [target_h]
+
+        try:
+            self.column_command_pub.publish(cmd)
+            self.column_target_height = target_h
+            self.column_move_deadline = node.get_clock().now() + Duration(seconds=self.column_wait_timeout_s)
+            self.waiting_for_column = True
+            node.get_logger().info(
+                f"[{self.name}] Column position command sent: target={target_h:.3f}m "
+                f"(current={column_current:.3f}m, topic={self.column_command_topic})"
+            )
+            return True
+        except Exception as e:
+            node.get_logger().error(f"[{self.name}] Failed to publish column position command: {e}")
+            return False
+
+    def _configure_column_control(self, node, ctx) -> None:
+        use_sim = bool(ctx.get("sim", False))
+        desired_mode = "trajectory_action" if use_sim else "position_topic"
+        if self.column_control_mode == desired_mode:
+            return
+
+        self.column_control_mode = desired_mode
+
+        if desired_mode == "trajectory_action":
+            self.column_client = ActionClient(node, FollowJointTrajectory, self.column_action_name)
+            self.column_command_pub = None
+            node.get_logger().info(
+                f"[{self.name}] Column control configured for simulation via {self.column_action_name}"
+            )
+            return
+
+        self.column_command_pub = node.create_publisher(Float64MultiArray, self.column_command_topic, 10)
+        self.column_client = None
+        node.get_logger().info(
+            f"[{self.name}] Column control configured for real robot via {self.column_command_topic}"
+        )
     
     def _column_reached_target(self, node, ctx) -> bool:
         """
@@ -819,8 +885,7 @@ class ExhaustiveScan(State):
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, node)
         
-        if self.column_client is None:
-            self.column_client = ActionClient(node, FollowJointTrajectory, self.column_action_name)
+        self._configure_column_control(node, ctx)
         
         if self.script_command_client is None:
             self.script_command_client = node.create_client(ScriptCommand, '/send_script_command')
