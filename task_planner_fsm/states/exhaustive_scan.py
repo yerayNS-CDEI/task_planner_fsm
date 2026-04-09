@@ -76,7 +76,8 @@ class ExhaustiveScan(State):
         self.current_height_idx = -1
         
         # Column parameters (similar to goal_router)
-        self.column_admissible_heights = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        self.column_min_height_m = 0.0
+        self.column_max_height_m = 0.9
         self.arm_reachable_z_min = 0.0
         self.arm_reachable_z_max = 1.1
         self.column_tolerance_m = 0.01  # Increased from 0.005 to 0.01 (10mm tolerance)
@@ -233,25 +234,14 @@ class ExhaustiveScan(State):
 
     def _choose_column_height_for_goal_z(self, goal_z_in_arm_base: float) -> float:
         """
-        Choose minimal column height that makes the goal vertically reachable.
-        Similar to goal_router's choose_column_height_for_goal.
-        Returns selected height (or 0.0 if goal is below arm_base or already reachable).
+        Compute the exact column extension needed to make the goal vertically reachable.
+        The column only moves upward, which lowers the goal by the same amount in arm_base.
+        If the goal is already within the arm's vertical reach, return the minimum column height.
+        If the goal is too high, extend just enough to bring it onto arm_reachable_z_max.
+        Clamp the result to the physical column range.
         """
-        # If target is below arm_base, no column extension needed
-        if goal_z_in_arm_base < 0.0:
-            return 0.0
-        
-        # Check each admissible height (prefer minimal extension)
-        heights_sorted = sorted(self.column_admissible_heights)
-        
-        for h in heights_sorted:
-            # When column extends by h, goal appears h lower in arm_base frame
-            adjusted_z = goal_z_in_arm_base - h
-            if self.arm_reachable_z_min <= adjusted_z <= self.arm_reachable_z_max:
-                return h
-        
-        # If no height works, return maximum (last resort)
-        return heights_sorted[-1] if heights_sorted else 0.0
+        required_height = max(0.0, float(goal_z_in_arm_base) - self.arm_reachable_z_max)
+        return max(self.column_min_height_m, min(required_height, self.column_max_height_m))
     
     def _command_column(self, node, ctx, height_m: float):
         """
@@ -1355,11 +1345,11 @@ class ExhaustiveScan(State):
             self.total_goals_count = sum(len(q) for q in self.goals_by_height.values())
             node.get_logger().info(
                 f"[{self.name}] Grouped {self.total_goals_count} goals into {len(self.height_sequence)} "
-                f"column heights (highest first): {[f'{h:.2f}m' for h in self.height_sequence]}"
+                f"column target heights (highest first): {[f'{h:.3f}m' for h in self.height_sequence]}"
             )
             for h in self.height_sequence:
                 node.get_logger().info(
-                    f"  Height {h:.2f}m: {len(self.goals_by_height[h])} goals"
+                    f"  Height {h:.3f}m: {len(self.goals_by_height[h])} goals"
                 )
             
             self.goals_initialized = True
@@ -1503,7 +1493,7 @@ class ExhaustiveScan(State):
                     column_current = ctx.get("column_current_height", 0.0)
                     node.get_logger().info(
                         f"[{self.name}] Starting height group {self.current_height_idx + 1}/{len(self.height_sequence)}: "
-                        f"{next_height:.2f}m with {len(self.goals_queue)} goals"
+                        f"{next_height:.3f}m with {len(self.goals_queue)} goals"
                     )
                     
                     # Command column to move to this height
@@ -1529,7 +1519,7 @@ class ExhaustiveScan(State):
                         self.column_move_deadline = None
                         self._column_stable_since = None
                         node.get_logger().info(
-                            f"[{self.name}] Column already at target height {next_height:.2f}m "
+                            f"[{self.name}] Column already at target height {next_height:.3f}m "
                             f"(diff={height_diff*1000:.1f}mm, skipping movement)"
                         )
                         self._set_status(
