@@ -27,7 +27,7 @@ class ArmFolding(State):
         node.get_logger().info(f"[{self.name}] Entering folding state.")
         
         # Create service client for position_sender_node
-        self.service_client = node.create_client(SendPosition, '/arm/send_position')
+        self.service_client = node.create_client(SendPosition, '/send_position')
         
         ctx["folding_success"] = False
         ctx["error_triggered"] = False
@@ -75,17 +75,21 @@ class ArmFolding(State):
             return
 
         # Send dashboard command first (before any service request)
+        # Skip in Gazebo simulation — only needed for real robot
         if not self.dashboard_sent:
-            node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
-            success, message = send_dashboard_play_command()
-
-            if success:
-                node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
+            if ctx.get("sim", False):
+                node.get_logger().info(f"[{self.name}] Gazebo simulation: skipping dashboard play command.")
                 self.dashboard_sent = True
             else:
-                node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
-                ctx["error_triggered"] = True
-                return
+                node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
+                success, message = send_dashboard_play_command()
+                if success:
+                    node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
+                    self.dashboard_sent = True
+                else:
+                    node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
+                    ctx["error_triggered"] = True
+                    return
 
         # If no future, send next goal
         if self.future is None:

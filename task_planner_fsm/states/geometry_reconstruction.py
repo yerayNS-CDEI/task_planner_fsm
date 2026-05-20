@@ -53,7 +53,7 @@ class GeometryReconstruction(State):
         requested_sim = bool(ctx.get("sim", False))
         planner_backend = str(ctx.get("planner_backend", "legacy")).strip().lower()
         if not requested_sim:
-            node.get_logger().warn(f"[{self.name}] FSM was started with sim=false, but hybrid_sim=true requires sim=true. Forcing sim:=true for move_robot.launch.py.")
+            node.get_logger().warn(f"[{self.name}] FSM was started with sim=false, forcing sim:=true for Gazebo navigation launch.")
         sim_value = "true"
         ## Activacion de la simulación de navegación
         p = ctx.get("_procs", {}).get("nav_sim")
@@ -61,42 +61,41 @@ class GeometryReconstruction(State):
             node.get_logger().info(f"[{self.name}] Navigation already running (pid={p.pid}).")
         else:
             try:
-                # Check if URSim is reachable (hybrid mode requires URSim on 192.168.56.101)
-                ursim_ip = "192.168.56.101"
-                ursim_port = 29999  # UR Dashboard port
-                node.get_logger().info(f"[{self.name}] Checking URSim connectivity at {ursim_ip}:{ursim_port}...")
-                
-                ursim_ready = False
-                for attempt in range(5):  # Increased from 3 to 5 attempts
+                # Check if UR robot is reachable before launching
+                robot_ip = "192.168.1.102"
+                robot_port = 29999  # UR Dashboard port
+                node.get_logger().info(f"[{self.name}] Checking UR robot connectivity at {robot_ip}:{robot_port}...")
+
+                robot_ready = False
+                for attempt in range(5):
                     try:
-                        sock = socket.create_connection((ursim_ip, ursim_port), timeout=3)  # Increased timeout
+                        sock = socket.create_connection((robot_ip, robot_port), timeout=3)
                         sock.close()
-                        ursim_ready = True
-                        node.get_logger().info(f"[{self.name}] URSim is reachable at {ursim_ip}")
-                        # Give URSim extra time to stabilize after connection
+                        robot_ready = True
+                        node.get_logger().info(f"[{self.name}] UR robot is reachable at {robot_ip}")
                         time.sleep(2)
                         break
                     except (socket.timeout, socket.error) as e:
                         node.get_logger().warn(
-                            f"[{self.name}] URSim not reachable (attempt {attempt+1}/5): {e}"
+                            f"[{self.name}] UR robot not reachable (attempt {attempt+1}/5): {e}"
                         )
-                        if attempt < 4:  # Don't sleep on last attempt
-                            time.sleep(3)  # Wait longer between attempts
-                
-                if not ursim_ready:
+                        if attempt < 4:
+                            time.sleep(3)
+
+                if not robot_ready:
                     node.get_logger().error(
-                        f"[{self.name}] URSim not reachable at {ursim_ip}:{ursim_port} after 5 attempts. "
-                        f"Ensure terminal 1 has: ros2 run ur_client_library start_ursim.sh -m ur10e -v 5.17.3"
+                        f"[{self.name}] UR robot not reachable at {robot_ip}:{robot_port} after 5 attempts. "
+                        f"Ensure the robot is powered on and network is configured correctly."
                     )
                     # Continue anyway - the TF check will catch the issue
-                
-                # Launch navigation stack
-                node.get_logger().info(f"[{self.name}] Launching navigation stack with hybrid_sim=true...")
+
+                # Launch navigation stack with Gazebo
+                node.get_logger().info(f"[{self.name}] Launching navigation stack with Gazebo (hybrid_sim=false)...")
                 start_proc(
                     ctx, "nav_sim",
                     ["ros2", "launch", "navi_wall", "move_robot.launch.py",
-                    f"sim:={sim_value}", "mode:=full", "controller_type:=omni", "hybrid_sim:=true", 
-                    f"robot_ip:={ursim_ip}", "database_name:=rtabmap_fsm", "headless:=true",
+                    f"sim:={sim_value}", "mode:=full", "controller_type:=omni", "hybrid_sim:=false",
+                    f"robot_ip:={robot_ip}", "database_name:=rtabmap_fsm", "headless:=true",
                     f"planner_backend:={planner_backend}",
                     "use_sim_time:=true"]
                 )

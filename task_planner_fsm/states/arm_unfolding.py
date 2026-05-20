@@ -21,7 +21,7 @@ class ArmUnfolding(State):
         node.get_logger().info(f"[{self.name}] Entering unfolding state.")
 
         # Create service client for position_sender_node
-        self.service_client = node.create_client(SendPosition, '/arm/send_position')
+        self.service_client = node.create_client(SendPosition, '/send_position')
 
         ctx["unfolding_success"] = False
         ctx["error_triggered"] = False
@@ -34,23 +34,27 @@ class ArmUnfolding(State):
             return
 
         # Send dashboard command first (before service request)
+        # Skip in Gazebo simulation — only needed for real robot
         if not self.dashboard_sent:
-            node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
-            success, message = send_dashboard_play_command()
-
-            if success:
-                node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
+            if ctx.get("sim", False):
+                node.get_logger().info(f"[{self.name}] Gazebo simulation: skipping dashboard play command.")
                 self.dashboard_sent = True
             else:
-                node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
-                ctx["error_triggered"] = True
-                return
+                node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
+                success, message = send_dashboard_play_command()
+                if success:
+                    node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
+                    self.dashboard_sent = True
+                else:
+                    node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
+                    ctx["error_triggered"] = True
+                    return
 
         # Send service request if not already sent
         if not self.goal_sent:
             # Wait for service to be available
             if not self.service_client.wait_for_service(timeout_sec=1.0):
-                node.get_logger().warn(f"[{self.name}] Service /arm/send_position not available")
+                node.get_logger().warn(f"[{self.name}] Service /send_position not available")
                 ctx["error_triggered"] = True
                 return
             
