@@ -1,4 +1,8 @@
 from ..state import State
+from ..utils.wall_geometry import (
+    ee_rpy_deg_from_inward_normal,
+    inward_normal_from_wall_points,
+)
 import math
 
 class ComputeWallPoints(State):
@@ -10,7 +14,7 @@ class ComputeWallPoints(State):
         self.predefined_walls = [
             ((3.0, 0.0, 2.0), (3.0, -3.0, 3.0)),
             ((9.0, 0.0, 0.19), (9.0, -4.5, 2.0)),
-            ((10.0, 0.0, 0.2), (10.0, -4.5, 3.0)),
+            ((10.0, -4.5, 0.2), (10.0, 0.0, 3.0)),
         ]
 
     def on_enter(self, ctx):
@@ -48,9 +52,14 @@ class ComputeWallPoints(State):
             p2[2]
         )
 
+        inward_normal = inward_normal_from_wall_points(p1, p2)
+        ee_rpy_deg = ee_rpy_deg_from_inward_normal(inward_normal)
+
         return {
             "original": (tuple(p1), tuple(p2)),
             "scan_line": (scan_start, scan_end),
+            "inward_normal": inward_normal,
+            "ee_rpy_deg": ee_rpy_deg,
         }
 
     def _parse_indices(self, raw_text):
@@ -108,6 +117,15 @@ class ComputeWallPoints(State):
             ctx["database_generated"] = True
             ctx["walls_left"] = num_walls
             ctx["walls_data"] = walls_data
+            ctx["wall_inward_normals"] = [w["inward_normal"] for w in walls_data]
+            ctx["wall_ee_rpy_deg"] = [w["ee_rpy_deg"] for w in walls_data]
+            for idx, wall in enumerate(walls_data, 1):
+                n = wall["inward_normal"]
+                r, p, y = wall["ee_rpy_deg"]
+                node.get_logger().info(
+                    f"[{self.name}] Wall {idx} inward normal=({n[0]:.3f}, {n[1]:.3f}, {n[2]:.3f}) "
+                    f"→ EE rpy_deg=({r:.1f}, {p:.1f}, {y:.1f})"
+                )
             node.get_logger().info(f"[{self.name}] {num_walls} predefined wall(s) loaded successfully.")
 
         else:
