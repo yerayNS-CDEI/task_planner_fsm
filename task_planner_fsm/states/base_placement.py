@@ -79,7 +79,7 @@ class BasePlacement(State):
             )
             ctx["error_triggered"] = True
             return
-
+        
         self.pending_reqs.clear()
 
         def chunker(seq, size):
@@ -127,11 +127,11 @@ class BasePlacement(State):
                     req.poses_ee_xyzrpy = list_vertices
                     req.obstacle_rects = []
                     req.obstacle_circles = []
-                    req.min_dist = 0.6  # Close wall distance enabled by pre-approach step preventing singularities
+                    req.min_dist = 0.9  # Close wall distance enabled by pre-approach step preventing singularities
                     req.round_decimals = 3
                     req.grid_res = 0.1
-                    req.x_limits = [-10.0,10.0]
-                    req.y_limits = [-10.0,10.0]
+                    req.x_limits = [-100.0,100.0]
+                    req.y_limits = [-100.0,100.0]
                     req.enable_simulator = False
                     req.enable_robot_viz = False
 

@@ -584,7 +584,7 @@ class RobotFSMNode(Node):
                     "database_name:=rtabmap_fsm",
                     "headless:=true",
                     "use_sim_time:=true",
-                    "hybrid_sim:=true",
+                    "hybrid_sim:=false",
                     f"planner_backend:={planner_backend}",
                 ],
             )
