@@ -61,8 +61,8 @@ class WallDiscretization(State):
             req.end_point.x   = float(end_point[0])
             req.end_point.y   = float(end_point[1])
             req.end_point.z   = float(end_point[2])
-            req.robot_amplitude_range   = 1.3
-            req.robot_height_range      = 1.3
+            req.robot_amplitude_range   = 1.0
+            req.robot_height_range      = 1.0
             req.sensors_amplitude_range = 0.4
             req.sensors_height_range    = 0.4
             req.resolution              = 0.1
