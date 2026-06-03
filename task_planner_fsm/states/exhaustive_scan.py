@@ -17,7 +17,11 @@ from control_msgs.msg import JointTolerance
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration as DurationMsg
 from std_msgs.msg import Float64MultiArray
-from arm_control.srv import ScriptCommand
+from sensor_msgs.msg import JointState
+from moveit_msgs.srv import GetPositionIK
+from moveit_msgs.msg import (
+    RobotState,
+)
 
 class ExhaustiveScan(State):
     def __init__(self, name):
@@ -39,6 +43,7 @@ class ExhaustiveScan(State):
         self.wall_orientation = None  # Store computed orientation
         self.pre_approach_goal = None
         self.pre_approach_goals = deque()
+        self.pre_approach_planner_sequence = deque()  # planner per stage: 'ompl' or 'ptp'
         self.pre_approach_total_stages = 0
         self.pre_approach_stage_idx = 0
         self.pre_approach_sent = False
@@ -51,14 +56,12 @@ class ExhaustiveScan(State):
         self.waiting_for_post_scan_delay = False
         self.post_scan_retraction_sent = False
         self.waiting_for_post_scan_retraction = False
+        self._post_scan_retraction_pose: PoseStamped = None
+        self._post_scan_retraction_ptp_tried = False
+        self._post_scan_retraction_ompl_tried = False
         
-        # Script command service client
-        self.script_command_client = None
-        self.pending_service_future = None
-        self.service_call_deadline = None
-        self.service_timeout_s = 45.0  # Timeout for movel service calls
-        self.total_goals_count = 0  # Track total number of goals
-        self.scan_motion_backend = "auto"
+        self.total_goals_count = 0
+        self.scan_motion_backend = "moveit_lin"
         self.active_goal_backend = None
         
         # Column extension tracking
@@ -90,18 +93,88 @@ class ExhaustiveScan(State):
         self.column_settle_time_s = 0.5  # Increased from 0.25 to 0.5 seconds for better stability
         self.column_skip_movement_threshold_m = 0.025  # Skip movements smaller than 25mm to avoid oscillation issues
         
-        # Movement parameters for movel command
-        self.movel_acceleration = 1.2  # m/s²
-        self.movel_velocity = 0.1  # m/s
-        self.movel_blend_radius = 0.0  # Stop at each point
         self.pre_approach_retract_distance_m = 0.12
+        # How far below the first scan row the OMPL pre-approach target is placed.
+        # Must be large enough to escape the self-collision zone: arm_forearm_link hits
+        # arm_plate_link when z > ~0.85m in arm_base with small horizontal reach.
+        # 0.6m offset → pre-approach at z≈0.5m (46% of UR10e reach), well clear of plate.
+        self.pre_approach_height_offset_m = 0.6
         self.pre_approach_max_step_xy_m = 0.15
         self.pre_approach_max_step_z_m = 0.12
         self.pre_approach_max_rotation_step_rad = 0.25
         self.scan_goal_stride = 1
         self.skipped_lin_goals = 0
+        self.lin_goal_retry_count = 0
+        self.lin_goal_max_retries = 3
+        self._inflight_lin_goal_arm: PoseStamped = None
+        self._inflight_lin_goal_map: PoseStamped = None
+        self.lin_subscriber_wait_deadline = None
+        self.lin_subscriber_wait_timeout_s = 15.0
+        # Distance the EE is kept in front of the wall surface for scan goals.
+        # Wall discretization places goals ON the surface; MoveIt requires a collision-free
+        # standoff so the arm never reaches inside the wall geometry.
+        self.scan_standoff_distance_m = 0.20
         self.post_scan_delay_s = 4.0  # Delay before final retraction
         self.post_scan_retract_distance_m = 0.15  # Final retraction distance from wall
+
+        # Pre-approach candidate search:
+        # Some walls (especially behind the robot) have no collision-free IK at the
+        # default pre-approach pose because random IK at the goal hits sensor mounts.
+        # We pre-screen multiple candidate (z-offset, tilt-about-wall-normal) pairs
+        # via compute_ik before sending any goal to the planner.  The first candidate
+        # that returns a valid (collision-free) IK solution is used.  If all fail we
+        # mark the current column-height group as unreachable and continue with the
+        # next group rather than aborting the panel.
+        self.pre_approach_candidate_offsets_m = [0.6, 0.8, 0.4, 1.0, 0.2, 0.9, 0.3]
+        self.pre_approach_candidate_tilts_rad = [
+            0.0,
+            math.radians(20.0),
+            math.radians(-20.0),
+            math.radians(45.0),
+            math.radians(-45.0),
+        ]
+        # IK feasibility check (per-candidate) parameters
+        self.pre_approach_ik_timeout_s = 0.5      # compute_ik service timeout
+        self.pre_approach_ik_call_timeout_s = 2.0  # max wait for future before giving up
+
+        # Service client + joint state cache (initialised in on_enter)
+        self.compute_ik_client = None
+        self.current_joint_state: JointState = None
+        self.joint_state_sub = None
+
+        # One-shot scan-goal reachability pre-check (runs before 35-candidate loop)
+        self.scan_goal_precheck_done: bool = False
+        self.scan_goal_precheck_pending: bool = False
+        self.scan_goal_precheck_future = None
+        self.scan_goal_precheck_deadline = None
+
+        # Pre-approach candidate search state
+        self.pre_approach_candidates: deque = deque()
+        self.pre_approach_search_initialized = False
+        self.pre_approach_search_failed = False
+        self.pre_approach_ik_pending = False
+        self.pre_approach_ik_future = None
+        self.pre_approach_ik_current_candidate = None
+        self.pre_approach_ik_deadline = None
+        # Two-phase IK validation memo (per-orientation):
+        #   'scan' phase tests IK at the first scan-row position with the candidate
+        #         orientation.  If invalid, all z-offsets for that orientation
+        #         are skipped — no point checking the pre-approach pose when LIN
+        #         can't possibly land its goal.
+        #   'pre'  phase tests IK at the pre-approach offset position.  Per
+        #         z-offset.
+        # Phase order: 'pre' fires first (seeded by current joint state); on success its
+        # result joint state is captured and used to seed the 'scan' IK check.  This
+        # ensures Pilz LIN, which starts from the post-pre-approach joint state, finds
+        # an IK solution in the same family as the pre-approach — eliminating the
+        # IK-family mismatch that caused systematic -31 failures.
+        self.pre_approach_ik_phase = 'pre'  # current phase of the in-flight call
+        self.pre_approach_passed_orient_indices: set = set()   # kept for compat, unused
+        self.pre_approach_failed_orient_indices: set = set()   # kept for compat, unused
+        self.unreachable_heights = set()
+
+        # --- Goal IK pre-screening (runs before any sequence is sent) ---
+        # Each goal in the height group is async-validated via compute_ik using the
 
     def _status_data(self, ctx, **extra) -> Dict:
         data = {
@@ -192,19 +265,43 @@ class ExhaustiveScan(State):
         dot = max(-1.0, min(1.0, abs(dot)))
         return 2.0 * math.acos(dot)
 
-    def _resolve_scan_motion_backend(self) -> str:
-        backend = str(self.scan_motion_backend).strip().lower()
-        if backend in {"moveit_lin", "urscript_movel"}:
-            return backend
-        if self.goal_pub_lin is not None and self.goal_pub_lin.get_subscription_count() > 0:
-            return "moveit_lin"
-        return "urscript_movel"
-
     def _sample_scan_goals(self, ordered_goals: List[Pose]) -> List[Pose]:
         stride = max(1, int(self.scan_goal_stride))
         if stride <= 1:
             return ordered_goals
         return ordered_goals[::stride]
+
+    def _reduce_to_row_endpoints(self, ordered_goals: List[Pose], resolution: float = 0.1) -> List[Pose]:
+        """Return only the first and last goal of each horizontal Z-row.
+
+        Goals arrive in serpentine order (alternating direction per row).
+        Two consecutive Pose objects belong to the same row when their Z values
+        differ by less than *resolution*.  Rows with a single goal are kept as-is.
+        """
+        if not ordered_goals:
+            return ordered_goals
+
+        endpoints: List[Pose] = []
+        row_start = ordered_goals[0]
+        row_last  = ordered_goals[0]
+
+        for pose in ordered_goals[1:]:
+            if abs(pose.position.z - row_start.position.z) < resolution:
+                row_last = pose
+            else:
+                # Flush current row
+                endpoints.append(row_start)
+                if row_last is not row_start:
+                    endpoints.append(row_last)
+                row_start = pose
+                row_last  = pose
+
+        # Flush final row
+        endpoints.append(row_start)
+        if row_last is not row_start:
+            endpoints.append(row_last)
+
+        return endpoints
 
     def _publish_lin_goal_marker(self, node, pose_stamped: PoseStamped):
         if self.goal_marker_pub is None:
@@ -232,15 +329,15 @@ class ExhaustiveScan(State):
         marker.frame_locked = True
         self.goal_marker_pub.publish(marker)
 
-    def _choose_column_height_for_goal_z(self, goal_z_in_arm_base: float) -> float:
+    def _choose_column_height_for_goal_z(self, goal_z_world_relative: float) -> float:
         """
-        Compute the exact column extension needed to make the goal vertically reachable.
-        The column only moves upward, which lowers the goal by the same amount in arm_base.
-        If the goal is already within the arm's vertical reach, return the minimum column height.
-        If the goal is too high, extend just enough to bring it onto arm_reachable_z_max.
-        Clamp the result to the physical column range.
+        Compute the column extension needed to make the goal vertically reachable.
+        goal_z_world_relative is the goal z measured from the robot base (world-relative),
+        independent of the current column position. The column raises the arm_base, so each
+        metre of column extension lowers the goal by one metre in arm_base z.
+        Returns the minimum required column height, clamped to the physical range.
         """
-        required_height = max(0.0, float(goal_z_in_arm_base) - self.arm_reachable_z_max)
+        required_height = max(0.0, float(goal_z_world_relative) - self.arm_reachable_z_max)
         return max(self.column_min_height_m, min(required_height, self.column_max_height_m))
     
     def _command_column(self, node, ctx, height_m: float):
@@ -298,16 +395,18 @@ class ExhaustiveScan(State):
 
         goal.trajectory.points = [pt]
 
-        # Set goal tolerances to override controller defaults
-        # This prevents aborts due to tight default tolerances (e.g., 0.1m)
+        # Position tolerance at JTC level (coarse — FSM _column_reached_target does the
+        # tight 10 mm stability check).  Velocity set to 0.0 to disable the JTC velocity
+        # check at goal time: the simulation column often arrives with residual velocity
+        # that triggers an abort even though the position is correct.
         goal_tol = JointTolerance()
         goal_tol.name = self.column_joint_name
-        goal_tol.position = 0.015  # 15mm position tolerance at goal
-        goal_tol.velocity = self.column_vel_tol  # Velocity must be small at goal
+        goal_tol.position = 0.05   # 50 mm JTC-level tolerance; FSM uses 10 mm
+        goal_tol.velocity = 0.0    # 0.0 = disabled; FSM handles settling independently
         goal.goal_tolerance = [goal_tol]
 
-        # Set goal time tolerance (allow extra time to settle)
-        goal.goal_time_tolerance = DurationMsg(sec=2, nanosec=0)
+        # Generous extra window so the action succeeds rather than aborting early.
+        goal.goal_time_tolerance = DurationMsg(sec=10, nanosec=0)
 
         self.column_target_height = target_h
         self.column_move_deadline = node.get_clock().now() + Duration(seconds=self.column_wait_timeout_s)
@@ -555,9 +654,185 @@ class ExhaustiveScan(State):
         
         # Build rotation matrix: R = [x_axis | y_axis | z_axis]
         R = np.column_stack([x_axis, y_axis, z_axis])
-        
+
         # Convert to quaternion
         return self._rotation_matrix_to_quaternion(R)
+
+    # ---------------- Pre-approach candidate IK pre-screening ----------------
+
+    def _joint_state_cb(self, msg: JointState):
+        self.current_joint_state = msg
+
+    def _axis_angle_to_quaternion(
+        self, axis: np.ndarray, angle: float
+    ) -> Tuple[float, float, float, float]:
+        n = np.linalg.norm(axis)
+        if n < 1e-9 or abs(angle) < 1e-9:
+            return (0.0, 0.0, 0.0, 1.0)
+        unit = axis / n
+        half = 0.5 * float(angle)
+        s = math.sin(half)
+        return (
+            float(unit[0] * s),
+            float(unit[1] * s),
+            float(unit[2] * s),
+            float(math.cos(half)),
+        )
+
+    def _quaternion_multiply(
+        self,
+        q1: Tuple[float, float, float, float],
+        q2: Tuple[float, float, float, float],
+    ) -> Tuple[float, float, float, float]:
+        x1, y1, z1, w1 = q1
+        x2, y2, z2, w2 = q2
+        return (
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        )
+
+    def _build_pose_stamped_arm_base(
+        self,
+        node,
+        pos: Tuple[float, float, float],
+        q: Tuple[float, float, float, float],
+    ) -> PoseStamped:
+        ps = PoseStamped()
+        ps.header.frame_id = 'arm_base'
+        ps.header.stamp = node.get_clock().now().to_msg()
+        ps.pose.position.x = float(pos[0])
+        ps.pose.position.y = float(pos[1])
+        ps.pose.position.z = float(pos[2])
+        ps.pose.orientation.x = float(q[0])
+        ps.pose.orientation.y = float(q[1])
+        ps.pose.orientation.z = float(q[2])
+        ps.pose.orientation.w = float(q[3])
+        return ps
+
+    def _generate_pre_approach_candidates(
+        self,
+        node,
+        effective_first_pos: np.ndarray,
+        wall_normal: np.ndarray,
+    ) -> deque:
+        """
+        Build a list of candidate dicts, each containing BOTH a pre-approach pose
+        and the first-scan pose with the same orientation.
+
+        The pre-approach must reach the offset position; the first LIN scan goal
+        must be IK-valid at the scan row z with the SAME orientation (otherwise
+        LIN SLERPs orientation between two IK families and fails with -31).  Both
+        poses are pre-validated by compute_ik before sending any goal to the
+        planner.
+
+        Candidates vary by:
+          - tilt rotation about the wall normal axis (outer loop) — preserves the
+            EE z-axis (approach direction) so the scan footprint is unchanged
+          - z offset below the scan row (inner loop) — only the pre-approach pose
+            uses this offset; the scan pose stays at the first scan row z
+        """
+        if self.wall_orientation:
+            q_wall = tuple(self.wall_orientation)
+        else:
+            q_wall = (0.0, 0.0, 0.0, 1.0)
+
+        candidates = deque()
+
+        for orient_idx, tilt in enumerate(self.pre_approach_candidate_tilts_rad):
+            if abs(tilt) > 1e-9:
+                q_tilt = self._axis_angle_to_quaternion(wall_normal, tilt)
+                q_candidate = self._quaternion_multiply(q_tilt, q_wall)
+            else:
+                q_candidate = q_wall
+            q_candidate = (
+                float(q_candidate[0]),
+                float(q_candidate[1]),
+                float(q_candidate[2]),
+                float(q_candidate[3]),
+            )
+
+            # Scan pose: at the first scan row z, candidate orientation.
+            # Independent of z_offset so it's shared across all candidates with
+            # the same orientation.
+            scan_pose = self._build_pose_stamped_arm_base(
+                node,
+                (effective_first_pos[0], effective_first_pos[1], effective_first_pos[2]),
+                q_candidate,
+            )
+
+            for z_off in self.pre_approach_candidate_offsets_m:
+                pre_z = max(0.15, float(effective_first_pos[2]) - float(z_off))
+                pre_pose = self._build_pose_stamped_arm_base(
+                    node,
+                    (effective_first_pos[0], effective_first_pos[1], pre_z),
+                    q_candidate,
+                )
+                description = (
+                    f"orient_idx={orient_idx} (tilt={math.degrees(tilt):+.0f}°), "
+                    f"z_off={z_off:.2f}m, pre_z={pre_z:.3f}m"
+                )
+                candidates.append({
+                    'orient_idx': orient_idx,
+                    'orientation': q_candidate,
+                    'pre_pose': pre_pose,
+                    'scan_pose': scan_pose,
+                    'description': description,
+                    'planner': 'ompl',
+                })
+        return candidates
+
+    def _start_ik_request(self, node, candidate: Dict, phase: str, seed_joint_state=None) -> bool:
+        """
+        Fire an async compute_ik request for `candidate` in the given `phase`.
+
+        phase='pre'  validates the pre-approach pose (seeded with current joint state).
+        phase='scan' validates the first-scan row pose (seeded with the pre-approach IK
+                     result joint state so Pilz LIN starts in the same IK family).
+
+        seed_joint_state overrides self.current_joint_state when provided.
+
+        Returns True on dispatch, False if the service isn't ready.
+        """
+        if phase == 'scan':
+            pose = candidate['scan_pose']
+        elif phase == 'pre':
+            pose = candidate['pre_pose']
+        else:
+            node.get_logger().error(f"[{self.name}] Unknown IK phase '{phase}'.")
+            return False
+
+        if self.compute_ik_client is None or not self.compute_ik_client.service_is_ready():
+            node.get_logger().warn(
+                f"[{self.name}] compute_ik service not ready; "
+                f"skipping candidate '{candidate['description']}' (phase={phase})."
+            )
+            return False
+
+        request = GetPositionIK.Request()
+        request.ik_request.group_name = 'arm_manipulator'
+        request.ik_request.pose_stamped = pose
+        request.ik_request.avoid_collisions = True
+        request.ik_request.timeout = DurationMsg(
+            sec=int(self.pre_approach_ik_timeout_s),
+            nanosec=int((self.pre_approach_ik_timeout_s % 1.0) * 1e9),
+        )
+        seed = seed_joint_state if seed_joint_state is not None else self.current_joint_state
+        if seed is not None:
+            robot_state = RobotState()
+            robot_state.joint_state = seed
+            robot_state.is_diff = False
+            request.ik_request.robot_state = robot_state
+
+        self.pre_approach_ik_future = self.compute_ik_client.call_async(request)
+        self.pre_approach_ik_pending = True
+        self.pre_approach_ik_current_candidate = candidate
+        self.pre_approach_ik_phase = phase
+        self.pre_approach_ik_deadline = node.get_clock().now() + Duration(
+            seconds=self.pre_approach_ik_call_timeout_s
+        )
+        return True
 
     def _build_pre_approach_goals(
         self,
@@ -566,141 +841,132 @@ class ExhaustiveScan(State):
         first_scan_goal_map: Pose,
         wall_normal: np.ndarray,
         planner_backend: str,
-    ) -> List[PoseStamped]:
+    ) -> List[Tuple[PoseStamped, str]]:
         """
-        Build pre-approach goals in arm_base frame.
+        Build pre-approach stages as (PoseStamped, planner_type) pairs.
 
-        For MoveIt:
-        - Retract from the first scan goal by retract_distance along wall normal
-        - Send a single LIN-compatible pre-approach goal at the retracted scan-start pose
+        For MoveIt — single OMPL stage using an "approach from below" strategy:
+          The pre-approach is placed at the same x,y as the first scan goal (at standoff
+          distance from wall), but pre_approach_height_offset_m BELOW it. This avoids
+          the backward-retraction position that sits close to the arm base at high z,
+          where all IK solutions self-collide (arm_forearm_link hits arm_plate_link).
+          Wall orientation is used directly so LIN can start without a reorientation
+          stage: the first LIN move raises the arm straight up to the first scan row.
 
-        For legacy:
-        - Keep a single simpler staging pose using the generic goal topic
+        For legacy: single generic pose goal.
         """
-        # Get current end-effector position from TF
-        # Try common UR robot end-effector frame names (with arm_ prefix)
-        ee_frame_candidates = ["arm_tool0", "arm_wrist_3_link", "arm_ee_link", "arm_flange", "tool0", "wrist_3_link", "ee_link", "flange"]
-        current_ee_pos = None
-        current_ee_orientation = None
-        used_ee_frame = None
-        
-        for ee_frame in ee_frame_candidates:
-            try:
-                if tf_buffer.can_transform('arm_base', ee_frame, rclpy.time.Time(), Duration(seconds=0.1)):
-                    tf_ee = tf_buffer.lookup_transform(
-                        'arm_base', ee_frame, rclpy.time.Time(), Duration(seconds=1.0)
-                    )
-                    current_ee_pos = np.array([
-                        tf_ee.transform.translation.x,
-                        tf_ee.transform.translation.y,
-                        tf_ee.transform.translation.z
-                    ])
-                    current_ee_orientation = (
-                        tf_ee.transform.rotation.x,
-                        tf_ee.transform.rotation.y,
-                        tf_ee.transform.rotation.z,
-                        tf_ee.transform.rotation.w,
-                    )
-                    used_ee_frame = ee_frame
-                    node.get_logger().info(
-                        f"[{self.name}] Current EE position from TF ({ee_frame}): "
-                        f"({current_ee_pos[0]:.3f}, {current_ee_pos[1]:.3f}, {current_ee_pos[2]:.3f})"
-                    )
-                    break
-            except Exception as e:
-                continue
-        
-        if current_ee_pos is None:
-            node.get_logger().warn(
-                f"[{self.name}] Could not get current EE position from TF. "
-                f"Tried frames: {ee_frame_candidates}. Using fallback approach."
-            )
-            # Fallback: use a safe default Z height
-            current_ee_pos = np.array([0.0, 0.0, 0.5])  # Safe assumed height
-            current_ee_orientation = self.wall_orientation
-        
         # Transform first scan goal to arm_base frame
         ps_map = PoseStamped()
         ps_map.header.frame_id = "map"
         ps_map.header.stamp = node.get_clock().now().to_msg()
         ps_map.pose = first_scan_goal_map
-
-        tf = tf_buffer.lookup_transform(
-            'arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0)
-        )
+        tf = tf_buffer.lookup_transform('arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0))
         first_goal_arm = do_transform_pose_stamped(ps_map, tf)
         first_goal_pos = np.array([
             first_goal_arm.pose.position.x,
             first_goal_arm.pose.position.y,
-            first_goal_arm.pose.position.z
+            first_goal_arm.pose.position.z,
         ])
-        
-        # Compute retreat direction (normalized wall normal pointing away from wall)
-        retreat_dir = wall_normal / np.linalg.norm(wall_normal)
-        retreat = float(self.pre_approach_retract_distance_m)
-        
-        # Pre-approach position: first_goal retracted along wall normal
-        retracted_pos = first_goal_pos - retreat_dir * retreat
-        
-        # Preserve the current EE orientation for the staging move to avoid an
-        # unnecessary IK jump before the first scan segment.
-        if current_ee_orientation:
-            qx, qy, qz, qw = current_ee_orientation
-        elif self.wall_orientation:
-            qx, qy, qz, qw = self.wall_orientation
-        else:
-            qx, qy, qz, qw = (0.0, 0.0, 0.0, 1.0)
 
-        staged_goals: List[PoseStamped] = []
+        retreat_dir = wall_normal / np.linalg.norm(wall_normal)
+
+        # Effective first scan position: standoff distance in front of wall surface.
+        effective_first_pos = first_goal_pos - retreat_dir * self.scan_standoff_distance_m
+
         now = node.get_clock().now().to_msg()
+        staged_goals: List[Tuple[PoseStamped, str]] = []
 
         if planner_backend == "moveit":
-            target_orientation = self.wall_orientation if self.wall_orientation else (qx, qy, qz, qw)
+            # Approach from below: same x,y as first scan goal at standoff distance,
+            # z lowered by pre_approach_height_offset_m.
+            # Rationale: backward retraction (pulling arm toward base) at high z puts
+            # the arm in a near-vertical configuration where ALL IK solutions cause
+            # arm_forearm_link to collide with arm_plate_link → "unable to sample goal tree".
+            # Staying at the scan goal's horizontal distance from base while lowering z
+            # keeps the arm in a comfortable, non-self-colliding configuration.
+            # Wall orientation is used directly so no PTP reorientation stage is needed
+            # before LIN: the first LIN move is a clean vertical rise to the first scan row.
+            height_offset = float(self.pre_approach_height_offset_m)
+            # Floor at 0.25m: keeps arm above base plate even if first scan row is very low.
+            pre_approach_z = max(0.25, float(effective_first_pos[2]) - height_offset)
+            pre_approach_pos = np.array([
+                effective_first_pos[0],
+                effective_first_pos[1],
+                pre_approach_z,
+            ])
+
+            if self.wall_orientation:
+                qx, qy, qz, qw = self.wall_orientation
+            else:
+                qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+
+            ps1 = PoseStamped()
+            ps1.header.frame_id = 'arm_base'
+            ps1.header.stamp = now
+            ps1.pose.position.x = float(pre_approach_pos[0])
+            ps1.pose.position.y = float(pre_approach_pos[1])
+            ps1.pose.position.z = float(pre_approach_pos[2])
+            ps1.pose.orientation.x = qx
+            ps1.pose.orientation.y = qy
+            ps1.pose.orientation.z = qz
+            ps1.pose.orientation.w = qw
+            staged_goals.append((ps1, 'ompl'))
+
+            node.get_logger().info(
+                f"[{self.name}] Pre-approach (approach-from-below): OMPL to "
+                f"pos=({pre_approach_pos[0]:.3f}, {pre_approach_pos[1]:.3f}, {pre_approach_pos[2]:.3f}), "
+                f"wall_orient q=({qx:.3f},{qy:.3f},{qz:.3f},{qw:.3f}), "
+                f"height_offset={height_offset:.3f}m below first scan row z={effective_first_pos[2]:.3f}m"
+            )
+        else:
+            # Legacy: approach with horizontal retraction from first scan position
+            ee_frame_candidates = ["arm_tool0", "arm_wrist_3_link", "arm_ee_link",
+                                    "arm_flange", "tool0", "wrist_3_link", "ee_link", "flange"]
+            current_ee_pos = np.array([0.0, 0.0, 0.5])
+            current_ee_orientation = (0.0, 0.0, 0.0, 1.0)
+            for ee_frame in ee_frame_candidates:
+                try:
+                    if tf_buffer.can_transform('arm_base', ee_frame, rclpy.time.Time(), Duration(seconds=0.1)):
+                        tf_ee = tf_buffer.lookup_transform(
+                            'arm_base', ee_frame, rclpy.time.Time(), Duration(seconds=1.0)
+                        )
+                        current_ee_pos = np.array([
+                            tf_ee.transform.translation.x,
+                            tf_ee.transform.translation.y,
+                            tf_ee.transform.translation.z,
+                        ])
+                        current_ee_orientation = (
+                            tf_ee.transform.rotation.x,
+                            tf_ee.transform.rotation.y,
+                            tf_ee.transform.rotation.z,
+                            tf_ee.transform.rotation.w,
+                        )
+                        break
+                except Exception:
+                    continue
+
+            retracted_pos = effective_first_pos - retreat_dir * float(self.pre_approach_retract_distance_m)
+            qx, qy, qz, qw = current_ee_orientation
             ps_arm = PoseStamped()
             ps_arm.header.frame_id = 'arm_base'
             ps_arm.header.stamp = now
             ps_arm.pose.position.x = float(retracted_pos[0])
             ps_arm.pose.position.y = float(retracted_pos[1])
-            ps_arm.pose.position.z = float(retracted_pos[2])
-            ps_arm.pose.orientation.x = target_orientation[0]
-            ps_arm.pose.orientation.y = target_orientation[1]
-            ps_arm.pose.orientation.z = target_orientation[2]
-            ps_arm.pose.orientation.w = target_orientation[3]
-            staged_goals.append(ps_arm)
-
-            node.get_logger().info(
-                f"[{self.name}] MoveIt pre-approach goal computed: "
-                f"pos=({retracted_pos[0]:.3f}, {retracted_pos[1]:.3f}, {retracted_pos[2]:.3f}), "
-                f"ee_frame={used_ee_frame}, retract={retreat:.3f}m"
-            )
-        else:
-            pre_approach_pos = np.array([
-                retracted_pos[0],
-                retracted_pos[1],
-                current_ee_pos[2],
-            ])
-            ps_arm = PoseStamped()
-            ps_arm.header.frame_id = 'arm_base'
-            ps_arm.header.stamp = now
-            ps_arm.pose.position.x = float(pre_approach_pos[0])
-            ps_arm.pose.position.y = float(pre_approach_pos[1])
-            ps_arm.pose.position.z = float(pre_approach_pos[2])
+            ps_arm.pose.position.z = float(current_ee_pos[2])
             ps_arm.pose.orientation.x = qx
             ps_arm.pose.orientation.y = qy
             ps_arm.pose.orientation.z = qz
             ps_arm.pose.orientation.w = qw
-            staged_goals.append(ps_arm)
-
+            staged_goals.append((ps_arm, 'legacy'))
             node.get_logger().info(
-                f"[{self.name}] Legacy pre-approach goal computed: "
-                f"pos=({pre_approach_pos[0]:.3f}, {pre_approach_pos[1]:.3f}, {pre_approach_pos[2]:.3f}), "
-                f"ee_frame={used_ee_frame}, retract={retreat:.3f}m"
+                f"[{self.name}] Pre-approach goal computed (legacy): "
+                f"pos=({retracted_pos[0]:.3f}, {retracted_pos[1]:.3f}, {current_ee_pos[2]:.3f}m)"
             )
 
         return staged_goals
 
     def _send_pre_approach_goal(self, ctx):
-        """Send pre-approach arm goal using the same execution-status handshake used by fold/unfold."""
+        """Send the current pre-approach stage, selecting planner from the per-stage sequence."""
         node = ctx["node"]
 
         if not self.pre_approach_goals:
@@ -709,23 +975,32 @@ class ExhaustiveScan(State):
             return
 
         self.pre_approach_goal = self.pre_approach_goals[0]
+        planner_type = self.pre_approach_planner_sequence[0] if self.pre_approach_planner_sequence else 'ompl'
 
         planner_backend = str(ctx.get("planner_backend", "legacy")).strip().lower()
         if planner_backend == "moveit":
-            pre_approach_pub = self.goal_pub_ompl
-            goal_topic = "/arm/goal_pose_ompl"
-            goal_label = "MoveIt OMPL"
+            if planner_type == 'ptp':
+                pre_approach_pub = self.goal_pub_ptp
+                goal_topic = "/arm/goal_pose_ptp"
+                goal_label = "MoveIt PTP"
+            else:
+                # OMPL (APS): collision-aware free-space move to approach-from-below
+                # position with wall orientation. Wall orientation is used directly so
+                # LIN can start without a separate reorientation stage.
+                pre_approach_pub = self.goal_pub_ompl
+                goal_topic = "/arm/goal_pose_ompl"
+                goal_label = "MoveIt OMPL-APS"
         else:
             pre_approach_pub = self.goal_pub
             goal_topic = "/arm/goal_pose"
             goal_label = "legacy planner"
 
-        # Reset execution status before publishing a new goal.
         ctx["execution_status"] = False
         ctx["planner_goal_failed"] = False
         if pre_approach_pub is None or pre_approach_pub.get_subscription_count() == 0:
             node.get_logger().error(
-                f"[{self.name}] No subscriber detected on {goal_topic} for the pre-approach goal."
+                f"[{self.name}] No subscriber on {goal_topic} for pre-approach stage "
+                f"{self.pre_approach_stage_idx + 1}/{self.pre_approach_total_stages}."
             )
             ctx["error_triggered"] = True
             return
@@ -739,13 +1014,21 @@ class ExhaustiveScan(State):
         node.get_logger().info(
             f"[{self.name}] Sent pre-approach stage {self.pre_approach_stage_idx + 1}/{self.pre_approach_total_stages} "
             f"via {goal_topic} using {goal_label}: "
-            f"pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
-            f"retract={self.pre_approach_retract_distance_m:.3f}m"
+            f"pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f})"
         )
 
     def _prepare_pre_approach_sequence(self, ctx) -> bool:
+        """
+        Drive the per-tick pre-approach candidate search.
+
+        Returns True when self.pre_approach_goals is populated with a validated
+        candidate (IK confirmed collision-free).  Returns False otherwise — caller
+        should check self.pre_approach_search_failed (search exhausted, current
+        height-group unreachable) and ctx["error_triggered"] (fatal misconfig).
+        """
         node = ctx["node"]
 
+        # Already have a validated candidate queued.
         if self.pre_approach_goals:
             return True
         if not self.goals_queue:
@@ -759,33 +1042,308 @@ class ExhaustiveScan(State):
 
         planner_backend = str(ctx.get("planner_backend", "legacy")).strip().lower()
 
-        try:
-            staged_pre_approach_goals = self._build_pre_approach_goals(
-                node,
-                self.tf_buffer,
-                self.goals_queue[0],
-                self.wall_orientation_normal,
-                planner_backend,
-            )
-            self.pre_approach_goals = deque(staged_pre_approach_goals)
-            self.pre_approach_total_stages = len(staged_pre_approach_goals)
-            self.pre_approach_stage_idx = 0
+        # Legacy backend: keep original single-shot behaviour (no IK pre-screening).
+        if planner_backend != 'moveit':
+            try:
+                staged = self._build_pre_approach_goals(
+                    node, self.tf_buffer, self.goals_queue[0],
+                    self.wall_orientation_normal, planner_backend,
+                )
+                if not staged:
+                    raise RuntimeError("No pre-approach goals were generated")
+                self.pre_approach_goals = deque([g for g, _ in staged])
+                self.pre_approach_planner_sequence = deque([p for _, p in staged])
+                self.pre_approach_total_stages = len(staged)
+                self.pre_approach_stage_idx = 0
+                self.pre_approach_goal = self.pre_approach_goals[0]
+                return True
+            except Exception as exc:
+                node.get_logger().error(f"[{self.name}] Failed to build pre-approach goal: {exc}")
+                ctx["error_triggered"] = True
+                return False
 
-            if not self.pre_approach_goals:
-                raise RuntimeError("No pre-approach goals were generated")
+        # MoveIt: candidate search with IK pre-screening.
+        # ----- Step 0: one-shot scan-goal reachability pre-check -----
+        # Check whether the first scan goal is reachable at all before spending
+        # ~70 s cycling all 35 pre-approach candidates.  If compute_ik returns
+        # NO_IK_SOLUTION with a neutral seed, the position is outside the
+        # workspace — bail in <0.5 s instead of timing out 35 times.
+        if not self.scan_goal_precheck_done:
+            if self.scan_goal_precheck_pending and self.scan_goal_precheck_future is not None:
+                now = node.get_clock().now()
+                timed_out = (
+                    self.scan_goal_precheck_deadline is not None
+                    and now > self.scan_goal_precheck_deadline
+                )
+                if timed_out or self.scan_goal_precheck_future.done():
+                    ok = False
+                    if not timed_out:
+                        try:
+                            resp = self.scan_goal_precheck_future.result()
+                            ok = resp is not None and resp.error_code.val == resp.error_code.SUCCESS
+                            err_val = resp.error_code.val if resp is not None else 'none'
+                        except Exception:
+                            err_val = 'exception'
+                    else:
+                        err_val = 'timeout'
+                    self.scan_goal_precheck_pending = False
+                    self.scan_goal_precheck_future = None
+                    if ok:
+                        node.get_logger().info(
+                            f"[{self.name}] Scan-goal pre-check PASSED — goal is reachable. "
+                            f"Proceeding with candidate search."
+                        )
+                        self.scan_goal_precheck_done = True
+                        # fall through to Step 1
+                    else:
+                        node.get_logger().warn(
+                            f"[{self.name}] Scan-goal pre-check FAILED (err={err_val}): "
+                            f"first scan goal is outside workspace. Skipping all "
+                            f"{self._pre_approach_candidate_count_total()} candidates."
+                        )
+                        self.pre_approach_search_failed = True
+                        return False
+                else:
+                    return False  # future still in-flight
+            elif not self.scan_goal_precheck_pending:
+                # Fire IK for the first scan goal with neutral (current joint state) seed.
+                try:
+                    ps_map = PoseStamped()
+                    ps_map.header.frame_id = "map"
+                    ps_map.header.stamp = node.get_clock().now().to_msg()
+                    ps_map.pose = self.goals_queue[0]
+                    tf = self.tf_buffer.lookup_transform(
+                        'arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0)
+                    )
+                    scan_goal_arm = do_transform_pose_stamped(ps_map, tf)
+                    # Pull standoff (same transform as _send_next_goal)
+                    if self.wall_orientation_normal is not None and self.scan_standoff_distance_m > 0.0:
+                        n = self.wall_orientation_normal / np.linalg.norm(self.wall_orientation_normal)
+                        scan_goal_arm.pose.position.x -= float(n[0]) * self.scan_standoff_distance_m
+                        scan_goal_arm.pose.position.y -= float(n[1]) * self.scan_standoff_distance_m
+                        scan_goal_arm.pose.position.z -= float(n[2]) * self.scan_standoff_distance_m
+                    qx, qy, qz, qw = self.wall_orientation
+                    scan_goal_arm.pose.orientation.x = qx
+                    scan_goal_arm.pose.orientation.y = qy
+                    scan_goal_arm.pose.orientation.z = qz
+                    scan_goal_arm.pose.orientation.w = qw
 
-            self.pre_approach_goal = self.pre_approach_goals[0]
-            p = self.pre_approach_goals[-1].pose.position
-            node.get_logger().info(
-                f"[{self.name}] Pre-approach sequence prepared: "
-                f"{self.pre_approach_total_stages} stage(s), final_pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}), "
-                f"retract={self.pre_approach_retract_distance_m:.3f}m"
+                    request = GetPositionIK.Request()
+                    request.ik_request.group_name = 'arm_manipulator'
+                    request.ik_request.pose_stamped = scan_goal_arm
+                    request.ik_request.timeout = DurationMsg(
+                        sec=int(self.pre_approach_ik_timeout_s),
+                        nanosec=int((self.pre_approach_ik_timeout_s % 1.0) * 1e9),
+                    )
+                    if self.current_joint_state is not None:
+                        robot_state = RobotState()
+                        robot_state.joint_state = self.current_joint_state
+                        robot_state.is_diff = False
+                        request.ik_request.robot_state = robot_state
+
+                    self.scan_goal_precheck_future = self.compute_ik_client.call_async(request)
+                    self.scan_goal_precheck_pending = True
+                    self.scan_goal_precheck_deadline = node.get_clock().now() + Duration(
+                        seconds=self.pre_approach_ik_call_timeout_s
+                    )
+                    node.get_logger().info(
+                        f"[{self.name}] Firing scan-goal reachability pre-check "
+                        f"(z_arm={scan_goal_arm.pose.position.z:.3f}m) before candidate search."
+                    )
+                except Exception as exc:
+                    node.get_logger().warn(
+                        f"[{self.name}] Scan-goal pre-check setup failed ({exc}); skipping pre-check."
+                    )
+                    self.scan_goal_precheck_done = True  # skip and proceed to candidate search
+                return False  # wait for next tick
+
+        # ----- Step 1: initialise the candidate list if not done yet -----
+        if not self.pre_approach_search_initialized:
+            try:
+                ps_map = PoseStamped()
+                ps_map.header.frame_id = "map"
+                ps_map.header.stamp = node.get_clock().now().to_msg()
+                ps_map.pose = self.goals_queue[0]
+                tf = self.tf_buffer.lookup_transform(
+                    'arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0)
+                )
+                first_goal_arm = do_transform_pose_stamped(ps_map, tf)
+                first_goal_pos = np.array([
+                    first_goal_arm.pose.position.x,
+                    first_goal_arm.pose.position.y,
+                    first_goal_arm.pose.position.z,
+                ])
+                retreat_dir = self.wall_orientation_normal / np.linalg.norm(self.wall_orientation_normal)
+                effective_first_pos = first_goal_pos - retreat_dir * self.scan_standoff_distance_m
+
+                self.pre_approach_candidates = self._generate_pre_approach_candidates(
+                    node, effective_first_pos, self.wall_orientation_normal,
+                )
+                self.pre_approach_search_initialized = True
+                node.get_logger().info(
+                    f"[{self.name}] Pre-approach candidate search initialised: "
+                    f"{len(self.pre_approach_candidates)} candidate(s) to evaluate "
+                    f"(first scan at z={effective_first_pos[2]:.3f}m)."
+                )
+            except Exception as exc:
+                node.get_logger().error(f"[{self.name}] Failed to initialise candidate search: {exc}")
+                ctx["error_triggered"] = True
+                return False
+
+        # ----- Step 2: poll the in-flight IK request (if any) -----
+        if self.pre_approach_ik_pending and self.pre_approach_ik_future is not None:
+            now = node.get_clock().now()
+            timed_out = (
+                self.pre_approach_ik_deadline is not None
+                and now > self.pre_approach_ik_deadline
             )
-            return True
-        except Exception as exc:
-            node.get_logger().error(f"[{self.name}] Failed to build pre-approach goal: {exc}")
-            ctx["error_triggered"] = True
-            return False
+            if timed_out or self.pre_approach_ik_future.done():
+                candidate = self.pre_approach_ik_current_candidate
+                description = candidate['description']
+                phase = self.pre_approach_ik_phase
+                orient_idx = candidate['orient_idx']
+
+                if timed_out:
+                    node.get_logger().warn(
+                        f"[{self.name}] IK timeout for [{description}] phase={phase}."
+                    )
+                    ok = False
+                    err_code = 'timeout'
+                else:
+                    try:
+                        response = self.pre_approach_ik_future.result()
+                        ok = (
+                            response is not None
+                            and response.error_code.val == response.error_code.SUCCESS
+                        )
+                        err_code = response.error_code.val if response is not None else 'unknown'
+                    except Exception as exc:
+                        node.get_logger().warn(
+                            f"[{self.name}] IK raised for [{description}] phase={phase}: {exc}"
+                        )
+                        ok = False
+                        err_code = 'exception'
+
+                self.pre_approach_ik_pending = False
+                self.pre_approach_ik_future = None
+
+                if phase == 'pre':
+                    if ok:
+                        # Pre-approach IK valid — capture the result joint state so the
+                        # scan-row IK check can be seeded with it.  Pilz LIN starts from
+                        # the post-pre-approach configuration, so seeding scan-row IK with
+                        # that configuration guarantees family consistency (no SLERP jump).
+                        candidate['pre_ik_passed'] = True
+                        try:
+                            candidate['pre_result_joint_state'] = response.solution.joint_state
+                        except Exception:
+                            candidate['pre_result_joint_state'] = None
+                        node.get_logger().info(
+                            f"[{self.name}] Pre-approach IK passed for [{description}]; "
+                            f"validating scan-row IK with pre-approach joint state as seed."
+                        )
+                        # Do NOT pop — dispatch loop fires phase='scan' for this candidate.
+                    else:
+                        node.get_logger().info(
+                            f"[{self.name}] Pre-approach IK FAILED for [{description}] "
+                            f"(err={err_code}); trying next z-offset."
+                        )
+                        if self.pre_approach_candidates:
+                            self.pre_approach_candidates.popleft()
+                else:  # phase == 'scan'
+                    if ok:
+                        # Both pre-approach and scan-row IK valid in the same IK family.
+                        # Accept this candidate.
+                        pre_pose = candidate['pre_pose']
+                        p = pre_pose.pose.position
+                        node.get_logger().info(
+                            f"[{self.name}] Pre-approach candidate ACCEPTED [{description}]: "
+                            f"pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f}). "
+                            f"Pre-approach and scan-row IK collision-free in same IK family."
+                        )
+                        # IMPORTANT: align self.wall_orientation with the accepted
+                        # candidate orientation so subsequent LIN scan goals use
+                        # the same orientation throughout (no SLERP family change).
+                        self.wall_orientation = candidate['orientation']
+                        self.pre_approach_goals = deque([pre_pose])
+                        self.pre_approach_planner_sequence = deque([candidate['planner']])
+                        self.pre_approach_total_stages = 1
+                        self.pre_approach_stage_idx = 0
+                        self.pre_approach_goal = pre_pose
+                        # Search done.
+                        self.pre_approach_candidates.clear()
+                        return True
+                    else:
+                        # Scan-row IK failed with pre-approach seed → LIN cannot bridge
+                        # the two poses in a single IK family.  Try next candidate.
+                        node.get_logger().info(
+                            f"[{self.name}] Scan-row IK FAILED for [{description}] "
+                            f"(err={err_code}) using pre-approach seed; trying next candidate."
+                        )
+                        if self.pre_approach_candidates:
+                            self.pre_approach_candidates.popleft()
+            else:
+                # IK still in flight — wait next tick.
+                return False
+
+        # ----- Step 3: dispatch the next IK request, or declare search failed -----
+        while self.pre_approach_candidates:
+            next_candidate = self.pre_approach_candidates[0]  # peek
+
+            if next_candidate.get('pre_ik_passed'):
+                # Pre-approach IK already validated — fire scan-row IK seeded with
+                # the pre-approach result joint state to ensure IK family continuity
+                # for Pilz LIN (pre-approach → first scan goal).
+                seed = next_candidate.get('pre_result_joint_state')
+                if self._start_ik_request(node, next_candidate, phase='scan', seed_joint_state=seed):
+                    return False
+            else:
+                # Validate pre-approach IK first (seeded with current joint state).
+                if self._start_ik_request(node, next_candidate, phase='pre'):
+                    return False
+
+            # service_is_ready returned False — skip this candidate this tick.
+            self.pre_approach_candidates.popleft()
+
+        # No candidates left.
+        node.get_logger().error(
+            f"[{self.name}] All {self._pre_approach_candidate_count_total()} pre-approach "
+            f"candidates failed IK validation for current height-group; "
+            f"marking unreachable."
+        )
+        self.pre_approach_search_failed = True
+        return False
+
+    def _pre_approach_candidate_count_total(self) -> int:
+        return (
+            len(self.pre_approach_candidate_offsets_m)
+            * len(self.pre_approach_candidate_tilts_rad)
+        )
+
+    def _reset_pre_approach_search(self):
+        self.scan_goal_precheck_done = False
+        self.scan_goal_precheck_pending = False
+        self.scan_goal_precheck_future = None
+        self.scan_goal_precheck_deadline = None
+        self.pre_approach_candidates.clear()
+        self.pre_approach_search_initialized = False
+        self.pre_approach_search_failed = False
+        self.pre_approach_ik_pending = False
+        self.pre_approach_ik_future = None
+        self.pre_approach_ik_current_candidate = None
+        self.pre_approach_ik_deadline = None
+        self.pre_approach_ik_phase = 'pre'
+        self.pre_approach_passed_orient_indices = set()
+        self.pre_approach_failed_orient_indices = set()
+        self.pre_approach_goals.clear()
+        self.pre_approach_planner_sequence.clear()
+        self.pre_approach_total_stages = 0
+        self.pre_approach_stage_idx = 0
+        self.pre_approach_goal = None
+        self.pre_approach_sent = False
+        self.pre_approach_done = False
+        self.waiting_for_pre_approach = False
+        self.pre_approach_verbose = False
 
     def _estimate_step_threshold(self, sorted_vals: List[float], resolution: float = None) -> float:
         if len(sorted_vals) < 2:
@@ -874,17 +1432,22 @@ class ExhaustiveScan(State):
         if self.tf_buffer is None:
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, node)
-        
+
         self._configure_column_control(node, ctx)
-        
-        if self.script_command_client is None:
-            self.script_command_client = node.create_client(ScriptCommand, '/send_script_command')
 
         self.goal_pub = node.create_publisher(PoseStamped, '/arm/goal_pose', 10)
         self.goal_pub_ptp = node.create_publisher(PoseStamped, '/arm/goal_pose_ptp', 10)
         self.goal_pub_lin = node.create_publisher(PoseStamped, '/arm/goal_pose_lin', 10)
         self.goal_pub_ompl = node.create_publisher(PoseStamped, '/arm/goal_pose_ompl', 10)
         self.goal_marker_pub = node.create_publisher(Marker, '/scan_goal_marker', 10)
+
+        # MoveIt IK service for candidate pre-approach pre-screening.
+        if self.compute_ik_client is None:
+            self.compute_ik_client = node.create_client(GetPositionIK, 'compute_ik')
+        if self.joint_state_sub is None:
+            self.joint_state_sub = node.create_subscription(
+                JointState, '/joint_states', self._joint_state_cb, 10
+            )
         self.goals_queue.clear()
         self.goals_by_height.clear()
         self.height_sequence.clear()
@@ -900,23 +1463,41 @@ class ExhaustiveScan(State):
         self.wall_orientation_normal = None  # Store wall normal for post-scan retraction
         self.pre_approach_goal = None
         self.pre_approach_goals.clear()
+        self.pre_approach_planner_sequence.clear()
         self.pre_approach_total_stages = 0
         self.pre_approach_stage_idx = 0
         self.pre_approach_sent = False
         self.pre_approach_done = False
         self.waiting_for_pre_approach = False
         self.pre_approach_verbose = False
+        # Reset candidate-search state for this entry.
+        self.pre_approach_candidates.clear()
+        self.pre_approach_search_initialized = False
+        self.pre_approach_search_failed = False
+        self.pre_approach_ik_pending = False
+        self.pre_approach_ik_future = None
+        self.pre_approach_ik_current_candidate = None
+        self.pre_approach_ik_deadline = None
+        self.pre_approach_ik_phase = 'pre'
+        self.pre_approach_passed_orient_indices = set()
+        self.pre_approach_failed_orient_indices = set()
+        self.unreachable_heights = set()
         self.post_scan_delay_start = None
         self.waiting_for_post_scan_delay = False
         self.post_scan_retraction_sent = False
         self.waiting_for_post_scan_retraction = False
+        self._post_scan_retraction_pose = None
+        self._post_scan_retraction_ptp_tried = False
+        self._post_scan_retraction_ompl_tried = False
         self._column_stable_since = None
         self.column_target_height = None
-        self.pending_service_future = None
-        self.service_call_deadline = None
         self.total_goals_count = 0
         self.skipped_lin_goals = 0
-        self.scan_motion_backend = str(ctx.get("scan_motion_backend", "auto")).strip().lower()
+        self.lin_goal_retry_count = 0
+        self._inflight_lin_goal_arm = None
+        self._inflight_lin_goal_map = None
+        self.lin_subscriber_wait_deadline = None
+        self.scan_motion_backend = "moveit_lin"
         self.active_goal_backend = None
         planner_backend = str(ctx.get("planner_backend", "legacy")).strip().lower()
         ctx["error_triggered"] = False
@@ -1002,69 +1583,37 @@ class ExhaustiveScan(State):
                 "panel_vertices": len(panel_vertices),
             },
         )
-    
-    def _handle_service_failure(self, ctx, error_message: str):
-        """
-        Handle script command service failure.
-        Logs error and triggers state transition to error handling.
-        """
-        node = ctx["node"]
-        node.get_logger().error(f"[{self.name}] Script command failed: {error_message}")
-        ctx["error_triggered"] = True
-        self.waiting_for_arrival = False
-        self.pending_service_future = None
-        self.service_call_deadline = None
-        self.active_goal_backend = None
-        self._set_status(
-            ctx,
-            f"Goal execution failed: {error_message}",
-            phase="error",
-            data={"error_message": error_message},
-            level="error",
-        )
-        self._publish_event(
-            ctx,
-            "goal_failed",
-            "Exhaustive scan goal failed",
-            details={"error_message": error_message},
-            level="error",
-        )
 
     def _send_next_goal(self, ctx):
-        """Send the next goal after the column reaches the required height."""
+        """Send the next goal via MoveIt LIN."""
         node = ctx["node"]
 
         if not self.goals_queue:
-            # Queue empty - will trigger height change in run()
             return
 
-        # Take next goal (still in MAP frame)
-        next_goal_map = self.goals_queue.popleft()
-        self.current_goal_idx += 1
+        # Peek at the next goal (MAP frame) without popping — don't commit until
+        # we know the publisher is ready.
+        next_goal_map = self.goals_queue[0]
 
-        # Transform to arm_base NOW (after column is at correct height)
         ps_map = PoseStamped()
         ps_map.header.frame_id = 'map'
         ps_map.header.stamp = node.get_clock().now().to_msg()
         ps_map.pose = next_goal_map
-        
-        # Verify transform is available
+
         if not self.tf_buffer.can_transform('arm_base', 'map', rclpy.time.Time(), Duration(seconds=0.5)):
             node.get_logger().error(f"[{self.name}] Transform map->arm_base not available when sending goal")
             ctx["error_triggered"] = True
             return
-        
+
         try:
-            tf = self.tf_buffer.lookup_transform(
-                'arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0)
-            )
+            tf = self.tf_buffer.lookup_transform('arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0))
             ps_arm = do_transform_pose_stamped(ps_map, tf)
             ps_arm.header.frame_id = 'arm_base'
         except Exception as e:
             node.get_logger().error(f"[{self.name}] Failed to transform goal to arm base frame: {e}")
             ctx["error_triggered"] = True
             return
-        
+
         # Apply wall-facing orientation
         if self.wall_orientation:
             qx, qy, qz, qw = self.wall_orientation
@@ -1072,106 +1621,72 @@ class ExhaustiveScan(State):
             ps_arm.pose.orientation.y = qy
             ps_arm.pose.orientation.z = qz
             ps_arm.pose.orientation.w = qw
-        else:
-            qx = ps_arm.pose.orientation.x
-            qy = ps_arm.pose.orientation.y
-            qz = ps_arm.pose.orientation.z
-            qw = ps_arm.pose.orientation.w
-        
-        # Convert quaternion to rotation vector for movel command
-        rx, ry, rz = self._quaternion_to_rotation_vector(qx, qy, qz, qw)
 
-        backend = self._resolve_scan_motion_backend()
-        self.active_goal_backend = backend
+        # Pull the goal away from the wall surface by scan_standoff_distance_m so the
+        # EE stays at a safe, collision-free distance and LIN IK always has a solution.
+        # wall_orientation_normal points TOWARD the wall, so subtracting moves EE away.
+        if self.wall_orientation_normal is not None and self.scan_standoff_distance_m > 0.0:
+            n = self.wall_orientation_normal / np.linalg.norm(self.wall_orientation_normal)
+            ps_arm.pose.position.x -= float(n[0]) * self.scan_standoff_distance_m
+            ps_arm.pose.position.y -= float(n[1]) * self.scan_standoff_distance_m
+            ps_arm.pose.position.z -= float(n[2]) * self.scan_standoff_distance_m
 
-        if backend == "moveit_lin":
-            if self.goal_pub_lin is None or self.goal_pub_lin.get_subscription_count() == 0:
+        # Wait for MoveIt LIN subscriber with a deadline before committing
+        if self.goal_pub_lin is None or self.goal_pub_lin.get_subscription_count() == 0:
+            if self.lin_subscriber_wait_deadline is None:
+                self.lin_subscriber_wait_deadline = node.get_clock().now() + Duration(
+                    seconds=self.lin_subscriber_wait_timeout_s
+                )
                 node.get_logger().warn(
-                    f"[{self.name}] MoveIt LIN publisher has no subscribers; falling back to URScript movel."
+                    f"[{self.name}] Waiting up to {self.lin_subscriber_wait_timeout_s:.0f}s "
+                    f"for MoveIt LIN subscriber on /arm/goal_pose_lin..."
                 )
-                backend = "urscript_movel"
-                self.active_goal_backend = backend
-            else:
-                ctx["execution_status"] = False
-                ctx["planner_goal_failed"] = False
-                self.pending_service_future = None
-                self.waiting_for_arrival = True
-                self._publish_lin_goal_marker(node, ps_map)
-                self.goal_pub_lin.publish(ps_arm)
-                node.get_logger().info(
-                    f"[{self.name}] Sending goal {self.current_goal_idx + 1}/{self.total_goals_count} via MoveIt LIN. "
-                    f"pos=({ps_arm.pose.position.x:.3f}, {ps_arm.pose.position.y:.3f}, {ps_arm.pose.position.z:.3f}), "
-                    f"q=({qx:.3f}, {qy:.3f}, {qz:.3f}, {qw:.3f})."
+            elif node.get_clock().now() > self.lin_subscriber_wait_deadline:
+                node.get_logger().error(
+                    f"[{self.name}] Timed out waiting for MoveIt LIN subscriber "
+                    f"after {self.lin_subscriber_wait_timeout_s:.0f}s."
                 )
-                self._set_status(
-                    ctx,
-                    "Executing scan goal via MoveIt LIN",
-                    phase="running",
-                    progress_current=self.current_goal_idx + 1,
-                    progress_total=self.total_goals_count,
-                    data={"goal_backend": backend},
-                )
-                return
+                ctx["error_triggered"] = True
+                self.lin_subscriber_wait_deadline = None
+            return  # retry next tick
 
-        # Determine if this is first or last goal
-        is_first_goal = (self.current_goal_idx == 0)
-        # Panel goals are never the last command - the post-scan retraction comes after
-        # So all panel goals should have restart_program=False
-        is_last_goal = False
-        
-        # Prepare service request
-        request = ScriptCommand.Request()
-        request.command_name = 'movel'
-        request.numeric_params = [
-            float(ps_arm.pose.position.x),
-            float(ps_arm.pose.position.y),
-            float(ps_arm.pose.position.z),
-            float(rx),
-            float(ry),
-            float(rz),
-            float(self.movel_acceleration),
-            float(self.movel_velocity),
-            0.0,  # time parameter (0 = use velocity control)
-            float(self.movel_blend_radius)
-        ]
-        request.string_params = []
-        request.stop_program = is_first_goal
-        request.restart_program = is_last_goal
+        # Subscriber available — commit and send
+        self.goals_queue.popleft()
+        self.current_goal_idx += 1
+        self.lin_subscriber_wait_deadline = None
+        self.lin_goal_retry_count = 0
+        self._inflight_lin_goal_arm = ps_arm
+        self._inflight_lin_goal_map = ps_map
 
-        if not self.script_command_client.wait_for_service(timeout_sec=1.0):
-            node.get_logger().error(f"[{self.name}] Script command service not available!")
-            ctx["error_triggered"] = True
-            self.active_goal_backend = None
-            return
-        
-        # Call service asynchronously
-        self.pending_service_future = self.script_command_client.call_async(request)
-        self.service_call_deadline = node.get_clock().now() + Duration(seconds=self.service_timeout_s)
+        ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
+        self.active_goal_backend = "moveit_lin"
         self.waiting_for_arrival = True
-        
+        self._publish_lin_goal_marker(node, ps_map)
+        self.goal_pub_lin.publish(ps_arm)
         node.get_logger().info(
-            f"[{self.name}] Sending goal {self.current_goal_idx + 1}/{self.total_goals_count} via script command. "
+            f"[{self.name}] Sending goal {self.current_goal_idx + 1}/{self.total_goals_count} via MoveIt LIN. "
             f"pos=({ps_arm.pose.position.x:.3f}, {ps_arm.pose.position.y:.3f}, {ps_arm.pose.position.z:.3f}), "
-            f"rot_vec=({rx:.3f}, {ry:.3f}, {rz:.3f}). "
-            f"stop_program={is_first_goal}, restart_program={is_last_goal}"
+            f"q=({ps_arm.pose.orientation.x:.3f}, {ps_arm.pose.orientation.y:.3f}, "
+            f"{ps_arm.pose.orientation.z:.3f}, {ps_arm.pose.orientation.w:.3f})."
         )
         self._set_status(
             ctx,
-            "Executing scan goal via URScript movel",
+            "Executing scan goal via MoveIt LIN",
             phase="running",
             progress_current=self.current_goal_idx + 1,
             progress_total=self.total_goals_count,
-            data={"goal_backend": self.active_goal_backend},
+            data={"goal_backend": "moveit_lin"},
         )
 
     def _send_post_scan_retraction(self, ctx):
-        """Send final wall retraction movel command after completing all scan goals."""
+        """Send final wall retraction via MoveIt LIN after completing all scan goals."""
         node = ctx["node"]
-        
+
         # Get current end-effector position from TF
         ee_frame_candidates = ["arm_tool0", "arm_wrist_3_link", "arm_ee_link", "arm_flange"]
         current_ee_pos = None
-        
+
         for ee_frame in ee_frame_candidates:
             try:
                 if self.tf_buffer.can_transform('arm_base', ee_frame, rclpy.time.Time(), Duration(seconds=0.1)):
@@ -1186,51 +1701,49 @@ class ExhaustiveScan(State):
                     break
             except Exception:
                 continue
-        
+
         if current_ee_pos is None:
             node.get_logger().error(f"[{self.name}] Could not get current EE position for post-scan retraction.")
             ctx["error_triggered"] = True
             return
-        
+
+        if self.goal_pub_lin is None or self.goal_pub_lin.get_subscription_count() == 0:
+            node.get_logger().error(f"[{self.name}] MoveIt LIN publisher has no subscribers; cannot send retraction.")
+            ctx["error_triggered"] = True
+            return
+
         # Compute retracted position along wall normal
         retreat_dir = self.wall_orientation_normal / np.linalg.norm(self.wall_orientation_normal)
         retreat = float(self.post_scan_retract_distance_m)
-        
         retracted_pos = current_ee_pos - retreat_dir * retreat
-        
-        # Build movel command
+
         if self.wall_orientation:
             qx, qy, qz, qw = self.wall_orientation
         else:
             qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
-        
-        rx, ry, rz = self._quaternion_to_rotation_vector(qx, qy, qz, qw)
-        
-        request = ScriptCommand.Request()
-        request.command_name = 'movel'
-        request.numeric_params = [
-            float(retracted_pos[0]),
-            float(retracted_pos[1]),
-            float(retracted_pos[2]),
-            float(rx),
-            float(ry),
-            float(rz),
-            float(self.movel_acceleration),
-            float(self.movel_velocity),
-            0.0,
-            float(self.movel_blend_radius)
-        ]
-        request.string_params = []
-        request.stop_program = False
-        request.restart_program = True  # Final command, restart program
-        
-        self.pending_service_future = self.script_command_client.call_async(request)
-        self.service_call_deadline = node.get_clock().now() + Duration(seconds=self.service_timeout_s)
+
+        ps = PoseStamped()
+        ps.header.frame_id = 'arm_base'
+        ps.pose.position.x = float(retracted_pos[0])
+        ps.pose.position.y = float(retracted_pos[1])
+        ps.pose.position.z = float(retracted_pos[2])
+        ps.pose.orientation.x = qx
+        ps.pose.orientation.y = qy
+        ps.pose.orientation.z = qz
+        ps.pose.orientation.w = qw
+
+        ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
+        self.active_goal_backend = "moveit_lin"
         self.waiting_for_post_scan_retraction = True
         self.post_scan_retraction_sent = True
-        
+        self._post_scan_retraction_pose = ps
+        self._post_scan_retraction_ptp_tried = False
+        self._post_scan_retraction_ompl_tried = False
+
+        self.goal_pub_lin.publish(ps)
         node.get_logger().info(
-            f"[{self.name}] Sending post-scan retraction movel: "
+            f"[{self.name}] Sending post-scan retraction via MoveIt LIN: "
             f"pos=({retracted_pos[0]:.3f}, {retracted_pos[1]:.3f}, {retracted_pos[2]:.3f}), "
             f"retract={retreat:.3f}m"
         )
@@ -1295,7 +1808,17 @@ class ExhaustiveScan(State):
                     f"{len(ordered_goals)} -> {len(sampled_goals)} goal(s)."
                 )
             ordered_goals = sampled_goals
-            
+
+            # Reduce each horizontal row to its first and last goal so a single
+            # LIN sweep covers the full row instead of N individual goal steps.
+            reduced_goals = self._reduce_to_row_endpoints(ordered_goals, resolution=0.1)
+            if len(reduced_goals) != len(ordered_goals):
+                node.get_logger().info(
+                    f"[{self.name}] Row-endpoint reduction: "
+                    f"{len(ordered_goals)} -> {len(reduced_goals)} goal(s)."
+                )
+            ordered_goals = reduced_goals
+
             # Compute orientation where z-axis points towards the wall using vertex-based normal
             qx, qy, qz, qw = self._compute_orientation_towards_wall(wall_normal)
             node.get_logger().info(
@@ -1307,31 +1830,37 @@ class ExhaustiveScan(State):
             self.wall_orientation = (qx, qy, qz, qw)
             self.wall_orientation_normal = wall_normal  # Store for post-scan retraction
 
-            # Group goals by required column height
-            # Goals are still in MAP frame at this point
+            # Group goals by required column height.
+            # Goals are still in MAP frame at this point.
+            # We transform to arm_base to get current z, then add the current column
+            # height back to obtain a world-relative z that is independent of the column
+            # position at the time of grouping. This keeps grouping stable across retries
+            # (re-entering the state when the column is at a non-zero position must
+            # produce the same height groups as the initial entry at column=0).
+            column_current_for_grouping = float(ctx.get("column_current_height", 0.0))
             for p in ordered_goals:
-                # Transform to arm-base frame temporarily to determine required height
                 ps_map = PoseStamped()
                 ps_map.header.frame_id = "map"
                 ps_map.header.stamp = node.get_clock().now().to_msg()
                 ps_map.pose = p
-                
+
                 try:
-                    # Double-check transform is still available
                     if not self.tf_buffer.can_transform('arm_base', 'map', rclpy.time.Time(), Duration(seconds=0.1)):
                         node.get_logger().warn(f"[{self.name}] TF temporarily unavailable during grouping")
-                        goal_z = 0.5  # Default fallback
+                        goal_z_arm_base = 0.5
                     else:
                         tf = self.tf_buffer.lookup_transform(
                             'arm_base', 'map', rclpy.time.Time(), Duration(seconds=1.0)
                         )
                         ps_arm = do_transform_pose_stamped(ps_map, tf)
-                        goal_z = ps_arm.pose.position.z
+                        goal_z_arm_base = ps_arm.pose.position.z
                 except Exception as e:
                     node.get_logger().warn(f"[{self.name}] TF lookup failed during grouping: {e}")
-                    goal_z = 0.5  # Default fallback
-                
-                required_height = self._choose_column_height_for_goal_z(goal_z)
+                    goal_z_arm_base = 0.5
+
+                # World-relative z: arm_base z + current column height
+                goal_z_world = goal_z_arm_base + column_current_for_grouping
+                required_height = self._choose_column_height_for_goal_z(goal_z_world)
                 
                 # Store original map-frame pose (will transform when sending)
                 if required_height not in self.goals_by_height:
@@ -1410,7 +1939,6 @@ class ExhaustiveScan(State):
         
         # Check if we need to move to next height group
         if not self.waiting_for_arrival:
-            # Current height group exhausted?
             if len(self.goals_queue) == 0:
                 # Move to next height
                 self.current_height_idx += 1
@@ -1418,12 +1946,21 @@ class ExhaustiveScan(State):
                 if self.current_height_idx >= len(self.height_sequence):
                     # All heights processed - start post-scan delay before retraction
                     if not self.waiting_for_post_scan_delay and not self.post_scan_retraction_sent:
+                        # Mark panel complete here — retraction is best-effort cleanup and
+                        # must not cause a re-scan of an already-completed panel on retry.
+                        _completed = ctx.setdefault("completed_base_indices", [])
+                        _idx = ctx.get("selected_base_idx")
+                        if _idx is not None and _idx not in _completed:
+                            _completed.append(_idx)
+                            ctx["panels_left"] = ctx.get("panels_left", 1) - 1
+                            if ctx.get("panels_left", 0) <= 0:
+                                ctx["exhaustive_scan_done"] = True
+                            node.get_logger().info(
+                                f"[{self.name}] All scan goals completed. Panel marked done. "
+                                f"Remaining: {ctx['panels_left']} panel(s)."
+                            )
                         self.post_scan_delay_start = node.get_clock().now()
                         self.waiting_for_post_scan_delay = True
-                        node.get_logger().info(
-                            f"[{self.name}] All scan goals completed. "
-                            f"Waiting {self.post_scan_delay_s:.1f}s before final retraction..."
-                        )
                         self._set_status(
                             ctx,
                             "Waiting before post-scan retraction",
@@ -1432,13 +1969,13 @@ class ExhaustiveScan(State):
                             progress_total=self.total_goals_count,
                         )
                         return
-                    
+
                     # Check if delay has elapsed
                     if self.waiting_for_post_scan_delay:
                         elapsed = (node.get_clock().now() - self.post_scan_delay_start).nanoseconds / 1e9
                         if elapsed >= self.post_scan_delay_s:
                             self.waiting_for_post_scan_delay = False
-                            node.get_logger().info(f"[{self.name}] Post-scan delay complete. Sending retraction movel...")
+                            node.get_logger().info(f"[{self.name}] Post-scan delay complete. Sending retraction via MoveIt LIN...")
                             self._send_post_scan_retraction(ctx)
                             # Fall through to service call check below
                         else:
@@ -1450,24 +1987,15 @@ class ExhaustiveScan(State):
                                 data={"delay_elapsed_s": round(elapsed, 2), "delay_total_s": self.post_scan_delay_s},
                             )
                             return
-                    
-                    # If retraction sent, skip rest of goal processing and check service response below
+
+                    # If retraction sent, skip rest of goal processing and check MoveIt completion below
                     if self.post_scan_retraction_sent and self.waiting_for_post_scan_retraction:
-                        # Fall through to service call check at the end of run()
                         pass
-                    
-                    # Retraction complete - mark panel as done
+
+                    # Retraction done (succeeded or skipped) - emit completion event and return
                     elif self.post_scan_retraction_sent and not self.waiting_for_post_scan_retraction:
                         self.movement_done = True
-                        node.get_logger().info(f"[{self.name}] Panel scan and retraction completed.")
-                        completed_base_indices = ctx.setdefault("completed_base_indices", [])
-                        selected_base_idx = ctx.get("selected_base_idx")
-                        if selected_base_idx is not None and selected_base_idx not in completed_base_indices:
-                            completed_base_indices.append(selected_base_idx)
-                        ctx["panels_left"] -= 1
-                        if ctx.get("panels_left", 0) <= 0:
-                            node.get_logger().info(f"[{self.name}] No panels left to exhaustively scan.")
-                            ctx["exhaustive_scan_done"] = True
+                        node.get_logger().info(f"[{self.name}] Panel scan complete (retraction done/skipped).")
                         self._set_status(
                             ctx,
                             "Completed exhaustive scan for selected base",
@@ -1482,14 +2010,22 @@ class ExhaustiveScan(State):
                             details={"remaining_panels": ctx.get("panels_left", 0)},
                         )
                         return
-                    
+
                     # If we reach here, we're in an unexpected state in post-scan phase
                     # Just fall through to service check
                 else:
-                    # Not yet beyond all heights - load next height's goals
+                    # Not yet beyond all heights - load next height's goals.
+                    # NOTE: do NOT reset pre_approach state here.  Once the first
+                    # height's pre-approach succeeded the arm is already in
+                    # wall-scanning configuration (wall orientation at standoff).
+                    # Subsequent heights only need a LIN translation to the next
+                    # scan goal — no new OMPL pre-approach is required.  The
+                    # failure handler below handles the case where the *first*
+                    # pre-approach attempt fails: it resets state so the next
+                    # height can try a fresh candidate search.
                     next_height = self.height_sequence[self.current_height_idx]
                     self.goals_queue = self.goals_by_height[next_height].copy()
-                    
+
                     column_current = ctx.get("column_current_height", 0.0)
                     node.get_logger().info(
                         f"[{self.name}] Starting height group {self.current_height_idx + 1}/{len(self.height_sequence)}: "
@@ -1531,6 +2067,35 @@ class ExhaustiveScan(State):
 
             if not self.pre_approach_done:
                 if not self._prepare_pre_approach_sequence(ctx):
+                    # Candidate IK search exhausted → mark this height as unreachable
+                    # and let the next tick advance to the next height group.
+                    if self.pre_approach_search_failed:
+                        current_height = (
+                            self.height_sequence[self.current_height_idx]
+                            if 0 <= self.current_height_idx < len(self.height_sequence)
+                            else None
+                        )
+                        skipped_count = len(self.goals_queue)
+                        if current_height is not None:
+                            self.unreachable_heights.add(current_height)
+                        node.get_logger().warn(
+                            f"[{self.name}] Height group {self.current_height_idx + 1}/"
+                            f"{len(self.height_sequence)} (col={current_height}) is unreachable "
+                            f"(no IK-feasible pre-approach). Skipping {skipped_count} scan goal(s)."
+                        )
+                        self.goals_queue.clear()
+                        self.skipped_lin_goals += skipped_count
+                        self._reset_pre_approach_search()
+                        self._set_status(
+                            ctx,
+                            "Pre-approach unreachable — skipping height group",
+                            phase="warning",
+                            level="warn",
+                            data={
+                                "skipped_height": current_height,
+                                "skipped_goals_this_height": skipped_count,
+                            },
+                        )
                     return
 
                 if not self.pre_approach_sent:
@@ -1540,17 +2105,37 @@ class ExhaustiveScan(State):
 
                 if self.waiting_for_pre_approach:
                     if ctx.get("planner_goal_failed"):
-                        node.get_logger().error(
-                            f"[{self.name}] Pre-approach stage {self.pre_approach_stage_idx + 1}/{self.pre_approach_total_stages} failed."
-                        )
+                        # IK was validated before send, but the planner still couldn't
+                        # path to it (constrained workspace).  Skip this height group
+                        # rather than aborting the entire panel.
                         ctx["planner_goal_failed"] = False
                         self.waiting_for_pre_approach = False
-                        ctx["error_triggered"] = True
+                        current_height = (
+                            self.height_sequence[self.current_height_idx]
+                            if 0 <= self.current_height_idx < len(self.height_sequence)
+                            else None
+                        )
+                        skipped_count = len(self.goals_queue)
+                        if current_height is not None:
+                            self.unreachable_heights.add(current_height)
+                        node.get_logger().warn(
+                            f"[{self.name}] Pre-approach planner failed for height group "
+                            f"{self.current_height_idx + 1}/{len(self.height_sequence)} "
+                            f"(col={current_height}) despite IK validation. "
+                            f"Skipping {skipped_count} scan goal(s) and continuing."
+                        )
+                        self.goals_queue.clear()
+                        self.skipped_lin_goals += skipped_count
+                        self._reset_pre_approach_search()
                         self._set_status(
                             ctx,
-                            "Pre-approach stage failed",
-                            phase="error",
-                            level="error",
+                            "Pre-approach planner failed — skipping height group",
+                            phase="warning",
+                            level="warn",
+                            data={
+                                "skipped_height": current_height,
+                                "skipped_goals_this_height": skipped_count,
+                            },
                         )
                         return
 
@@ -1563,6 +2148,8 @@ class ExhaustiveScan(State):
                         self.pre_approach_stage_idx += 1
                         if self.pre_approach_goals:
                             self.pre_approach_goals.popleft()
+                        if self.pre_approach_planner_sequence:
+                            self.pre_approach_planner_sequence.popleft()
 
                         if not self.pre_approach_goals:
                             self.pre_approach_done = True
@@ -1598,129 +2185,134 @@ class ExhaustiveScan(State):
                     )
                     return
             else:
-                # Current height still has goals - send next one
+                # Pre-approach done — send next scan goal
                 self._send_next_goal(ctx)
-            
+
             # Don't return if waiting for retraction - let it fall through to service check
             if not (self.post_scan_retraction_sent and self.waiting_for_post_scan_retraction):
                 return
-        
+
         if self.active_goal_backend == "moveit_lin":
             if ctx.get("planner_goal_failed"):
-                self.skipped_lin_goals += 1
-                node.get_logger().warn(
-                    f"[{self.name}] MoveIt LIN goal {self.current_goal_idx + 1}/{self.total_goals_count} failed. "
-                    f"Skipping this scan point and continuing "
-                    f"(skipped {self.skipped_lin_goals} total)."
-                )
                 ctx["planner_goal_failed"] = False
-                self.waiting_for_arrival = False
-                self.active_goal_backend = None
-                self._set_status(
-                    ctx,
-                    "MoveIt LIN goal failed, skipping scan point",
-                    phase="warning",
-                    progress_current=self.current_goal_idx + 1,
-                    progress_total=self.total_goals_count,
-                    data={"skipped_lin_goals": self.skipped_lin_goals},
-                    level="warn",
-                )
+                if self.waiting_for_post_scan_retraction:
+                    pose = self._post_scan_retraction_pose
+                    # Fallback order: LIN (initial) → PTP (joint-space, robust near
+                    # singularities) → OMPL (free-space, last resort) → skip.
+                    # Pilz LIN fails when the straight Cartesian path requires joint
+                    # velocities that exceed limits (near-singularity effect on time
+                    # parametrisation). PTP plans in joint space and avoids this entirely.
+                    ptp_available = (
+                        not self._post_scan_retraction_ptp_tried
+                        and self.goal_pub_ptp is not None
+                        and self.goal_pub_ptp.get_subscription_count() > 0
+                        and pose is not None
+                    )
+                    ompl_available = (
+                        not self._post_scan_retraction_ompl_tried
+                        and self.goal_pub_ompl is not None
+                        and self.goal_pub_ompl.get_subscription_count() > 0
+                        and pose is not None
+                    )
+                    if ptp_available:
+                        self._post_scan_retraction_ptp_tried = True
+                        self.goal_pub_ptp.publish(pose)
+                        node.get_logger().warn(
+                            f"[{self.name}] Post-scan retraction via MoveIt LIN failed; "
+                            "retrying via PTP (joint-space)."
+                        )
+                        self._set_status(ctx, "Retrying post-scan retraction via PTP", phase="running")
+                    elif ompl_available:
+                        self._post_scan_retraction_ompl_tried = True
+                        self.goal_pub_ompl.publish(pose)
+                        node.get_logger().warn(
+                            f"[{self.name}] Post-scan retraction via PTP failed; "
+                            "retrying via OMPL."
+                        )
+                        self._set_status(ctx, "Retrying post-scan retraction via OMPL", phase="running")
+                    else:
+                        node.get_logger().warn(
+                            f"[{self.name}] Post-scan retraction failed (LIN → PTP → OMPL). "
+                            "Arm left at scan position; skipping retraction."
+                        )
+                        self.waiting_for_post_scan_retraction = False
+                        self.waiting_for_arrival = False
+                        self.active_goal_backend = None
+                        self._set_status(ctx, "Post-scan retraction skipped; continuing", phase="warning", level="warn")
+                elif self.lin_goal_retry_count < self.lin_goal_max_retries:
+                    self.lin_goal_retry_count += 1
+                    ctx["execution_status"] = False
+                    ctx["planner_goal_failed"] = False
+                    self._publish_lin_goal_marker(node, self._inflight_lin_goal_map)
+
+                    self.active_goal_backend = "moveit_lin"
+                    self.goal_pub_lin.publish(self._inflight_lin_goal_arm)
+
+                    node.get_logger().warn(
+                        f"[{self.name}] MoveIt LIN goal {self.current_goal_idx + 1}/{self.total_goals_count} failed. "
+                        f"Retry {self.lin_goal_retry_count}/{self.lin_goal_max_retries} via LIN..."
+                    )
+                    self._set_status(
+                        ctx,
+                        "Retrying scan goal via LIN",
+                        phase="running",
+                        progress_current=self.current_goal_idx + 1,
+                        progress_total=self.total_goals_count,
+                        data={"retry": self.lin_goal_retry_count, "max_retries": self.lin_goal_max_retries},
+                    )
+                else:
+                    self.skipped_lin_goals += 1
+                    self.waiting_for_arrival = False
+                    self.active_goal_backend = None
+                    node.get_logger().warn(
+                        f"[{self.name}] MoveIt LIN goal {self.current_goal_idx + 1}/{self.total_goals_count} failed "
+                        f"after {self.lin_goal_max_retries} retries. Skipping "
+                        f"(skipped {self.skipped_lin_goals} total)."
+                    )
+                    self._set_status(
+                        ctx,
+                        "MoveIt LIN goal failed after retries, skipping scan point",
+                        phase="warning",
+                        progress_current=self.current_goal_idx + 1,
+                        progress_total=self.total_goals_count,
+                        data={"skipped_lin_goals": self.skipped_lin_goals, "max_retries": self.lin_goal_max_retries},
+                        level="warn",
+                    )
                 return
 
             if ctx.get("execution_status") is True:
-                node.get_logger().info(
-                    f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully via MoveIt LIN."
-                )
                 ctx["execution_status"] = False
                 ctx["planner_goal_failed"] = False
                 self.waiting_for_arrival = False
                 self.active_goal_backend = None
-                self._set_status(
-                    ctx,
-                    "Scan goal completed successfully via MoveIt LIN",
-                    phase="running",
-                    progress_current=self.current_goal_idx + 1,
-                    progress_total=self.total_goals_count,
-                )
+                if self.waiting_for_post_scan_retraction:
+                    node.get_logger().info(f"[{self.name}] Post-scan retraction completed successfully via MoveIt LIN.")
+                    self.waiting_for_post_scan_retraction = False
+                    self._set_status(ctx, "Post-scan retraction complete", phase="running")
+                else:
+                    node.get_logger().info(
+                        f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully via MoveIt LIN."
+                    )
+                    self._set_status(
+                        ctx,
+                        "Scan goal completed successfully via MoveIt LIN",
+                        phase="running",
+                        progress_current=self.current_goal_idx + 1,
+                        progress_total=self.total_goals_count,
+                    )
                 return
 
-            self._set_status(
-                ctx,
-                "Waiting for MoveIt LIN goal completion",
-                phase="waiting",
-                progress_current=self.current_goal_idx + 1,
-                progress_total=self.total_goals_count,
-            )
-            return
-
-        # Check if service call is pending
-        if self.pending_service_future is not None:
-            # Check for timeout
-            if self.service_call_deadline and node.get_clock().now() > self.service_call_deadline:
-                node.get_logger().error(
-                    f"[{self.name}] Service call timeout! No response received within {self.service_timeout_s}s"
-                )
-                self.pending_service_future = None
-                self.service_call_deadline = None
-                ctx["error_triggered"] = True
-                self._set_status(
-                    ctx,
-                    "Service call timed out",
-                    phase="error",
-                    data={"service_timeout_s": self.service_timeout_s},
-                    level="error",
-                )
-                return
-            
-            if self.pending_service_future.done():
-                try:
-                    response = self.pending_service_future.result()
-                    if response.success:
-                        if self.waiting_for_post_scan_retraction:
-                            node.get_logger().info(
-                                f"[{self.name}] Post-scan retraction completed successfully: {response.message}"
-                            )
-                            self.waiting_for_post_scan_retraction = False
-                            self.pending_service_future = None
-                            self.service_call_deadline = None
-                            self._set_status(ctx, "Post-scan retraction complete", phase="running")
-                        else:
-                            node.get_logger().info(
-                                f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully: {response.message}"
-                            )
-                            self.waiting_for_arrival = False
-                            self.pending_service_future = None
-                            self.service_call_deadline = None
-                            self._set_status(
-                                ctx,
-                                "Scan goal completed successfully",
-                                phase="running",
-                                progress_current=self.current_goal_idx + 1,
-                                progress_total=self.total_goals_count,
-                                data={"response_message": response.message},
-                            )
-                        node.get_logger().info(
-                            f"[{self.name}] Goal {self.current_goal_idx + 1} completed successfully: {response.message}"
-                        )
-                        self.waiting_for_arrival = False
-                        self.pending_service_future = None
-                        self.active_goal_backend = None
-                    else:
-                        self._handle_service_failure(ctx, response.message)
-                        return
-                except Exception as e:
-                    self._handle_service_failure(ctx, str(e))
-                    return
+            if self.waiting_for_post_scan_retraction:
+                self._set_status(ctx, "Waiting for post-scan retraction via MoveIt LIN", phase="waiting")
             else:
-                # Still waiting for service response
                 self._set_status(
                     ctx,
-                    "Waiting for goal service response",
+                    "Waiting for MoveIt LIN goal completion",
                     phase="waiting",
                     progress_current=self.current_goal_idx + 1,
                     progress_total=self.total_goals_count,
                 )
-                return
+            return
 
     def check_transition(self, ctx):
         if ctx.get("error_triggered"):
