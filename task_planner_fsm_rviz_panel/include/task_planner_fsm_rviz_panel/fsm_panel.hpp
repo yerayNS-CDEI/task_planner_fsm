@@ -11,7 +11,8 @@
 
 class QLabel;
 class QGraphicsEllipseItem;
-class QGraphicsLineItem;
+class QGraphicsPathItem;
+class QGraphicsPolygonItem;
 class QGraphicsScene;
 class QGraphicsView;
 
@@ -48,7 +49,8 @@ private:
   {
     QString from;
     QString to;
-    QGraphicsLineItem * item{nullptr};
+    QGraphicsPathItem * item{nullptr};
+    QGraphicsPolygonItem * arrow{nullptr};
   };
 
   using StringMsg = std_msgs::msg::String;
