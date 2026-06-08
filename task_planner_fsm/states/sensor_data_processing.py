@@ -16,7 +16,8 @@ class SensorDataProcessing(State):
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Calling the service /sensor_data_processing")
-        ctx["interest_areas_ready"] = False
+        ctx["data_processed"] = False
+        ctx["drilling_required"] = False
         ctx["error_triggered"] = False
 
         self.client = node.create_client(SetBool, "/sensor_data_processing")
@@ -49,10 +50,10 @@ class SensorDataProcessing(State):
             self.future = None
 
     def check_transition(self, ctx):
-        if not ctx.get("drilling_required"):
-            return "ArmFolding"
-        elif ctx.get("drilling_required"):
-            return "SendDataToPokeye"
         if ctx.get("error_triggered"):
             return "Error"
-        return None
+        if not ctx.get("data_processed"):
+            return None
+        if ctx.get("drilling_required"):
+            return "SendDataToPokeye"
+        return "ArmFolding"

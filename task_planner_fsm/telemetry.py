@@ -79,7 +79,7 @@ _GROUPS = {
     # "WallDiscretization": "phase_2",
     # "BasePlacement": "phase_2",
     # "ExhaustiveScan": "phase_2",
-    "HomePosition": "phase_2",
+    "HomePosition": "phase_3",
     "Finished": "terminal",
     "Error": "terminal",
 }
