@@ -11,17 +11,20 @@ class ArmUnfolding(State):
         self.future = None
         self.verbose = False
         self.dashboard_sent = False
-        
+        self.service_wait_deadline = None
+        self.service_wait_timeout_s = 30.0
+
     def on_enter(self, ctx):
         self.goal_sent = False
         self.movement_done = False
         self.verbose = False
         self.dashboard_sent = False
+        self.service_wait_deadline = None
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering unfolding state.")
 
         # Create service client for position_sender_node
-        self.service_client = node.create_client(SendPosition, '/arm/send_position')
+        self.service_client = node.create_client(SendPosition, '/send_position')
 
         ctx["unfolding_success"] = False
         ctx["error_triggered"] = False
@@ -34,25 +37,42 @@ class ArmUnfolding(State):
             return
 
         # Send dashboard command first (before service request)
+        # Skip in Gazebo simulation — only needed for real robot
         if not self.dashboard_sent:
-            node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
-            success, message = send_dashboard_play_command()
-
-            if success:
-                node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
+            if ctx.get("sim", False):
+                node.get_logger().info(f"[{self.name}] Gazebo simulation: skipping dashboard play command.")
                 self.dashboard_sent = True
             else:
-                node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
-                ctx["error_triggered"] = True
-                return
+                node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
+                success, message = send_dashboard_play_command()
+                if success:
+                    node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
+                    self.dashboard_sent = True
+                else:
+                    node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
+                    ctx["error_triggered"] = True
+                    return
 
         # Send service request if not already sent
         if not self.goal_sent:
-            # Wait for service to be available
-            if not self.service_client.wait_for_service(timeout_sec=1.0):
-                node.get_logger().warn(f"[{self.name}] Service /arm/send_position not available")
-                ctx["error_triggered"] = True
-                return
+            if not self.service_client.service_is_ready():
+                if self.service_wait_deadline is None:
+                    self.service_wait_deadline = (
+                        node.get_clock().now().nanoseconds / 1e9 + self.service_wait_timeout_s
+                    )
+                    node.get_logger().warn(
+                        f"[{self.name}] Waiting up to {self.service_wait_timeout_s:.0f}s "
+                        f"for service /send_position..."
+                    )
+                elif node.get_clock().now().nanoseconds / 1e9 > self.service_wait_deadline:
+                    node.get_logger().error(
+                        f"[{self.name}] Service /send_position not available after "
+                        f"{self.service_wait_timeout_s:.0f}s."
+                    )
+                    ctx["error_triggered"] = True
+                    self.service_wait_deadline = None
+                return  # retry next tick
+            self.service_wait_deadline = None
             
             # Create service request
             request = SendPosition.Request()
@@ -88,10 +108,21 @@ class ArmUnfolding(State):
                 ctx["error_triggered"] = True
                 return
         
-        # Wait for execution to complete
+        # Wait for execution to complete.  The planner publishes /execution_status
+        # = True only on actual success; failures arrive on /planner/goal_failed.
+        # Check the failure signal first so we don't hang waiting for a True that
+        # will never come.
+        if ctx.get("planner_goal_failed"):
+            ctx["planner_goal_failed"] = False
+            node.get_logger().error(
+                f"[{self.name}] Planner reported failure while moving to unfolded_fsm."
+            )
+            ctx["error_triggered"] = True
+            return
+
         exec_status = ctx.get("execution_status")
         if exec_status is True:
-            # Movement completed
+            # Movement completed successfully
             self.movement_done = True
             ctx["execution_status"] = False  # Reset for next state
             node.get_logger().info(f"[{self.name}] Position unfolded_fsm reached. Movement complete.")

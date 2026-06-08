@@ -13,9 +13,11 @@ class ArmFolding(State):
         self.goals_queue = deque()
         self.current_goal = None
         self.dashboard_sent = False
-        self.goals_sent = 0  # Track how many goals have been sent
-        self.goals_completed = 0  # Track how many movements have completed
-        self.total_goals = 1  # Total goals in the sequence
+        self.goals_sent = 0
+        self.goals_completed = 0
+        self.total_goals = 1
+        self.service_wait_deadline = None
+        self.service_wait_timeout_s = 30.0
         
     def on_enter(self, ctx):
         self.movement_done = False
@@ -27,7 +29,7 @@ class ArmFolding(State):
         node.get_logger().info(f"[{self.name}] Entering folding state.")
         
         # Create service client for position_sender_node
-        self.service_client = node.create_client(SendPosition, '/arm/send_position')
+        self.service_client = node.create_client(SendPosition, '/send_position')
         
         ctx["folding_success"] = False
         ctx["error_triggered"] = False
@@ -38,30 +40,43 @@ class ArmFolding(State):
         
         self.current_goal = None
         self.future = None
+        self.service_wait_deadline = None
+        self.service_wait_timeout_s = 30.0
             
     def _send_next_goal(self, ctx):
         """Sends the next goal via service call."""
         node = ctx["node"]
 
         if not self.goals_queue:
-            # No more goals to send
             return
 
-        # Get next position name
+        # Check service availability before committing to this goal
+        if not self.service_client.service_is_ready():
+            if self.service_wait_deadline is None:
+                self.service_wait_deadline = (
+                    node.get_clock().now().nanoseconds / 1e9 + self.service_wait_timeout_s
+                )
+                node.get_logger().warn(
+                    f"[{self.name}] Waiting up to {self.service_wait_timeout_s:.0f}s "
+                    f"for service /send_position..."
+                )
+            elif node.get_clock().now().nanoseconds / 1e9 > self.service_wait_deadline:
+                node.get_logger().error(
+                    f"[{self.name}] Service /send_position not available after "
+                    f"{self.service_wait_timeout_s:.0f}s."
+                )
+                ctx["error_triggered"] = True
+                self.service_wait_deadline = None
+            return  # retry next tick
+
+        # Service ready — commit and send
+        self.service_wait_deadline = None
         self.current_goal = self.goals_queue.popleft()
         self.goals_sent += 1
-        
-        # Wait for service to be available
-        if not self.service_client.wait_for_service(timeout_sec=1.0):
-            node.get_logger().warn(f"[{self.name}] Service /arm/send_position not available")
-            ctx["error_triggered"] = True
-            return
-        
-        # Create service request
+
         request = SendPosition.Request()
         request.position_name = self.current_goal
-        
-        # Send async service call
+
         self.future = self.service_client.call_async(request)
         node.get_logger().info(
             f"[{self.name}] Sending service request for position: {self.current_goal} "
@@ -75,17 +90,21 @@ class ArmFolding(State):
             return
 
         # Send dashboard command first (before any service request)
+        # Skip in Gazebo simulation — only needed for real robot
         if not self.dashboard_sent:
-            node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
-            success, message = send_dashboard_play_command()
-
-            if success:
-                node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
+            if ctx.get("sim", False):
+                node.get_logger().info(f"[{self.name}] Gazebo simulation: skipping dashboard play command.")
                 self.dashboard_sent = True
             else:
-                node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
-                ctx["error_triggered"] = True
-                return
+                node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
+                success, message = send_dashboard_play_command()
+                if success:
+                    node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
+                    self.dashboard_sent = True
+                else:
+                    node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
+                    ctx["error_triggered"] = True
+                    return
 
         # If no future, send next goal
         if self.future is None:
@@ -114,25 +133,35 @@ class ArmFolding(State):
                 ctx["error_triggered"] = True
                 return
         
-        # Wait for execution to complete
+        # Wait for execution to complete.  /execution_status only goes True on
+        # actual success; failures arrive on /planner/goal_failed, so check that
+        # signal first to avoid hanging on a True that will never come.
+        if ctx.get("planner_goal_failed"):
+            ctx["planner_goal_failed"] = False
+            node.get_logger().error(
+                f"[{self.name}] Planner reported failure while moving to {self.current_goal}."
+            )
+            ctx["error_triggered"] = True
+            return
+
         exec_status = ctx.get("execution_status")
         if exec_status is True:
-            # Movement completed
+            # Movement completed successfully
             self.goals_completed += 1
             node.get_logger().info(
                 f"[{self.name}] Position {self.current_goal} reached "
                 f"(completed {self.goals_completed}/{self.total_goals})."
             )
-            
+
             # Clear future and flags now that movement is complete
             self.future = None
             if hasattr(self, '_service_response_processed'):
                 delattr(self, '_service_response_processed')
             self.verbose = False
-            
+
             # Reset execution status for next goal
             ctx["execution_status"] = False
-            
+
             # Check if all goals are completed
             if self.goals_completed >= self.total_goals:
                 self.movement_done = True

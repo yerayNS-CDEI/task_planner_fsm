@@ -6,14 +6,14 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
         # Shell script — not a ROS node, must use ExecuteProcess
-        ExecuteProcess(
-            cmd=[
-                'ros2', 'run', 'ur_client_library', 'start_ursim.sh',
-                '-m', 'ur10e', '-v', '5.17.3',
-            ],
-            output='screen',
-            name='ursim',
-        ),
+        # ExecuteProcess(
+        #     cmd=[
+        #         'ros2', 'run', 'ur_client_library', 'start_ursim.sh',
+        #         '-m', 'ur10e', '-v', '5.17.3',
+        #     ],
+        #     output='screen',
+        #     name='ursim',
+        # ),
         Node(
             package='task_planner_fsm',
             executable='mock_server',
@@ -33,10 +33,10 @@ def generate_launch_description():
             name='wall_discretization_node',
             output='screen',
         ),
-        Node(
-            package='arm_control',
-            executable='script_command_service_node',
-            name='script_command_service_node',
-            output='screen',
-        ),
+        # Node(
+        #     package='arm_control',
+        #     executable='script_command_service_node',
+        #     name='script_command_service_node',
+        #     output='screen',
+        # ),
     ])

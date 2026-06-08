@@ -66,6 +66,19 @@ class BasePlacement(State):
             node.get_logger().error(f"[{self.name}] No wall_panels_vertices found in context.")
             ctx["error_triggered"] = True
             return
+
+        # Per-wall EE orientation derived from each wall's inward normal so the
+        # EE z-axis always points into the wall (replaces the hard-coded
+        # (0, 90, 0) that only worked for walls scanned from in front of map).
+        wall_ee_rpy_deg = ctx.get("wall_ee_rpy_deg")
+        if not wall_ee_rpy_deg or len(wall_ee_rpy_deg) < len(walls_results_panels):
+            node.get_logger().error(
+                f"[{self.name}] Missing per-wall EE orientations in context "
+                f"(wall_ee_rpy_deg has {len(wall_ee_rpy_deg or [])} entries, "
+                f"need {len(walls_results_panels)})."
+            )
+            ctx["error_triggered"] = True
+            return
         
         self.pending_reqs.clear()
 
@@ -79,6 +92,10 @@ class BasePlacement(State):
         global_panel_idx = 0
 
         for wall, wall_panels in enumerate(walls_results_panels,1):
+            roll_deg, pitch_deg, yaw_deg = wall_ee_rpy_deg[wall - 1]
+            node.get_logger().info(
+                f"[{self.name}] Wall {wall} EE rpy_deg=({roll_deg:.1f}, {pitch_deg:.1f}, {yaw_deg:.1f})"
+            )
             wall_vertices = chunker(wall_panels, 4)
             for idx, panel in enumerate(wall_vertices,1):
                 xy_key = tuple(sorted(
@@ -103,18 +120,18 @@ class BasePlacement(State):
                         y = round(float(v.position.y), 1)
                         z = round(float(v.position.z), 1)
                         z = round(z + z_shift, 3)
-                        list_vertices.extend([x,y,z,0.0,90.0,0.0])
+                        list_vertices.extend([x, y, z, roll_deg, pitch_deg, yaw_deg])
                         node.get_logger().debug(f"[{self.name}] Wall {wall} panel {idx} z_raw={v.position.z:.3f} → z_adj={z:.3f} (base={panel_base_z}, z0={z0})")
 
                     req = OptimalBase.Request()
                     req.poses_ee_xyzrpy = list_vertices
                     req.obstacle_rects = []
                     req.obstacle_circles = []
-                    req.min_dist = 0.6  # Close wall distance enabled by pre-approach step preventing singularities
+                    req.min_dist = 0.9  # Close wall distance enabled by pre-approach step preventing singularities
                     req.round_decimals = 3
                     req.grid_res = 0.1
-                    req.x_limits = [-10.0,10.0]
-                    req.y_limits = [-10.0,10.0]
+                    req.x_limits = [-100.0,100.0]
+                    req.y_limits = [-100.0,100.0]
                     req.enable_simulator = False
                     req.enable_robot_viz = False
 

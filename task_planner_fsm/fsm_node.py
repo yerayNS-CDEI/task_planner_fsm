@@ -40,6 +40,10 @@ from task_planner_fsm.states import (
 )
 from task_planner_fsm.states.proc_utils import start_proc, stop_all
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
+from task_planner_fsm.utils.wall_geometry import (
+    ee_rpy_deg_from_inward_normal,
+    inward_normal_from_wall_points,
+)
 
 FSM_STATE_ORDER = [
     "Initialization",
@@ -128,7 +132,7 @@ NAV_SIM_REQUIRED_START_STATES = {
 PREDEFINED_WALLS = [
     ((3.0, 0.0, 2.0), (3.0, -3.0, 3.0)),
     ((9.0, 0.0, 0.19), (9.0, -4.5, 2.0)),
-    ((10.0, 0.0, 0.2), (10.0, -4.5, 3.0)),
+    ((10.0, -4.5, 0.2), (10.0, 0.0, 3.0)),
 ]
 
 
@@ -293,9 +297,14 @@ class RobotFSMNode(Node):
             p2[2],
         )
 
+        inward_normal = inward_normal_from_wall_points(p1, p2)
+        ee_rpy_deg = ee_rpy_deg_from_inward_normal(inward_normal)
+
         return {
             "original": (tuple(p1), tuple(p2)),
             "scan_line": (scan_start, scan_end),
+            "inward_normal": inward_normal,
+            "ee_rpy_deg": ee_rpy_deg,
         }
 
     def _prompt_walls_data(self) -> List[Dict[str, Tuple]]:
@@ -575,7 +584,7 @@ class RobotFSMNode(Node):
                     "database_name:=rtabmap_fsm",
                     "headless:=true",
                     "use_sim_time:=true",
-                    "hybrid_sim:=true",
+                    "hybrid_sim:=false",
                     f"planner_backend:={planner_backend}",
                 ],
             )
@@ -626,6 +635,8 @@ class RobotFSMNode(Node):
         if initial_state in WALL_DATA_REQUIRED_INITIAL_STATES:
             walls_data = self._prompt_walls_data()
             self.ctx["walls_data"] = walls_data
+            self.ctx["wall_inward_normals"] = [w["inward_normal"] for w in walls_data]
+            self.ctx["wall_ee_rpy_deg"] = [w["ee_rpy_deg"] for w in walls_data]
             self.ctx["database_generated"] = bool(walls_data)
             if resolved_scan_phase == 1:
                 self.ctx["walls_left"] = len(walls_data)
