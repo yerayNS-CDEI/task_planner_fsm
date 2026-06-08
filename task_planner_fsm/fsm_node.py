@@ -20,23 +20,28 @@ from std_msgs.msg import Bool, String
 
 from task_planner_fsm.machine import StateMachine
 from task_planner_fsm.states import (
-    AreasOfInterest,
     ArmFolding,
     ArmUnfolding,
-    BasePlacement,
     ComputeWallPoints,
     CreateMap,
     Error,
-    ExhaustiveScan,
     Finished,
     GeometryReconstruction,
     HomePosition,
     Initialization,
     NavigateToTarget,
     ObjectID,
+    WallLinesComputation,
     ScanWall,
-    WallDiscretization,
     WallTargetSelection,
+    SensorDataProcessing,
+    SendDataToPokeye,
+    ScanCeiling,
+    ScanFloor,
+    # AreasOfInterest,
+    # BasePlacement,
+    # ExhaustiveScan,
+    # WallDiscretization,
 )
 from task_planner_fsm.states.proc_utils import start_proc, stop_all
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
@@ -49,27 +54,39 @@ FSM_STATE_ORDER = [
     "Initialization",
     "CreateMap",
     "ObjectID",
+    "WallLinesComputation",
     "GeometryReconstruction",
     "ComputeWallPoints",
     "WallTargetSelection",
     "NavigateToTarget",
     "ArmUnfolding",
-    "ArmFolding",
     "ScanWall",
-    "AreasOfInterest",
-    "WallDiscretization",
-    "BasePlacement",
-    "ExhaustiveScan",
+    "SensorDataProcessing",
+    "SendDataToPokeye",
+    "ArmFolding",
+    "ScanFloor",
+    "ScanCeiling",
+    # "AreasOfInterest",
+    # "WallDiscretization",
+    # "BasePlacement",
+    # "ExhaustiveScan",
     "HomePosition",
     "Finished",
     "Error",
 ]
 
 PHASE2_DEFAULT_INITIAL_STATES = {
-    "AreasOfInterest",
-    "WallDiscretization",
-    "BasePlacement",
-    "ExhaustiveScan",
+    # "AreasOfInterest",
+    # "WallDiscretization",
+    # "BasePlacement",
+    # "ExhaustiveScan",
+    "ScanFloor",
+    "HomePosition",
+    "Finished",
+}
+
+PHASE3_DEFAULT_INITIAL_STATES = {
+    "ScanCeiling",
     "HomePosition",
     "Finished",
 }
@@ -80,10 +97,10 @@ WALL_DATA_REQUIRED_INITIAL_STATES = {
     "ArmUnfolding",
     "ArmFolding",
     "ScanWall",
-    "AreasOfInterest",
-    "WallDiscretization",
-    "BasePlacement",
-    "ExhaustiveScan",
+    # "AreasOfInterest",
+    # "WallDiscretization",
+    # "BasePlacement",
+    # "ExhaustiveScan",
     "HomePosition",
 }
 
@@ -98,7 +115,7 @@ PHASE2_BASE_REQUIRED_INITIAL_STATES = {
     "ArmUnfolding",
     "ScanWall",
     "ArmFolding",
-    "ExhaustiveScan",
+    # "ExhaustiveScan",
 }
 
 NEEDS_SYNTHETIC_DISCRETIZATION_INITIAL_STATES = {
@@ -107,8 +124,8 @@ NEEDS_SYNTHETIC_DISCRETIZATION_INITIAL_STATES = {
     "ArmUnfolding",
     "ArmFolding",
     "ScanWall",
-    "BasePlacement",
-    "ExhaustiveScan",
+    # "BasePlacement",
+    # "ExhaustiveScan",
     "HomePosition",
 }
 
@@ -116,10 +133,10 @@ NAV_CLIENT_BOOTSTRAP_STATES = {
     "ArmUnfolding",
     "ArmFolding",
     "ScanWall",
-    "AreasOfInterest",
-    "WallDiscretization",
-    "BasePlacement",
-    "ExhaustiveScan",
+    # "AreasOfInterest",
+    # "WallDiscretization",
+    # "BasePlacement",
+    # "ExhaustiveScan",
     "HomePosition",
 }
 
@@ -130,7 +147,7 @@ NAV_SIM_REQUIRED_START_STATES = {
 }
 
 PREDEFINED_WALLS = [
-    ((3.0, 0.0, 2.0), (3.0, -3.0, 3.0)),
+    ((4.0, 0.0, 2.0), (4.0, -3.0, 3.0)),
     ((9.0, 0.0, 0.19), (9.0, -4.5, 2.0)),
     ((10.0, -4.5, 0.2), (10.0, 0.0, 3.0)),
 ]
@@ -207,6 +224,7 @@ class RobotFSMNode(Node):
                 Initialization("Initialization"),
                 CreateMap("CreateMap"),
                 ObjectID("ObjectID"),
+                WallLinesComputation("WallLinesComputation"),
                 GeometryReconstruction("GeometryReconstruction"),
                 ComputeWallPoints("ComputeWallPoints"),
                 WallTargetSelection("WallTargetSelection"),
@@ -214,10 +232,14 @@ class RobotFSMNode(Node):
                 ArmUnfolding("ArmUnfolding"),
                 ArmFolding("ArmFolding"),
                 ScanWall("ScanWall"),
-                AreasOfInterest("AreasOfInterest"),
-                WallDiscretization("WallDiscretization"),
-                BasePlacement("BasePlacement"),
-                ExhaustiveScan("ExhaustiveScan"),
+                ScanFloor("ScanFloor"),
+                ScanCeiling("ScanCeiling"),
+                SensorDataProcessing("SensorDataProcessing"),
+                SendDataToPokeye("SendDataToPokeye"),
+                # AreasOfInterest("AreasOfInterest"),
+                # WallDiscretization("WallDiscretization"),
+                # BasePlacement("BasePlacement"),
+                # ExhaustiveScan("ExhaustiveScan"),
                 HomePosition("HomePosition"),
                 Finished("Finished"),
                 Error("Error"),

@@ -174,22 +174,10 @@ class ArmFolding(State):
                 self.verbose = True
 
     def check_transition(self, ctx):        
-        if ctx.get("scan_phase") == 1:
-            if self.movement_done and not ctx.get("scan_done"):
-                # print("ARM FOLDING - AF1")
-                return "WallTargetSelection"
-            if self.movement_done and ctx.get("scan_done"):
-                # print("ARM FOLDING - AF2")
-                return "AreasOfInterest"
-        if ctx.get("scan_phase") == 2:
-            if self.movement_done and ctx.get("recompute_base_placement"):
-                return "BasePlacement"
-            if self.movement_done and not ctx.get("exhaustive_scan_done"):
-                # print("ARM FOLDING - AF3")
-                return "WallTargetSelection"
-            if self.movement_done and ctx.get("exhaustive_scan_done"):
-                # print("ARM FOLDING - AF4")
-                return "HomePosition"
+        if self.movement_done and not ctx.get("scan_done"):
+            return "WallTargetSelection"
+        if self.movement_done and ctx.get("scan_done"):
+            return "HomePosition"
         if ctx.get("error_triggered"):
             return "Error"
         

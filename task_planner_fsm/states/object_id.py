@@ -66,7 +66,7 @@ class ObjectID(State):
 
     def check_transition(self, ctx):
         if ctx.get("object_id_ready"):
-            return "GeometryReconstruction"
+            return "WallLinesComputation"
         if ctx.get("error_triggered"):
             return "Error"
         return None

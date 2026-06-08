@@ -12,7 +12,7 @@ class ComputeWallPoints(State):
         self.step_count = 0
         self.MAX_STEPS = 5
         self.predefined_walls = [
-            ((3.0, 0.0, 2.0), (3.0, -3.0, 3.0)),
+            ((4.0, 0.0, 2.0), (4.0, -3.0, 3.0)),
             ((9.0, 0.0, 0.19), (9.0, -4.5, 2.0)),
             ((10.0, -4.5, 0.2), (10.0, 0.0, 3.0)),
         ]

@@ -136,7 +136,9 @@ class ArmUnfolding(State):
         if self.movement_done and ctx.get("scan_phase") == 1:
             return "ScanWall"
         if self.movement_done and ctx.get("scan_phase") == 2:
-            return "ExhaustiveScan"
+            return "FloorScan"
+        if self.movement_done and ctx.get("scan_phase") == 3:
+            return "CeilingScan"
         if ctx.get("error_triggered"):
             return "Error"
         return None

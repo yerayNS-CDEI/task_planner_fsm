@@ -173,7 +173,8 @@ class ScanWall(State):
     def check_transition(self, ctx):
         if self.finished: # and not ctx.get("scan_done"):
             # return "WallTargetSelection"
-            return "ArmFolding"
+            # return "ArmFolding"
+            return "SensorDataProcessing"
         # if ctx.get("scan_done"):
         #     return "HomePosition"
         if ctx.get("error_triggered"):
