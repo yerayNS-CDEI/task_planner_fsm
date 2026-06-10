@@ -150,6 +150,7 @@ PREDEFINED_WALLS = [
     ((4.0, 0.0, 2.0), (4.0, -3.0, 3.0)),
     ((9.0, 0.0, 0.19), (9.0, -4.5, 2.0)),
     ((10.0, -4.5, 0.2), (10.0, 0.0, 3.0)),
+    ((4.0, 2.0, 0.2), (8.0, 2.0, 3.0)),
 ]
 
 
@@ -293,7 +294,11 @@ class RobotFSMNode(Node):
             return value
 
     def _build_wall_data(
-        self, p1: Tuple[float, float, float], p2: Tuple[float, float, float], offset: float = 0.6
+        self,
+        p1: Tuple[float, float, float],
+        p2: Tuple[float, float, float],
+        offset: float = 0.6,
+        scan_lines_z: Optional[List[float]] = None,
     ) -> Dict[str, Tuple]:
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
@@ -322,11 +327,19 @@ class RobotFSMNode(Node):
         inward_normal = inward_normal_from_wall_points(p1, p2)
         ee_rpy_deg = ee_rpy_deg_from_inward_normal(inward_normal)
 
+        # Horizontal scan lines (heights), bottom-first. Default to a single line
+        # at the wall's scan-line z, preserving single-pass behaviour.
+        if scan_lines_z:
+            scan_lines_z = sorted(float(z) for z in scan_lines_z)
+        else:
+            scan_lines_z = [float(scan_start[2])]
+
         return {
             "original": (tuple(p1), tuple(p2)),
             "scan_line": (scan_start, scan_end),
             "inward_normal": inward_normal,
             "ee_rpy_deg": ee_rpy_deg,
+            "scan_lines_z": scan_lines_z,
         }
 
     def _prompt_walls_data(self) -> List[Dict[str, Tuple]]:
@@ -368,8 +381,34 @@ class RobotFSMNode(Node):
             walls_data = []
             for idx in selected_indices:
                 p1, p2 = PREDEFINED_WALLS[idx - 1]
-                walls_data.append(self._build_wall_data(p1, p2))
+                scan_lines_z = self._prompt_wall_lines(idx)
+                walls_data.append(self._build_wall_data(p1, p2, scan_lines_z=scan_lines_z))
             return walls_data
+
+    def _prompt_wall_lines(self, wall_idx: int) -> List[float]:
+        """Prompt for the number of horizontal lines and their z heights.
+
+        Returns a list sorted ascending (bottom first). Accepting the defaults
+        (empty input) yields a single line, preserving single-pass behaviour.
+        """
+        num_lines = self._prompt_int(f">> Wall {wall_idx}: number of horizontal lines", 1, 20, 1)
+        default_str = " ".join("0.0" for _ in range(num_lines))
+        while True:
+            raw = self._safe_input(
+                f">> Wall {wall_idx}: z values for the {num_lines} line(s) "
+                f"(e.g. 0.5 1.2 2.0) [{default_str}]: "
+            ).strip()
+            if not raw:
+                return [0.0] * num_lines
+            try:
+                z_values = [float(tok) for tok in raw.replace(",", " ").split()]
+            except ValueError:
+                print(f"Invalid z value list: '{raw}'")
+                continue
+            if len(z_values) != num_lines:
+                print(f"Requested {num_lines} line(s) but provided {len(z_values)} z value(s).")
+                continue
+            return sorted(z_values)
 
     def _make_pose(self, x: float, y: float, z: float) -> Pose:
         pose = Pose()
@@ -542,8 +581,13 @@ class RobotFSMNode(Node):
         self.ctx["current_wall_index"] = wall_idx
         self.ctx["target_scan_wall"] = target_scan_wall
         self.ctx["target_scan_point"] = target_scan_point
+        self.ctx["current_wall_scan_lines"] = list(
+            walls_data[wall_idx].get("scan_lines_z") or [target_scan_wall[0][2]]
+        )
+        self.ctx["current_line_idx"] = 0
         self.get_logger().info(
-            f"[FSM] Phase-1 bootstrap target set: wall #{wall_idx}, point={target_scan_point}"
+            f"[FSM] Phase-1 bootstrap target set: wall #{wall_idx}, point={target_scan_point}, "
+            f"lines z={self.ctx['current_wall_scan_lines']}"
         )
 
     def _prompt_phase2_base(self):

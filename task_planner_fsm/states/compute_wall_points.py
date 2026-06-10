@@ -15,6 +15,7 @@ class ComputeWallPoints(State):
             ((4.0, 0.0, 2.0), (4.0, -3.0, 3.0)),
             ((9.0, 0.0, 0.19), (9.0, -4.5, 2.0)),
             ((10.0, -4.5, 0.2), (10.0, 0.0, 3.0)),
+            ((4.0, 2.0, 0.2), (8.0, 2.0, 3.0)),
         ]
 
     def on_enter(self, ctx):
@@ -27,7 +28,7 @@ class ComputeWallPoints(State):
         ctx["error_triggered"] = False
         ctx["walls_left"] = 0
     
-    def _build_wall_data(self, p1, p2, offset=0.6):
+    def _build_wall_data(self, p1, p2, offset=0.6, scan_lines_z=None):
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
         length = math.hypot(dx, dy)
@@ -55,16 +56,47 @@ class ComputeWallPoints(State):
         inward_normal = inward_normal_from_wall_points(p1, p2)
         ee_rpy_deg = ee_rpy_deg_from_inward_normal(inward_normal)
 
+        # Horizontal scan lines (heights), bottom-first. Default to a single line
+        # at the wall's scan-line z, preserving the previous single-pass behaviour.
+        if scan_lines_z:
+            scan_lines_z = sorted(float(z) for z in scan_lines_z)
+        else:
+            scan_lines_z = [float(scan_start[2])]
+
         return {
             "original": (tuple(p1), tuple(p2)),
             "scan_line": (scan_start, scan_end),
             "inward_normal": inward_normal,
             "ee_rpy_deg": ee_rpy_deg,
+            "scan_lines_z": scan_lines_z,
         }
 
     def _parse_indices(self, raw_text):
         tokens = raw_text.replace(",", " ").split()
         return [int(tok) for tok in tokens]
+
+    def _parse_floats(self, raw_text):
+        tokens = raw_text.replace(",", " ").split()
+        return [float(tok) for tok in tokens]
+
+    def _prompt_wall_lines(self, wall_idx):
+        """Prompt for the number of horizontal lines and their z heights.
+
+        Returns a list of z values sorted ascending (bottom line first).
+        Raises ValueError on invalid input so the caller can abort the step.
+        """
+        num_lines = int(input(f">> Wall {wall_idx}: number of horizontal lines? (>=1) ").strip())
+        if num_lines < 1:
+            raise ValueError(f"Wall {wall_idx}: number of lines must be >= 1.")
+
+        z_values = self._parse_floats(
+            input(f">> Wall {wall_idx}: z values for the {num_lines} line(s) (e.g. 0.5 1.2 2.0): ").strip()
+        )
+        if len(z_values) != num_lines:
+            raise ValueError(
+                f"Wall {wall_idx}: requested {num_lines} line(s) but provided {len(z_values)} z value(s)."
+            )
+        return sorted(z_values)
 
     def run(self, ctx):
         node = ctx["node"]
@@ -101,7 +133,8 @@ class ComputeWallPoints(State):
                     if idx < 1 or idx > max_walls:
                         raise ValueError(f"Wall index {idx} out of range (1-{max_walls}).")
                     p1, p2 = self.predefined_walls[idx - 1]
-                    walls_data.append(self._build_wall_data(p1, p2))
+                    scan_lines_z = self._prompt_wall_lines(idx)
+                    walls_data.append(self._build_wall_data(p1, p2, scan_lines_z=scan_lines_z))
 
             except ValueError as e:
                 print(f"[{self.name}] Invalid input: {e}")
@@ -112,7 +145,11 @@ class ComputeWallPoints(State):
             node.get_logger().info(f"[{self.name}] Selected scan lines:")
             for idx, wall in enumerate(walls_data, 1):
                 s_start, s_end = wall["scan_line"]
-                node.get_logger().info(f"  Wall {idx}: {s_start} -> {s_end}")
+                heights = ", ".join(f"{z:.3f}" for z in wall["scan_lines_z"])
+                node.get_logger().info(
+                    f"  Wall {idx}: {s_start} -> {s_end} | "
+                    f"{len(wall['scan_lines_z'])} line(s) at z=[{heights}]"
+                )
 
             ctx["database_generated"] = True
             ctx["walls_left"] = num_walls

@@ -104,7 +104,20 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
             ctx["target_scan_wall"] = walls_data[selected_wall_idx]["scan_line"]
             ctx["target_scan_point"] = selected_point
             ctx["target_selected"] = True
-            node.get_logger().info(f"[{self.name}] Wall #{selected_wall_idx} selected at point {selected_point}.")
+
+            # Horizontal scan lines (heights) for this wall, bottom-first.
+            # ScanWall consumes them one at a time, self-looping per line.
+            scan_lines_z = walls_data[selected_wall_idx].get("scan_lines_z")
+            if not scan_lines_z:
+                # Fallback to a single line at the wall's scan-line z.
+                scan_lines_z = [walls_data[selected_wall_idx]["scan_line"][0][2]]
+            ctx["current_wall_scan_lines"] = list(scan_lines_z)
+            ctx["current_line_idx"] = 0
+
+            node.get_logger().info(
+                f"[{self.name}] Wall #{selected_wall_idx} selected at point {selected_point}. "
+                f"{len(scan_lines_z)} line(s) at z={[round(z, 3) for z in scan_lines_z]}."
+            )
 
         elif ctx.get("scan_phase") == 2:
             # Robot position (real or simulated)
