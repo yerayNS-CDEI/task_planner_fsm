@@ -4,7 +4,12 @@ from example_interfaces.srv import SetBool
 import subprocess, os, signal, shlex
 import time
 
-from task_planner_fsm.states.proc_utils import start_proc, stop_proc
+from task_planner_fsm.states.proc_utils import (
+    start_proc,
+    stop_proc,
+    wait_processes_gone,
+    SIM_STACK_PATTERNS,
+)
 
 class CreateMap(State):
     def __init__(self, name):
@@ -31,28 +36,38 @@ class CreateMap(State):
                 node.get_logger().info(f"[{self.name}] Exploration finished. Launch exited with code {rc}.")
                 ctx["map_ready"] = (rc == 0)
                 ctx["error_triggered"] = (rc != 0)
-                # Stop with Gazebo force-kill patterns as fallback
-                gazebo_patterns = ['gz sim', 'ign gazebo', 'ruby.*gz', 'gzserver', 'gz-sim']
-                stop_proc(ctx, "mapping", force_kill_patterns=gazebo_patterns)
+                # Graceful group shutdown; on_exit does the thorough wait.
+                stop_proc(ctx, "mapping", force_kill_patterns=SIM_STACK_PATTERNS)
 
     def on_exit(self, ctx):
         node = ctx["node"]
-        node.get_logger().info(f"[{self.name}] Exiting state; ensuring exploration is stopped...")
-        
-        #### POPEN  TO LAUNCH PROCESSES
-  
-        # Force kill Gazebo IMMEDIATELY to prevent launch system from escalating
-        node.get_logger().info(f"[{self.name}] Force killing Gazebo processes...")
-        gazebo_patterns = ['gz sim', 'ign gazebo', 'ruby.*gz', 'gzserver', 'gz-sim']
-        for pattern in gazebo_patterns:
-            try:
-                subprocess.run(['pkill', '-9', '-f', pattern], timeout=2, stderr=subprocess.DEVNULL)
-            except:
-                pass
-        
-        # Now stop the launch process
-        stop_proc(ctx, "mapping", timeout=5.0)
-        time.sleep(1)  # Brief pause to ensure cleanup
+        node.get_logger().info(f"[{self.name}] Exiting state; tearing down the mapping stack cleanly...")
+
+        # 1) Graceful, whole-process-group shutdown of the mapping launch
+        #    (SIGINT -> SIGTERM -> SIGKILL). This lets ros2 launch shut its
+        #    children down cleanly so DDS participants deregister and rtabmap
+        #    releases its sqlite database, instead of -9'ing Gazebo only and
+        #    orphaning robot_state_publisher / controllers / rtabmap / rviz.
+        stop_proc(ctx, "mapping", timeout=10.0, force_kill_patterns=SIM_STACK_PATTERNS)
+
+        # 2) Wait until every node from the mapping launch is actually gone, so
+        #    the next launch (ObjectID) does not collide with orphaned nodes or a
+        #    locked rtabmap DB. Fixed sleeps are replaced by this real check.
+        if not wait_processes_gone(SIM_STACK_PATTERNS, timeout=25.0, node=node):
+            node.get_logger().warn(
+                f"[{self.name}] Sim-stack processes still present after teardown; force-killing stragglers..."
+            )
+            for pattern in SIM_STACK_PATTERNS:
+                try:
+                    subprocess.run(['pkill', '-9', '-f', pattern], timeout=2, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+            wait_processes_gone(SIM_STACK_PATTERNS, timeout=10.0, node=node)
+
+        # 3) Small settle so DDS discovery clears any stale endpoints before the
+        #    new stack starts publishing.
+        time.sleep(3)
+        node.get_logger().info(f"[{self.name}] Mapping stack fully stopped.")
 
     def check_transition(self, ctx):
         if ctx.get("map_ready"):

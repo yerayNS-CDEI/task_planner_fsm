@@ -3,7 +3,12 @@ from example_interfaces.srv import SetBool
 
 import time, socket
 
-from task_planner_fsm.states.proc_utils import start_proc
+from task_planner_fsm.states.proc_utils import (
+    start_proc,
+    stop_proc,
+    wait_stack_ready,
+    SIM_STACK_PATTERNS,
+)
 
 class ObjectID(State):
     def __init__(self, name):
@@ -107,10 +112,32 @@ class ObjectID(State):
                 f"use_sim_time:={sim_value}"]
             )
 
-            # Wait for processes to initialize
-            node.get_logger().info(f"[{self.name}] Waiting 10 seconds for processes to initialize...")
-            time.sleep(10)
-            node.get_logger().info(f"[{self.name}] Navigation + localization simulation started.")
+            # Wait until the stack is actually producing data instead of a blind
+            # sleep. We gate on topics that are known to exist in this system and
+            # that map directly to the symptoms we want to avoid:
+            #   /clock          -> sim time is running
+            #   /tf             -> robot_state_publisher / TF is up (robot model)
+            #   /joint_states   -> ros2_control controllers are active
+            #   /rtabmap/odom   -> rtabmap odometry is initialized and receiving data
+            required_topics = ctx.get(
+                "stack_ready_topics",
+                ["/clock", "/tf", "/joint_states", "/rtabmap/odom"],
+            )
+            ready_timeout = float(ctx.get("stack_ready_timeout", 90.0))
+            node.get_logger().info(
+                f"[{self.name}] Waiting (up to {ready_timeout:.0f}s) for navigation + localization stack to become ready..."
+            )
+            if not wait_stack_ready(ctx, required_topics, timeout=ready_timeout):
+                node.get_logger().error(
+                    f"[{self.name}] Navigation + localization stack did not become ready; aborting and tearing it down."
+                )
+                # Tear the half-started stack down so the Error path is clean and a
+                # retry does not inherit orphaned nodes.
+                stop_proc(ctx, "nav_sim", timeout=10.0, force_kill_patterns=SIM_STACK_PATTERNS)
+                ctx["error_triggered"] = True
+                return False
+
+            node.get_logger().info(f"[{self.name}] Navigation + localization stack is ready.")
             return True
 
         except Exception as e:
