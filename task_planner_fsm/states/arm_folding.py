@@ -77,6 +77,11 @@ class ArmFolding(State):
         request = SendPosition.Request()
         request.position_name = self.current_goal
 
+        # Reset execution signals before sending so we wait for a FRESH result
+        # rather than a stale True/failure left over from a previous state.
+        ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
+
         self.future = self.service_client.call_async(request)
         node.get_logger().info(
             f"[{self.name}] Sending service request for position: {self.current_goal} "
