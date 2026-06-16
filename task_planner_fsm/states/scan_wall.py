@@ -8,6 +8,8 @@ from rclpy.task import Future
 from rclpy.duration import Duration
 import rclpy.time
 from arm_control.srv import SendPosition
+from ur_msgs.srv import SetForceMode
+from std_srvs.srv import Trigger
 import subprocess, os, signal
 from math import atan2, sin, cos
 import time
@@ -44,6 +46,12 @@ class ScanWall(State):
         self.column_retract_commanded = False
         self.sweep_target_point = None   # endpoint the current sweep drives to
 
+        # Force mode (real robot only): press the GPR wheel against the wall (Z)
+        # while the distance-sensor alignment holds the plate orientation.
+        self.force_mode_start_client = None
+        self.force_mode_stop_client = None
+        self.force_mode_active = False
+
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering scanning state.")
@@ -67,6 +75,7 @@ class ScanWall(State):
         self.retract_verbose = False
         self.column_retract_commanded = False
         self.sweep_target_point = None
+        self.force_mode_active = False
         ctx["error_triggered"] = False
 
         self.column.reset()
@@ -83,10 +92,11 @@ class ScanWall(State):
                 ctx["error_triggered"] = True
                 return
 
-        # NOTE: the sensor-alignment processes (arduino_sensors_sim, align_ee_to_wall)
-        # are intentionally NOT started here. They are launched only once the arm is
-        # pre-positioned at the line height and the base is about to actively scan
-        # (see _start_arm_processes, called from the scan phase).
+        # NOTE: the alignment processes (distance sensors + wall_parallel_controller)
+        # and, on the real robot, force_mode are intentionally NOT started here. They
+        # are activated only once the arm is pre-positioned at the line height and the
+        # base is about to actively scan (see _start_arm_processes / _start_force_mode,
+        # called from the scan phase).
 
     # ------------------------------------------------------------------
     # Per-line resolution
@@ -112,11 +122,23 @@ class ScanWall(State):
     # Arm process control (scan phase only)
     # ------------------------------------------------------------------
     def _start_arm_processes(self, ctx):
-        """Activate arduino_sensors_sim + align_ee_to_wall for the active scan."""
+        """Activate the distance-sensor reader + wall_parallel_controller for the
+        active scan. Sim uses the simulated sensors; real uses the Arduino reader.
+        """
         node = ctx["node"]
+        use_sim = bool(ctx.get("sim", False))
+        if use_sim:
+            sensor_cmd = ["ros2", "run", "arm_control", "arduino_sensors_sim", "--ros-args",
+                          "-p", "autostart:=true", "-p", "publish_rate:=5.0", "-p", "batch_size:=2"]
+            sensor_name = "arduino_sensors_sim"
+        else:
+            sensor_cmd = ["ros2", "run", "arm_control", "arduino_sensors"]
+            sensor_name = "arduino_sensors"
         arm_procs = [
-            ("arduino_sensors_proc", ["ros2", "run", "arm_control", "arduino_sensors_sim", "--ros-args", "-p", "autostart:=true"], "arduino_sensors_sim"),
-            ("align_ee_proc",        ["ros2", "run", "arm_control", "align_ee_to_wall"],    "align_ee_to_wall"),
+            ("arduino_sensors_proc", sensor_cmd, sensor_name),
+            ("wall_parallel_proc",
+             ["ros2", "run", "arm_control", "wall_parallel_controller", "--ros-args", "-p", "control_rate:=2.0"],
+             "wall_parallel_controller"),
         ]
         for proc_key, cmd_args, proc_name in arm_procs:
             if ctx.get(proc_key) and ctx[proc_key].poll() is None:
@@ -144,8 +166,8 @@ class ScanWall(State):
     def _stop_arm_processes(self, ctx):
         node = ctx["node"]
         for proc_key, proc_name in [
-            ("arduino_sensors_proc", "arduino_sensors_sim"),
-            ("align_ee_proc",        "align_ee_to_wall"),
+            ("arduino_sensors_proc", "distance sensors"),
+            ("wall_parallel_proc",   "wall_parallel_controller"),
         ]:
             proc = ctx.get(proc_key)
             if proc and proc.poll() is None:
@@ -157,6 +179,68 @@ class ScanWall(State):
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                     node.get_logger().warn(f"[{self.name}] Forzado SIGKILL a '{proc_name}'.")
             ctx[proc_key] = None
+
+    # ------------------------------------------------------------------
+    # Force mode (real robot only): GPR press against the wall
+    # ------------------------------------------------------------------
+    def _build_force_mode_request(self):
+        """Press the GPR (offset -0.08 m in tool0 X) against the wall with 5 N
+        along the task-frame Z; only Z is compliant so the sensor alignment keeps
+        full control of orientation."""
+        req = SetForceMode.Request()
+        req.task_frame.header.frame_id = "arm_tool0"
+        req.task_frame.pose.position.x = -0.08
+        req.task_frame.pose.orientation.w = 1.0
+        req.selection_vector_z = True          # Z compliant; all others stiff
+        req.wrench.force.z = 5.0
+        req.type = 2                           # NO_TRANSFORM (task frame as given)
+        req.speed_limits.linear.z = 0.05
+        req.deviation_limits = [0.1, 0.1, 0.15, 0.1, 0.1, 0.1]
+        req.damping_factor = 0.025
+        req.gain_scaling = 0.5
+        return req
+
+    def _log_force_mode_result(self, node, future, label):
+        try:
+            res = future.result()
+            node.get_logger().info(
+                f"[{self.name}] force_mode {label}: success={getattr(res, 'success', True)}"
+            )
+        except Exception as e:
+            node.get_logger().error(f"[{self.name}] force_mode {label} call failed: {e}")
+
+    def _start_force_mode(self, ctx):
+        """Real robot only. Start the GPR press for this line sweep."""
+        if bool(ctx.get("sim", False)):
+            return
+        node = ctx["node"]
+        if self.force_mode_start_client is None:
+            self.force_mode_start_client = node.create_client(
+                SetForceMode, "/force_mode_controller/start_force_mode")
+        if not self.force_mode_start_client.wait_for_service(timeout_sec=5.0):
+            node.get_logger().error(f"[{self.name}] start_force_mode service unavailable.")
+            ctx["error_triggered"] = True
+            return
+        node.get_logger().info(f"[{self.name}] Starting force mode (GPR press 5N on Z).")
+        fut = self.force_mode_start_client.call_async(self._build_force_mode_request())
+        fut.add_done_callback(lambda f: self._log_force_mode_result(node, f, "start"))
+        self.force_mode_active = True
+
+    def _stop_force_mode(self, ctx):
+        """Real robot only. Stop the GPR press (safe no-op if never started)."""
+        if bool(ctx.get("sim", False)) or not self.force_mode_active:
+            return
+        node = ctx["node"]
+        if self.force_mode_stop_client is None:
+            self.force_mode_stop_client = node.create_client(
+                Trigger, "/force_mode_controller/stop_force_mode")
+        self.force_mode_active = False
+        if not self.force_mode_stop_client.wait_for_service(timeout_sec=5.0):
+            node.get_logger().error(f"[{self.name}] stop_force_mode service unavailable.")
+            return
+        node.get_logger().info(f"[{self.name}] Stopping force mode.")
+        fut = self.force_mode_stop_client.call_async(Trigger.Request())
+        fut.add_done_callback(lambda f: self._log_force_mode_result(node, f, "stop"))
 
     # ------------------------------------------------------------------
     # Column height from the map-frame line z
@@ -334,6 +418,12 @@ class ScanWall(State):
             node.get_logger().info(f"[{self.name}] Waiting 10s for arm processes to stabilise...")
             time.sleep(10.0)
 
+            # Real robot: now that the plate is aligning, press the GPR against the
+            # wall for this line sweep (sim has no force_mode controller -> no-op).
+            self._start_force_mode(ctx)
+            if ctx.get("error_triggered"):
+                return
+
             wall_data = ctx.get("target_scan_wall", None)
             prev_target_point = ctx.get("target_scan_point", None)
 
@@ -407,7 +497,8 @@ class ScanWall(State):
         result = future.result().result
         status = future.result().status
 
-        node.get_logger().info(f"[{self.name}] Scanning finished. Stopping arm processes for safety...")
+        node.get_logger().info(f"[{self.name}] Scanning finished. Stopping force mode + arm processes for safety...")
+        self._stop_force_mode(ctx)      # release the press before the arm retracts
         self._stop_arm_processes(ctx)
         time.sleep(2)   # delay to avoid errors in the arm goals
 
@@ -508,7 +599,8 @@ class ScanWall(State):
                 ctx["scan_done"] = True
 
     def on_exit(self, ctx):
-        ## Desactivacion de arduino_sensors_sim y align_ee_to_wall (safety net)
+        ## Safety net: release force mode (real) and stop sensor + alignment nodes.
+        self._stop_force_mode(ctx)
         self._stop_arm_processes(ctx)
 
     def check_transition(self, ctx):
