@@ -53,7 +53,7 @@ class CreateMap(State):
         # 2) Wait until every node from the mapping launch is actually gone, so
         #    the next launch (ObjectID) does not collide with orphaned nodes or a
         #    locked rtabmap DB. Fixed sleeps are replaced by this real check.
-        if not wait_processes_gone(SIM_STACK_PATTERNS, timeout=25.0, node=node):
+        if not wait_processes_gone(SIM_STACK_PATTERNS, timeout=3.0, node=node):
             node.get_logger().warn(
                 f"[{self.name}] Sim-stack processes still present after teardown; force-killing stragglers..."
             )
