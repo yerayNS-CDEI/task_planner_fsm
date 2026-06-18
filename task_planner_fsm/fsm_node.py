@@ -133,6 +133,7 @@ NAV_CLIENT_BOOTSTRAP_STATES = {
     "ArmUnfolding",
     "ArmFolding",
     "ScanWall",
+    "ScanFloor",
     # "AreasOfInterest",
     # "WallDiscretization",
     # "BasePlacement",
