@@ -7,6 +7,7 @@ from task_planner_fsm.states.proc_utils import (
     start_proc,
     stop_proc,
     wait_stack_ready,
+    wait_services_ready,
     SIM_STACK_PATTERNS,
 )
 
@@ -136,6 +137,29 @@ class ObjectID(State):
                 stop_proc(ctx, "nav_sim", timeout=10.0, force_kill_patterns=SIM_STACK_PATTERNS)
                 ctx["error_triggered"] = True
                 return False
+
+            # The collision-checking stack only comes up in the legacy backend,
+            # and it loses a startup race under load often enough that we must
+            # gate on it explicitly. Without this the FSM proceeds while the
+            # collision node is still stuck waiting for its robot_state_publisher,
+            # so the planner silently runs without collision validation until a
+            # manual restart (see planner_node collision-service retry logic).
+            if planner_backend == "legacy":
+                collision_services = ctx.get(
+                    "collision_ready_services",
+                    ["/collision/check_collision_pose"],
+                )
+                collision_timeout = float(ctx.get("collision_ready_timeout", 60.0))
+                node.get_logger().info(
+                    f"[{self.name}] Waiting (up to {collision_timeout:.0f}s) for collision checking service to come up..."
+                )
+                if not wait_services_ready(ctx, collision_services, timeout=collision_timeout):
+                    node.get_logger().error(
+                        f"[{self.name}] Collision checking service did not come up; aborting and tearing it down."
+                    )
+                    stop_proc(ctx, "nav_sim", timeout=10.0, force_kill_patterns=SIM_STACK_PATTERNS)
+                    ctx["error_triggered"] = True
+                    return False
 
             node.get_logger().info(f"[{self.name}] Navigation + localization stack is ready.")
             return True

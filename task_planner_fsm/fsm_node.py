@@ -43,7 +43,12 @@ from task_planner_fsm.states import (
     # ExhaustiveScan,
     # WallDiscretization,
 )
-from task_planner_fsm.states.proc_utils import start_proc, stop_all
+from task_planner_fsm.states.proc_utils import (
+    start_proc,
+    stop_all,
+    wait_stack_ready,
+    wait_services_ready,
+)
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
 from task_planner_fsm.utils.wall_geometry import (
     ee_rpy_deg_from_inward_normal,
@@ -133,6 +138,7 @@ NAV_CLIENT_BOOTSTRAP_STATES = {
     "ArmUnfolding",
     "ArmFolding",
     "ScanWall",
+    "ScanFloor",
     # "AreasOfInterest",
     # "WallDiscretization",
     # "BasePlacement",
@@ -656,6 +662,43 @@ class RobotFSMNode(Node):
             )
             time.sleep(2.0)
             self.get_logger().info("[FSM] Navigation + localization simulation started by bootstrap.")
+
+            # Mirror ObjectID's readiness gates. When the FSM is started at a
+            # non-initial state this bootstrap path replaces ObjectID, so without
+            # these checks it would race ahead while the stack — in particular the
+            # collision-checking service — is still coming up, and the planner
+            # would silently plan without collision validation.
+            required_topics = self.ctx.get(
+                "stack_ready_topics",
+                ["/clock", "/tf", "/joint_states", "/rtabmap/odom"],
+            )
+            ready_timeout = float(self.ctx.get("stack_ready_timeout", 90.0))
+            self.get_logger().info(
+                f"[FSM] Waiting (up to {ready_timeout:.0f}s) for navigation + localization stack to become ready..."
+            )
+            if not wait_stack_ready(self.ctx, required_topics, timeout=ready_timeout):
+                self.ctx["error_triggered"] = True
+                self.get_logger().error(
+                    "[FSM] Navigation + localization stack did not become ready during bootstrap."
+                )
+                return
+
+            if planner_backend == "legacy":
+                collision_services = self.ctx.get(
+                    "collision_ready_services",
+                    ["/collision/check_collision_pose"],
+                )
+                collision_timeout = float(self.ctx.get("collision_ready_timeout", 60.0))
+                self.get_logger().info(
+                    f"[FSM] Waiting (up to {collision_timeout:.0f}s) for collision checking service to come up..."
+                )
+                if not wait_services_ready(self.ctx, collision_services, timeout=collision_timeout):
+                    self.ctx["error_triggered"] = True
+                    self.get_logger().error(
+                        "[FSM] Collision checking service did not come up during bootstrap; "
+                        "the planner would run without collision validation."
+                    )
+                    return
         except Exception as exc:
             self.ctx["error_triggered"] = True
             self.get_logger().error(

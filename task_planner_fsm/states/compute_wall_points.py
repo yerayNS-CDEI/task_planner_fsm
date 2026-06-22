@@ -27,6 +27,21 @@ class ComputeWallPoints(State):
         ctx["database_generated"] = False
         ctx["error_triggered"] = False
         ctx["walls_left"] = 0
+
+    def _build_available_walls(self, ctx):
+        """Selectable walls: those detected from the map first, then predefined.
+
+        Each entry is ``(label, (p1, p2))`` where ``label`` notes the source so
+        the operator can tell map-detected walls from the hardcoded fallbacks.
+        Detected walls are produced by GeometryReconstruction and live in
+        ``ctx["detected_walls"]`` as ``((x, y, z), (x, y, z))`` map-frame pairs.
+        """
+        available = []
+        for p1, p2 in ctx.get("detected_walls", []):
+            available.append(("detected", (tuple(p1), tuple(p2))))
+        for p1, p2 in self.predefined_walls:
+            available.append(("predefined", (tuple(p1), tuple(p2))))
+        return available
     
     def _build_wall_data(self, p1, p2, offset=0.6, scan_lines_z=None):
         dx = p2[0] - p1[0]
@@ -107,12 +122,16 @@ class ComputeWallPoints(State):
             return
 
         if not self.started:
-            print(f"[{self.name}] Available predefined walls:")
-            for i, (p1, p2) in enumerate(self.predefined_walls, 1):
-                print(f"  {i}: p1={p1}, p2={p2}")
+            available_walls = self._build_available_walls(ctx)
+            print(f"[{self.name}] Available walls:")
+            for i, (source, (p1, p2)) in enumerate(available_walls, 1):
+                tag = "[map]" if source == "detected" else "[predefined]"
+                print(f"  {i}: {tag} p1={p1}, p2={p2}")
 
             try:
-                max_walls = len(self.predefined_walls)
+                max_walls = len(available_walls)
+                if max_walls == 0:
+                    raise ValueError("No walls available to scan.")
                 num_walls = int(input(f">> Number of walls to scan? (1-{max_walls}) ").strip())
                 if num_walls <= 0 or num_walls > max_walls:
                     raise ValueError(f"Number must be between 1 and {max_walls}.")
@@ -132,7 +151,7 @@ class ComputeWallPoints(State):
                 for idx in selected_indices:
                     if idx < 1 or idx > max_walls:
                         raise ValueError(f"Wall index {idx} out of range (1-{max_walls}).")
-                    p1, p2 = self.predefined_walls[idx - 1]
+                    p1, p2 = available_walls[idx - 1][1]
                     scan_lines_z = self._prompt_wall_lines(idx)
                     walls_data.append(self._build_wall_data(p1, p2, scan_lines_z=scan_lines_z))
 

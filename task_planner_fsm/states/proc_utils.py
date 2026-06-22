@@ -236,6 +236,56 @@ def wait_stack_ready(
         node.get_logger().error(f"[stack-ready] Timed out after {timeout}s; no publisher on: {pending}")
     return False
 
+def _list_services(timeout: float = 4.0) -> set:
+    """Set of service names currently visible in the ROS graph, via the ros2 CLI."""
+    try:
+        r = subprocess.run(['ros2', 'service', 'list'],
+                           capture_output=True, text=True, timeout=timeout)
+        return {line.strip() for line in r.stdout.splitlines() if line.strip()}
+    except Exception:
+        return set()
+
+
+def wait_services_ready(
+    ctx: dict,
+    required_services: Iterable[str],
+    timeout: float = 60.0,
+    poll_interval: float = 2.0,
+) -> bool:
+    """Block until every service in `required_services` is present in the graph.
+
+    Complements ``wait_stack_ready`` for parts of the stack that expose no topic
+    to gate on — notably the collision-checking service, which loses a startup
+    race under load often enough that the FSM must wait for it explicitly instead
+    of proceeding while the planner silently runs without collision validation.
+
+    Uses the ``ros2 service list`` CLI so it works even while the FSM node's own
+    executor is blocked inside this call. Returns True if all services appeared
+    within `timeout`, False otherwise.
+    """
+    node = ctx.get("node")
+    pending = list(required_services)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        available = _list_services()
+        still_pending = []
+        for svc in pending:
+            if svc in available:
+                if node:
+                    node.get_logger().info(f"[stack-ready] service '{svc}' is available.")
+            else:
+                still_pending.append(svc)
+        pending = still_pending
+        if not pending:
+            return True
+        if node:
+            node.get_logger().info(f"[stack-ready] Still waiting for service(s): {pending}")
+        time.sleep(poll_interval)
+    if node:
+        node.get_logger().error(f"[stack-ready] Timed out after {timeout}s; missing service(s): {pending}")
+    return False
+
+
 def stop_all(ctx: dict) -> None:
     node = ctx.get("node")
     node.get_logger().info(f"Stopping all managed processes. Keys:{ctx.get('_procs', {}).keys()}")
