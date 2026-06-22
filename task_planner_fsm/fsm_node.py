@@ -649,7 +649,7 @@ class RobotFSMNode(Node):
                     "controller_type:=omni",
                     "database_name:=rtabmap_fsm",
                     "headless:=true",
-                    "use_sim_time:=true",
+                    f"use_sim_time:={sim_value}",
                     "hybrid_sim:=false",
                     f"planner_backend:={planner_backend}",
                 ],

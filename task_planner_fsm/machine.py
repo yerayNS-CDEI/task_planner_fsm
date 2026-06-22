@@ -12,7 +12,13 @@ class StateMachine:
         self.ctx["last_state"] = None   # initialization
         self._retried_current_state = False
         self._state_enter_time_monotonic = time.monotonic()
-        self.ctx.setdefault('mapping_cmd', ['ros2', 'launch', 'navi_wall', 'global_exploration.launch.py', 'headless:=true'])
+        sim_value = 'true' if self.ctx.get('sim', False) else 'false'
+        self.ctx.setdefault('mapping_cmd', [
+            'ros2', 'launch', 'navi_wall', 'global_exploration.launch.py',
+            f'sim:={sim_value}',
+            f'use_sim_time:={sim_value}',
+            'headless:=true',
+        ])
         install_global_cleanup(self.ctx)
         self.current_state.on_enter(self.ctx)
         self.ctx["is_initial_entry"] = False
