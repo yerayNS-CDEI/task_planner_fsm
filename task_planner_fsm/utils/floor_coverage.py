@@ -490,3 +490,175 @@ def build_coverage_plan(grid: np.ndarray, origin: Point2, resolution: float,
         "segments": segments,
         "segment_angles": segment_angles,
     }
+
+
+def _distinct_line_count(segments: Sequence[Segment], angle: float) -> int:
+    """Number of distinct parallel lines (perpendicular offsets) in ``segments``.
+
+    A single line split by obstacles yields several segments at the same offset,
+    so counting offsets (not segments) measures how many lanes the sweep needs.
+    """
+    perp_x, perp_y = -math.sin(angle), math.cos(angle)
+    offsets = {round(x0 * perp_x + y0 * perp_y, 3) for (x0, y0), _ in segments}
+    return len(offsets)
+
+
+def segment_rooms(reachable: np.ndarray, radius_cells: int) -> Tuple[np.ndarray, int]:
+    """Split a reachable free mask into rooms separated by narrow passages.
+
+    Eroding the free space by ``radius_cells`` pinches off any passage narrower
+    than ~``2 * radius_cells`` (e.g. a doorway), so the eroded cores label as
+    separate rooms. Every reachable cell is then assigned to its nearest core, so
+    the rooms tile the whole region and the doorway is absorbed into the nearest
+    room.
+
+    Returns ``(labels, n_rooms)`` with ``labels`` in ``1..n_rooms`` on reachable
+    cells and ``0`` elsewhere. Falls back to a single room when SciPy is
+    unavailable, ``radius_cells <= 0``, or fewer than two cores survive erosion.
+    """
+    if not reachable.any():
+        return np.zeros_like(reachable, dtype=np.int32), 0
+    if radius_cells <= 0 or _ndimage is None:
+        return reachable.astype(np.int32), 1
+
+    structure = _disk_structure(int(radius_cells))
+    core = _ndimage.binary_erosion(reachable, structure=structure, border_value=0)
+    core_labels, n = _ndimage.label(core)
+    if n <= 1:
+        return reachable.astype(np.int32), 1
+
+    # Assign every reachable cell to the nearest surviving core label.
+    _, inds = _ndimage.distance_transform_edt(core_labels == 0, return_indices=True)
+    nearest = core_labels[tuple(inds)]
+    labels = np.where(reachable, nearest, 0).astype(np.int32)
+    return labels, int(n)
+
+
+def _room_centroids(labels: np.ndarray, room_ids: Sequence[int], origin: Point2,
+                    resolution: float) -> dict:
+    cents = {}
+    for k in room_ids:
+        idx = np.argwhere(labels == k)
+        if idx.size == 0:
+            continue
+        cx = origin[0] + (float(idx[:, 1].mean()) + 0.5) * resolution
+        cy = origin[1] + (float(idx[:, 0].mean()) + 0.5) * resolution
+        cents[k] = (cx, cy)
+    return cents
+
+
+def _order_rooms(labels: np.ndarray, room_ids: Sequence[int], origin: Point2,
+                 resolution: float, start_xy: Optional[Point2]) -> List[int]:
+    """Greedy nearest-centroid room order, starting nearest the robot."""
+    cents = _room_centroids(labels, room_ids, origin, resolution)
+    remaining = [k for k in room_ids if k in cents]
+    if not remaining:
+        return []
+    cur = start_xy if start_xy is not None else cents[remaining[0]]
+    ordered: List[int] = []
+    while remaining:
+        k = min(remaining, key=lambda r: math.dist(cur, cents[r]))
+        ordered.append(k)
+        cur = cents[k]
+        remaining.remove(k)
+    return ordered
+
+
+def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
+                            start_cell: Tuple[int, int], *, spacing_m: float,
+                            inflation_m: float, min_len_m: float,
+                            max_cost: int = _DEFAULT_MAX_COST,
+                            angle: Optional[float] = None,
+                            axis: str = "auto",
+                            room_split_erosion_m: float = 0.0) -> dict:
+    """One-direction serpentine coverage of the reachable free region.
+
+    Unlike :func:`build_coverage_plan` (which sweeps BOTH perpendicular
+    directions and therefore covers the room twice), this returns a SINGLE
+    boustrophedon pass: the base visits every reachable cell once, in clean
+    parallel lanes ``spacing_m`` apart, without doubling back. This is what an
+    object-search sweep wants.
+
+    Lanes are aligned to the dominant wall angle. ``axis`` selects which of the
+    two wall-aligned directions to sweep:
+      * ``"auto"`` (default): the direction with fewer lanes (i.e. lanes that run
+        along the room's longer dimension -> fewer turns / shorter route);
+      * ``"dominant"``: force the dominant wall angle ``theta``;
+      * ``"perpendicular"``: force ``theta + 90 deg``.
+
+    ``grid`` is a nav2 costmap; cells with cost above ``max_cost`` (inflation +
+    obstacles) are untraversable, so lanes stay collision-free using the
+    costmap's own inflation. ``inflation_m`` adds an OPTIONAL extra margin on top
+    of that (raise it to keep lane endpoints further into free space, away from
+    walls). ``start_cell`` is ``(row, col)``.
+
+    ``room_split_erosion_m`` > 0 enables room-by-room coverage: the free space is
+    split into rooms wherever a passage is narrower than ~``2 *
+    room_split_erosion_m`` (e.g. a doorway), and each room is fully swept before
+    moving to the next (rooms ordered nearest-first from the robot). This stops
+    the base shuttling back and forth between rooms. 0 disables it (one global
+    sweep).
+
+    Returns ``{angle, segments, segment_angles, reachable, line_count,
+    room_count}`` where ``segments`` is in execution order and ``segment_angles``
+    is the parallel per-segment heading (all equal: a single sweep direction).
+    """
+    theta = dominant_wall_angle(grid) if angle is None else (angle % (math.pi / 2.0))
+
+    blocked = blocked_mask(grid, max_cost)
+    radius_cells = int(round(inflation_m / resolution)) if resolution > 0 else 0
+    inflated = inflate_obstacles(blocked, radius_cells)
+
+    free = free_mask(grid, max_cost) & ~inflated
+    reachable = reachable_free_mask(free, start_cell)
+
+    start_xy = (
+        origin[0] + (start_cell[1] + 0.5) * resolution,
+        origin[1] + (start_cell[0] + 0.5) * resolution,
+    )
+
+    # Pick the sweep direction once, globally, so lanes stay consistent across
+    # rooms: fewer lanes (auto) means lanes run along the longer dimension.
+    theta_a = theta
+    theta_b = theta + math.pi / 2.0
+    axis = (axis or "auto").strip().lower()
+    if axis in ("dominant", "a"):
+        chosen_angle = theta_a
+    elif axis in ("perpendicular", "perp", "b"):
+        chosen_angle = theta_b
+    else:  # auto
+        lines_a = generate_coverage_lines(reachable, origin, resolution, theta_a,
+                                          spacing_m, min_len_m)
+        lines_b = generate_coverage_lines(reachable, origin, resolution, theta_b,
+                                          spacing_m, min_len_m)
+        count_a = _distinct_line_count(lines_a, theta_a) if lines_a else math.inf
+        count_b = _distinct_line_count(lines_b, theta_b) if lines_b else math.inf
+        chosen_angle = theta_b if count_b < count_a else theta_a
+
+    # Split into rooms (or a single room) and sweep each fully before the next.
+    room_radius = int(round(room_split_erosion_m / resolution)) if resolution > 0 else 0
+    room_labels, n_rooms = segment_rooms(reachable, room_radius)
+    room_ids = [k for k in range(1, n_rooms + 1) if np.any(room_labels == k)]
+    ordered_ids = _order_rooms(room_labels, room_ids, origin, resolution, start_xy)
+
+    segments: List[Segment] = []
+    current_xy = start_xy
+    for k in ordered_ids:
+        room_mask = (room_labels == k) & reachable
+        room_lines = generate_coverage_lines(room_mask, origin, resolution,
+                                             chosen_angle, spacing_m, min_len_m)
+        room_route = order_serpentine(room_lines, chosen_angle, current_xy)
+        if room_route:
+            segments.extend(room_route)
+            current_xy = room_route[-1][1]
+
+    segment_angles = [chosen_angle] * len(segments)
+
+    return {
+        "angle": chosen_angle,
+        "segments": segments,
+        "segment_angles": segment_angles,
+        "reachable": reachable,
+        "line_count": _distinct_line_count(segments, chosen_angle) if segments else 0,
+        "room_count": len(ordered_ids),
+    }
