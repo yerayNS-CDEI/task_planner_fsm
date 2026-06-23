@@ -54,6 +54,11 @@ class ObjectID(State):
 
             # Start camera, Yolo model, and object ID system here, and monitor completion
             node.get_logger().info(f"[{self.name}] Starting object ID system for real robot (not implemented in this example).")
+            
+            start_proc(
+                ctx, "object_id",
+                ["ros2", "launch", "navi_wall", "yolo_object_detection.launch.py"]
+            )
 
     def _start_robot_stack(self, ctx):
         """Launch the navigation/localization stack (Gazebo). Returns True when
@@ -61,9 +66,9 @@ class ObjectID(State):
         node = ctx["node"]
         requested_sim = bool(ctx.get("sim", False))
         planner_backend = str(ctx.get("planner_backend", "legacy")).strip().lower()
-        if not requested_sim:
-            node.get_logger().warn(f"[{self.name}] FSM was started with sim=false, forcing sim:=true for Gazebo navigation launch.")
-        sim_value = "true"
+        # Honour the sim value from the context, same as CreateMap / machine.py
+        # (which build mapping_cmd from ctx.get('sim')). No more forcing sim:=true.
+        sim_value = "true" if requested_sim else "false"
         ## Activacion de la simulación de navegación
         p = ctx.get("_procs", {}).get("nav_sim")
         if p and p.poll() is None:
@@ -116,14 +121,19 @@ class ObjectID(State):
             # Wait until the stack is actually producing data instead of a blind
             # sleep. We gate on topics that are known to exist in this system and
             # that map directly to the symptoms we want to avoid:
-            #   /clock          -> sim time is running
+            #   /clock          -> sim time is running (SIMULATION ONLY)
             #   /tf             -> robot_state_publisher / TF is up (robot model)
             #   /joint_states   -> ros2_control controllers are active
             #   /rtabmap/odom   -> rtabmap odometry is initialized and receiving data
-            required_topics = ctx.get(
-                "stack_ready_topics",
-                ["/clock", "/tf", "/joint_states", "/rtabmap/odom"],
-            )
+            #
+            # /clock is only published when sim time is running, so it must NOT be
+            # required on the real robot — otherwise wait_stack_ready always times
+            # out, _start_robot_stack returns False, and on_enter bails out before
+            # ever launching the object-ID (YOLO) stack.
+            default_ready_topics = ["/tf", "/joint_states", "/rtabmap/odom"]
+            if requested_sim:
+                default_ready_topics = ["/clock"] + default_ready_topics
+            required_topics = ctx.get("stack_ready_topics", default_ready_topics)
             ready_timeout = float(ctx.get("stack_ready_timeout", 90.0))
             node.get_logger().info(
                 f"[{self.name}] Waiting (up to {ready_timeout:.0f}s) for navigation + localization stack to become ready..."
@@ -197,6 +207,14 @@ class ObjectID(State):
 
             # Start camera, Yolo model, and object ID system here, and set up future to monitor completion
             node.get_logger().info(f"[{self.name}] Object ID for real robot not implemented yet.")
+
+    def on_exit(self, ctx):
+        # Stop the object-ID launch (camera/YOLO) when leaving the state. The
+        # navigation stack ("nav_sim") is intentionally left running for the
+        # following states; only the object-ID process is torn down here.
+        node = ctx["node"]
+        node.get_logger().info(f"[{self.name}] Exiting state; stopping the object ID process...")
+        stop_proc(ctx, "object_id", timeout=10.0)
 
     def check_transition(self, ctx):
         if ctx.get("object_id_ready"):
