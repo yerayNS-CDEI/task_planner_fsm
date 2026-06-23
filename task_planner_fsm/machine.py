@@ -13,11 +13,20 @@ class StateMachine:
         self._retried_current_state = False
         self._state_enter_time_monotonic = time.monotonic()
         sim_value = 'true' if self.ctx.get('sim', False) else 'false'
+        # Mapping is now two processes managed by CreateMap: a PERSISTENT
+        # mapping + nav2 stack (mapping_cmd) and a SEPARATE, self-terminating
+        # frontier explorer (explore_cmd). Keeping them separate lets the stack
+        # stay alive after exploration finishes, so CreateMap can drive a second
+        # structured densification sweep before tearing everything down.
         self.ctx.setdefault('mapping_cmd', [
-            'ros2', 'launch', 'navi_wall', 'global_exploration.launch.py',
+            'ros2', 'launch', 'navi_wall', 'mapping_stack.launch.py',
             f'sim:={sim_value}',
             f'use_sim_time:={sim_value}',
             'headless:=true',
+        ])
+        self.ctx.setdefault('explore_cmd', [
+            'ros2', 'launch', 'navi_wall', 'exploration.launch.py',
+            f'use_sim_time:={sim_value}',
         ])
         install_global_cleanup(self.ctx)
         self.current_state.on_enter(self.ctx)

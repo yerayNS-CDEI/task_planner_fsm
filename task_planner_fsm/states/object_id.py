@@ -5,18 +5,23 @@ over the already-inflated nav2 global costmap, so the omnidirectional base
 visits *all* reachable free space once — in clean wall-aligned lanes, without
 doubling back or revisiting — giving YOLO a chance to see objects from short
 range anywhere in the room. The route is published as RViz markers for
-debugging and executed with Nav2's NavigateThroughPoses action.
+debugging and executed with Nav2's NavigateToPose action.
 
-The coverage geometry is reused from ``utils/floor_coverage`` (the same library
-ScanFloor uses): it aligns lanes to the dominant wall angle and splits each lane
-around obstacles, so the plan is structured and revisit-free by construction.
+The coverage geometry and execution are handled by the shared
+``utils/coverage_driver.CoverageDriver`` (it wraps ``utils/floor_coverage``):
+it aligns lanes to the dominant wall angle, splits each lane around obstacles
+and sweeps room-by-room, so the plan is structured and revisit-free by
+construction. ``CreateMap`` uses the same driver for its densification sweep,
+with its OWN parameters, so the two sweeps are tuned independently.
 
 Config is read from ``ctx`` (all keys optional):
+  object_id_sweep_enabled         run the coverage sweep at all (default True)
   object_id_line_spacing_m        lane spacing in metres (default 1.5)
   object_id_max_traversable_cost  costmap cost <= this is drivable (default 65)
   object_id_min_segment_length_m  drop lane runs shorter than this (default 0.5)
-  object_id_obstacle_inflation_m  extra margin on top of the costmap (default 0)
+  object_id_wall_clearance_m      extra margin on top of the costmap (default 0.4)
   object_id_sweep_axis            "auto" | "dominant" | "perpendicular"
+  object_id_room_split_erosion_m  room-by-room split threshold (default 1.3)
   object_id_costmap_topic         default "/global_costmap/costmap"
   object_id_map_topic             raw-map fallback, default "/map"
   object_id_dry_run               plan + markers only, skip base motion
@@ -24,26 +29,14 @@ Config is read from ``ctx`` (all keys optional):
   object_id_yolo_cmd              optional command to launch YOLO
 """
 
-import math
 import shlex
 import socket
 import time
-from typing import List, Optional, Sequence, Tuple
 
-import numpy as np
-import rclpy.time
-from action_msgs.msg import GoalStatus
 from example_interfaces.srv import SetBool
-from geometry_msgs.msg import Point, PoseStamped
-from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
-from nav_msgs.msg import OccupancyGrid
-from rclpy.action import ActionClient
-from rclpy.duration import Duration
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from visualization_msgs.msg import Marker, MarkerArray
 
 from ..state import State
-from ..utils.floor_coverage import build_single_sweep_plan
+from ..utils.coverage_driver import CoverageConfig, CoverageDriver
 from task_planner_fsm.states.proc_utils import (
     start_proc,
     stop_proc,
@@ -61,33 +54,11 @@ class ObjectID(State):
         self.client = None
         self.future = None
 
-        # Navigation/action fields.
-        self.nav_client = None
-        self.use_through_poses = False
-        self._send_goal_future = None
-        self._get_result_future = None
-        self._goal_handle = None
-        self._last_poses_remaining = None
-
-        # Sequential (NavigateToPose) execution state.
-        self.wp_idx = 0
-        self.nav_goal_sent = False
-        self.nav_done = False
-        self.nav_failed = False
-        self.nav_success_count = 0
-
-        # Grid + visualization.
-        self.costmap_sub = None
-        self.map_sub = None
-        self.marker_pub = None
-        self.latest_costmap = None
-        self.latest_map = None
+        # Shared coverage driver (planning + markers + navigation).
+        self.driver = None
 
         self.sim_value = None
         self.phase = "idle"
-        self.grid_wait_start = None
-        self.generated_waypoints: List[PoseStamped] = []
-        self._last_plan_debug = {}
 
     # ------------------------------------------------------------------
     # FSM lifecycle
@@ -98,17 +69,7 @@ class ObjectID(State):
         ctx["object_id_ready"] = False
         ctx["error_triggered"] = False
         self.phase = "starting"
-        self.generated_waypoints = []
-        self._last_plan_debug = {}
-        self._send_goal_future = None
-        self._get_result_future = None
-        self._goal_handle = None
-        self._last_poses_remaining = None
-        self.wp_idx = 0
-        self.nav_goal_sent = False
-        self.nav_done = False
-        self.nav_failed = False
-        self.nav_success_count = 0
+        self.driver = None
 
         if not self._start_robot_stack(ctx):
             self.phase = "error"
@@ -121,64 +82,60 @@ class ObjectID(State):
             self._start_mock_object_id(ctx)
             return
 
-        self._ensure_grid_subscriptions(ctx)
-        self._ensure_marker_publisher(ctx)
         self._start_object_id_detection(ctx)
         self._start_optional_yolo_process(ctx)
 
-        # Default to sequential NavigateToPose: it is robust to a single hard-to-
-        # reach waypoint (it just retries/skips that one), whereas
-        # NavigateThroughPoses fails the whole plan if any pose is unreachable,
-        # which can leave the base stuck mid-route. Opt back in with
-        # object_id_use_nav_through_poses:=True.
-        self.use_through_poses = bool(ctx.get("object_id_use_nav_through_poses", False))
-        if self.use_through_poses:
-            action_type, action_name = NavigateThroughPoses, "/navigate_through_poses"
-        else:
-            action_type, action_name = NavigateToPose, "/navigate_to_pose"
+        # Optionally skip the coverage sweep entirely (e.g. to avoid driving the
+        # whole room twice when CreateMap already ran a densification sweep). YOLO
+        # and the nav stack still come up; the state just transitions through.
+        if not bool(ctx.get("object_id_sweep_enabled", True)):
+            node.get_logger().info(
+                f"[{self.name}] object_id_sweep_enabled=False: skipping coverage sweep."
+            )
+            ctx["object_id_ready"] = True
+            ctx["object_id_data"] = ctx.get("walls_data")
+            self.phase = "done"
+            return
 
-        if self.nav_client is None:
-            self.nav_client = ActionClient(node, action_type, action_name)
-
-        if not bool(ctx.get("object_id_dry_run", False)):
-            node.get_logger().info(f"[{self.name}] Waiting for {action_name} action server...")
-            if not self.nav_client.wait_for_server(timeout_sec=10.0):
-                node.get_logger().error(f"[{self.name}] {action_name} action server not available.")
-                ctx["error_triggered"] = True
-                self.phase = "error"
-                return
+        cfg = self._build_coverage_config(ctx)
+        self.driver = CoverageDriver(node, self.name, cfg)
+        if not self.driver.ensure_io(ctx, wait_for_server_timeout=10.0):
+            ctx["error_triggered"] = True
+            self.phase = "error"
+            return
 
         node.get_logger().info(
-            f"[{self.name}] Coverage planner ready. Preferred grid: "
-            f"{ctx.get('object_id_costmap_topic', '/global_costmap/costmap')} "
-            f"(fallback {ctx.get('object_id_map_topic', '/map')})."
+            f"[{self.name}] Coverage planner ready. Preferred grid: {cfg.costmap_topic} "
+            f"(fallback {cfg.map_topic})."
         )
-        self.grid_wait_start = time.time()
-        self.phase = "waiting_grid"
+        self.driver.begin(ctx)
+        self.phase = "running"
 
     def run(self, ctx):
         if self.phase == "mock_waiting":
             self._run_mock_object_id(ctx)
             return
 
-        if self.phase in {"idle", "error", "done"}:
+        if self.phase in {"idle", "error", "done", "starting"}:
             return
 
-        if self.phase == "waiting_grid":
-            grid_msg, grid_source = self._select_grid_for_planning(ctx)
-            if grid_msg is None:
-                return
-            self._plan_and_execute(ctx, grid_msg, grid_source)
-            return
-
-        if self.phase == "navigating" and not self.use_through_poses:
-            # Sequential mode is driven from run(); through-poses mode is fully
-            # asynchronous via its result callback.
-            self._run_sequential_navigation(ctx)
+        if self.phase == "running" and self.driver is not None:
+            status = self.driver.tick(ctx)
+            # Surface plan results for debugging / downstream once computed.
+            if self.driver.generated_waypoints:
+                ctx["object_id_waypoints"] = self.driver.generated_waypoints
+                ctx["object_id_plan_debug"] = self.driver.last_plan_debug
+            if status == CoverageDriver.DONE:
+                ctx["object_id_ready"] = True
+                ctx["object_id_data"] = ctx.get("walls_data")
+                self.phase = "done"
+            elif status == CoverageDriver.FAILED:
+                ctx["error_triggered"] = True
+                self.phase = "error"
 
     def on_exit(self, ctx):
-        if bool(ctx.get("object_id_clear_markers_on_exit", False)):
-            self._clear_markers(ctx)
+        if self.driver is not None and bool(ctx.get("object_id_clear_markers_on_exit", False)):
+            self.driver.clear_markers()
         # Stop the YOLO object-detection launch when leaving the state. The
         # navigation stack ("nav_sim") is intentionally left running for the
         # following states; only the object-ID process is torn down here. This
@@ -195,155 +152,31 @@ class ObjectID(State):
         return None
 
     # ------------------------------------------------------------------
-    # Planning + execution
+    # Coverage configuration
     # ------------------------------------------------------------------
-    def _plan_and_execute(self, ctx, grid_msg: OccupancyGrid, grid_source: str):
-        node = ctx["node"]
-        node.get_logger().info(f"[{self.name}] Planning coverage route from {grid_source}.")
-
-        waypoints = self._compute_coverage_waypoints(ctx, grid_msg, grid_source)
-        if not waypoints:
-            node.get_logger().error(f"[{self.name}] Could not compute any valid coverage waypoints.")
-            ctx["error_triggered"] = True
-            self.phase = "error"
-            return
-
-        self.generated_waypoints = waypoints
-        ctx["object_id_waypoints"] = waypoints
-        ctx["object_id_plan_debug"] = self._last_plan_debug
-        self._publish_plan_markers(ctx, waypoints)
-
-        node.get_logger().info(
-            f"[{self.name}] Coverage plan: {self._last_plan_debug.get('room_count', 1)} room(s), "
-            f"{self._last_plan_debug.get('line_count', 0)} lane(s) "
-            f"-> {len(waypoints)} waypoint(s), angle "
-            f"{math.degrees(self._last_plan_debug.get('angle', 0.0)):.1f} deg, "
-            f"spacing {self._last_plan_debug.get('line_spacing_m', 0.0):.2f} m, "
-            f"clearance {self._last_plan_debug.get('wall_clearance_m', 0.0):.2f} m."
+    def _build_coverage_config(self, ctx) -> CoverageConfig:
+        return CoverageConfig(
+            costmap_topic=str(ctx.get("object_id_costmap_topic", "/global_costmap/costmap")),
+            map_topic=str(ctx.get("object_id_map_topic", "/map")),
+            allow_map_fallback=bool(ctx.get("object_id_allow_map_fallback", True)),
+            costmap_wait_timeout=float(ctx.get("object_id_costmap_wait_timeout", 10.0)),
+            line_spacing_m=float(ctx.get("object_id_line_spacing_m", 1.5)),
+            min_segment_length_m=float(ctx.get("object_id_min_segment_length_m", 0.5)),
+            wall_clearance_m=float(ctx.get("object_id_wall_clearance_m", 0.4)),
+            axis=str(ctx.get("object_id_sweep_axis", "auto")),
+            room_split_erosion_m=float(ctx.get("object_id_room_split_erosion_m", 1.3)),
+            max_traversable_cost=int(ctx.get("object_id_max_traversable_cost", 65)),
+            map_occupied_threshold=int(ctx.get("object_id_map_occupied_threshold", 50)),
+            dry_run=bool(ctx.get("object_id_dry_run", False)),
+            # Default to sequential NavigateToPose: it is robust to a single
+            # hard-to-reach waypoint (it just retries/skips that one), whereas
+            # NavigateThroughPoses fails the whole plan if any pose is
+            # unreachable. Opt back in with object_id_use_nav_through_poses:=True.
+            use_through_poses=bool(ctx.get("object_id_use_nav_through_poses", False)),
+            marker_topic="/object_id/coverage_markers",
+            marker_namespace="object_id",
+            show_heading_arrows=bool(ctx.get("object_id_show_heading_arrows", False)),
         )
-
-        if bool(ctx.get("object_id_dry_run", False)):
-            node.get_logger().warn(
-                f"[{self.name}] dry_run: markers published, skipping base motion. "
-                f"Inspect /object_id/coverage_markers in RViz."
-            )
-            ctx["object_id_ready"] = True
-            self.phase = "done"
-            return
-
-        self.wp_idx = 0
-        self.nav_goal_sent = False
-        self.nav_done = False
-        self.nav_failed = False
-        self.nav_success_count = 0
-        if self.use_through_poses:
-            self._send_navigate_through_poses_goal(ctx, waypoints)
-        self.phase = "navigating"
-
-    def _compute_coverage_waypoints(
-        self, ctx, grid_msg: OccupancyGrid, grid_source: str
-    ) -> List[PoseStamped]:
-        node = ctx["node"]
-        info = grid_msg.info
-        resolution = float(info.resolution)
-        width = int(info.width)
-        height = int(info.height)
-        if width <= 0 or height <= 0 or resolution <= 0.0:
-            node.get_logger().error(f"[{self.name}] Invalid occupancy grid metadata.")
-            return []
-
-        grid = np.asarray(grid_msg.data, dtype=np.int16).reshape((height, width))
-        origin = (float(info.origin.position.x), float(info.origin.position.y))
-
-        # A raw /map (0/100/-1) needs a low threshold; an inflated costmap can use
-        # a higher one so lanes get as close to the walls as the base safely can.
-        is_costmap = "costmap" in grid_source.lower()
-        if is_costmap:
-            max_cost = int(ctx.get("object_id_max_traversable_cost", 65))
-        else:
-            max_cost = int(ctx.get("object_id_map_occupied_threshold", 50)) - 1
-
-        spacing_m = float(ctx.get("object_id_line_spacing_m", 1.5))
-        min_len_m = float(ctx.get("object_id_min_segment_length_m", 0.5))
-        # Extra clearance on top of the costmap inflation: keeps lane endpoints
-        # in free space instead of right up against the walls/obstacles.
-        inflation_m = float(ctx.get("object_id_wall_clearance_m", 0.4))
-        axis = str(ctx.get("object_id_sweep_axis", "auto"))
-        # Split rooms wherever a passage is narrower than ~2x this; each room is
-        # fully swept before the next, so the base does not shuttle between them.
-        room_split_m = float(ctx.get("object_id_room_split_erosion_m", 1.3))
-
-        start_r, start_c = self._get_start_cell(ctx, info, origin, resolution)
-
-        plan = build_single_sweep_plan(
-            grid, origin, resolution, (start_r, start_c),
-            spacing_m=spacing_m,
-            inflation_m=inflation_m,
-            min_len_m=min_len_m,
-            max_cost=max_cost,
-            axis=axis,
-            room_split_erosion_m=room_split_m,
-        )
-        segments = plan.get("segments", [])
-        if not segments:
-            node.get_logger().error(
-                f"[{self.name}] No coverage lanes generated (grid empty or fully blocked)."
-            )
-            return []
-
-        points = self._segments_to_points(segments)
-        if len(points) < 1:
-            return []
-
-        # Face the direction of travel; the final pose keeps the previous heading.
-        waypoints = []
-        last_yaw = 0.0
-        for idx, (x, y) in enumerate(points):
-            nxt = points[idx + 1] if idx + 1 < len(points) else None
-            yaw = self._heading_to(x, y, nxt) if nxt is not None else last_yaw
-            last_yaw = yaw
-            waypoints.append(self._make_pose_stamped(ctx, x, y, float(yaw)))
-
-        self._last_plan_debug = {
-            "route_strategy": "single_sweep",
-            "angle": float(plan.get("angle", 0.0)),
-            "line_count": int(plan.get("line_count", 0)),
-            "room_count": int(plan.get("room_count", 1)),
-            "segment_count": len(segments),
-            "waypoint_count": len(waypoints),
-            "line_spacing_m": spacing_m,
-            "wall_clearance_m": inflation_m,
-            "max_traversable_cost": max_cost,
-        }
-        return waypoints
-
-    @staticmethod
-    def _segments_to_points(
-        segments: Sequence[Tuple[Tuple[float, float], Tuple[float, float]]]
-    ) -> List[Tuple[float, float]]:
-        """Flatten ordered lane segments into a deduplicated waypoint sequence."""
-        points: List[Tuple[float, float]] = []
-        for p0, p1 in segments:
-            for p in (p0, p1):
-                if not points or math.hypot(points[-1][0] - p[0], points[-1][1] - p[1]) > 1e-6:
-                    points.append((float(p[0]), float(p[1])))
-        return points
-
-    def _get_start_cell(self, ctx, info, origin, resolution) -> Tuple[int, int]:
-        """Robot start cell (row, col), from odom/base_position, TF, or map centre."""
-        base = ctx.get("base_position")
-        if base is not None:
-            c = int((float(base.x) - origin[0]) / resolution)
-            r = int((float(base.y) - origin[1]) / resolution)
-            return r, c
-
-        xy = self._get_current_robot_xy(ctx)
-        if xy is not None:
-            c = int((xy[0] - origin[0]) / resolution)
-            r = int((xy[1] - origin[1]) / resolution)
-            return r, c
-
-        return int(info.height) // 2, int(info.width) // 2
 
     # ------------------------------------------------------------------
     # Stack and optional process setup
@@ -534,421 +367,3 @@ class ObjectID(State):
                 ctx["error_triggered"] = True
                 self.phase = "error"
             self.future = None
-
-    # ------------------------------------------------------------------
-    # Grid subscriptions
-    # ------------------------------------------------------------------
-    def _ensure_grid_subscriptions(self, ctx):
-        node = ctx["node"]
-        costmap_topic = ctx.get("object_id_costmap_topic", "/global_costmap/costmap")
-        map_topic = ctx.get("object_id_map_topic", "/map")
-
-        if self.costmap_sub is None:
-            costmap_qos = QoSProfile(depth=1)
-            costmap_qos.reliability = ReliabilityPolicy.RELIABLE
-            costmap_qos.durability = DurabilityPolicy.VOLATILE
-            self.costmap_sub = node.create_subscription(
-                OccupancyGrid, costmap_topic, self._costmap_callback, costmap_qos
-            )
-
-        if self.map_sub is None:
-            map_qos = QoSProfile(depth=1)
-            map_qos.reliability = ReliabilityPolicy.RELIABLE
-            map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-            self.map_sub = node.create_subscription(
-                OccupancyGrid, map_topic, self._map_callback, map_qos
-            )
-
-    def _costmap_callback(self, msg):
-        self.latest_costmap = msg
-
-    def _map_callback(self, msg):
-        self.latest_map = msg
-
-    def _select_grid_for_planning(self, ctx) -> Tuple[Optional[OccupancyGrid], Optional[str]]:
-        node = ctx["node"]
-        costmap_timeout = float(ctx.get("object_id_costmap_wait_timeout", 10.0))
-        allow_map_fallback = bool(ctx.get("object_id_allow_map_fallback", True))
-
-        if self.latest_costmap is not None:
-            return self.latest_costmap, str(ctx.get("object_id_costmap_topic", "/global_costmap/costmap"))
-
-        elapsed = time.time() - float(self.grid_wait_start or time.time())
-        if elapsed < costmap_timeout:
-            if int(elapsed) in {0, 3, 6, 9}:
-                node.get_logger().info(
-                    f"[{self.name}] Waiting for inflated global costmap "
-                    f"({elapsed:.1f}/{costmap_timeout:.1f}s)..."
-                )
-            return None, None
-
-        if allow_map_fallback and self.latest_map is not None:
-            node.get_logger().warn(
-                f"[{self.name}] Costmap not received after {costmap_timeout:.1f}s. "
-                f"Falling back to /map (no inflation; lanes stay further from walls)."
-            )
-            return self.latest_map, str(ctx.get("object_id_map_topic", "/map"))
-
-        if int(elapsed) % 5 == 0:
-            node.get_logger().warn(f"[{self.name}] Still waiting for costmap/map grid...")
-        return None, None
-
-    # ------------------------------------------------------------------
-    # Sequential NavigateToPose execution (default, robust)
-    # ------------------------------------------------------------------
-    def _run_sequential_navigation(self, ctx):
-        node = ctx["node"]
-        waypoints = self.generated_waypoints
-        total = len(waypoints)
-
-        if self.wp_idx >= total:
-            node.get_logger().info(
-                f"[{self.name}] Coverage route completed "
-                f"({self.nav_success_count}/{total} waypoints reached)."
-            )
-            ctx["object_id_ready"] = True
-            ctx["object_id_data"] = ctx.get("walls_data")
-            self.phase = "done"
-            return
-
-        if not self.nav_goal_sent:
-            self._send_nav_to_pose_goal(ctx, waypoints[self.wp_idx])
-            return
-
-        if self.nav_done:
-            reached = self.wp_idx + 1
-            if self.nav_failed:
-                node.get_logger().warn(
-                    f"[{self.name}] Coverage: waypoint {reached}/{total} not reached; skipping it."
-                )
-            else:
-                self.nav_success_count += 1
-                node.get_logger().info(
-                    f"[{self.name}] Coverage: reached waypoint {reached}/{total}, "
-                    f"{total - reached} remaining."
-                )
-            self.wp_idx += 1
-            self.nav_goal_sent = False
-            self.nav_done = False
-            self.nav_failed = False
-
-    def _send_nav_to_pose_goal(self, ctx, pose: PoseStamped):
-        node = ctx["node"]
-        if self.nav_client is None:
-            node.get_logger().error(f"[{self.name}] NavigateToPose client is missing.")
-            ctx["error_triggered"] = True
-            self.phase = "error"
-            return
-
-        pose.header.stamp = node.get_clock().now().to_msg()
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = pose
-
-        self.nav_done = False
-        self.nav_failed = False
-        self.nav_goal_sent = True
-        self._send_goal_future = self.nav_client.send_goal_async(goal_msg)
-        self._send_goal_future.add_done_callback(
-            lambda fut: self._nav_to_pose_response_callback(ctx, fut)
-        )
-
-    def _nav_to_pose_response_callback(self, ctx, future):
-        node = ctx["node"]
-        try:
-            goal_handle = future.result()
-        except Exception as e:
-            node.get_logger().warn(f"[{self.name}] NavigateToPose goal request failed: {e}")
-            self.nav_failed = True
-            self.nav_done = True
-            return
-
-        if not goal_handle.accepted:
-            node.get_logger().warn(f"[{self.name}] NavigateToPose goal rejected.")
-            self.nav_failed = True
-            self.nav_done = True
-            return
-
-        self._goal_handle = goal_handle
-        self._get_result_future = goal_handle.get_result_async()
-        self._get_result_future.add_done_callback(
-            lambda fut: self._nav_to_pose_result_callback(ctx, fut)
-        )
-
-    def _nav_to_pose_result_callback(self, ctx, future):
-        node = ctx["node"]
-        try:
-            status = int(future.result().status)
-        except Exception as e:
-            node.get_logger().warn(f"[{self.name}] NavigateToPose result failed: {e}")
-            self.nav_failed = True
-            self.nav_done = True
-            return
-        if status != GoalStatus.STATUS_SUCCEEDED:
-            self.nav_failed = True
-        self.nav_done = True
-
-    # ------------------------------------------------------------------
-    # Nav2 action execution (legacy NavigateThroughPoses, opt-in)
-    # ------------------------------------------------------------------
-    def _send_navigate_through_poses_goal(self, ctx, waypoints: Sequence[PoseStamped]):
-        node = ctx["node"]
-        if self.nav_client is None:
-            node.get_logger().error(f"[{self.name}] NavigateThroughPoses client is missing.")
-            ctx["error_triggered"] = True
-            self.phase = "error"
-            return
-
-        now = node.get_clock().now().to_msg()
-        for pose in waypoints:
-            pose.header.stamp = now
-
-        goal_msg = NavigateThroughPoses.Goal()
-        if hasattr(goal_msg, "poses"):
-            goal_msg.poses = list(waypoints)
-        elif hasattr(goal_msg, "goals") and hasattr(goal_msg.goals, "poses"):
-            goal_msg.goals.poses = list(waypoints)
-        else:
-            node.get_logger().error(
-                f"[{self.name}] Unsupported NavigateThroughPoses goal layout in this Nav2 version."
-            )
-            ctx["error_triggered"] = True
-            self.phase = "error"
-            return
-
-        node.get_logger().info(f"[{self.name}] Sending NavigateThroughPoses goal with {len(waypoints)} poses.")
-        self._send_goal_future = self.nav_client.send_goal_async(
-            goal_msg,
-            feedback_callback=lambda feedback: self._navigation_feedback_callback(ctx, feedback),
-        )
-        self._send_goal_future.add_done_callback(lambda fut: self._navigation_goal_response_callback(ctx, fut))
-
-    def _navigation_goal_response_callback(self, ctx, future):
-        node = ctx["node"]
-        try:
-            goal_handle = future.result()
-        except Exception as e:
-            node.get_logger().error(f"[{self.name}] NavigateThroughPoses goal request failed: {e}")
-            ctx["error_triggered"] = True
-            self.phase = "error"
-            return
-
-        if not goal_handle.accepted:
-            node.get_logger().error(f"[{self.name}] NavigateThroughPoses goal was rejected.")
-            ctx["error_triggered"] = True
-            self.phase = "error"
-            return
-
-        node.get_logger().info(f"[{self.name}] NavigateThroughPoses goal accepted.")
-        self._goal_handle = goal_handle
-        self._get_result_future = goal_handle.get_result_async()
-        self._get_result_future.add_done_callback(lambda fut: self._navigation_result_callback(ctx, fut))
-
-    def _navigation_feedback_callback(self, ctx, feedback_msg):
-        node = ctx["node"]
-        feedback = feedback_msg.feedback
-        poses_remaining = getattr(feedback, "number_of_poses_remaining", None)
-        distance_remaining = getattr(feedback, "distance_remaining", None)
-        if poses_remaining is None:
-            return
-
-        # Feedback arrives continuously; only log when a waypoint is actually
-        # reached, i.e. when the remaining-pose count drops.
-        if self._last_poses_remaining is not None and poses_remaining >= self._last_poses_remaining:
-            return
-        self._last_poses_remaining = poses_remaining
-
-        if distance_remaining is not None:
-            node.get_logger().info(
-                f"[{self.name}] Coverage: {poses_remaining} poses remaining, "
-                f"{distance_remaining:.2f} m remaining."
-            )
-        else:
-            node.get_logger().info(
-                f"[{self.name}] Coverage: {poses_remaining} poses remaining."
-            )
-
-    def _navigation_result_callback(self, ctx, future):
-        node = ctx["node"]
-        try:
-            result_msg = future.result()
-            status = int(result_msg.status)
-        except Exception as e:
-            node.get_logger().error(f"[{self.name}] NavigateThroughPoses result failed: {e}")
-            ctx["error_triggered"] = True
-            self.phase = "error"
-            return
-
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            node.get_logger().info(f"[{self.name}] Coverage route completed successfully.")
-            ctx["object_id_ready"] = True
-            ctx["object_id_data"] = ctx.get("walls_data")
-            self.phase = "done"
-        else:
-            node.get_logger().error(f"[{self.name}] Coverage navigation failed with status {status}.")
-            ctx["error_triggered"] = True
-            self.phase = "error"
-
-    # ------------------------------------------------------------------
-    # RViz markers
-    # ------------------------------------------------------------------
-    def _ensure_marker_publisher(self, ctx):
-        node = ctx["node"]
-        if self.marker_pub is None:
-            marker_qos = QoSProfile(depth=1)
-            marker_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-            self.marker_pub = node.create_publisher(
-                MarkerArray, "/object_id/coverage_markers", marker_qos
-            )
-
-    def _clear_markers(self, ctx):
-        if self.marker_pub is None:
-            return
-        marker = Marker()
-        marker.action = Marker.DELETEALL
-        self.marker_pub.publish(MarkerArray(markers=[marker]))
-
-    def _publish_plan_markers(self, ctx, waypoints: Sequence[PoseStamped]):
-        node = ctx["node"]
-        if self.marker_pub is None:
-            return
-
-        markers = []
-        delete_marker = Marker()
-        delete_marker.action = Marker.DELETEALL
-        markers.append(delete_marker)
-
-        frame_id = "map"
-        stamp = node.get_clock().now().to_msg()
-
-        # Route line through the ordered waypoints.
-        route_marker = Marker()
-        route_marker.header.frame_id = frame_id
-        route_marker.header.stamp = stamp
-        route_marker.ns = "object_id_route"
-        route_marker.id = 1
-        route_marker.type = Marker.LINE_STRIP
-        route_marker.action = Marker.ADD
-        route_marker.scale.x = 0.05
-        route_marker.color.r = 0.0
-        route_marker.color.g = 1.0
-        route_marker.color.b = 0.2
-        route_marker.color.a = 0.9
-        route_marker.pose.orientation.w = 1.0
-        for pose in waypoints:
-            route_marker.points.append(Point(x=pose.pose.position.x, y=pose.pose.position.y, z=0.05))
-        markers.append(route_marker)
-
-        # Waypoint spheres.
-        waypoint_marker = Marker()
-        waypoint_marker.header.frame_id = frame_id
-        waypoint_marker.header.stamp = stamp
-        waypoint_marker.ns = "object_id_waypoints"
-        waypoint_marker.id = 0
-        waypoint_marker.type = Marker.SPHERE_LIST
-        waypoint_marker.action = Marker.ADD
-        waypoint_marker.scale.x = 0.16
-        waypoint_marker.scale.y = 0.16
-        waypoint_marker.scale.z = 0.16
-        waypoint_marker.color.r = 0.1
-        waypoint_marker.color.g = 0.8
-        waypoint_marker.color.b = 1.0
-        waypoint_marker.color.a = 0.95
-        waypoint_marker.pose.orientation.w = 1.0
-        for pose in waypoints:
-            waypoint_marker.points.append(Point(x=pose.pose.position.x, y=pose.pose.position.y, z=0.08))
-        markers.append(waypoint_marker)
-
-        # Heading arrows (the yellow ones) show the base yaw at each goal. Off by
-        # default; enable with object_id_show_heading_arrows:=True.
-        show_arrows = bool(ctx.get("object_id_show_heading_arrows", False))
-
-        # Orientation arrows and numeric labels.
-        for idx, pose in enumerate(waypoints):
-            if show_arrows:
-                yaw = self._yaw_from_quaternion(pose.pose.orientation)
-                arrow = Marker()
-                arrow.header.frame_id = frame_id
-                arrow.header.stamp = stamp
-                arrow.ns = "object_id_yaw"
-                arrow.id = 1000 + idx
-                arrow.type = Marker.ARROW
-                arrow.action = Marker.ADD
-                arrow.scale.x = 0.4
-                arrow.scale.y = 0.06
-                arrow.scale.z = 0.06
-                arrow.color.r = 1.0
-                arrow.color.g = 0.7
-                arrow.color.b = 0.1
-                arrow.color.a = 0.95
-                arrow.pose.orientation.w = 1.0
-                start = Point(x=pose.pose.position.x, y=pose.pose.position.y, z=0.12)
-                end = Point(
-                    x=pose.pose.position.x + 0.4 * math.cos(yaw),
-                    y=pose.pose.position.y + 0.4 * math.sin(yaw),
-                    z=0.12,
-                )
-                arrow.points = [start, end]
-                markers.append(arrow)
-
-            text = Marker()
-            text.header.frame_id = frame_id
-            text.header.stamp = stamp
-            text.ns = "object_id_labels"
-            text.id = 2000 + idx
-            text.type = Marker.TEXT_VIEW_FACING
-            text.action = Marker.ADD
-            text.pose.position.x = pose.pose.position.x
-            text.pose.position.y = pose.pose.position.y
-            text.pose.position.z = 0.4
-            text.pose.orientation.w = 1.0
-            text.scale.z = 0.2
-            text.color.r = 1.0
-            text.color.g = 1.0
-            text.color.b = 1.0
-            text.color.a = 0.95
-            text.text = str(idx + 1)
-            markers.append(text)
-
-        self.marker_pub.publish(MarkerArray(markers=markers))
-        node.get_logger().info(
-            f"[{self.name}] Published coverage markers on /object_id/coverage_markers."
-        )
-
-    # ------------------------------------------------------------------
-    # Geometry / transforms
-    # ------------------------------------------------------------------
-    def _get_current_robot_xy(self, ctx) -> Optional[Tuple[float, float]]:
-        tf_buffer = ctx.get("tf_buffer")
-        if tf_buffer is None:
-            return None
-        for base_frame in ("base_link", "base_footprint", "turret_footprint", "base", "chassis"):
-            try:
-                if tf_buffer.can_transform("map", base_frame, rclpy.time.Time(), Duration(seconds=0.2)):
-                    tf = tf_buffer.lookup_transform("map", base_frame, rclpy.time.Time(), Duration(seconds=0.5))
-                    return float(tf.transform.translation.x), float(tf.transform.translation.y)
-            except Exception:
-                continue
-        return None
-
-    def _make_pose_stamped(self, ctx, x: float, y: float, yaw: float) -> PoseStamped:
-        node = ctx["node"]
-        pose = PoseStamped()
-        pose.header.frame_id = "map"
-        pose.header.stamp = node.get_clock().now().to_msg()
-        pose.pose.position.x = float(x)
-        pose.pose.position.y = float(y)
-        pose.pose.position.z = 0.0
-        pose.pose.orientation.z = math.sin(yaw / 2.0)
-        pose.pose.orientation.w = math.cos(yaw / 2.0)
-        return pose
-
-    @staticmethod
-    def _heading_to(x: float, y: float, target: Optional[Tuple[float, float]]) -> float:
-        if target is None:
-            return 0.0
-        return math.atan2(target[1] - y, target[0] - x)
-
-    def _yaw_from_quaternion(self, q) -> float:
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        return math.atan2(siny_cosp, cosy_cosp)
