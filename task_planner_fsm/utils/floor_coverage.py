@@ -23,6 +23,11 @@ try:  # SciPy is already a project dependency (see arm_control), but stay gracef
 except Exception:  # pragma: no cover - exercised only when SciPy is absent.
     _ndimage = None
 
+try:  # OpenCV ships with the YOLO/perception stack; used for contour tracing.
+    import cv2 as _cv2
+except Exception:  # pragma: no cover - exercised only when OpenCV is absent.
+    _cv2 = None
+
 Point2 = Tuple[float, float]
 Segment = Tuple[Point2, Point2]
 
@@ -660,5 +665,250 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
         "segment_angles": segment_angles,
         "reachable": reachable,
         "line_count": _distinct_line_count(segments, chosen_angle) if segments else 0,
+        "room_count": len(ordered_ids),
+    }
+
+
+# ----------------------------------------------------------------------------
+# Perimeter (wall-following) coverage
+# ----------------------------------------------------------------------------
+def _outer_contour_cells(mask: np.ndarray) -> List[Tuple[int, int]]:
+    """Ordered ``(row, col)`` cells tracing the outer boundary of ``mask``.
+
+    Uses OpenCV's contour tracer when available (clean, ordered, handles the
+    longest boundary), and a pure-numpy Moore-neighbour walk as a fallback.
+    Only the outer boundary is returned; interior holes (columns) are ignored,
+    which is what a single perimeter lap wants.
+    """
+    if not mask.any():
+        return []
+    m = mask.astype(np.uint8)
+    if _cv2 is not None:
+        contours, _ = _cv2.findContours(m, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return []
+        cnt = max(contours, key=_cv2.contourArea)
+        # OpenCV points are (x=col, y=row); return (row, col).
+        return [(int(p[0][1]), int(p[0][0])) for p in cnt]
+    return _trace_boundary_moore(mask)
+
+
+def _trace_boundary_moore(mask: np.ndarray) -> List[Tuple[int, int]]:
+    """Moore-neighbour boundary trace (clockwise) with Jacob's stopping rule."""
+    rows, cols = mask.shape
+    idx = np.argwhere(mask)
+    if idx.size == 0:
+        return []
+    # Start at the topmost, then leftmost, foreground cell.
+    order = np.lexsort((idx[:, 1], idx[:, 0]))
+    start = (int(idx[order[0], 0]), int(idx[order[0], 1]))
+
+    def is_fg(r, c):
+        return 0 <= r < rows and 0 <= c < cols and bool(mask[r, c])
+
+    # Clockwise Moore neighbourhood offsets, starting from "west".
+    nbrs = [(0, -1), (-1, -1), (-1, 0), (-1, 1),
+            (0, 1), (1, 1), (1, 0), (1, -1)]
+    boundary = [start]
+    cur = start
+    back_dir = 0  # came from the west of the start
+    max_steps = 8 * int(mask.sum()) + 8
+    for _ in range(max_steps):
+        found = False
+        for k in range(8):
+            d = (back_dir + 1 + k) % 8
+            nr, nc = cur[0] + nbrs[d][0], cur[1] + nbrs[d][1]
+            if is_fg(nr, nc):
+                # New backtrack direction points from the neighbour back to cur.
+                back_dir = (d + 4) % 8
+                cur = (nr, nc)
+                found = True
+                break
+        if not found:
+            break
+        if cur == start and len(boundary) > 2:
+            break
+        boundary.append(cur)
+    return boundary
+
+
+def _resample_contour(contour_rc: Sequence[Tuple[int, int]], spacing_m: float,
+                      resolution: float, rows: int, cols: int
+                      ) -> List[Tuple[int, int]]:
+    """Resample a closed contour to roughly ``spacing_m``-spaced ``(row, col)`` cells."""
+    if len(contour_rc) < 3:
+        return [tuple(map(int, p)) for p in contour_rc]
+    spacing_cells = max(1.0, spacing_m / resolution) if resolution > 0 else 1.0
+    pts = np.asarray(contour_rc, dtype=float)
+    closed = np.vstack([pts, pts[0]])
+    seg = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    if total <= 0.0:
+        return [tuple(map(int, contour_rc[0]))]
+    n = max(3, int(round(total / spacing_cells)))
+    targets = np.linspace(0.0, total, n, endpoint=False)
+    out: List[Tuple[int, int]] = []
+    j = 0
+    for t in targets:
+        while j + 1 < len(cum) and cum[j + 1] < t:
+            j += 1
+        seg_len = cum[j + 1] - cum[j]
+        frac = 0.0 if seg_len <= 0.0 else (t - cum[j]) / seg_len
+        p = closed[j] * (1.0 - frac) + closed[j + 1] * frac
+        r = min(max(int(round(p[0])), 0), rows - 1)
+        c = min(max(int(round(p[1])), 0), cols - 1)
+        if not out or (r, c) != out[-1]:
+            out.append((r, c))
+    return out
+
+
+def _inward_headings(loop_rc: Sequence[Tuple[int, int]], mask: np.ndarray
+                     ) -> List[float]:
+    """Yaw (rad) facing the room interior at each boundary cell.
+
+    The interior direction is the gradient of the distance transform of the
+    free region (distance grows toward the room centre), lightly smoothed so the
+    normal is stable along straight walls and rounds corners gracefully. Falls
+    back to "point at the region centroid" when SciPy is unavailable or the
+    gradient vanishes.
+    """
+    rows, cols = mask.shape
+    idx = np.argwhere(mask)
+    cen_r = float(idx[:, 0].mean()) if idx.size else 0.0
+    cen_c = float(idx[:, 1].mean()) if idx.size else 0.0
+
+    grad_y = grad_x = None
+    if _ndimage is not None:
+        dist = _ndimage.distance_transform_edt(mask)
+        dist = _ndimage.gaussian_filter(dist, sigma=2.0)
+        grad_y, grad_x = np.gradient(dist)  # d/drow (+y), d/dcol (+x)
+
+    headings: List[float] = []
+    for r, c in loop_rc:
+        r = min(max(int(r), 0), rows - 1)
+        c = min(max(int(c), 0), cols - 1)
+        if grad_x is not None:
+            vx = float(grad_x[r, c])
+            vy = float(grad_y[r, c])
+        else:
+            vx = vy = 0.0
+        if math.hypot(vx, vy) < 1e-6:
+            vx, vy = cen_c - c, cen_r - r  # point at centroid
+        headings.append(math.atan2(vy, vx))
+    return headings
+
+
+def _rotate_loop_to_nearest(loop_rc: List[Tuple[int, int]], ref_xy: Point2,
+                            origin: Point2, resolution: float
+                            ) -> List[Tuple[int, int]]:
+    """Rotate a closed loop so it starts at the cell nearest ``ref_xy``."""
+    if not loop_rc:
+        return loop_rc
+    rx, ry = ref_xy
+    best_i, best_d = 0, math.inf
+    for i, (r, c) in enumerate(loop_rc):
+        x = origin[0] + (c + 0.5) * resolution
+        y = origin[1] + (r + 0.5) * resolution
+        d = (x - rx) ** 2 + (y - ry) ** 2
+        if d < best_d:
+            best_i, best_d = i, d
+    return loop_rc[best_i:] + loop_rc[:best_i]
+
+
+def build_perimeter_plan(grid: np.ndarray, origin: Point2, resolution: float,
+                         start_cell: Tuple[int, int], *, spacing_m: float,
+                         inflation_m: float, max_cost: int = _DEFAULT_MAX_COST,
+                         angle: Optional[float] = None,
+                         room_split_erosion_m: float = 0.0,
+                         min_loop_len_m: float = 1.5) -> dict:
+    """Single wall-following lap of the reachable free region's boundary.
+
+    Instead of slicing the room into parallel lanes (see
+    :func:`build_single_sweep_plan`), this traces ONE loop along the costmap
+    edge — i.e. just inside the walls and inflation layer — and orients the base
+    to face the room interior at every waypoint, so a forward-facing camera looks
+    across the open space (long range) rather than at the adjacent wall.
+
+    The drive ring keeps clear of the walls by the costmap's own inflation plus
+    the optional extra ``inflation_m`` margin (raise it to stand further off the
+    wall). ``spacing_m`` is the along-loop waypoint spacing. With
+    ``room_split_erosion_m`` > 0 each room is lapped separately (nearest-first),
+    so the base does not weave between rooms through a doorway.
+
+    Coverage is the perimeter only: a single lap does NOT visit the centre of a
+    room wider than ~2x the camera range. Use it for corridors / narrow spaces,
+    or combine with a serpentine for large halls. ``start_cell`` is ``(row, col)``.
+
+    Returns ``{angle, waypoints, segments, reachable, loop_count, room_count}``
+    where ``waypoints`` is an ordered list of ``(x, y, yaw)`` (yaw faces the
+    interior) and ``segments`` are consecutive point pairs for marker reuse.
+    """
+    theta = dominant_wall_angle(grid) if angle is None else (angle % (math.pi / 2.0))
+
+    blocked = blocked_mask(grid, max_cost)
+    radius_cells = int(round(inflation_m / resolution)) if resolution > 0 else 0
+    inflated = inflate_obstacles(blocked, radius_cells)
+
+    free = free_mask(grid, max_cost) & ~inflated
+    reachable = reachable_free_mask(free, start_cell)
+    rows, cols = reachable.shape
+
+    start_xy = (
+        origin[0] + (start_cell[1] + 0.5) * resolution,
+        origin[1] + (start_cell[0] + 0.5) * resolution,
+    )
+
+    room_radius = int(round(room_split_erosion_m / resolution)) if resolution > 0 else 0
+    room_labels, n_rooms = segment_rooms(reachable, room_radius)
+    room_ids = [k for k in range(1, n_rooms + 1) if np.any(room_labels == k)]
+    ordered_ids = _order_rooms(room_labels, room_ids, origin, resolution, start_xy)
+
+    waypoints: List[Tuple[float, float, float]] = []
+    segments: List[Segment] = []
+    current_xy = start_xy
+    loop_count = 0
+
+    for k in ordered_ids:
+        room_mask = (room_labels == k) & reachable
+        contour_rc = _outer_contour_cells(room_mask)
+        if len(contour_rc) < 3:
+            continue
+        loop_rc = _resample_contour(contour_rc, spacing_m, resolution, rows, cols)
+        if len(loop_rc) < 3:
+            continue
+        # Drop tiny loops (slivers / noise) below the minimum lap length.
+        perim_m = sum(
+            math.hypot(loop_rc[i][0] - loop_rc[i - 1][0], loop_rc[i][1] - loop_rc[i - 1][1])
+            for i in range(len(loop_rc))
+        ) * resolution
+        if perim_m < min_loop_len_m:
+            continue
+
+        loop_rc = _rotate_loop_to_nearest(loop_rc, current_xy, origin, resolution)
+        headings = _inward_headings(loop_rc, room_mask)
+
+        # Close the lap by returning to the entry cell.
+        loop_rc_closed = loop_rc + [loop_rc[0]]
+        headings_closed = headings + [headings[0]]
+
+        pts_xy = [
+            (origin[0] + (c + 0.5) * resolution, origin[1] + (r + 0.5) * resolution)
+            for r, c in loop_rc_closed
+        ]
+        for (x, y), h in zip(pts_xy, headings_closed):
+            waypoints.append((float(x), float(y), float(h)))
+        for i in range(len(pts_xy) - 1):
+            segments.append((pts_xy[i], pts_xy[i + 1]))
+
+        current_xy = pts_xy[-1]
+        loop_count += 1
+
+    return {
+        "angle": theta,
+        "waypoints": waypoints,
+        "segments": segments,
+        "reachable": reachable,
+        "loop_count": loop_count,
         "room_count": len(ordered_ids),
     }

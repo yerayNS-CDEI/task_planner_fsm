@@ -11,8 +11,20 @@ The coverage geometry is reused from ``utils/floor_coverage`` (the same library
 ScanFloor uses): it aligns lanes to the dominant wall angle and splits each lane
 around obstacles, so the plan is structured and revisit-free by construction.
 
+Two route strategies are available via ``object_id_route_strategy``:
+  "serpent" (default)  a single boustrophedon sweep of all free space (lawnmower
+                       lanes); covers everywhere but stays mid-room.
+  "perimeter"          a single wall-following lap along the costmap edge, with
+                       the base facing the room interior so the camera looks
+                       across the open space (long range). Fast; best for
+                       corridors / narrow rooms. A lone lap does not visit the
+                       centre of a hall wider than ~2x camera range.
+
 Config is read from ``ctx`` (all keys optional):
+  object_id_route_strategy        "serpent" (default) | "perimeter"
   object_id_line_spacing_m        lane spacing in metres (default 1.5)
+  object_id_perimeter_spacing_m   along-lap waypoint spacing (default: line spacing)
+  object_id_perimeter_min_loop_m  drop perimeter loops shorter than this (default 1.5)
   object_id_max_traversable_cost  costmap cost <= this is drivable (default 65)
   object_id_min_segment_length_m  drop lane runs shorter than this (default 0.5)
   object_id_obstacle_inflation_m  extra margin on top of the costmap (default 0)
@@ -43,7 +55,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from visualization_msgs.msg import Marker, MarkerArray
 
 from ..state import State
-from ..utils.floor_coverage import build_single_sweep_plan
+from ..utils.floor_coverage import build_perimeter_plan, build_single_sweep_plan
 from task_planner_fsm.states.proc_utils import (
     start_proc,
     stop_proc,
@@ -267,13 +279,20 @@ class ObjectID(State):
         min_len_m = float(ctx.get("object_id_min_segment_length_m", 0.5))
         # Extra clearance on top of the costmap inflation: keeps lane endpoints
         # in free space instead of right up against the walls/obstacles.
-        inflation_m = float(ctx.get("object_id_wall_clearance_m", 0.4))
+        inflation_m = float(ctx.get("object_id_wall_clearance_m", 0.8))
         axis = str(ctx.get("object_id_sweep_axis", "auto"))
         # Split rooms wherever a passage is narrower than ~2x this; each room is
         # fully swept before the next, so the base does not shuttle between them.
         room_split_m = float(ctx.get("object_id_room_split_erosion_m", 1.3))
 
         start_r, start_c = self._get_start_cell(ctx, info, origin, resolution)
+
+        strategy = str(ctx.get("object_id_route_strategy", "perimeter")).strip().lower()
+        if strategy in ("perimeter", "wall", "wall_follow", "contour"):
+            return self._compute_perimeter_waypoints(
+                ctx, grid, origin, resolution,
+                (start_r, start_c), inflation_m, max_cost,
+            )
 
         plan = build_single_sweep_plan(
             grid, origin, resolution, (start_r, start_c),
@@ -310,6 +329,54 @@ class ObjectID(State):
             "line_count": int(plan.get("line_count", 0)),
             "room_count": int(plan.get("room_count", 1)),
             "segment_count": len(segments),
+            "waypoint_count": len(waypoints),
+            "line_spacing_m": spacing_m,
+            "wall_clearance_m": inflation_m,
+            "max_traversable_cost": max_cost,
+        }
+        return waypoints
+
+    def _compute_perimeter_waypoints(
+        self, ctx, grid, origin, resolution, start_cell,
+        inflation_m: float, max_cost: int,
+    ) -> List[PoseStamped]:
+        """Wall-following lap: base faces the interior for long-range camera view.
+
+        Room splitting is intentionally disabled here: the perimeter is a single
+        global loop around *all* the reachable space, kept clear of the inflated
+        obstacles by the costmap inflation plus the extra ``inflation_m`` margin.
+        """
+        node = ctx["node"]
+        spacing_m = float(
+            ctx.get("object_id_perimeter_spacing_m",
+                    ctx.get("object_id_line_spacing_m", 1.5))
+        )
+        min_loop_m = float(ctx.get("object_id_perimeter_min_loop_m", 1.5))
+
+        plan = build_perimeter_plan(
+            grid, origin, resolution, start_cell,
+            spacing_m=spacing_m,
+            inflation_m=inflation_m,
+            max_cost=max_cost,
+            room_split_erosion_m=0.0,  # one global perimeter, no per-room splitting
+            min_loop_len_m=min_loop_m,
+        )
+        pts = plan.get("waypoints", [])
+        if not pts:
+            node.get_logger().error(
+                f"[{self.name}] No perimeter loop generated (grid empty or fully blocked)."
+            )
+            return []
+
+        # yaw already faces the room interior; use it directly.
+        waypoints = [self._make_pose_stamped(ctx, x, y, yaw) for (x, y, yaw) in pts]
+
+        self._last_plan_debug = {
+            "route_strategy": "perimeter",
+            "angle": float(plan.get("angle", 0.0)),
+            "line_count": int(plan.get("loop_count", 0)),
+            "room_count": int(plan.get("room_count", 1)),
+            "segment_count": len(plan.get("segments", [])),
             "waypoint_count": len(waypoints),
             "line_spacing_m": spacing_m,
             "wall_clearance_m": inflation_m,
