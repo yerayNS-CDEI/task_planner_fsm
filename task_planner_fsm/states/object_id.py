@@ -1,34 +1,40 @@
-"""ObjectID: navigate the base over the whole space while YOLO runs.
+"""ObjectID: drive a wall-following perimeter route over the space while YOLO runs.
 
-This state plans a single-direction boustrophedon (lawnmower) coverage route
-over the already-inflated nav2 global costmap, so the omnidirectional base
-visits *all* reachable free space once — in clean wall-aligned lanes, without
-doubling back or revisiting — giving YOLO a chance to see objects from short
-range anywhere in the room. The route is published as RViz markers for
-debugging and executed with Nav2's NavigateThroughPoses action.
+This state plans a perimeter (wall-following) route over the already-inflated
+nav2 global costmap: the free space is split into its natural connected
+components -- each room, corridor or pocket -- and each is lapped once along its
+boundary, with the base facing the room interior so a forward camera looks
+across the open space. Components too small for a lap still get a single point,
+so no free patch is skipped. The route is published as RViz markers for
+debugging and executed with Nav2 (sequential NavigateToPose by default).
 
-The coverage geometry is reused from ``utils/floor_coverage`` (the same library
-ScanFloor uses): it aligns lanes to the dominant wall angle and splits each lane
-around obstacles, so the plan is structured and revisit-free by construction.
-
-Two route strategies are available via ``object_id_route_strategy``:
-  "serpent" (default)  a single boustrophedon sweep of all free space (lawnmower
-                       lanes); covers everywhere but stays mid-room.
-  "perimeter"          a single wall-following lap along the costmap edge, with
-                       the base facing the room interior so the camera looks
-                       across the open space (long range). Fast; best for
-                       corridors / narrow rooms. A lone lap does not visit the
-                       centre of a hall wider than ~2x camera range.
+The geometry comes from ``utils/floor_coverage.build_perimeter_plan``. Two cost
+thresholds decide where points go: ``object_id_max_traversable_cost`` is the
+permissive *reachability* threshold (it may include the inflation band, so a
+patch joined to the room only through inflation still counts as reachable), while
+``object_id_waypoint_max_cost`` is the strict *placement* threshold -- set to 0
+so every waypoint lands on genuine free space, just inside the free/inflation
+seam rather than within the inflation band.
 
 Config is read from ``ctx`` (all keys optional):
-  object_id_route_strategy        "serpent" (default) | "perimeter"
-  object_id_line_spacing_m        lane spacing in metres (default 1.5)
-  object_id_perimeter_spacing_m   along-lap waypoint spacing (default: line spacing)
-  object_id_perimeter_min_loop_m  drop perimeter loops shorter than this (default 1.5)
-  object_id_max_traversable_cost  costmap cost <= this is drivable (default 65)
-  object_id_min_segment_length_m  drop lane runs shorter than this (default 0.5)
-  object_id_obstacle_inflation_m  extra margin on top of the costmap (default 0)
-  object_id_sweep_axis            "auto" | "dominant" | "perpendicular"
+  object_id_perimeter_spacing_m   along-lap waypoint spacing in metres (default 2.5)
+  object_id_perimeter_min_loop_m  components with a shorter boundary get a single
+                                  point instead of a lap (default 1.5)
+  object_id_perimeter_min_point_dist_m  minimum spacing between consecutive lap
+                                  waypoints; prunes near-duplicate points that
+                                  cause back-and-forth motion (default 0.5*spacing)
+  object_id_max_traversable_cost  costmap cost <= this is drivable/reachable (default 65)
+  object_id_waypoint_max_cost     cost <= this may host a waypoint; 0 keeps points
+                                  in free space, off the inflation band (default 0)
+  object_id_ensure_pocket_coverage  give every free patch >=1 point, incl. tiny
+                                  ones below the min-loop length (default True)
+  object_id_skip_start_waypoint   drop a leading waypoint coinciding with the
+                                  robot's pose so it moves directly (default True)
+  object_id_greedy_nearest        order the route as a pure greedy nearest-neighbour
+                                  tour (always go to the closest point) instead of
+                                  per-component boundary laps (default True)
+  object_id_wall_clearance_m      OPTIONAL extra standoff on top of the costmap
+                                  inflation, in metres (default 0)
   object_id_costmap_topic         default "/global_costmap/costmap"
   object_id_map_topic             raw-map fallback, default "/map"
   object_id_dry_run               plan + markers only, skip base motion
@@ -55,7 +61,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from visualization_msgs.msg import Marker, MarkerArray
 
 from ..state import State
-from ..utils.floor_coverage import build_perimeter_plan, build_single_sweep_plan
+from ..utils.floor_coverage import build_perimeter_plan
 from task_planner_fsm.states.proc_utils import (
     start_proc,
     stop_proc,
@@ -225,13 +231,14 @@ class ObjectID(State):
         ctx["object_id_plan_debug"] = self._last_plan_debug
         self._publish_plan_markers(ctx, waypoints)
 
+        dbg = self._last_plan_debug
         node.get_logger().info(
-            f"[{self.name}] Coverage plan: {self._last_plan_debug.get('room_count', 1)} room(s), "
-            f"{self._last_plan_debug.get('line_count', 0)} lane(s) "
-            f"-> {len(waypoints)} waypoint(s), angle "
-            f"{math.degrees(self._last_plan_debug.get('angle', 0.0)):.1f} deg, "
-            f"spacing {self._last_plan_debug.get('line_spacing_m', 0.0):.2f} m, "
-            f"clearance {self._last_plan_debug.get('wall_clearance_m', 0.0):.2f} m."
+            f"[{self.name}] Perimeter plan: {dbg.get('room_count', 1)} free patch(es) "
+            f"-> {dbg.get('loop_count', 0)} lap(s) + {dbg.get('pocket_count', 0)} pocket point(s) "
+            f"= {len(waypoints)} waypoint(s), spacing {dbg.get('spacing_m', 0.0):.2f} m, "
+            f"clearance {dbg.get('wall_clearance_m', 0.0):.2f} m, "
+            f"placement cost <= {dbg.get('waypoint_max_cost', 0)}, "
+            f"reachable cost <= {dbg.get('max_traversable_cost', 0)}."
         )
 
         if bool(ctx.get("object_id_dry_run", False)):
@@ -255,6 +262,7 @@ class ObjectID(State):
     def _compute_coverage_waypoints(
         self, ctx, grid_msg: OccupancyGrid, grid_source: str
     ) -> List[PoseStamped]:
+        """Build the perimeter route as oriented PoseStamped waypoints."""
         node = ctx["node"]
         info = grid_msg.info
         resolution = float(info.resolution)
@@ -267,104 +275,54 @@ class ObjectID(State):
         grid = np.asarray(grid_msg.data, dtype=np.int16).reshape((height, width))
         origin = (float(info.origin.position.x), float(info.origin.position.y))
 
-        # A raw /map (0/100/-1) needs a low threshold; an inflated costmap can use
-        # a higher one so lanes get as close to the walls as the base safely can.
+        # Reachability (traversable) threshold: permissive so a patch joined to
+        # the room only through inflation still counts as reachable. A raw /map
+        # (0/100/-1) has no inflation gradient, so it uses a low threshold.
         is_costmap = "costmap" in grid_source.lower()
         if is_costmap:
             max_cost = int(ctx.get("object_id_max_traversable_cost", 65))
         else:
             max_cost = int(ctx.get("object_id_map_occupied_threshold", 50)) - 1
 
-        spacing_m = float(ctx.get("object_id_line_spacing_m", 1.5))
-        min_len_m = float(ctx.get("object_id_min_segment_length_m", 0.5))
-        # Extra clearance on top of the costmap inflation: keeps lane endpoints
-        # in free space instead of right up against the walls/obstacles.
-        inflation_m = float(ctx.get("object_id_wall_clearance_m", 0.8))
-        axis = str(ctx.get("object_id_sweep_axis", "auto"))
-        # Split rooms wherever a passage is narrower than ~2x this; each room is
-        # fully swept before the next, so the base does not shuttle between them.
-        room_split_m = float(ctx.get("object_id_room_split_erosion_m", 1.3))
-
-        start_r, start_c = self._get_start_cell(ctx, info, origin, resolution)
-
-        strategy = str(ctx.get("object_id_route_strategy", "perimeter")).strip().lower()
-        if strategy in ("perimeter", "wall", "wall_follow", "contour"):
-            return self._compute_perimeter_waypoints(
-                ctx, grid, origin, resolution,
-                (start_r, start_c), inflation_m, max_cost,
-            )
-
-        plan = build_single_sweep_plan(
-            grid, origin, resolution, (start_r, start_c),
-            spacing_m=spacing_m,
-            inflation_m=inflation_m,
-            min_len_m=min_len_m,
-            max_cost=max_cost,
-            axis=axis,
-            room_split_erosion_m=room_split_m,
-        )
-        segments = plan.get("segments", [])
-        if not segments:
-            node.get_logger().error(
-                f"[{self.name}] No coverage lanes generated (grid empty or fully blocked)."
-            )
-            return []
-
-        points = self._segments_to_points(segments)
-        if len(points) < 1:
-            return []
-
-        # Face the direction of travel; the final pose keeps the previous heading.
-        waypoints = []
-        last_yaw = 0.0
-        for idx, (x, y) in enumerate(points):
-            nxt = points[idx + 1] if idx + 1 < len(points) else None
-            yaw = self._heading_to(x, y, nxt) if nxt is not None else last_yaw
-            last_yaw = yaw
-            waypoints.append(self._make_pose_stamped(ctx, x, y, float(yaw)))
-
-        self._last_plan_debug = {
-            "route_strategy": "single_sweep",
-            "angle": float(plan.get("angle", 0.0)),
-            "line_count": int(plan.get("line_count", 0)),
-            "room_count": int(plan.get("room_count", 1)),
-            "segment_count": len(segments),
-            "waypoint_count": len(waypoints),
-            "line_spacing_m": spacing_m,
-            "wall_clearance_m": inflation_m,
-            "max_traversable_cost": max_cost,
-        }
-        return waypoints
-
-    def _compute_perimeter_waypoints(
-        self, ctx, grid, origin, resolution, start_cell,
-        inflation_m: float, max_cost: int,
-    ) -> List[PoseStamped]:
-        """Wall-following lap: base faces the interior for long-range camera view.
-
-        Room splitting is intentionally disabled here: the perimeter is a single
-        global loop around *all* the reachable space, kept clear of the inflated
-        obstacles by the costmap inflation plus the extra ``inflation_m`` margin.
-        """
-        node = ctx["node"]
-        spacing_m = float(
-            ctx.get("object_id_perimeter_spacing_m",
-                    ctx.get("object_id_line_spacing_m", 1.5))
-        )
+        # Placement threshold: where waypoints may actually land. Default 0 keeps
+        # them on genuine free cells, just inside the free/inflation seam.
+        waypoint_max_cost = int(ctx.get("object_id_waypoint_max_cost", 0))
+        # Give every free patch at least one point, even tiny pockets.
+        ensure_pockets = bool(ctx.get("object_id_ensure_pocket_coverage", True))
+        # Along-lap waypoint spacing and the minimum boundary length for a lap.
+        spacing_m = float(ctx.get("object_id_perimeter_spacing_m", 2.5))
         min_loop_m = float(ctx.get("object_id_perimeter_min_loop_m", 1.5))
+        # Minimum spacing between consecutive lap waypoints (default 0.5*spacing):
+        # prunes near-duplicate points that otherwise cause back-and-forth motion.
+        _mpd = ctx.get("object_id_perimeter_min_point_dist_m", 1.0)
+        min_point_dist_m = None if _mpd is None else float(_mpd)
+        # Drop a leading waypoint that coincides with the robot's current pose so
+        # it starts driving to the first real point instead of to where it stands.
+        drop_start_waypoint = bool(ctx.get("object_id_skip_start_waypoint", True))
+        # Order the whole route as a pure greedy nearest-neighbour tour (always go
+        # to the closest point) instead of following per-component boundary laps.
+        greedy_nearest = bool(ctx.get("object_id_greedy_nearest", True))
+        # OPTIONAL extra standoff on top of the costmap inflation.
+        inflation_m = float(ctx.get("object_id_wall_clearance_m", 0.1))
+
+        start_cell = self._get_start_cell(ctx, info, origin, resolution)
 
         plan = build_perimeter_plan(
             grid, origin, resolution, start_cell,
             spacing_m=spacing_m,
             inflation_m=inflation_m,
             max_cost=max_cost,
-            room_split_erosion_m=0.0,  # one global perimeter, no per-room splitting
+            waypoint_max_cost=waypoint_max_cost,
+            ensure_pocket_coverage=ensure_pockets,
             min_loop_len_m=min_loop_m,
+            min_point_dist_m=min_point_dist_m,
+            drop_start_waypoint=drop_start_waypoint,
+            greedy_nearest=greedy_nearest,
         )
         pts = plan.get("waypoints", [])
         if not pts:
             node.get_logger().error(
-                f"[{self.name}] No perimeter loop generated (grid empty or fully blocked)."
+                f"[{self.name}] No perimeter route generated (grid empty or fully blocked)."
             )
             return []
 
@@ -372,29 +330,19 @@ class ObjectID(State):
         waypoints = [self._make_pose_stamped(ctx, x, y, yaw) for (x, y, yaw) in pts]
 
         self._last_plan_debug = {
-            "route_strategy": "perimeter",
             "angle": float(plan.get("angle", 0.0)),
-            "line_count": int(plan.get("loop_count", 0)),
+            "loop_count": int(plan.get("loop_count", 0)),
+            "pocket_count": int(plan.get("pocket_count", 0)),
             "room_count": int(plan.get("room_count", 1)),
-            "segment_count": len(plan.get("segments", [])),
             "waypoint_count": len(waypoints),
-            "line_spacing_m": spacing_m,
+            "spacing_m": spacing_m,
+            "min_point_dist_m": (0.5 * spacing_m if min_point_dist_m is None
+                                 else min_point_dist_m),
             "wall_clearance_m": inflation_m,
             "max_traversable_cost": max_cost,
+            "waypoint_max_cost": waypoint_max_cost,
         }
         return waypoints
-
-    @staticmethod
-    def _segments_to_points(
-        segments: Sequence[Tuple[Tuple[float, float], Tuple[float, float]]]
-    ) -> List[Tuple[float, float]]:
-        """Flatten ordered lane segments into a deduplicated waypoint sequence."""
-        points: List[Tuple[float, float]] = []
-        for p0, p1 in segments:
-            for p in (p0, p1):
-                if not points or math.hypot(points[-1][0] - p[0], points[-1][1] - p[1]) > 1e-6:
-                    points.append((float(p[0]), float(p[1])))
-        return points
 
     def _get_start_cell(self, ctx, info, origin, resolution) -> Tuple[int, int]:
         """Robot start cell (row, col), from odom/base_position, TF, or map centre."""
@@ -634,7 +582,7 @@ class ObjectID(State):
 
     def _select_grid_for_planning(self, ctx) -> Tuple[Optional[OccupancyGrid], Optional[str]]:
         node = ctx["node"]
-        costmap_timeout = float(ctx.get("object_id_costmap_wait_timeout", 10.0))
+        costmap_timeout = float(ctx.get("object_id_costmap_wait_timeout", 20.0))
         allow_map_fallback = bool(ctx.get("object_id_allow_map_fallback", True))
 
         if self.latest_costmap is not None:

@@ -210,6 +210,96 @@ def _flood_fill(free: np.ndarray, seed: Tuple[int, int]) -> np.ndarray:
 
 
 # ----------------------------------------------------------------------------
+# Waypoint placement mask + pocket-coverage fallback
+# ----------------------------------------------------------------------------
+def placement_mask(grid: np.ndarray, reachable: np.ndarray,
+                   waypoint_max_cost: int) -> np.ndarray:
+    """Cells inside ``reachable`` that are clear enough to host a waypoint.
+
+    ``reachable`` is computed with the permissive *traversable* threshold (so it
+    spans everything nav2 can drive to, including space joined only through the
+    inflation layer). This narrows it to cells whose cost is within
+    ``waypoint_max_cost`` -- typically 0, i.e. genuinely free space -- so points
+    land just inside the free/inflation seam instead of within the inflation band.
+    """
+    return reachable & (grid >= 0) & (grid <= int(waypoint_max_cost))
+
+
+def _representative_cell(component: np.ndarray) -> Optional[Tuple[int, int]]:
+    """Most-interior ``(row, col)`` of one connected component (deepest cell).
+
+    Uses the distance transform so the point sits as far from the component's
+    edge as possible; falls back to the cell nearest the centroid when SciPy is
+    unavailable. Returns ``None`` for an empty component.
+    """
+    idx = np.argwhere(component)
+    if idx.size == 0:
+        return None
+    if _ndimage is not None:
+        dist = _ndimage.distance_transform_edt(component)
+        flat = int(np.argmax(dist))
+        r, c = np.unravel_index(flat, component.shape)
+        return int(r), int(c)
+    cr, cc = float(idx[:, 0].mean()), float(idx[:, 1].mean())
+    d2 = (idx[:, 0] - cr) ** 2 + (idx[:, 1] - cc) ** 2
+    r, c = idx[int(np.argmin(d2))]
+    return int(r), int(c)
+
+
+def uncovered_pocket_cells(placement: np.ndarray,
+                           covered_cells: Sequence[Tuple[int, int]]
+                           ) -> List[Tuple[int, int]]:
+    """One representative ``(row, col)`` per placement component left uncovered.
+
+    Labels the connected components of ``placement`` and returns a single
+    interior cell for every component that contains none of ``covered_cells``
+    (the cells already touched by the generated route). This guarantees that
+    every patch of free space -- however small -- receives at least one
+    waypoint, since being free means the base reached it during mapping.
+    """
+    if not placement.any():
+        return []
+
+    if _ndimage is not None:
+        labels, n = _ndimage.label(placement)
+    else:  # graceful: treat the whole mask as a single component
+        labels = placement.astype(np.int32)
+        n = 1
+
+    rows, cols = placement.shape
+    covered_labels = set()
+    for r, c in covered_cells:
+        if 0 <= r < rows and 0 <= c < cols:
+            lab = int(labels[r, c])
+            if lab > 0:
+                covered_labels.add(lab)
+
+    reps: List[Tuple[int, int]] = []
+    for lab in range(1, n + 1):
+        if lab in covered_labels:
+            continue
+        cell = _representative_cell(labels == lab)
+        if cell is not None:
+            reps.append(cell)
+    return reps
+
+
+def _segment_covered_cells(segments: Sequence[Segment], origin: Point2,
+                           resolution: float, shape: Tuple[int, int]
+                           ) -> List[Tuple[int, int]]:
+    """``(row, col)`` cells touched by each segment's endpoints and midpoint."""
+    rows, cols = shape
+    cells: List[Tuple[int, int]] = []
+    for (x0, y0), (x1, y1) in segments:
+        for x, y in ((x0, y0), (x1, y1), (0.5 * (x0 + x1), 0.5 * (y0 + y1))):
+            c = int((x - origin[0]) / resolution)
+            r = int((y - origin[1]) / resolution)
+            if 0 <= r < rows and 0 <= c < cols:
+                cells.append((r, c))
+    return cells
+
+
+# ----------------------------------------------------------------------------
 # Coverage line generation
 # ----------------------------------------------------------------------------
 def generate_coverage_lines(reachable: np.ndarray, origin: Point2,
@@ -573,6 +663,8 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
                             start_cell: Tuple[int, int], *, spacing_m: float,
                             inflation_m: float, min_len_m: float,
                             max_cost: int = _DEFAULT_MAX_COST,
+                            waypoint_max_cost: Optional[int] = None,
+                            ensure_pocket_coverage: bool = False,
                             angle: Optional[float] = None,
                             axis: str = "auto",
                             room_split_erosion_m: float = 0.0) -> dict:
@@ -597,6 +689,20 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
     of that (raise it to keep lane endpoints further into free space, away from
     walls). ``start_cell`` is ``(row, col)``.
 
+    ``max_cost`` and ``waypoint_max_cost`` serve two different jobs. ``max_cost``
+    is the *traversable* threshold: it decides which cells count as drivable for
+    the reachability flood-fill, so keep it permissive (it may include the
+    inflation band) to keep narrow-necked space connected. ``waypoint_max_cost``
+    (default: same as ``max_cost``) is the *placement* threshold: lanes are only
+    laid on cells within it. Set it low (e.g. 0) to keep waypoints in genuine
+    free space -- just inside the free/inflation seam -- while still reaching
+    pockets joined to the room only through inflation.
+
+    ``ensure_pocket_coverage`` guarantees that every connected patch of placement
+    (free) space gets at least one waypoint: after the sweep, any free component
+    the lanes missed (e.g. one too small for a lane of length ``min_len_m``)
+    receives a single interior point, returned under ``extra_points``.
+
     ``room_split_erosion_m`` > 0 enables room-by-room coverage: the free space is
     split into rooms wherever a passage is narrower than ~``2 *
     room_split_erosion_m`` (e.g. a doorway), and each room is fully swept before
@@ -604,9 +710,11 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
     the base shuttling back and forth between rooms. 0 disables it (one global
     sweep).
 
-    Returns ``{angle, segments, segment_angles, reachable, line_count,
-    room_count}`` where ``segments`` is in execution order and ``segment_angles``
-    is the parallel per-segment heading (all equal: a single sweep direction).
+    Returns ``{angle, segments, segment_angles, extra_points, reachable,
+    placement, line_count, room_count}`` where ``segments`` is in execution order,
+    ``segment_angles`` is the parallel per-segment heading (all equal: a single
+    sweep direction), and ``extra_points`` is a list of ``(x, y)`` fallback points
+    (empty unless ``ensure_pocket_coverage``).
     """
     theta = dominant_wall_angle(grid) if angle is None else (angle % (math.pi / 2.0))
 
@@ -616,6 +724,11 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
 
     free = free_mask(grid, max_cost) & ~inflated
     reachable = reachable_free_mask(free, start_cell)
+
+    # Waypoints land only on placement cells (default: same as the traversable
+    # set, so behaviour is unchanged unless waypoint_max_cost is lowered).
+    wp_max_cost = max_cost if waypoint_max_cost is None else int(waypoint_max_cost)
+    placement = placement_mask(grid, reachable, wp_max_cost) & ~inflated
 
     start_xy = (
         origin[0] + (start_cell[1] + 0.5) * resolution,
@@ -632,15 +745,18 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
     elif axis in ("perpendicular", "perp", "b"):
         chosen_angle = theta_b
     else:  # auto
-        lines_a = generate_coverage_lines(reachable, origin, resolution, theta_a,
+        lines_a = generate_coverage_lines(placement, origin, resolution, theta_a,
                                           spacing_m, min_len_m)
-        lines_b = generate_coverage_lines(reachable, origin, resolution, theta_b,
+        lines_b = generate_coverage_lines(placement, origin, resolution, theta_b,
                                           spacing_m, min_len_m)
         count_a = _distinct_line_count(lines_a, theta_a) if lines_a else math.inf
         count_b = _distinct_line_count(lines_b, theta_b) if lines_b else math.inf
         chosen_angle = theta_b if count_b < count_a else theta_a
 
     # Split into rooms (or a single room) and sweep each fully before the next.
+    # Room membership uses the full reachable region (so a pocket reachable only
+    # through inflation still belongs to its room), while lanes are restricted to
+    # the placement cells within that room.
     room_radius = int(round(room_split_erosion_m / resolution)) if resolution > 0 else 0
     room_labels, n_rooms = segment_rooms(reachable, room_radius)
     room_ids = [k for k in range(1, n_rooms + 1) if np.any(room_labels == k)]
@@ -649,7 +765,7 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
     segments: List[Segment] = []
     current_xy = start_xy
     for k in ordered_ids:
-        room_mask = (room_labels == k) & reachable
+        room_mask = (room_labels == k) & placement
         room_lines = generate_coverage_lines(room_mask, origin, resolution,
                                              chosen_angle, spacing_m, min_len_m)
         room_route = order_serpentine(room_lines, chosen_angle, current_xy)
@@ -659,11 +775,23 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
 
     segment_angles = [chosen_angle] * len(segments)
 
+    # Guarantee a point in every free pocket the lanes missed.
+    extra_points: List[Point2] = []
+    if ensure_pocket_coverage:
+        covered = _segment_covered_cells(segments, origin, resolution, placement.shape)
+        for r, c in uncovered_pocket_cells(placement, covered):
+            extra_points.append((
+                origin[0] + (c + 0.5) * resolution,
+                origin[1] + (r + 0.5) * resolution,
+            ))
+
     return {
         "angle": chosen_angle,
         "segments": segments,
         "segment_angles": segment_angles,
+        "extra_points": extra_points,
         "reachable": reachable,
+        "placement": placement,
         "line_count": _distinct_line_count(segments, chosen_angle) if segments else 0,
         "room_count": len(ordered_ids),
     }
@@ -816,33 +944,180 @@ def _rotate_loop_to_nearest(loop_rc: List[Tuple[int, int]], ref_xy: Point2,
     return loop_rc[best_i:] + loop_rc[:best_i]
 
 
+def _snap_cell_to_mask(r: int, c: int, mask: np.ndarray) -> Tuple[int, int]:
+    """Nearest ``(row, col)`` that is True in ``mask`` (the cell itself if already True).
+
+    Guards against contour resampling rounding a point a cell off the free
+    region; expands a small window first (the common case is a 1-cell miss) and
+    only falls back to a full search if needed.
+    """
+    rows, cols = mask.shape
+    r = min(max(int(r), 0), rows - 1)
+    c = min(max(int(c), 0), cols - 1)
+    if mask[r, c]:
+        return (r, c)
+    for rad in (1, 2, 3):
+        r0, r1 = max(0, r - rad), min(rows, r + rad + 1)
+        c0, c1 = max(0, c - rad), min(cols, c + rad + 1)
+        sub = np.argwhere(mask[r0:r1, c0:c1])
+        if sub.size:
+            d2 = (sub[:, 0] + r0 - r) ** 2 + (sub[:, 1] + c0 - c) ** 2
+            rr, cc = sub[int(np.argmin(d2))]
+            return (int(rr + r0), int(cc + c0))
+    idx = np.argwhere(mask)
+    d2 = (idx[:, 0] - r) ** 2 + (idx[:, 1] - c) ** 2
+    rr, cc = idx[int(np.argmin(d2))]
+    return (int(rr), int(cc))
+
+
+def _free_components(placement: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+    """Label the connected components of the placement mask.
+
+    Each component is a contiguous patch of free space (a room, a pocket, ...).
+    Falls back to a single component when SciPy is unavailable.
+    """
+    if not placement.any():
+        return np.zeros_like(placement, dtype=np.int32), []
+    if _ndimage is not None:
+        labels, n = _ndimage.label(placement)
+    else:  # graceful: whole mask as one component
+        labels = placement.astype(np.int32)
+        n = 1
+    return labels, [k for k in range(1, n + 1) if np.any(labels == k)]
+
+
+def _greedy_nearest_route(points: Sequence[Tuple[float, float, float]],
+                          start_xy: Point2) -> List[Tuple[float, float, float]]:
+    """Order ``(x, y, yaw)`` points by always taking the nearest remaining one.
+
+    A pure greedy nearest-neighbour tour from ``start_xy``: at each step the
+    closest unvisited point to the current position is appended. This ignores the
+    boundary/lap structure entirely, so the base always drives to its nearest
+    point next (at the cost of no longer following a clean wall-hugging lap).
+    """
+    remaining = list(points)
+    out: List[Tuple[float, float, float]] = []
+    cx, cy = start_xy
+    while remaining:
+        best_i, best_d = 0, math.inf
+        for i, (x, y, _) in enumerate(remaining):
+            d = (x - cx) ** 2 + (y - cy) ** 2
+            if d < best_d:
+                best_i, best_d = i, d
+        p = remaining.pop(best_i)
+        out.append(p)
+        cx, cy = p[0], p[1]
+    return out
+
+
+def _two_opt_route(points: Sequence[Tuple[float, float, float]], start_xy: Point2,
+                   max_passes: int = 20) -> List[Tuple[float, float, float]]:
+    """2-opt refinement of an open route from ``start_xy`` through all ``points``.
+
+    Greedy nearest-neighbour can start in the middle of a row of points, drive out
+    to one endpoint and then double back across the middle to reach the other --
+    an edge crossing. 2-opt repeatedly reverses any sub-path whose reversal makes
+    the total route shorter, which removes such crossings and leaves a sweep that
+    enters a near-collinear run at its nearest endpoint. ``start_xy`` is a fixed
+    anchor (the robot) and is never reordered. Runs until no improvement or
+    ``max_passes`` is reached (O(n^2) per pass; n is small here).
+    """
+    if len(points) < 3:
+        return list(points)
+
+    # Index 0 is the fixed start anchor; 1..n are the movable waypoints.
+    nodes: List[Tuple[float, float]] = [start_xy] + [(p[0], p[1]) for p in points]
+    order = list(range(1, len(nodes)))
+    n = len(order)
+
+    def dist(a: int, b: int) -> float:
+        return math.hypot(nodes[a][0] - nodes[b][0], nodes[a][1] - nodes[b][1])
+
+    for _ in range(max_passes):
+        improved = False
+        for i in range(n):
+            prev = 0 if i == 0 else order[i - 1]          # predecessor (anchor if first)
+            for j in range(i + 1, n):
+                a, b = order[i], order[j]
+                # Edge removed before the segment: (prev, a); after: (b, next).
+                if j + 1 < n:
+                    nxt = order[j + 1]
+                    delta = (dist(prev, b) + dist(a, nxt)
+                             - dist(prev, a) - dist(b, nxt))
+                else:  # reversing the tail: only the leading edge changes
+                    delta = dist(prev, b) - dist(prev, a)
+                if delta < -1e-9:
+                    order[i:j + 1] = order[i:j + 1][::-1]
+                    improved = True
+        if not improved:
+            break
+
+    return [points[k - 1] for k in order]
+
+
 def build_perimeter_plan(grid: np.ndarray, origin: Point2, resolution: float,
                          start_cell: Tuple[int, int], *, spacing_m: float,
                          inflation_m: float, max_cost: int = _DEFAULT_MAX_COST,
+                         waypoint_max_cost: Optional[int] = None,
+                         ensure_pocket_coverage: bool = True,
                          angle: Optional[float] = None,
-                         room_split_erosion_m: float = 0.0,
-                         min_loop_len_m: float = 1.5) -> dict:
-    """Single wall-following lap of the reachable free region's boundary.
+                         min_loop_len_m: float = 1.5,
+                         min_point_dist_m: Optional[float] = None,
+                         drop_start_waypoint: bool = True,
+                         greedy_nearest: bool = True) -> dict:
+    """Wall-following lap of every free-space patch, traced on genuine free cells.
 
-    Instead of slicing the room into parallel lanes (see
-    :func:`build_single_sweep_plan`), this traces ONE loop along the costmap
-    edge — i.e. just inside the walls and inflation layer — and orients the base
-    to face the room interior at every waypoint, so a forward-facing camera looks
-    across the open space (long range) rather than at the adjacent wall.
+    The free (placement) space is split into its natural connected components --
+    each room, corridor or pocket -- and they are visited nearest-first from the
+    robot. A component large enough gets a single boundary lap (resampled to
+    ``spacing_m``, base facing the interior so a forward camera looks across the
+    open space); a component too small for a lap of length ``min_loop_len_m`` gets
+    one interior point instead, so no free patch is ever skipped. This replaces
+    erosion-based room splitting -- the components do the splitting for free.
 
-    The drive ring keeps clear of the walls by the costmap's own inflation plus
-    the optional extra ``inflation_m`` margin (raise it to stand further off the
-    wall). ``spacing_m`` is the along-loop waypoint spacing. With
-    ``room_split_erosion_m`` > 0 each room is lapped separately (nearest-first),
-    so the base does not weave between rooms through a doorway.
+    Two cost thresholds keep the points where they belong:
+      * ``max_cost`` -- *traversable* threshold for the reachability flood-fill.
+        Keep it permissive (it may include the inflation band) so a patch joined
+        to the room only through inflation still counts as reachable.
+      * ``waypoint_max_cost`` (default: same as ``max_cost``) -- *placement*
+        threshold the laps are traced on. Set it to 0 to keep every waypoint on
+        true free cells, sitting just inside the free/inflation seam rather than
+        within the inflation band. ``inflation_m`` adds an OPTIONAL extra standoff:
+        it erodes the placement region inward from the free/inflation seam, so a
+        small value (e.g. 0.1-0.2 m) lifts the lap a little clear of the inflation
+        layer instead of hugging it. 0 keeps the lap right on the seam.
 
-    Coverage is the perimeter only: a single lap does NOT visit the centre of a
-    room wider than ~2x the camera range. Use it for corridors / narrow spaces,
-    or combine with a serpentine for large halls. ``start_cell`` is ``(row, col)``.
+    ``ensure_pocket_coverage`` (default True) controls whether sub-``min_loop_len_m``
+    components still get their single interior point; set False to drop them.
+    ``start_cell`` is ``(row, col)``.
 
-    Returns ``{angle, waypoints, segments, reachable, loop_count, room_count}``
-    where ``waypoints`` is an ordered list of ``(x, y, yaw)`` (yaw faces the
-    interior) and ``segments`` are consecutive point pairs for marker reuse.
+    ``min_point_dist_m`` (default: ``0.5 * spacing_m``) is the minimum spacing kept
+    between waypoints. Resampling a ragged or thin cost-0 boundary, plus snapping
+    samples back onto free cells, can otherwise drop several points onto the same
+    or adjacent cells; those near-duplicates make the base shuffle back and forth.
+    A point is discarded when it lands within this distance of ANY waypoint kept so
+    far -- not just the previous one -- so non-consecutive near-duplicates (a lap
+    passing near itself, or two rooms' boundaries meeting) are removed too, as is
+    the lap-closing return point. Set it to 0 to keep every resampled point.
+
+    ``drop_start_waypoint`` (default True) discards any leading waypoint that lands
+    within ``min_point_dist_m`` of the robot's start pose, since the first lap point
+    is the boundary cell nearest the robot and is often right where it already
+    stands -- navigating to it is a no-op. With it dropped, the route begins at the
+    first point the base actually has to move to. Set False to keep that point.
+
+    ``greedy_nearest`` (default True) re-orders the whole point set as a greedy
+    nearest-neighbour tour from the robot, then refines it with 2-opt: every move
+    goes to a near waypoint and edge crossings are removed, so a near-collinear row
+    is entered at its nearest endpoint rather than from the middle. This minimises
+    "skip the nearby point" hops and back-tracking, at the cost of no longer
+    following clean wall-hugging laps. Set False to keep the per-component
+    boundary-lap ordering.
+
+    Returns ``{angle, waypoints, segments, reachable, placement, loop_count,
+    pocket_count, room_count}`` where ``waypoints`` is an ordered list of
+    ``(x, y, yaw)`` (yaw faces the interior) and ``segments`` are consecutive
+    point pairs for marker reuse.
     """
     theta = dominant_wall_angle(grid) if angle is None else (angle % (math.pi / 2.0))
 
@@ -854,61 +1129,168 @@ def build_perimeter_plan(grid: np.ndarray, origin: Point2, resolution: float,
     reachable = reachable_free_mask(free, start_cell)
     rows, cols = reachable.shape
 
+    # Minimum spacing (in cells) enforced between consecutive lap waypoints, so
+    # resampling/snapping near-duplicates do not make the base shuffle in place.
+    # Floor of 1 cell still removes exact duplicates even when the request is 0.
+    min_dist_m = 0.5 * spacing_m if min_point_dist_m is None else float(min_point_dist_m)
+    min_sep_cells = max(1.0, min_dist_m / resolution) if resolution > 0 else 1.0
+    min_sep_sq = min_sep_cells * min_sep_cells
+    # Same threshold in world units, used to drop a waypoint that lands within
+    # ``min_dist_m`` of ANY already-kept waypoint (not just the previous one), so
+    # non-consecutive near-duplicates -- where a lap passes near itself or two
+    # rooms' boundaries meet -- are removed too.
+    min_dist_sq_m = min_dist_m * min_dist_m
+
+    # Waypoints are placed only on genuine free cells (default: same as the
+    # traversable set, so behaviour is unchanged unless waypoint_max_cost is set).
+    wp_max_cost = max_cost if waypoint_max_cost is None else int(waypoint_max_cost)
+    placement = placement_mask(grid, reachable, wp_max_cost)
+
+    # Clearance from the inflation layer: erode the placement region away from the
+    # free/inflation SEAM (any cell above wp_max_cost, plus unknown), not just away
+    # from the inscribed obstacle. Cost-0 cells already sit at nav2's full inflation
+    # radius, so eroding against the inscribed obstacle would need a clearance
+    # larger than that radius to have any effect; eroding against the seam makes a
+    # small ``inflation_m`` immediately pull the lap a little inside the seam.
+    if radius_cells > 0:
+        seam_blocked = (grid > wp_max_cost) | (grid < 0)
+        placement = placement & ~inflate_obstacles(seam_blocked, radius_cells)
+
     start_xy = (
         origin[0] + (start_cell[1] + 0.5) * resolution,
         origin[1] + (start_cell[0] + 0.5) * resolution,
     )
 
-    room_radius = int(round(room_split_erosion_m / resolution)) if resolution > 0 else 0
-    room_labels, n_rooms = segment_rooms(reachable, room_radius)
-    room_ids = [k for k in range(1, n_rooms + 1) if np.any(room_labels == k)]
-    ordered_ids = _order_rooms(room_labels, room_ids, origin, resolution, start_xy)
+    # Each free-space component is a room/pocket. World coords of every cell per
+    # component, used to visit them nearest-first by their closest cell to the
+    # robot (not by centroid, which for a big enclosing ring sits in the middle).
+    labels, comp_ids = _free_components(placement)
+    comp_xy = {}
+    for k in comp_ids:
+        idx = np.argwhere(labels == k)
+        comp_xy[k] = (
+            origin[0] + (idx[:, 1] + 0.5) * resolution,
+            origin[1] + (idx[:, 0] + 0.5) * resolution,
+        )
 
     waypoints: List[Tuple[float, float, float]] = []
     segments: List[Segment] = []
+    accepted_xy: List[Point2] = []  # every kept waypoint, for global dedup
+    # Seeding the start pose makes the global filter drop a leading waypoint that
+    # coincides with the robot, so the route begins at the first point it must
+    # actually drive to instead of "navigating" to where it already stands.
+    if drop_start_waypoint:
+        accepted_xy.append(start_xy)
     current_xy = start_xy
     loop_count = 0
+    pocket_count = 0
 
-    for k in ordered_ids:
-        room_mask = (room_labels == k) & reachable
-        contour_rc = _outer_contour_cells(room_mask)
-        if len(contour_rc) < 3:
-            continue
-        loop_rc = _resample_contour(contour_rc, spacing_m, resolution, rows, cols)
-        if len(loop_rc) < 3:
-            continue
-        # Drop tiny loops (slivers / noise) below the minimum lap length.
-        perim_m = sum(
+    def _far_enough(x: float, y: float) -> bool:
+        """True if (x, y) is at least ``min_dist_m`` from every kept waypoint."""
+        for ax, ay in accepted_xy:
+            if (x - ax) ** 2 + (y - ay) ** 2 < min_dist_sq_m:
+                return False
+        return True
+
+    remaining = list(comp_ids)
+    while remaining:
+        # Visit next the component whose nearest cell to the current position is
+        # closest, recomputed from where the previous lap actually ended -- so the
+        # route always heads to the nearest unvisited region instead of doubling
+        # back as a precomputed, centroid-based order could.
+        best_k, best_d = remaining[0], math.inf
+        for cand in remaining:
+            xs, ys = comp_xy[cand]
+            d = float(np.min((xs - current_xy[0]) ** 2 + (ys - current_xy[1]) ** 2))
+            if d < best_d:
+                best_d, best_k = d, cand
+        k = best_k
+        remaining.remove(k)
+        comp = labels == k
+
+        # Trace the component boundary and snap every sample back onto a free
+        # cell, keeping only points at least ``min_sep_cells`` from the previous
+        # kept one (drops near-duplicates that snapping/resampling introduce).
+        contour_rc = _outer_contour_cells(comp)
+        loop_rc: List[Tuple[int, int]] = []
+        if len(contour_rc) >= 3:
+            for r, c in _resample_contour(contour_rc, spacing_m, resolution, rows, cols):
+                cell = _snap_cell_to_mask(r, c, comp)
+                if not loop_rc:
+                    loop_rc.append(cell)
+                    continue
+                dr = cell[0] - loop_rc[-1][0]
+                dc = cell[1] - loop_rc[-1][1]
+                if dr * dr + dc * dc >= min_sep_sq:
+                    loop_rc.append(cell)
+
+        perim_m = resolution * sum(
             math.hypot(loop_rc[i][0] - loop_rc[i - 1][0], loop_rc[i][1] - loop_rc[i - 1][1])
             for i in range(len(loop_rc))
-        ) * resolution
-        if perim_m < min_loop_len_m:
-            continue
+        ) if len(loop_rc) >= 3 else 0.0
 
-        loop_rc = _rotate_loop_to_nearest(loop_rc, current_xy, origin, resolution)
-        headings = _inward_headings(loop_rc, room_mask)
+        if len(loop_rc) >= 3 and perim_m >= min_loop_len_m:
+            loop_rc = _rotate_loop_to_nearest(loop_rc, current_xy, origin, resolution)
+            headings = _inward_headings(loop_rc, comp)
 
-        # Close the lap by returning to the entry cell.
-        loop_rc_closed = loop_rc + [loop_rc[0]]
-        headings_closed = headings + [headings[0]]
+            pts_xy = [
+                (origin[0] + (c + 0.5) * resolution, origin[1] + (r + 0.5) * resolution)
+                for r, c in loop_rc
+            ]
+            # Keep only points far enough from every waypoint kept so far (this
+            # also drops the lap-closing return point, which coincides with the
+            # entry). Segments connect consecutive kept points, closing the lap.
+            lap_kept: List[Point2] = []
+            for (x, y), h in zip(pts_xy, headings):
+                if not _far_enough(x, y):
+                    continue
+                waypoints.append((float(x), float(y), float(h)))
+                accepted_xy.append((x, y))
+                lap_kept.append((x, y))
+            for i in range(len(lap_kept) - 1):
+                segments.append((lap_kept[i], lap_kept[i + 1]))
+            if len(lap_kept) >= 3:
+                segments.append((lap_kept[-1], lap_kept[0]))  # close the lap
+            if lap_kept:
+                current_xy = lap_kept[-1]
+                loop_count += 1
 
-        pts_xy = [
-            (origin[0] + (c + 0.5) * resolution, origin[1] + (r + 0.5) * resolution)
-            for r, c in loop_rc_closed
+        elif ensure_pocket_coverage:
+            # Too small for a lap: drop one interior point so it is still visited,
+            # unless that patch is already covered by a nearby kept waypoint.
+            cell = _representative_cell(comp)
+            if cell is None:
+                continue
+            r, c = cell
+            x = origin[0] + (c + 0.5) * resolution
+            y = origin[1] + (r + 0.5) * resolution
+            if not _far_enough(x, y):
+                continue
+            yaw = _inward_headings([(r, c)], comp)[0]
+            waypoints.append((float(x), float(y), float(yaw)))
+            accepted_xy.append((x, y))
+            current_xy = (x, y)
+            pocket_count += 1
+
+    # Optionally discard the lap structure and visit every point greedily nearest-
+    # first from the robot, rebuilding the marker segments to match the new order.
+    if greedy_nearest and waypoints:
+        waypoints = _greedy_nearest_route(waypoints, start_xy)
+        # 2-opt cleanup: removes crossings where greedy started mid-run and doubled
+        # back, so a near-collinear row is entered at its nearest endpoint instead.
+        waypoints = _two_opt_route(waypoints, start_xy)
+        segments = [
+            ((waypoints[i][0], waypoints[i][1]), (waypoints[i + 1][0], waypoints[i + 1][1]))
+            for i in range(len(waypoints) - 1)
         ]
-        for (x, y), h in zip(pts_xy, headings_closed):
-            waypoints.append((float(x), float(y), float(h)))
-        for i in range(len(pts_xy) - 1):
-            segments.append((pts_xy[i], pts_xy[i + 1]))
-
-        current_xy = pts_xy[-1]
-        loop_count += 1
 
     return {
         "angle": theta,
         "waypoints": waypoints,
         "segments": segments,
         "reachable": reachable,
+        "placement": placement,
         "loop_count": loop_count,
-        "room_count": len(ordered_ids),
+        "pocket_count": pocket_count,
+        "room_count": len(comp_ids),
     }
