@@ -394,8 +394,8 @@ The FSM consists of **17 states** that execute sequentially with conditional tra
 | State | Purpose | Key Actions | Transition Condition |
 |-------|---------|-------------|----------------------|
 | **Initialization** | System startup | Log home position (map origin), wait for external trigger | `/start_flag` received |
-| **CreateMap** | Environment mapping | Launch `global_exploration.launch.py`, monitor `/map_done` | Map creation complete |
-| **ObjectID** | Object detection | Call `/object_id_sim` service (mock or real vision system) | Service returns success |
+| **CreateMap** | Environment mapping | Launch persistent `mapping_stack.launch.py` + separate `exploration.launch.py`; after exploration finishes, run an optional structured densification coverage sweep (`create_map_densify_enabled`) | Map creation complete |
+| **ObjectID** | Object detection | Bring up nav stack + YOLO and drive a structured coverage sweep (`object_id_sweep_enabled`) so the camera sees the whole space | Coverage sweep complete |
 | **GeometryReconstruction** | 3D model building | Call `/start_geometry_reconstruction`, launch nav_sim with hybrid mode | Reconstruction complete |
 | **ComputeWallPoints** | Wall definition | Define 3 predefined walls with endpoints and scan trajectories | Walls data populated |
 | **WallTargetSelection** | Next wall selection | Find closest unscanned wall to current robot position | Wall selected |
