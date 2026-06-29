@@ -168,7 +168,14 @@ class RobotFSMNode(Node):
         scan_phase: Optional[int] = None,
         planner_backend: str = "legacy",
     ):
-        super().__init__("robot_fsm_node")
+        # Auto-declare any parameter passed as an override (e.g. via
+        # `--ros-args -p create_map_sweep_axis:=perpendicular` or a launch file),
+        # so per-state tuning knobs read from ctx below can be set without a
+        # declare_parameter call for each one.
+        super().__init__(
+            "robot_fsm_node",
+            automatically_declare_parameters_from_overrides=True,
+        )
         self.initial_state = initial_state
         self._stdin_warned = False
         self.planner_backend = str(planner_backend).strip().lower()
@@ -221,6 +228,18 @@ class RobotFSMNode(Node):
             "publish_fsm_event": self.publish_fsm_event,
             "tf_buffer": self.tf_buffer,
         }
+
+        # Bridge externally-set ROS parameter overrides into ctx so per-state
+        # tuning knobs (create_map_*, object_id_*, scan_*, ...) can be configured
+        # at launch. setdefault keeps the explicit ctx values above authoritative
+        # (a param cannot clobber e.g. "node"/"sim"); any other override lands in
+        # ctx under its flat name and is picked up by the matching ctx.get(...).
+        param_overrides = self.get_parameters_by_prefix("")
+        for pname, param in param_overrides.items():
+            if pname == "use_sim_time":
+                continue
+            self.ctx.setdefault(pname, param.value)
+            self.get_logger().info(f"[FSM] ctx param override: {pname}={param.value!r}")
 
         # Build test context for non-default initial state.
         self._bootstrap_context_for_initial_state(initial_state, scan_phase)

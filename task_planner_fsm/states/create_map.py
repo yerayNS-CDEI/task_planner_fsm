@@ -194,9 +194,12 @@ class CreateMap(State):
             min_segment_length_m=float(ctx.get("create_map_min_segment_length_m", 0.5)),
             wall_clearance_m=float(ctx.get("create_map_wall_clearance_m", 0.4)),
             axis=str(ctx.get("create_map_sweep_axis", "auto")),
-            room_split_erosion_m=float(ctx.get("create_map_room_split_erosion_m", 1.3)),
+            # 0.0 -> one global serpentine over the whole space (same as ScanFloor,
+            # one direction). Set > 0 to sweep room-by-room (splits at doorways).
+            room_split_erosion_m=float(ctx.get("create_map_room_split_erosion_m", 0.0)),
             max_traversable_cost=int(ctx.get("create_map_max_traversable_cost", 65)),
             map_occupied_threshold=int(ctx.get("create_map_map_occupied_threshold", 50)),
+            waypoint_merge_dist_m=float(ctx.get("create_map_waypoint_merge_dist_m", 0.2)),
             dry_run=bool(ctx.get("create_map_dry_run", False)),
             use_through_poses=bool(ctx.get("create_map_use_nav_through_poses", False)),
             marker_topic="/create_map/coverage_markers",

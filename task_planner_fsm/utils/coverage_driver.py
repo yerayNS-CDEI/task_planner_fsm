@@ -62,6 +62,9 @@ class CoverageConfig:
     room_split_erosion_m: float = 1.3
     max_traversable_cost: int = 65      # costmap cost <= this is drivable
     map_occupied_threshold: int = 50    # raw /map fallback occupancy threshold
+    # ``waypoint_merge_dist_m`` fuses consecutive waypoints closer than this
+    # (lane junctions / near-duplicates); <= 0 keeps every point.
+    waypoint_merge_dist_m: float = 0.2
 
     # Execution.
     dry_run: bool = False
@@ -312,7 +315,8 @@ class CoverageDriver:
             )
             return []
 
-        points = self._segments_to_points(segments)
+        merge_dist = self._resolve_merge_dist()
+        points = self._segments_to_points(segments, merge_dist)
         if len(points) < 1:
             return []
 
@@ -338,16 +342,41 @@ class CoverageDriver:
         }
         return waypoints
 
+    def _resolve_merge_dist(self) -> float:
+        """Distance below which consecutive waypoints are fused into one.
+
+        ``waypoint_merge_dist_m <= 0`` disables fusion (only exact duplicates are
+        dropped). Otherwise that value is used directly.
+        """
+        merge = float(self.cfg.waypoint_merge_dist_m)
+        return merge if merge > 0.0 else 0.0
+
     @staticmethod
     def _segments_to_points(
-        segments: Sequence[Tuple[Tuple[float, float], Tuple[float, float]]]
+        segments: Sequence[Tuple[Tuple[float, float], Tuple[float, float]]],
+        merge_dist: float = 0.0,
     ) -> List[Tuple[float, float]]:
-        """Flatten ordered lane segments into a deduplicated waypoint sequence."""
+        """Flatten ordered lane segments into a deduplicated waypoint sequence.
+
+        Each segment is a lane the base drives end-to-end, so its two endpoints are
+        always emitted. Where one lane's exit lands within ``merge_dist`` of the
+        next lane's entry (the connector between lanes is ~zero), the duplicate is
+        fused: the previous exit is reused as the next entry instead of adding a
+        second near-identical waypoint the base would shuffle between. A lane whose
+        own length is below ``merge_dist`` collapses to a single point. With
+        ``merge_dist <= 0`` only exact duplicates (> 1e-6 m) are dropped.
+        """
+        eps = max(float(merge_dist), 1e-6)
         points: List[Tuple[float, float]] = []
         for p0, p1 in segments:
-            for p in (p0, p1):
-                if not points or math.hypot(points[-1][0] - p[0], points[-1][1] - p[1]) > 1e-6:
-                    points.append((float(p[0]), float(p[1])))
+            entry = (float(p0[0]), float(p0[1]))
+            exit_ = (float(p1[0]), float(p1[1]))
+            # Fuse this lane's entry with the previous lane's exit if they coincide.
+            if not points or math.hypot(points[-1][0] - entry[0], points[-1][1] - entry[1]) > eps:
+                points.append(entry)
+            # Always emit the exit unless the lane is shorter than the merge radius.
+            if math.hypot(points[-1][0] - exit_[0], points[-1][1] - exit_[1]) > eps:
+                points.append(exit_)
         return points
 
     def _get_start_cell(self, ctx, info, origin, resolution) -> Tuple[int, int]:

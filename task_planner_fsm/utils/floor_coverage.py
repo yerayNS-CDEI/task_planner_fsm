@@ -394,11 +394,13 @@ def order_serpentine(segments: Sequence[Segment], angle: float,
     """Order lines for a serpentine sweep, entering each at its nearest endpoint.
 
     Lines are swept across the room in perpendicular-offset order (so coverage
-    progresses line by line and does not skip around). Within that sweep, every
-    segment is entered from whichever of its two endpoints is closest to the
-    robot's current position — i.e. the end of the previously scanned segment.
-    For clean full-width lines this reproduces a boustrophedon; for lines split
-    by obstacles it still always picks the nearest endpoint.
+    progresses line by line and never skips a line, only to come back for it
+    later). Each LINE is then traversed strictly monotonically along the sweep
+    axis: the base enters the line from the end nearest its current position and
+    runs to the far end. A line split by obstacles into several collinear pieces is
+    swept low->high (or high->low) as one run, so the base never enters a piece
+    from its middle and doubles back across it. Consecutive lines alternate
+    direction, reproducing a clean boustrophedon.
 
     When ``start_xy`` (e.g. the robot's position) is given, the sweep starts at
     the wall-adjacent line nearest the robot. Without it, it starts at the
@@ -433,29 +435,31 @@ def order_serpentine(segments: Sequence[Segment], angle: float,
     else:
         cur = None  # default: enter first segment at its lower-along endpoint
 
+    def along_lo(seg: Segment) -> float:
+        return min(along_of(seg[0]), along_of(seg[1]))
+
     out: List[Segment] = []
     for off in sorted_offsets:
-        remaining = list(groups[off])
-        # Greedily consume this line's segment(s), each entered at its nearest
-        # endpoint to the current position.
-        while remaining:
-            best_i, best_flip, best_d = 0, False, None
-            for i, (p0, p1) in enumerate(remaining):
-                if cur is None:
-                    # No reference yet: enter at the lower-along endpoint.
-                    flip = along_of(p0) > along_of(p1)
-                    d = -1.0  # deterministic; only one pass needed below
-                else:
-                    d0 = math.dist(cur, p0)
-                    d1 = math.dist(cur, p1)
-                    flip = d1 < d0
-                    d = min(d0, d1)
-                if best_d is None or d < best_d:
-                    best_i, best_flip, best_d = i, flip, d
-                if cur is None:
-                    break
-            p0, p1 = remaining.pop(best_i)
-            if best_flip:
+        pieces = list(groups[off])
+
+        # Sweep the whole line monotonically. Pick the direction (low->high or
+        # high->low) by whichever end of the line is nearer the current position,
+        # then emit every collinear piece in that order, each oriented to enter at
+        # its near end. This stops the base entering a split line from the middle
+        # (between two pieces) and crossing back over points it already passed --
+        # the cause of the back-and-forth loops.
+        line_lo = min(along_lo(s) for s in pieces)
+        line_hi = max(max(along_of(s[0]), along_of(s[1])) for s in pieces)
+        if cur is None:
+            ascending = True  # no reference yet: sweep from the lower-along end
+        else:
+            cur_along = along_of(cur)
+            ascending = abs(cur_along - line_lo) <= abs(cur_along - line_hi)
+
+        pieces.sort(key=along_lo, reverse=not ascending)
+        for p0, p1 in pieces:
+            enters_low = along_of(p0) <= along_of(p1)
+            if ascending != enters_low:
                 p0, p1 = p1, p0
             out.append((p0, p1))
             cur = p1
@@ -678,10 +682,12 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
 
     Lanes are aligned to the dominant wall angle. ``axis`` selects which of the
     two wall-aligned directions to sweep:
-      * ``"auto"`` (default): the direction with fewer lanes (i.e. lanes that run
-        along the room's longer dimension -> fewer turns / shorter route);
-      * ``"dominant"``: force the dominant wall angle ``theta``;
-      * ``"perpendicular"``: force ``theta + 90 deg``.
+      * ``"auto"`` (default, aliases ``"fewer"``/``"long"``): the direction with
+        fewer lanes (lanes run along the room's longer dimension -> fewest turns);
+      * ``"more"`` (aliases ``"short"``/``"cross"``): the OTHER one -- more, shorter
+        lanes running across the long dimension. Use it to try the opposite of auto;
+      * ``"dominant"``/``"a"``: force the dominant wall angle ``theta``;
+      * ``"perpendicular"``/``"perp"``/``"b"``: force ``theta + 90 deg``.
 
     ``grid`` is a nav2 costmap; cells with cost above ``max_cost`` (inflation +
     obstacles) are untraversable, so lanes stay collision-free using the
@@ -736,7 +742,13 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
     )
 
     # Pick the sweep direction once, globally, so lanes stay consistent across
-    # rooms: fewer lanes (auto) means lanes run along the longer dimension.
+    # rooms. The two wall-aligned options are theta_a (dominant) and theta_b
+    # (perpendicular). ``axis`` selects between them:
+    #   * "auto"/"fewer"/"long": fewer lanes -> lanes run along the longer
+    #     dimension (longest lanes, fewest turns). Default.
+    #   * "more"/"short"/"cross": the OTHER one -> more, shorter lanes running
+    #     across the long dimension. Use this to try the opposite of "auto".
+    #   * "dominant"/"a": force theta_a.   "perpendicular"/"perp"/"b": force theta_b.
     theta_a = theta
     theta_b = theta + math.pi / 2.0
     axis = (axis or "auto").strip().lower()
@@ -744,26 +756,38 @@ def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
         chosen_angle = theta_a
     elif axis in ("perpendicular", "perp", "b"):
         chosen_angle = theta_b
-    else:  # auto
+    else:  # data-driven: compare how many lanes each direction needs
         lines_a = generate_coverage_lines(placement, origin, resolution, theta_a,
                                           spacing_m, min_len_m)
         lines_b = generate_coverage_lines(placement, origin, resolution, theta_b,
                                           spacing_m, min_len_m)
         count_a = _distinct_line_count(lines_a, theta_a) if lines_a else math.inf
         count_b = _distinct_line_count(lines_b, theta_b) if lines_b else math.inf
-        chosen_angle = theta_b if count_b < count_a else theta_a
+        fewer_angle = theta_b if count_b < count_a else theta_a
+        more_angle = theta_a if count_b < count_a else theta_b
+        if axis in ("more", "short", "shorter", "cross"):
+            chosen_angle = more_angle
+        else:  # auto / fewer / long / longer
+            chosen_angle = fewer_angle
 
-    # Split into rooms (or a single room) and sweep each fully before the next.
-    # Room membership uses the full reachable region (so a pocket reachable only
-    # through inflation still belongs to its room), while lanes are restricted to
-    # the placement cells within that room.
+    # Anchor the sweep at the reachable region's corner nearest the robot, so it
+    # begins in a corner (hugging the walls) -- exactly like ScanFloor's
+    # build_coverage_plan -- instead of part-way along an edge.
+    anchor = nearest_region_corner(reachable, origin, resolution, chosen_angle, start_xy)
+
+    # Split into rooms only if asked (room_split_erosion_m > 0). With it disabled
+    # (the default for densify) segment_rooms returns a SINGLE room spanning the
+    # whole reachable region, so this is one global serpentine -- the same
+    # computation ScanFloor does, just for one direction. Room membership uses the
+    # full reachable region (so a pocket reachable only through inflation still
+    # belongs to its room); lanes are restricted to placement cells within it.
     room_radius = int(round(room_split_erosion_m / resolution)) if resolution > 0 else 0
     room_labels, n_rooms = segment_rooms(reachable, room_radius)
     room_ids = [k for k in range(1, n_rooms + 1) if np.any(room_labels == k)]
     ordered_ids = _order_rooms(room_labels, room_ids, origin, resolution, start_xy)
 
     segments: List[Segment] = []
-    current_xy = start_xy
+    current_xy = anchor
     for k in ordered_ids:
         room_mask = (room_labels == k) & placement
         room_lines = generate_coverage_lines(room_mask, origin, resolution,
