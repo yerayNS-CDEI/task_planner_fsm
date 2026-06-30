@@ -37,6 +37,25 @@ Config is read from ``ctx`` (all keys optional):
                                   inflation, in metres (default 0)
   object_id_costmap_topic         default "/global_costmap/costmap"
   object_id_map_topic             raw-map fallback, default "/map"
+  object_id_check_localization    gate planning on a good rtabmap localization
+                                  fix before computing waypoints (default True)
+  object_id_localization_topic    rtabmap localization pose w/ covariance,
+                                  default "/rtabmap/localization_pose". Only
+                                  published once rtabmap relocalizes against the
+                                  loaded map, so this is a true map-localization
+                                  fix (not just healthy odometry).
+  object_id_localization_max_xy_std   max acceptable horizontal position std-dev
+                                  in metres, sqrt(cov_xx+cov_yy) (default 0.25)
+  object_id_localization_max_yaw_std  max acceptable yaw std-dev in radians,
+                                  sqrt(cov_yawyaw) (default 0.20)
+  object_id_localization_timeout  seconds to wait for a good fix before giving up
+                                  (default 30.0)
+  object_id_localization_max_age  ignore localization-pose samples older than
+                                  this many seconds (default 30.0); rtabmap only
+                                  emits one per relocalization, so keep this
+                                  generous
+  object_id_localization_required when True (default) a bad/absent fix aborts to
+                                  Error; when False it only warns and proceeds
   object_id_dry_run               plan + markers only, skip base motion
   object_id_use_mock              legacy /object_id_sim service path
   object_id_yolo_cmd              optional command to launch YOLO
@@ -52,7 +71,7 @@ import numpy as np
 import rclpy.time
 from action_msgs.msg import GoalStatus
 from example_interfaces.srv import SetBool
-from geometry_msgs.msg import Point, PoseStamped
+from geometry_msgs.msg import Point, PoseStamped, PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
@@ -67,6 +86,7 @@ from task_planner_fsm.states.proc_utils import (
     stop_proc,
     wait_stack_ready,
     wait_services_ready,
+    kill_stale_stack,
     SIM_STACK_PATTERNS,
 )
 
@@ -101,6 +121,13 @@ class ObjectID(State):
         self.latest_costmap = None
         self.latest_map = None
 
+        # Localization-quality gate (rtabmap localization-pose covariance).
+        self.localization_sub = None
+        self.latest_localization_cov = None  # (cov_xx, cov_yy, cov_yawyaw, recv_time)
+        self.latest_localization_xy = None   # (x, y, recv_time) in the map frame
+        self.localization_wait_start = None
+        self._pending_grid = None
+
         self.sim_value = None
         self.phase = "idle"
         self.grid_wait_start = None
@@ -127,6 +154,10 @@ class ObjectID(State):
         self.nav_done = False
         self.nav_failed = False
         self.nav_success_count = 0
+        self.latest_localization_cov = None
+        self.latest_localization_xy = None
+        self.localization_wait_start = None
+        self._pending_grid = None
 
         if not self._start_robot_stack(ctx):
             self.phase = "error"
@@ -140,6 +171,7 @@ class ObjectID(State):
             return
 
         self._ensure_grid_subscriptions(ctx)
+        self._ensure_localization_subscriptions(ctx)
         self._ensure_marker_publisher(ctx)
         self._start_object_id_detection(ctx)
         self._start_optional_yolo_process(ctx)
@@ -186,6 +218,22 @@ class ObjectID(State):
             grid_msg, grid_source = self._select_grid_for_planning(ctx)
             if grid_msg is None:
                 return
+            # Hold the grid and gate planning on a good localization fix first.
+            self._pending_grid = (grid_msg, grid_source)
+            self.localization_wait_start = time.time()
+            self.phase = "checking_localization"
+            return
+
+        if self.phase == "checking_localization":
+            status = self._check_localization_quality(ctx)
+            if status == "pending":
+                return
+            if status == "bad":
+                ctx["error_triggered"] = True
+                self.phase = "error"
+                return
+            grid_msg, grid_source = self._pending_grid
+            self._pending_grid = None
             self._plan_and_execute(ctx, grid_msg, grid_source)
             return
 
@@ -280,7 +328,7 @@ class ObjectID(State):
         # (0/100/-1) has no inflation gradient, so it uses a low threshold.
         is_costmap = "costmap" in grid_source.lower()
         if is_costmap:
-            max_cost = int(ctx.get("object_id_max_traversable_cost", 65))
+            max_cost = int(ctx.get("object_id_max_traversable_cost", 99))
         else:
             max_cost = int(ctx.get("object_id_map_occupied_threshold", 50)) - 1
 
@@ -345,7 +393,24 @@ class ObjectID(State):
         return waypoints
 
     def _get_start_cell(self, ctx, info, origin, resolution) -> Tuple[int, int]:
-        """Robot start cell (row, col), from odom/base_position, TF, or map centre."""
+        """Robot start cell (row, col).
+
+        Prefer rtabmap's relocalized localization pose (the same fix the gate
+        validated) so the route is planned from where the robot actually is in
+        the map, then fall back to odom/base_position, TF, or the map centre.
+        """
+        node = ctx["node"]
+
+        loc = self.latest_localization_xy
+        if loc is not None:
+            c = int((loc[0] - origin[0]) / resolution)
+            r = int((loc[1] - origin[1]) / resolution)
+            node.get_logger().info(
+                f"[{self.name}] Planning start from relocalized pose "
+                f"({loc[0]:.2f}, {loc[1]:.2f}) m."
+            )
+            return r, c
+
         base = ctx.get("base_position")
         if base is not None:
             c = int((float(base.x) - origin[0]) / resolution)
@@ -408,6 +473,11 @@ class ObjectID(State):
             node.get_logger().info(
                 f"[{self.name}] Launching navigation stack with Gazebo/Nav2 (sim:={sim_value}, hybrid_sim:=false)..."
             )
+            # Free hardware resources held by any orphaned driver from a previous
+            # run (notably the SICK UDP ports 2115/2116) before relaunching, so the
+            # new stack's drivers can bind instead of failing with "Address already
+            # in use" and silently breaking odometry/localization.
+            kill_stale_stack(node=node)
             start_proc(
                 ctx,
                 "nav_sim",
@@ -607,6 +677,103 @@ class ObjectID(State):
         if int(elapsed) % 5 == 0:
             node.get_logger().warn(f"[{self.name}] Still waiting for costmap/map grid...")
         return None, None
+
+    # ------------------------------------------------------------------
+    # Localization-quality gate (rtabmap covariance)
+    # ------------------------------------------------------------------
+    def _ensure_localization_subscriptions(self, ctx):
+        """Subscribe to rtabmap's localization pose.
+
+        In localization mode (Mem/IncrementalMemory=false, set by move_robot's
+        ``localization:=true``) rtabmap publishes ``/rtabmap/localization_pose``
+        as a PoseWithCovarianceStamped each time it relocalizes against the
+        loaded map. Its covariance is a direct measure of how confidently the
+        robot is placed *in the map*, so receiving a fresh, low-covariance
+        sample is exactly the "the robot has localized itself" guarantee we want
+        before planning the coverage route.
+        """
+        node = ctx["node"]
+        loc_topic = ctx.get("object_id_localization_topic", "/rtabmap/localization_pose")
+        if self.localization_sub is None:
+            self.localization_sub = node.create_subscription(
+                PoseWithCovarianceStamped, loc_topic, self._localization_pose_callback, 10
+            )
+
+    def _localization_pose_callback(self, msg: PoseWithCovarianceStamped):
+        now = time.time()
+        # 6x6 row-major covariance; diagonal: xx=0, yy=7, yaw(=zz rot)=35.
+        cov = msg.pose.covariance
+        self.latest_localization_cov = (
+            float(cov[0]), float(cov[7]), float(cov[35]), now
+        )
+        # Keep the relocalized map-frame position so planning can start from
+        # where rtabmap actually placed the robot, not the older odom pose.
+        p = msg.pose.pose.position
+        self.latest_localization_xy = (float(p.x), float(p.y), now)
+
+    def _check_localization_quality(self, ctx) -> str:
+        """Decide whether the robot is localized well enough to start planning.
+
+        Returns ``"ok"`` to proceed, ``"pending"`` to keep waiting on this tick,
+        or ``"bad"`` to abort. Compares the position/yaw standard deviations
+        derived from rtabmap's covariance against configurable thresholds.
+        """
+        node = ctx["node"]
+
+        if not bool(ctx.get("object_id_check_localization", True)):
+            return "ok"
+
+        max_xy_std = float(ctx.get("object_id_localization_max_xy_std", 0.25))
+        max_yaw_std = float(ctx.get("object_id_localization_max_yaw_std", 0.20))
+        timeout = float(ctx.get("object_id_localization_timeout", 60.0))
+        max_age = float(ctx.get("object_id_localization_max_age", 60.0))
+        required = bool(ctx.get("object_id_localization_required", True))
+
+        now = time.time()
+        elapsed = now - float(self.localization_wait_start or now)
+        sample = self.latest_localization_cov
+
+        fresh = sample is not None and (now - sample[3]) <= max_age
+        if fresh:
+            cov_xx, cov_yy, cov_yawyaw, _ = sample
+            xy_std = math.sqrt(max(cov_xx + cov_yy, 0.0))
+            yaw_std = math.sqrt(max(cov_yawyaw, 0.0))
+            if xy_std <= max_xy_std and yaw_std <= max_yaw_std:
+                node.get_logger().info(
+                    f"[{self.name}] Localization OK: "
+                    f"xy_std={xy_std:.3f} m (<= {max_xy_std:.3f}), "
+                    f"yaw_std={yaw_std:.3f} rad (<= {max_yaw_std:.3f})."
+                )
+                return "ok"
+            if int(elapsed) % 5 == 0:
+                node.get_logger().warn(
+                    f"[{self.name}] Waiting for better localization: "
+                    f"xy_std={xy_std:.3f}/{max_xy_std:.3f} m, "
+                    f"yaw_std={yaw_std:.3f}/{max_yaw_std:.3f} rad "
+                    f"({elapsed:.0f}/{timeout:.0f}s)."
+                )
+        elif int(elapsed) % 5 == 0:
+            node.get_logger().warn(
+                f"[{self.name}] Waiting for an rtabmap localization fix on "
+                f"{ctx.get('object_id_localization_topic', '/rtabmap/localization_pose')} "
+                f"({elapsed:.0f}/{timeout:.0f}s)..."
+            )
+
+        if elapsed < timeout:
+            return "pending"
+
+        # Timed out without a good fix.
+        if required:
+            node.get_logger().error(
+                f"[{self.name}] Robot not confidently localized after {timeout:.0f}s; "
+                f"aborting before planning the coverage route."
+            )
+            return "bad"
+        node.get_logger().warn(
+            f"[{self.name}] Localization not confirmed after {timeout:.0f}s, but "
+            f"object_id_localization_required=False; proceeding anyway."
+        )
+        return "ok"
 
     # ------------------------------------------------------------------
     # Sequential NavigateToPose execution (default, robust)

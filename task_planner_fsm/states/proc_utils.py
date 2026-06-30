@@ -11,12 +11,33 @@ GAZEBO_PATTERNS = [
     'gz-sim',
 ]
 
+# Hardware sensor drivers brought up by the mapping / navigation stack. These
+# are the most dangerous to leave orphaned: they hold exclusive OS resources
+# (the SICK multiscan UDP receiver ports 2115/2116, the Ouster TCP/UDP session,
+# the RealSense USB device). A survivor from a previous run makes the next
+# launch's driver fail to bind ("Address already in use, error 98"), which
+# silently breaks the point-cloud -> icp_odometry -> rtabmap localization chain
+# (no /rtabmap/odom, no /map, empty costmap). SIGINT is routinely ignored by
+# sick_generic_caller, so these MUST be reachable by the force-kill paths.
+SENSOR_DRIVER_PATTERNS = [
+    'sick_generic_caller',
+    'os_driver',
+    'pointcloud_concatenate_node',
+    'robot_body_filter_node',
+    'icp_odometry',
+    'rgbd_sync',
+    'realsense2_camera_node',
+]
+
 # Every process that a single move_robot.launch.py / mapping launch brings up.
 # When we tear a launch down we must remove ALL of these, otherwise orphaned
 # nodes (a second robot_state_publisher, controller_manager, rtabmap, rviz, ...)
 # collide with the next launch and the new stack never comes up cleanly.
-SIM_STACK_PATTERNS = GAZEBO_PATTERNS + [
+SIM_STACK_PATTERNS = GAZEBO_PATTERNS + SENSOR_DRIVER_PATTERNS + [
     'move_robot.launch.py',
+    'mapping_stack.launch.py',
+    'exploration.launch.py',
+    'global_exploration.launch.py',
     'robot_state_publisher',
     'ros2_control_node',
     'controller_manager',
@@ -181,6 +202,47 @@ def wait_processes_gone(
     if node:
         node.get_logger().warn(f"Timed out after {timeout}s waiting for processes to exit.")
     return False
+
+
+def kill_stale_stack(
+    node=None,
+    patterns: Iterable[str] = SENSOR_DRIVER_PATTERNS,
+    exclude_pids: Optional[Iterable[int]] = None,
+    settle: float = 1.0,
+) -> List[int]:
+    """Force-kill lingering stack/sensor processes BEFORE launching a new stack.
+
+    Orphans from a previous run (crashed, or one whose ``ros2 launch`` was
+    Ctrl-C'd while ``sick_generic_caller`` ignored the SIGINT) keep holding the
+    SICK UDP ports 2115/2116 and the RealSense USB device. The next launch's
+    drivers then fail to bind ("Address already in use") and odometry /
+    localization silently never come up. Calling this at the start of the launch
+    guarantees a clean slate. It is a no-op when nothing matches.
+
+    Defaults to ``SENSOR_DRIVER_PATTERNS`` (the resource-holding drivers); pass
+    ``SIM_STACK_PATTERNS`` for a full-stack sweep. Returns the PIDs it killed.
+    """
+    exclude = set(exclude_pids or [])
+    exclude.add(os.getpid())
+    killed: List[int] = []
+    for pattern in patterns:
+        for pid in _pgrep(pattern):
+            if pid in exclude:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+                if node:
+                    node.get_logger().warn(
+                        f"[cleanup] Force-killed stale process pid={pid} matching '{pattern}'."
+                    )
+            except (ProcessLookupError, PermissionError):
+                pass
+    if killed and settle > 0:
+        # Give the kernel a moment to release the bound UDP sockets / USB handle
+        # before the new drivers try to claim them.
+        time.sleep(settle)
+    return killed
 
 
 def _topic_publisher_count(topic: str, timeout: float = 4.0) -> int:

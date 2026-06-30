@@ -31,6 +31,7 @@ from task_planner_fsm.states.proc_utils import (
     stop_proc,
     wait_stack_ready,
     wait_processes_gone,
+    kill_stale_stack,
     SIM_STACK_PATTERNS,
 )
 
@@ -54,6 +55,12 @@ class CreateMap(State):
         self.driver = None
         ctx["map_ready"] = False
         ctx["error_triggered"] = False
+
+        # Free hardware resources held by any orphaned driver from a previous
+        # run (notably the SICK UDP ports 2115/2116) before relaunching, so the
+        # new stack's drivers can bind instead of failing with "Address already
+        # in use" and silently breaking odometry/localization.
+        kill_stale_stack(node=node)
 
         cmd = ctx.get("mapping_cmd")
         if isinstance(cmd, str):
