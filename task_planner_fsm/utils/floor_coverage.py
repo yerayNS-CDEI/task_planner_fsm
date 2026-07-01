@@ -246,59 +246,6 @@ def _representative_cell(component: np.ndarray) -> Optional[Tuple[int, int]]:
     return int(r), int(c)
 
 
-def uncovered_pocket_cells(placement: np.ndarray,
-                           covered_cells: Sequence[Tuple[int, int]]
-                           ) -> List[Tuple[int, int]]:
-    """One representative ``(row, col)`` per placement component left uncovered.
-
-    Labels the connected components of ``placement`` and returns a single
-    interior cell for every component that contains none of ``covered_cells``
-    (the cells already touched by the generated route). This guarantees that
-    every patch of free space -- however small -- receives at least one
-    waypoint, since being free means the base reached it during mapping.
-    """
-    if not placement.any():
-        return []
-
-    if _ndimage is not None:
-        labels, n = _ndimage.label(placement)
-    else:  # graceful: treat the whole mask as a single component
-        labels = placement.astype(np.int32)
-        n = 1
-
-    rows, cols = placement.shape
-    covered_labels = set()
-    for r, c in covered_cells:
-        if 0 <= r < rows and 0 <= c < cols:
-            lab = int(labels[r, c])
-            if lab > 0:
-                covered_labels.add(lab)
-
-    reps: List[Tuple[int, int]] = []
-    for lab in range(1, n + 1):
-        if lab in covered_labels:
-            continue
-        cell = _representative_cell(labels == lab)
-        if cell is not None:
-            reps.append(cell)
-    return reps
-
-
-def _segment_covered_cells(segments: Sequence[Segment], origin: Point2,
-                           resolution: float, shape: Tuple[int, int]
-                           ) -> List[Tuple[int, int]]:
-    """``(row, col)`` cells touched by each segment's endpoints and midpoint."""
-    rows, cols = shape
-    cells: List[Tuple[int, int]] = []
-    for (x0, y0), (x1, y1) in segments:
-        for x, y in ((x0, y0), (x1, y1), (0.5 * (x0 + x1), 0.5 * (y0 + y1))):
-            c = int((x - origin[0]) / resolution)
-            r = int((y - origin[1]) / resolution)
-            if 0 <= r < rows and 0 <= c < cols:
-                cells.append((r, c))
-    return cells
-
-
 # ----------------------------------------------------------------------------
 # Coverage line generation
 # ----------------------------------------------------------------------------
@@ -591,233 +538,248 @@ def build_coverage_plan(grid: np.ndarray, origin: Point2, resolution: float,
     }
 
 
-def _distinct_line_count(segments: Sequence[Segment], angle: float) -> int:
-    """Number of distinct parallel lines (perpendicular offsets) in ``segments``.
+def geodesic_distance_field(passable: np.ndarray, start_cell: Tuple[int, int],
+                            resolution: float, downsample: int = 1) -> np.ndarray:
+    """Dijkstra shortest-path distance (metres) from ``start_cell`` over ``passable``.
 
-    A single line split by obstacles yields several segments at the same offset,
-    so counting offsets (not segments) measures how many lanes the sweep needs.
+    8-connected, with orthogonal step ``resolution`` and diagonal ``sqrt(2) *
+    resolution``, so distances follow the free space AROUND walls -- a point a
+    metre away across a wall is correctly far (it must detour through a doorway),
+    unlike a straight-line distance. Unreachable cells stay ``inf``.
+
+    ``downsample`` > 1 floods a coarsened copy of the mask (a coarse cell is
+    passable when ANY fine cell in it is) and upsamples the result, trading exact
+    cell distances for speed -- fine for ordering decisions on large maps.
     """
-    perp_x, perp_y = -math.sin(angle), math.cos(angle)
-    offsets = {round(x0 * perp_x + y0 * perp_y, 3) for (x0, y0), _ in segments}
-    return len(offsets)
+    import heapq
 
+    ds = max(1, int(downsample))
+    if ds > 1:
+        rows, cols = passable.shape
+        cr, cc = rows // ds, cols // ds
+        if cr >= 1 and cc >= 1:
+            coarse = passable[:cr * ds, :cc * ds].reshape(cr, ds, cc, ds).any(axis=(1, 3))
+            cstart = (min(start_cell[0] // ds, cr - 1), min(start_cell[1] // ds, cc - 1))
+            cdist = geodesic_distance_field(coarse, cstart, resolution * ds, downsample=1)
+            full = np.repeat(np.repeat(cdist, ds, axis=0), ds, axis=1)
+            out = np.full(passable.shape, np.inf, dtype=np.float64)
+            out[:full.shape[0], :full.shape[1]] = full
+            return out
 
-def segment_rooms(reachable: np.ndarray, radius_cells: int) -> Tuple[np.ndarray, int]:
-    """Split a reachable free mask into rooms separated by narrow passages.
+    rows, cols = passable.shape
+    dist = np.full((rows, cols), np.inf, dtype=np.float64)
+    sr, sc = int(start_cell[0]), int(start_cell[1])
+    if not (0 <= sr < rows and 0 <= sc < cols and passable[sr, sc]):
+        snap = _nearest_free_cell(passable, (sr, sc))
+        if snap is None:
+            return dist
+        sr, sc = snap
 
-    Eroding the free space by ``radius_cells`` pinches off any passage narrower
-    than ~``2 * radius_cells`` (e.g. a doorway), so the eroded cores label as
-    separate rooms. Every reachable cell is then assigned to its nearest core, so
-    the rooms tile the whole region and the doorway is absorbed into the nearest
-    room.
+    diag = math.sqrt(2.0) * resolution
+    orth = float(resolution)
+    nbrs = ((-1, 0, orth), (1, 0, orth), (0, -1, orth), (0, 1, orth),
+            (-1, -1, diag), (-1, 1, diag), (1, -1, diag), (1, 1, diag))
 
-    Returns ``(labels, n_rooms)`` with ``labels`` in ``1..n_rooms`` on reachable
-    cells and ``0`` elsewhere. Falls back to a single room when SciPy is
-    unavailable, ``radius_cells <= 0``, or fewer than two cores survive erosion.
-    """
-    if not reachable.any():
-        return np.zeros_like(reachable, dtype=np.int32), 0
-    if radius_cells <= 0 or _ndimage is None:
-        return reachable.astype(np.int32), 1
-
-    structure = _disk_structure(int(radius_cells))
-    core = _ndimage.binary_erosion(reachable, structure=structure, border_value=0)
-    core_labels, n = _ndimage.label(core)
-    if n <= 1:
-        return reachable.astype(np.int32), 1
-
-    # Assign every reachable cell to the nearest surviving core label.
-    _, inds = _ndimage.distance_transform_edt(core_labels == 0, return_indices=True)
-    nearest = core_labels[tuple(inds)]
-    labels = np.where(reachable, nearest, 0).astype(np.int32)
-    return labels, int(n)
-
-
-def _room_centroids(labels: np.ndarray, room_ids: Sequence[int], origin: Point2,
-                    resolution: float) -> dict:
-    cents = {}
-    for k in room_ids:
-        idx = np.argwhere(labels == k)
-        if idx.size == 0:
+    dist[sr, sc] = 0.0
+    pq = [(0.0, sr, sc)]
+    while pq:
+        d, r, c = heapq.heappop(pq)
+        if d > dist[r, c]:
             continue
-        cx = origin[0] + (float(idx[:, 1].mean()) + 0.5) * resolution
-        cy = origin[1] + (float(idx[:, 0].mean()) + 0.5) * resolution
-        cents[k] = (cx, cy)
-    return cents
+        for dr, dc, w in nbrs:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols and passable[nr, nc]:
+                nd = d + w
+                if nd < dist[nr, nc]:
+                    dist[nr, nc] = nd
+                    heapq.heappush(pq, (nd, nr, nc))
+    return dist
 
 
-def _order_rooms(labels: np.ndarray, room_ids: Sequence[int], origin: Point2,
-                 resolution: float, start_xy: Optional[Point2]) -> List[int]:
-    """Greedy nearest-centroid room order, starting nearest the robot."""
-    cents = _room_centroids(labels, room_ids, origin, resolution)
-    remaining = [k for k in room_ids if k in cents]
-    if not remaining:
-        return []
-    cur = start_xy if start_xy is not None else cents[remaining[0]]
-    ordered: List[int] = []
-    while remaining:
-        k = min(remaining, key=lambda r: math.dist(cur, cents[r]))
-        ordered.append(k)
-        cur = cents[k]
-        remaining.remove(k)
-    return ordered
+# ----------------------------------------------------------------------------
+# Uniform free-cell coverage (grid sampling + geodesic TSP tour)
+# ----------------------------------------------------------------------------
+def _choose_tile_cell(reachable: np.ndarray, placement: np.ndarray,
+                      grid: np.ndarray, r0: int, r1: int, c0: int, c1: int
+                      ) -> Optional[Tuple[int, int]]:
+    """Pick one ``(row, col)`` in tile ``[r0:r1, c0:c1]`` to host a waypoint.
 
-
-def build_single_sweep_plan(grid: np.ndarray, origin: Point2, resolution: float,
-                            start_cell: Tuple[int, int], *, spacing_m: float,
-                            inflation_m: float, min_len_m: float,
-                            max_cost: int = _DEFAULT_MAX_COST,
-                            waypoint_max_cost: Optional[int] = None,
-                            ensure_pocket_coverage: bool = False,
-                            angle: Optional[float] = None,
-                            axis: str = "auto",
-                            room_split_erosion_m: float = 0.0) -> dict:
-    """One-direction serpentine coverage of the reachable free region.
-
-    Unlike :func:`build_coverage_plan` (which sweeps BOTH perpendicular
-    directions and therefore covers the room twice), this returns a SINGLE
-    boustrophedon pass: the base visits every reachable cell once, in clean
-    parallel lanes ``spacing_m`` apart, without doubling back. This is what an
-    object-search sweep wants.
-
-    Lanes are aligned to the dominant wall angle. ``axis`` selects which of the
-    two wall-aligned directions to sweep:
-      * ``"auto"`` (default, aliases ``"fewer"``/``"long"``): the direction with
-        fewer lanes (lanes run along the room's longer dimension -> fewest turns);
-      * ``"more"`` (aliases ``"short"``/``"cross"``): the OTHER one -- more, shorter
-        lanes running across the long dimension. Use it to try the opposite of auto;
-      * ``"dominant"``/``"a"``: force the dominant wall angle ``theta``;
-      * ``"perpendicular"``/``"perp"``/``"b"``: force ``theta + 90 deg``.
-
-    ``grid`` is a nav2 costmap; cells with cost above ``max_cost`` (inflation +
-    obstacles) are untraversable, so lanes stay collision-free using the
-    costmap's own inflation. ``inflation_m`` adds an OPTIONAL extra margin on top
-    of that (raise it to keep lane endpoints further into free space, away from
-    walls). ``start_cell`` is ``(row, col)``.
-
-    ``max_cost`` and ``waypoint_max_cost`` serve two different jobs. ``max_cost``
-    is the *traversable* threshold: it decides which cells count as drivable for
-    the reachability flood-fill, so keep it permissive (it may include the
-    inflation band) to keep narrow-necked space connected. ``waypoint_max_cost``
-    (default: same as ``max_cost``) is the *placement* threshold: lanes are only
-    laid on cells within it. Set it low (e.g. 0) to keep waypoints in genuine
-    free space -- just inside the free/inflation seam -- while still reaching
-    pockets joined to the room only through inflation.
-
-    ``ensure_pocket_coverage`` guarantees that every connected patch of placement
-    (free) space gets at least one waypoint: after the sweep, any free component
-    the lanes missed (e.g. one too small for a lane of length ``min_len_m``)
-    receives a single interior point, returned under ``extra_points``.
-
-    ``room_split_erosion_m`` > 0 enables room-by-room coverage: the free space is
-    split into rooms wherever a passage is narrower than ~``2 *
-    room_split_erosion_m`` (e.g. a doorway), and each room is fully swept before
-    moving to the next (rooms ordered nearest-first from the robot). This stops
-    the base shuttling back and forth between rooms. 0 disables it (one global
-    sweep).
-
-    Returns ``{angle, segments, segment_angles, extra_points, reachable,
-    placement, line_count, room_count}`` where ``segments`` is in execution order,
-    ``segment_angles`` is the parallel per-segment heading (all equal: a single
-    sweep direction), and ``extra_points`` is a list of ``(x, y)`` fallback points
-    (empty unless ``ensure_pocket_coverage``).
+    Prefers a genuine placement (low-cost free) cell nearest the tile centre; if
+    the tile has reachable space but no placement cell (e.g. it is all inflation
+    band the base can still drive through), the lowest-cost reachable cell nearest
+    the centre is used instead. Returns ``None`` only when the tile has no
+    reachable cell at all, so every reachable tile yields exactly one point.
     """
-    theta = dominant_wall_angle(grid) if angle is None else (angle % (math.pi / 2.0))
+    sub_reach = reachable[r0:r1, c0:c1]
+    if not sub_reach.any():
+        return None
+    cr = (r1 - r0 - 1) / 2.0
+    cc = (c1 - c0 - 1) / 2.0
 
-    blocked = blocked_mask(grid, max_cost)
-    radius_cells = int(round(inflation_m / resolution)) if resolution > 0 else 0
-    inflated = inflate_obstacles(blocked, radius_cells)
+    sub_place = placement[r0:r1, c0:c1]
+    if sub_place.any():
+        idx = np.argwhere(sub_place)
+    else:
+        idx = np.argwhere(sub_reach)
+        costs = grid[r0:r1, c0:c1][idx[:, 0], idx[:, 1]]
+        keep = costs <= int(costs.min())
+        idx = idx[keep]
 
-    free = free_mask(grid, max_cost) & ~inflated
+    d2 = (idx[:, 0] - cr) ** 2 + (idx[:, 1] - cc) ** 2
+    rr, ccx = idx[int(np.argmin(d2))]
+    return (int(rr + r0), int(ccx + c0))
+
+
+def _geodesic_distance_matrix(nodes_rc: Sequence[Tuple[int, int]],
+                              passable: np.ndarray, resolution: float,
+                              downsample: int = 1) -> np.ndarray:
+    """All-pairs geodesic distance (metres) between ``nodes_rc`` over ``passable``.
+
+    One Dijkstra flood per node samples the distance to every other node. Pairs
+    left unreachable in the (optionally downsampled) flood are filled with a large
+    sentinel plus their straight-line distance, so the tour stays finite and still
+    visits them, last.
+    """
+    n = len(nodes_rc)
+    D = np.full((n, n), np.inf, dtype=np.float64)
+    for i, (r, c) in enumerate(nodes_rc):
+        field = geodesic_distance_field(passable, (r, c), resolution, downsample)
+        for j, (rj, cj) in enumerate(nodes_rc):
+            D[i, j] = field[rj, cj]
+        D[i, i] = 0.0
+
+    finite = D[np.isfinite(D)]
+    big = (float(finite.max()) * 10.0 + 1.0) if finite.size else 1.0
+    for i in range(n):
+        for j in range(n):
+            if not math.isfinite(D[i, j]):
+                euc = math.hypot(nodes_rc[i][0] - nodes_rc[j][0],
+                                 nodes_rc[i][1] - nodes_rc[j][1]) * resolution
+                D[i, j] = big + euc
+    return D
+
+
+def _open_tsp_order(D: np.ndarray, start_idx: int, refine: bool = True) -> List[int]:
+    """Open-tour visiting order over a distance matrix, anchored at ``start_idx``.
+
+    Greedy nearest-neighbour from the anchor, then 2-opt: repeatedly reverse any
+    sub-path whose reversal shortens the (open, non-returning) route. The anchor
+    is index 0 of the returned order and never moves. O(n^2) per 2-opt pass.
+    """
+    n = len(D)
+    unvis = set(range(n))
+    unvis.discard(start_idx)
+    order = [start_idx]
+    cur = start_idx
+    while unvis:
+        nxt = min(unvis, key=lambda j: D[cur, j])
+        order.append(nxt)
+        unvis.discard(nxt)
+        cur = nxt
+
+    if refine and n >= 4:
+        improved = True
+        while improved:
+            improved = False
+            for i in range(1, n - 1):
+                a = order[i - 1]
+                b = order[i]
+                for k in range(i + 1, n):
+                    c = order[k]
+                    if k + 1 < n:
+                        d = order[k + 1]
+                        delta = (D[a, c] + D[b, d]) - (D[a, b] + D[c, d])
+                    else:  # reversing the tail: only the leading edge changes
+                        delta = D[a, c] - D[a, b]
+                    if delta < -1e-9:
+                        order[i:k + 1] = order[i:k + 1][::-1]
+                        improved = True
+                        b = order[i]
+    return order
+
+
+def build_uniform_coverage_plan(grid: np.ndarray, origin: Point2, resolution: float,
+                                start_cell: Tuple[int, int], *, step_m: float,
+                                max_cost: int = _DEFAULT_MAX_COST,
+                                waypoint_max_cost: Optional[int] = None,
+                                inflation_m: float = 0.0,
+                                downsample: int = 1,
+                                refine_2opt: bool = True) -> dict:
+    """Uniform free-cell coverage: one waypoint per tile, ordered by geodesic TSP.
+
+    A deliberately simple, robust alternative to the lane/serpentine planner. The
+    reachable free space (flood-filled from ``start_cell`` with the permissive
+    ``max_cost`` so narrow gaps stay connected) is tiled at ``step_m``; every tile
+    holding reachable space contributes ONE waypoint (placed on the safest cell
+    near the tile centre via :func:`_choose_tile_cell`), so all free space gets
+    points and nothing is skipped. The points are then ordered as an open TSP with
+    a wall-aware geodesic distance matrix (nearest-neighbour + 2-opt), so the base
+    drives an efficient, non-revisiting tour. ``waypoint_max_cost`` (default: same
+    as ``max_cost``) is the strict placement threshold; ``inflation_m`` adds an
+    optional standoff eroded from the free/inflation seam. ``start_cell`` is
+    ``(row, col)``.
+
+    Returns ``{waypoints, segments, reachable, placement, point_count, angle}``
+    where ``waypoints`` is an ordered list of ``(x, y, yaw)`` (yaw faces the next
+    point) and ``segments`` are consecutive point pairs for marker reuse.
+    """
+    free = free_mask(grid, max_cost)
     reachable = reachable_free_mask(free, start_cell)
+    if not reachable.any():
+        return {"waypoints": [], "segments": [], "reachable": reachable,
+                "placement": np.zeros_like(reachable), "point_count": 0, "angle": 0.0}
 
-    # Waypoints land only on placement cells (default: same as the traversable
-    # set, so behaviour is unchanged unless waypoint_max_cost is lowered).
-    wp_max_cost = max_cost if waypoint_max_cost is None else int(waypoint_max_cost)
-    placement = placement_mask(grid, reachable, wp_max_cost) & ~inflated
+    wp_max = max_cost if waypoint_max_cost is None else int(waypoint_max_cost)
+    placement = reachable & (grid >= 0) & (grid <= wp_max)
+    radius_cells = int(round(inflation_m / resolution)) if resolution > 0 else 0
+    if radius_cells > 0:
+        seam_blocked = (grid > wp_max) | (grid < 0)
+        placement = placement & ~inflate_obstacles(seam_blocked, radius_cells)
 
-    start_xy = (
-        origin[0] + (start_cell[1] + 0.5) * resolution,
-        origin[1] + (start_cell[0] + 0.5) * resolution,
-    )
+    rows, cols = reachable.shape
+    step = max(1, int(round(step_m / resolution)))
+    pts_rc: List[Tuple[int, int]] = []
+    for r0 in range(0, rows, step):
+        for c0 in range(0, cols, step):
+            cell = _choose_tile_cell(reachable, placement, grid,
+                                     r0, min(r0 + step, rows), c0, min(c0 + step, cols))
+            if cell is not None:
+                pts_rc.append(cell)
+    if not pts_rc:
+        return {"waypoints": [], "segments": [], "reachable": reachable,
+                "placement": placement, "point_count": 0, "angle": 0.0}
 
-    # Pick the sweep direction once, globally, so lanes stay consistent across
-    # rooms. The two wall-aligned options are theta_a (dominant) and theta_b
-    # (perpendicular). ``axis`` selects between them:
-    #   * "auto"/"fewer"/"long": fewer lanes -> lanes run along the longer
-    #     dimension (longest lanes, fewest turns). Default.
-    #   * "more"/"short"/"cross": the OTHER one -> more, shorter lanes running
-    #     across the long dimension. Use this to try the opposite of "auto".
-    #   * "dominant"/"a": force theta_a.   "perpendicular"/"perp"/"b": force theta_b.
-    theta_a = theta
-    theta_b = theta + math.pi / 2.0
-    axis = (axis or "auto").strip().lower()
-    if axis in ("dominant", "a"):
-        chosen_angle = theta_a
-    elif axis in ("perpendicular", "perp", "b"):
-        chosen_angle = theta_b
-    else:  # data-driven: compare how many lanes each direction needs
-        lines_a = generate_coverage_lines(placement, origin, resolution, theta_a,
-                                          spacing_m, min_len_m)
-        lines_b = generate_coverage_lines(placement, origin, resolution, theta_b,
-                                          spacing_m, min_len_m)
-        count_a = _distinct_line_count(lines_a, theta_a) if lines_a else math.inf
-        count_b = _distinct_line_count(lines_b, theta_b) if lines_b else math.inf
-        fewer_angle = theta_b if count_b < count_a else theta_a
-        more_angle = theta_a if count_b < count_a else theta_b
-        if axis in ("more", "short", "shorter", "cross"):
-            chosen_angle = more_angle
-        else:  # auto / fewer / long / longer
-            chosen_angle = fewer_angle
+    # Anchor the tour at the robot's reachable start cell (dropped from output).
+    sr, sc = int(start_cell[0]), int(start_cell[1])
+    if not (0 <= sr < rows and 0 <= sc < cols and reachable[sr, sc]):
+        snap = _nearest_free_cell(reachable, (sr, sc))
+        if snap is not None:
+            sr, sc = snap
+    nodes = [(sr, sc)] + pts_rc
 
-    # Anchor the sweep at the reachable region's corner nearest the robot, so it
-    # begins in a corner (hugging the walls) -- exactly like ScanFloor's
-    # build_coverage_plan -- instead of part-way along an edge.
-    anchor = nearest_region_corner(reachable, origin, resolution, chosen_angle, start_xy)
+    D = _geodesic_distance_matrix(nodes, reachable, resolution, downsample)
+    order = _open_tsp_order(D, 0, refine_2opt)
+    ordered_rc = [nodes[i] for i in order if i != 0]
 
-    # Split into rooms only if asked (room_split_erosion_m > 0). With it disabled
-    # (the default for densify) segment_rooms returns a SINGLE room spanning the
-    # whole reachable region, so this is one global serpentine -- the same
-    # computation ScanFloor does, just for one direction. Room membership uses the
-    # full reachable region (so a pocket reachable only through inflation still
-    # belongs to its room); lanes are restricted to placement cells within it.
-    room_radius = int(round(room_split_erosion_m / resolution)) if resolution > 0 else 0
-    room_labels, n_rooms = segment_rooms(reachable, room_radius)
-    room_ids = [k for k in range(1, n_rooms + 1) if np.any(room_labels == k)]
-    ordered_ids = _order_rooms(room_labels, room_ids, origin, resolution, start_xy)
+    xy = [(origin[0] + (c + 0.5) * resolution, origin[1] + (r + 0.5) * resolution)
+          for r, c in ordered_rc]
+    waypoints: List[Tuple[float, float, float]] = []
+    for i, (x, y) in enumerate(xy):
+        nxt = xy[i + 1] if i + 1 < len(xy) else None
+        if nxt is not None:
+            yaw = math.atan2(nxt[1] - y, nxt[0] - x)
+        else:
+            yaw = waypoints[-1][2] if waypoints else 0.0
+        waypoints.append((float(x), float(y), float(yaw)))
 
-    segments: List[Segment] = []
-    current_xy = anchor
-    for k in ordered_ids:
-        room_mask = (room_labels == k) & placement
-        room_lines = generate_coverage_lines(room_mask, origin, resolution,
-                                             chosen_angle, spacing_m, min_len_m)
-        room_route = order_serpentine(room_lines, chosen_angle, current_xy)
-        if room_route:
-            segments.extend(room_route)
-            current_xy = room_route[-1][1]
-
-    segment_angles = [chosen_angle] * len(segments)
-
-    # Guarantee a point in every free pocket the lanes missed.
-    extra_points: List[Point2] = []
-    if ensure_pocket_coverage:
-        covered = _segment_covered_cells(segments, origin, resolution, placement.shape)
-        for r, c in uncovered_pocket_cells(placement, covered):
-            extra_points.append((
-                origin[0] + (c + 0.5) * resolution,
-                origin[1] + (r + 0.5) * resolution,
-            ))
-
+    segments = [(xy[i], xy[i + 1]) for i in range(len(xy) - 1)]
     return {
-        "angle": chosen_angle,
+        "waypoints": waypoints,
         "segments": segments,
-        "segment_angles": segment_angles,
-        "extra_points": extra_points,
         "reachable": reachable,
         "placement": placement,
-        "line_count": _distinct_line_count(segments, chosen_angle) if segments else 0,
-        "room_count": len(ordered_ids),
+        "point_count": len(waypoints),
+        "angle": 0.0,
     }
 
 

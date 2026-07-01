@@ -8,12 +8,13 @@ which is how this state detects "exploration finished". Crucially the mapping +
 nav2 stack is left RUNNING (it is a different process), so the robot is still
 localized, mapping, and navigable for the next phase.
 
-Phase 2 (DENSIFY, optional): drive a structured single-sweep coverage of the
-already-explored space (revisiting every place once, room-by-room, no shuttling)
-so rtabmap keeps integrating scans and the map gets denser/more accurate. The
-geometry + navigation are handled by the shared ``CoverageDriver`` — the same
-one ``ObjectID`` uses, but configured from this state's OWN ``create_map_*``
-parameters so the two sweeps stay independently tunable. Gate it off with
+Phase 2 (DENSIFY, optional): drive a uniform free-cell coverage of the
+already-explored space — the reachable free area is tiled at a fixed spacing,
+every tile gets one waypoint (so all free space is covered, nothing skipped), and
+the points are visited in a wall-aware geodesic TSP order (no revisiting) — so
+rtabmap keeps integrating scans and the map gets denser/more accurate. The
+geometry + navigation are handled by the ``CoverageDriver``, configured from this
+state's ``create_map_*`` parameters. Gate it off with
 ``create_map_densify_enabled:=False``.
 
 The whole stack is torn down in ``on_exit`` before the FSM moves on.
@@ -197,16 +198,26 @@ class CreateMap(State):
             map_topic=str(ctx.get("create_map_map_topic", "/map")),
             allow_map_fallback=bool(ctx.get("create_map_allow_map_fallback", True)),
             costmap_wait_timeout=float(ctx.get("create_map_costmap_wait_timeout", 10.0)),
-            line_spacing_m=float(ctx.get("create_map_line_spacing_m", 1.5)),
-            min_segment_length_m=float(ctx.get("create_map_min_segment_length_m", 0.5)),
-            wall_clearance_m=float(ctx.get("create_map_wall_clearance_m", 0.4)),
-            axis=str(ctx.get("create_map_sweep_axis", "auto")),
-            # 0.0 -> one global serpentine over the whole space (same as ScanFloor,
-            # one direction). Set > 0 to sweep room-by-room (splits at doorways).
-            room_split_erosion_m=float(ctx.get("create_map_room_split_erosion_m", 0.0)),
-            max_traversable_cost=int(ctx.get("create_map_max_traversable_cost", 65)),
+            # Waypoint spacing (tile size) for the uniform free-cell coverage grid.
+            coverage_step_m=float(ctx.get("create_map_coverage_step_m", 3.0)),
+            # Permissive connectivity threshold for the reachability flood-fill: a
+            # free area joined to the rest only through a narrow gap (1.0-1.8 m,
+            # whose centre the costmap inflates to a high-but-not-lethal cost)
+            # still flood-fills as reachable, so it gets a waypoint. Keep it just
+            # below the inscribed-obstacle cost (~99) -- above that the base could
+            # not safely drive there anyway.
+            max_traversable_cost=int(ctx.get("create_map_max_traversable_cost", 95)),
             map_occupied_threshold=int(ctx.get("create_map_map_occupied_threshold", 50)),
-            waypoint_merge_dist_m=float(ctx.get("create_map_waypoint_merge_dist_m", 0.2)),
+            # Strict placement threshold (0 = genuine free space): waypoints stay
+            # off the inflation band while connectivity above stays permissive.
+            waypoint_max_cost=int(ctx.get("create_map_waypoint_max_cost", 0)),
+            # Optional standoff eroded from the free/inflation seam, lifting points
+            # a little clear of the inflation band.
+            wall_clearance_m=float(ctx.get("create_map_wall_clearance_m", 0.1)),
+            # Coarsening factor for the geodesic floods used only to ORDER points
+            # (not the driven path). Higher = faster planning on a big map. Raise
+            # to 4-5 if planning is slow.
+            geodesic_downsample=int(ctx.get("create_map_geodesic_downsample", 3)),
             dry_run=bool(ctx.get("create_map_dry_run", False)),
             use_through_poses=bool(ctx.get("create_map_use_nav_through_poses", False)),
             marker_topic="/create_map/coverage_markers",

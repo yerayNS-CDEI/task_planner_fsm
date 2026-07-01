@@ -1,17 +1,18 @@
-"""Shared single-sweep coverage driver for FSM states.
+"""Uniform free-cell coverage driver for FSM states.
 
-This encapsulates the "plan a structured boustrophedon coverage of the reachable
-free space and drive it" behaviour that both :class:`ObjectID` (drive the base
-over the whole room once while YOLO runs) and :class:`CreateMap` (densify the map
-with a second, structured pass after exploration) need.
+This encapsulates the "cover the reachable free space with an ordered set of
+waypoints and drive them" behaviour that :class:`CreateMap` uses to densify the
+map with a second pass after exploration.
 
-The geometry comes from :func:`utils.floor_coverage.build_single_sweep_plan`: a
-single-direction, room-by-room serpentine that visits every reachable cell once,
-in clean wall-aligned lanes, without doubling back or shuttling between rooms.
+The geometry comes from :func:`utils.floor_coverage.build_uniform_coverage_plan`:
+the reachable free space is tiled at a fixed spacing, every tile gets one
+waypoint (so all free space is covered, nothing skipped), and the points are
+ordered as a wall-aware geodesic TSP tour (nearest-neighbour + 2-opt) so the base
+drives an efficient, non-revisiting route.
 
 The driver is non-blocking and tick-based, matching the FSM's cooperative run
 loop. A state owns one :class:`CoverageDriver`, builds a :class:`CoverageConfig`
-from its OWN ``ctx`` keys (so each state tunes its sweep independently), and:
+from its OWN ``ctx`` keys, and:
 
     driver.ensure_io(ctx)      # once: subscriptions + markers + nav action client
     driver.begin(ctx)          # start a fresh plan-and-drive cycle
@@ -23,7 +24,7 @@ returned status onto its own ready/error flags and transitions.
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -37,16 +38,12 @@ from rclpy.duration import Duration
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .floor_coverage import build_single_sweep_plan
+from .floor_coverage import build_uniform_coverage_plan
 
 
 @dataclass
 class CoverageConfig:
-    """Resolved configuration for one coverage sweep.
-
-    Each owning state builds this from its own ``ctx`` keys so the two sweeps
-    (e.g. CreateMap densification vs ObjectID search) stay independently tunable.
-    """
+    """Resolved configuration for one coverage pass (built from the owner's ctx)."""
 
     # Grid intake.
     costmap_topic: str = "/global_costmap/costmap"
@@ -54,17 +51,21 @@ class CoverageConfig:
     allow_map_fallback: bool = True
     costmap_wait_timeout: float = 10.0
 
-    # Planning (see build_single_sweep_plan).
-    line_spacing_m: float = 1.5
-    min_segment_length_m: float = 0.5
-    wall_clearance_m: float = 0.4
-    axis: str = "auto"
-    room_split_erosion_m: float = 1.3
+    # Waypoint spacing (tile size) for the uniform coverage grid.
+    coverage_step_m: float = 1.5
+
+    # Costs. ``max_traversable_cost`` is the permissive connectivity threshold for
+    # the reachability flood-fill (keep narrow gaps connected); ``waypoint_max_cost``
+    # (None -> same) is the strict placement threshold keeping points on genuinely
+    # free cells. ``wall_clearance_m`` adds an optional standoff eroded from the
+    # free/inflation seam. ``map_occupied_threshold`` is the raw-/map fallback.
     max_traversable_cost: int = 65      # costmap cost <= this is drivable
     map_occupied_threshold: int = 50    # raw /map fallback occupancy threshold
-    # ``waypoint_merge_dist_m`` fuses consecutive waypoints closer than this
-    # (lane junctions / near-duplicates); <= 0 keeps every point.
-    waypoint_merge_dist_m: float = 0.2
+    waypoint_max_cost: Optional[int] = None
+    wall_clearance_m: float = 0.4
+    # Coarsening factor for the geodesic floods used to ORDER points (not the
+    # driven path); higher = faster planning on a big map.
+    geodesic_downsample: int = 1
 
     # Execution.
     dry_run: bool = False
@@ -226,7 +227,7 @@ class CoverageDriver:
         if self.cfg.allow_map_fallback and self.latest_map is not None:
             node.get_logger().warn(
                 f"[{self.name}] Costmap not received after {self.cfg.costmap_wait_timeout:.1f}s. "
-                f"Falling back to {self.cfg.map_topic} (no inflation; lanes stay further from walls)."
+                f"Falling back to {self.cfg.map_topic} (no inflation)."
             )
             return self.latest_map, self.cfg.map_topic
 
@@ -251,12 +252,10 @@ class CoverageDriver:
         self._publish_plan_markers(waypoints)
 
         node.get_logger().info(
-            f"[{self.name}] Coverage plan: {self.last_plan_debug.get('room_count', 1)} room(s), "
-            f"{self.last_plan_debug.get('line_count', 0)} lane(s) "
-            f"-> {len(waypoints)} waypoint(s), angle "
-            f"{math.degrees(self.last_plan_debug.get('angle', 0.0)):.1f} deg, "
-            f"spacing {self.last_plan_debug.get('line_spacing_m', 0.0):.2f} m, "
-            f"clearance {self.last_plan_debug.get('wall_clearance_m', 0.0):.2f} m."
+            f"[{self.name}] Coverage plan: {len(waypoints)} waypoint(s) at "
+            f"{self.last_plan_debug.get('step_m', 0.0):.2f} m spacing "
+            f"(geodesic TSP order), clearance "
+            f"{self.last_plan_debug.get('wall_clearance_m', 0.0):.2f} m."
         )
 
         if self.cfg.dry_run:
@@ -289,95 +288,42 @@ class CoverageDriver:
         grid = np.asarray(grid_msg.data, dtype=np.int16).reshape((height, width))
         origin = (float(info.origin.position.x), float(info.origin.position.y))
 
-        # A raw /map (0/100/-1) needs a low threshold; an inflated costmap can use
-        # a higher one so lanes get as close to the walls as the base safely can.
+        # A raw /map (0/100/-1) fallback needs a low threshold; an inflated costmap
+        # uses the permissive connectivity threshold directly.
         is_costmap = "costmap" in grid_source.lower()
         if is_costmap:
             max_cost = int(self.cfg.max_traversable_cost)
         else:
             max_cost = int(self.cfg.map_occupied_threshold) - 1
 
-        start_r, start_c = self._get_start_cell(ctx, info, origin, resolution)
+        start_cell = self._get_start_cell(ctx, info, origin, resolution)
 
-        plan = build_single_sweep_plan(
-            grid, origin, resolution, (start_r, start_c),
-            spacing_m=self.cfg.line_spacing_m,
-            inflation_m=self.cfg.wall_clearance_m,
-            min_len_m=self.cfg.min_segment_length_m,
+        plan = build_uniform_coverage_plan(
+            grid, origin, resolution, start_cell,
+            step_m=float(self.cfg.coverage_step_m),
             max_cost=max_cost,
-            axis=self.cfg.axis,
-            room_split_erosion_m=self.cfg.room_split_erosion_m,
+            waypoint_max_cost=self.cfg.waypoint_max_cost,
+            inflation_m=float(self.cfg.wall_clearance_m),
+            downsample=int(self.cfg.geodesic_downsample),
         )
-        segments = plan.get("segments", [])
-        if not segments:
+        pts = plan.get("waypoints", [])
+        if not pts:
             node.get_logger().error(
-                f"[{self.name}] No coverage lanes generated (grid empty or fully blocked)."
+                f"[{self.name}] No coverage waypoints (grid empty or fully blocked)."
             )
             return []
 
-        merge_dist = self._resolve_merge_dist()
-        points = self._segments_to_points(segments, merge_dist)
-        if len(points) < 1:
-            return []
-
-        # Face the direction of travel; the final pose keeps the previous heading.
-        waypoints = []
-        last_yaw = 0.0
-        for idx, (x, y) in enumerate(points):
-            nxt = points[idx + 1] if idx + 1 < len(points) else None
-            yaw = self._heading_to(x, y, nxt) if nxt is not None else last_yaw
-            last_yaw = yaw
-            waypoints.append(self._make_pose_stamped(x, y, float(yaw)))
+        waypoints = [self._make_pose_stamped(x, y, float(yaw)) for (x, y, yaw) in pts]
 
         self.last_plan_debug = {
-            "route_strategy": "single_sweep",
-            "angle": float(plan.get("angle", 0.0)),
-            "line_count": int(plan.get("line_count", 0)),
-            "room_count": int(plan.get("room_count", 1)),
-            "segment_count": len(segments),
             "waypoint_count": len(waypoints),
-            "line_spacing_m": self.cfg.line_spacing_m,
-            "wall_clearance_m": self.cfg.wall_clearance_m,
-            "max_traversable_cost": max_cost,
+            "step_m": float(self.cfg.coverage_step_m),
+            "wall_clearance_m": float(self.cfg.wall_clearance_m),
+            "max_traversable_cost": int(max_cost),
+            "waypoint_max_cost": (int(max_cost) if self.cfg.waypoint_max_cost is None
+                                  else int(self.cfg.waypoint_max_cost)),
         }
         return waypoints
-
-    def _resolve_merge_dist(self) -> float:
-        """Distance below which consecutive waypoints are fused into one.
-
-        ``waypoint_merge_dist_m <= 0`` disables fusion (only exact duplicates are
-        dropped). Otherwise that value is used directly.
-        """
-        merge = float(self.cfg.waypoint_merge_dist_m)
-        return merge if merge > 0.0 else 0.0
-
-    @staticmethod
-    def _segments_to_points(
-        segments: Sequence[Tuple[Tuple[float, float], Tuple[float, float]]],
-        merge_dist: float = 0.0,
-    ) -> List[Tuple[float, float]]:
-        """Flatten ordered lane segments into a deduplicated waypoint sequence.
-
-        Each segment is a lane the base drives end-to-end, so its two endpoints are
-        always emitted. Where one lane's exit lands within ``merge_dist`` of the
-        next lane's entry (the connector between lanes is ~zero), the duplicate is
-        fused: the previous exit is reused as the next entry instead of adding a
-        second near-identical waypoint the base would shuffle between. A lane whose
-        own length is below ``merge_dist`` collapses to a single point. With
-        ``merge_dist <= 0`` only exact duplicates (> 1e-6 m) are dropped.
-        """
-        eps = max(float(merge_dist), 1e-6)
-        points: List[Tuple[float, float]] = []
-        for p0, p1 in segments:
-            entry = (float(p0[0]), float(p0[1]))
-            exit_ = (float(p1[0]), float(p1[1]))
-            # Fuse this lane's entry with the previous lane's exit if they coincide.
-            if not points or math.hypot(points[-1][0] - entry[0], points[-1][1] - entry[1]) > eps:
-                points.append(entry)
-            # Always emit the exit unless the lane is shorter than the merge radius.
-            if math.hypot(points[-1][0] - exit_[0], points[-1][1] - exit_[1]) > eps:
-                points.append(exit_)
-        return points
 
     def _get_start_cell(self, ctx, info, origin, resolution) -> Tuple[int, int]:
         """Robot start cell (row, col), from odom/base_position, TF, or map centre."""
@@ -714,12 +660,6 @@ class CoverageDriver:
         pose.pose.orientation.z = math.sin(yaw / 2.0)
         pose.pose.orientation.w = math.cos(yaw / 2.0)
         return pose
-
-    @staticmethod
-    def _heading_to(x: float, y: float, target: Optional[Tuple[float, float]]) -> float:
-        if target is None:
-            return 0.0
-        return math.atan2(target[1] - y, target[0] - x)
 
     @staticmethod
     def _yaw_from_quaternion(q) -> float:
