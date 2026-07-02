@@ -146,9 +146,15 @@ NAV_CLIENT_BOOTSTRAP_STATES = {
     "HomePosition",
 }
 
+# GeometryReconstruction is the first state of the wall-processing/scanning
+# pipeline: it itself only needs navi_wall's detected_walls.yaml on disk, but it
+# flows straight into ComputeWallPoints -> WallTargetSelection -> NavigateToTarget,
+# which need the navigation + localization stack. In the normal flow that stack is
+# already up (started by ObjectID), so when bootstrapping from GeometryReconstruction
+# (or later) we start it here too.
 NAV_SIM_REQUIRED_START_STATES = {
     s
-    for s in FSM_STATE_ORDER[FSM_STATE_ORDER.index("ComputeWallPoints") :]
+    for s in FSM_STATE_ORDER[FSM_STATE_ORDER.index("GeometryReconstruction") :]
     if s not in {"Finished", "Error"}
 }
 
