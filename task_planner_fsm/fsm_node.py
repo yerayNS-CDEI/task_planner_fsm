@@ -693,9 +693,16 @@ class RobotFSMNode(Node):
             # these checks it would race ahead while the stack — in particular the
             # collision-checking service — is still coming up, and the planner
             # would silently plan without collision validation.
+            # /clock is only published when sim time is running, so it must NOT
+            # be required on the real robot (sim:=false) — otherwise
+            # wait_stack_ready blocks on '/clock' forever and eventually times
+            # out. Mirror ObjectID's conditional gating here.
+            default_ready_topics = ["/tf", "/joint_states", "/rtabmap/odom"]
+            if self.ctx.get("sim", False):
+                default_ready_topics = ["/clock"] + default_ready_topics
             required_topics = self.ctx.get(
                 "stack_ready_topics",
-                ["/clock", "/tf", "/joint_states", "/rtabmap/odom"],
+                default_ready_topics,
             )
             ready_timeout = float(self.ctx.get("stack_ready_timeout", 90.0))
             self.get_logger().info(
