@@ -160,6 +160,12 @@ class ObjectID(State):
         self.generated_waypoints: List[PoseStamped] = []
         self._last_plan_debug = {}
 
+        # Whether we relaxed the Nav2 controller goal tolerances on entry, so
+        # on_exit only restores the strict defaults when they were actually
+        # changed (avoids noisy 'ros2 param set' failures on paths where the
+        # nav stack never came up).
+        self._goal_tolerances_relaxed = True
+
         # Wall detection (navi_wall detector + aggregator) run during the coverage
         # route; the refined (lidar-verified) walls are harvested into ctx on exit.
         self._wall_sub = None
@@ -191,6 +197,7 @@ class ObjectID(State):
         self._pending_grid = None
         self._wall_sub = None
         self._latest_walls = None
+        self._goal_tolerances_relaxed = False
 
         if not self._start_robot_stack(ctx):
             self.phase = "error"
@@ -235,6 +242,18 @@ class ObjectID(State):
                 ctx["error_triggered"] = True
                 self.phase = "error"
                 return
+
+            # Relax the Nav2 goal-checker tolerances for the loose wall-following
+            # coverage motion: the base only needs to get "near" each waypoint,
+            # not settle precisely on it. These match the values
+            # global_exploration.launch.py uses for frontier mapping. on_exit
+            # restores the strict nav2_params_omni defaults for the navigation
+            # states that follow.
+            self._goal_tolerances_relaxed = self._set_goal_tolerances(
+                ctx,
+                float(ctx.get("object_id_relaxed_xy_goal_tolerance", 0.5)),
+                float(ctx.get("object_id_relaxed_yaw_goal_tolerance", 3.14)),
+            )
 
         node.get_logger().info(
             f"[{self.name}] Coverage planner ready. Preferred grid: "
@@ -297,6 +316,18 @@ class ObjectID(State):
         stop_proc(ctx, "object_id", timeout=10.0)
         if bool(ctx.get("object_id_stop_yolo_on_exit", False)):
             stop_proc(ctx, "object_id_yolo")
+
+        # Restore the strict nav2_params_omni goal tolerances that the following
+        # navigation states rely on (ObjectID relaxed them on entry). Only when we
+        # actually changed them, so early-exit paths that never touched the
+        # controller don't emit spurious 'ros2 param set' warnings.
+        if self._goal_tolerances_relaxed:
+            self._set_goal_tolerances(
+                ctx,
+                float(ctx.get("object_id_default_xy_goal_tolerance", 0.25)),
+                float(ctx.get("object_id_default_yaw_goal_tolerance", 0.25)),
+            )
+            self._goal_tolerances_relaxed = False
 
     def check_transition(self, ctx):
         if ctx.get("object_id_ready"):
@@ -630,6 +661,61 @@ class ObjectID(State):
             cmd = shlex.split(cmd)
         node.get_logger().info(f"[{self.name}] Starting YOLO process: {' '.join(cmd)}")
         start_proc(ctx, "object_id_yolo", cmd)
+
+    # ------------------------------------------------------------------
+    # Nav2 goal-tolerance overrides
+    # ------------------------------------------------------------------
+    def _set_goal_tolerances(self, ctx, xy_tolerance: float, yaw_tolerance: float) -> bool:
+        """Set the controller_server goal-checker tolerances at runtime.
+
+        Nav2's SimpleGoalChecker exposes its xy/yaw goal tolerances as dynamic
+        parameters, so ObjectID can relax them on entry (loose wall-following
+        coverage motion) and restore the strict nav2_params_omni defaults on
+        exit — no relaunch needed. The ``goal_checker.`` prefix is the plugin
+        instance name from controller_server (see nav2_params_omni.yaml); these
+        keys mirror what navigation_launch.py rewrites at launch time.
+
+        Uses the ``ros2 param set`` CLI rather than a service client because the
+        FSM node's own executor is blocked inside this lifecycle call, exactly
+        like wait_stack_ready / wait_services_ready. Returns True only if every
+        parameter was set successfully.
+        """
+        node = ctx.get("node")
+        controller_node = str(ctx.get("object_id_controller_server_node", "/controller_server"))
+        params = {
+            "goal_checker.xy_goal_tolerance": xy_tolerance,
+            "goal_checker.yaw_goal_tolerance": yaw_tolerance,
+        }
+        all_ok = True
+        for name, value in params.items():
+            ok = False
+            for attempt in range(3):
+                try:
+                    r = subprocess.run(
+                        ["ros2", "param", "set", controller_node, name, str(value)],
+                        capture_output=True, text=True, timeout=10.0,
+                    )
+                    # 'ros2 param set' exits 0 and prints 'Set parameter successful'
+                    # on success; a rejected set prints 'Setting parameter failed'.
+                    if r.returncode == 0 and "successful" in r.stdout.lower():
+                        ok = True
+                        break
+                    if node:
+                        node.get_logger().warn(
+                            f"[{self.name}] 'ros2 param set {controller_node} {name} {value}' "
+                            f"attempt {attempt + 1}/3 failed: {(r.stdout + r.stderr).strip()}"
+                        )
+                except Exception as exc:
+                    if node:
+                        node.get_logger().warn(
+                            f"[{self.name}] Could not set {name} on {controller_node} "
+                            f"(attempt {attempt + 1}/3): {exc}"
+                        )
+                time.sleep(1.0)
+            if ok and node:
+                node.get_logger().info(f"[{self.name}] {controller_node} {name} -> {value}.")
+            all_ok = all_ok and ok
+        return all_ok
 
     # ------------------------------------------------------------------
     # Wall detection (navi_wall): launched before the coverage route so the
