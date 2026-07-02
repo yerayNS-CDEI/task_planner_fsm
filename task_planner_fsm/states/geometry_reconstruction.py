@@ -35,6 +35,15 @@ class GeometryReconstruction(State):
         self.publish_markers = True
         self.map_timeout_s = 30.0
         self.default_wall_z = 0.0
+        # When False (default), walls come from navi_wall's detected_walls.yaml
+        # (RGB/aggregator approach) instead of being detected from the 2D map
+        # grid. Set True to re-enable the legacy occupancy-grid detection.
+        self.detect_walls_from_map = False
+        # When True, call the mock /start_geometry_reconstruction service and
+        # wait for it (lets the FSM workflow be exercised without the real
+        # reconstruction pipeline). When False (default), skip it and load walls
+        # directly.
+        self.use_mock_service = False
         # Object (Window/Door) -> wall association.
         self.rgb_detections_dir = ""
         self.object_cluster_dist_m = 1.0
@@ -48,6 +57,14 @@ class GeometryReconstruction(State):
             "geometry_reconstruction_publish_wall_markers": True,
             "geometry_reconstruction_map_timeout_s": 30.0,
             "geometry_reconstruction_wall_default_z": 0.0,
+            # Source of the selectable walls. False (default): load navi_wall's
+            # detected_walls.yaml (the RGB/aggregator approach). True: detect
+            # walls from the 2D occupancy-grid map (legacy).
+            "geometry_reconstruction_detect_walls_from_map": False,
+            # When True, call the mock /start_geometry_reconstruction service and
+            # wait for it (test the FSM workflow without the real reconstruction
+            # pipeline). When False (default), skip the service call entirely.
+            "geometry_reconstruction_use_mock_service": False,
             # Debug: when non-empty, dump the exact occupancy grid the state runs
             # detection on (as <path>.npz) so the offline tuner can reproduce it.
             "geometry_reconstruction_debug_map_path": "",
@@ -98,6 +115,8 @@ class GeometryReconstruction(State):
         self.publish_markers = bool(gp("geometry_reconstruction_publish_wall_markers"))
         self.map_timeout_s = float(gp("geometry_reconstruction_map_timeout_s"))
         self.default_wall_z = float(gp("geometry_reconstruction_wall_default_z"))
+        self.detect_walls_from_map = bool(gp("geometry_reconstruction_detect_walls_from_map"))
+        self.use_mock_service = bool(gp("geometry_reconstruction_use_mock_service"))
         self.debug_map_path = str(gp("geometry_reconstruction_debug_map_path"))
         self.rgb_detections_dir = str(gp("geometry_reconstruction_rgb_detections_dir"))
         self.object_cluster_dist_m = float(gp("geometry_reconstruction_object_cluster_dist_m"))
@@ -135,7 +154,6 @@ class GeometryReconstruction(State):
     def on_enter(self, ctx):
         time.sleep(5)
         node = ctx["node"]
-        node.get_logger().info(f"[{self.name}] Calling the service /start_geometry_reconstruction")
         ctx["reconstruction_ready"] = False
         ctx["walls_detected"] = False
         ctx["error_triggered"] = False
@@ -143,9 +161,11 @@ class GeometryReconstruction(State):
         self._declare_params(node)
         self.latest_map = None
         self.map_wait_start = node.get_clock().now()
+        self.future = None
 
-        # Latched-map QoS so we receive the last published OccupancyGrid.
-        if self.map_sub is None:
+        # Latched-map QoS so we receive the last published OccupancyGrid. Only
+        # needed for the legacy occupancy-grid wall detection.
+        if self.detect_walls_from_map and self.map_sub is None:
             map_qos = QoSProfile(depth=1)
             map_qos.reliability = ReliabilityPolicy.RELIABLE
             map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
@@ -160,6 +180,19 @@ class GeometryReconstruction(State):
                 MarkerArray, "/geometry_reconstruction/wall_markers", marker_qos
             )
 
+        # Optional mock reconstruction service: when enabled, call the mock
+        # server and wait for it in run() Step 1 (exercises the FSM workflow
+        # without the real reconstruction pipeline). When disabled, skip it and
+        # go straight to loading walls.
+        if not self.use_mock_service:
+            node.get_logger().info(
+                f"[{self.name}] Mock service disabled; skipping "
+                f"/start_geometry_reconstruction and loading walls directly."
+            )
+            ctx["reconstruction_ready"] = True
+            return
+
+        node.get_logger().info(f"[{self.name}] Calling the mock service /start_geometry_reconstruction")
         self.client = node.create_client(SetBool, "/start_geometry_reconstruction")
         request = SetBool.Request()
         request.data = True
@@ -200,12 +233,110 @@ class GeometryReconstruction(State):
     def _detect_and_store_features(self, ctx):
         node = ctx["node"]
 
+        # Gather the selectable walls (and columns) from the configured source.
+        # Legacy path detects them from the 2D occupancy grid; the default path
+        # loads navi_wall's detected_walls.yaml (the RGB/aggregator approach).
+        if self.detect_walls_from_map:
+            result = self._detect_features_from_map(ctx)
+        else:
+            result = self._load_detected_walls_from_yaml(ctx)
+
+        # None means the source is still pending (e.g. waiting for the map) or an
+        # error was already flagged; run() will retry or check_transition aborts.
+        if result is None:
+            return
+        detected_walls, columns = result
+
+        ctx["detected_walls"] = detected_walls
+        ctx["detected_columns"] = columns
+        ctx["walls_detected"] = True
+
+        node.get_logger().info(
+            f"[{self.name}] Detected {len(detected_walls)} wall(s) and "
+            f"{len(columns)} column(s):"
+        )
+        for idx, (p0, p1) in enumerate(detected_walls, 1):
+            length = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+            node.get_logger().info(
+                f"  Wall {idx}: ({p0[0]:.2f}, {p0[1]:.2f}) -> "
+                f"({p1[0]:.2f}, {p1[1]:.2f})  |  {length:.2f} m"
+            )
+        for idx, col in enumerate(columns, 1):
+            cx, cy = col["center"]
+            node.get_logger().info(
+                f"  Column {idx}: ({cx:.2f}, {cy:.2f})  |  r={col['radius_m']:.2f} m"
+            )
+
+        # Associate RGB-detected objects (Window/Door) to the closest wall and
+        # store the result in ctx. Non-fatal: a missing/empty CSV or no walls
+        # only warns, so the FSM still advances to ComputeWallPoints.
+        self._associate_objects_to_walls(ctx)
+
+        if self.publish_markers:
+            self._publish_markers(node, detected_walls, columns)
+
+    # ------------------------------------------------------------------
+    # Wall source: navi_wall detected_walls.yaml (default)
+    # ------------------------------------------------------------------
+    def _load_detected_walls_from_yaml(self, ctx):
+        """Load the persistent walls from navi_wall's ``detected_walls.yaml`` as
+        ``((x, y, z), (x, y, z))`` map-frame endpoint pairs, ready to drop into
+        the wall-selection list (same shape as the legacy map-detected walls).
+
+        The 2D wall file carries a height range (``z_min``/``z_max``); the base
+        ``z_min`` is used for the endpoint z (falling back to the default wall z),
+        while the operator still supplies real scan heights in ComputeWallPoints.
+
+        Returns ``(walls, columns)`` (columns always empty), or ``None`` when no
+        walls are available so the caller flags an error.
+        """
+        node = ctx["node"]
+
+        detections_dir = self._resolve_detections_dir(ctx)
+        yaml_path = (
+            os.path.join(detections_dir, "detected_walls.yaml")
+            if detections_dir is not None
+            else None
+        )
+        raw_walls = self._load_walls_from_yaml(node, yaml_path) if yaml_path else []
+        if not raw_walls:
+            node.get_logger().error(
+                f"[{self.name}] No walls available from detected_walls.yaml "
+                f"({yaml_path or 'directory not found'}); cannot populate walls."
+            )
+            ctx["error_triggered"] = True
+            return None
+
+        detected_walls = []
+        for w in raw_walls:
+            z = float(w.get("z_min", self.default_wall_z))
+            p1, p2 = w["p1"], w["p2"]
+            detected_walls.append(
+                ((float(p1[0]), float(p1[1]), z), (float(p2[0]), float(p2[1]), z))
+            )
+
+        node.get_logger().info(
+            f"[{self.name}] Loaded {len(detected_walls)} wall(s) from '{yaml_path}'."
+        )
+        return detected_walls, []
+
+    # ------------------------------------------------------------------
+    # Wall source: 2D occupancy-grid detection (legacy)
+    # ------------------------------------------------------------------
+    def _detect_features_from_map(self, ctx):
+        """Detect walls + columns from the latest 2D occupancy grid.
+
+        Returns ``(detected_walls, columns)`` on success, or ``None`` when the
+        map is not ready yet (keep waiting) or an error was flagged.
+        """
+        node = ctx["node"]
+
         if not opencv_available():
             node.get_logger().error(
                 f"[{self.name}] OpenCV not available; cannot detect map features."
             )
             ctx["error_triggered"] = True
-            return
+            return None
 
         if self.latest_map is None:
             elapsed = (node.get_clock().now() - self.map_wait_start).nanoseconds / 1e9
@@ -220,14 +351,14 @@ class GeometryReconstruction(State):
                     f"[{self.name}] Waiting for map on '{self.map_topic}'...",
                     throttle_duration_sec=5.0,
                 )
-            return
+            return None
 
         grid_msg = self.latest_map
         info = grid_msg.info
         if info.resolution <= 0.0 or info.width == 0 or info.height == 0:
             node.get_logger().error(f"[{self.name}] Invalid map metadata.")
             ctx["error_triggered"] = True
-            return
+            return None
 
         grid = np.array(grid_msg.data, dtype=np.int16).reshape(info.height, info.width)
         origin = (info.origin.position.x, info.origin.position.y)
@@ -253,7 +384,7 @@ class GeometryReconstruction(State):
                 f"[{self.name}] No walls detected in the map on '{self.map_topic}'."
             )
             ctx["error_triggered"] = True
-            return
+            return None
 
         # Store walls as 3D ((x, y, z), (x, y, z)) endpoint pairs in the map frame
         # so the data drops straight into the wall-selection list (same shape as
@@ -264,33 +395,7 @@ class GeometryReconstruction(State):
             ((float(p0[0]), float(p0[1]), z), (float(p1[0]), float(p1[1]), z))
             for p0, p1 in segments
         ]
-        ctx["detected_walls"] = detected_walls
-        ctx["detected_columns"] = columns
-        ctx["walls_detected"] = True
-
-        node.get_logger().info(
-            f"[{self.name}] Detected {len(detected_walls)} wall(s) and "
-            f"{len(columns)} column(s) from the map:"
-        )
-        for idx, (p0, p1) in enumerate(detected_walls, 1):
-            length = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
-            node.get_logger().info(
-                f"  Wall {idx}: ({p0[0]:.2f}, {p0[1]:.2f}) -> "
-                f"({p1[0]:.2f}, {p1[1]:.2f})  |  {length:.2f} m"
-            )
-        for idx, col in enumerate(columns, 1):
-            cx, cy = col["center"]
-            node.get_logger().info(
-                f"  Column {idx}: ({cx:.2f}, {cy:.2f})  |  r={col['radius_m']:.2f} m"
-            )
-
-        # Associate RGB-detected objects (Window/Door) to the closest wall and
-        # store the result in ctx. Non-fatal: a missing/empty CSV or no walls
-        # only warns, so the FSM still advances to ComputeWallPoints.
-        self._associate_objects_to_walls(ctx)
-
-        if self.publish_markers:
-            self._publish_markers(node, detected_walls, columns)
+        return detected_walls, columns
 
     # ------------------------------------------------------------------
     # Object (Window/Door) -> wall association
@@ -474,11 +579,16 @@ class GeometryReconstruction(State):
             p2 = w.get("p2")
             if not p1 or not p2:
                 continue
-            walls.append({
+            entry = {
                 "id": w.get("id", len(walls)),
                 "p1": (float(p1[0]), float(p1[1])),
                 "p2": (float(p2[0]), float(p2[1])),
-            })
+            }
+            if w.get("z_min") is not None:
+                entry["z_min"] = float(w["z_min"])
+            if w.get("z_max") is not None:
+                entry["z_max"] = float(w["z_max"])
+            walls.append(entry)
         return walls
 
     def _walls_from_ctx(self, ctx):
