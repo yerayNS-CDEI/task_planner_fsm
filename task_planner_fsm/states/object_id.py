@@ -59,11 +59,23 @@ Config is read from ``ctx`` (all keys optional):
   object_id_dry_run               plan + markers only, skip base motion
   object_id_use_mock              legacy /object_id_sim service path
   object_id_yolo_cmd              optional command to launch YOLO
+
+Wall detection (navi_wall): launched before the coverage route so the robot's
+wall-following motion verifies the walls against the STATIC localization-mode map
+(no flicker). On exit the lidar-verified (refined/pink) walls are harvested into
+``ctx['verified_walls']`` (rich per-wall dicts) and ``ctx['verified_wall_segments']``
+(``((x,y,z),(x,y,z))`` map-frame endpoint pairs, the shape downstream wall states
+consume) for later use, and the detector is torn down (the nav stack stays up).
+  object_id_wall_detection_enabled  launch the detector + aggregator (default True)
+  object_id_walls_topic           aggregator persistent-walls topic
+                                  (default /wall_aggregator_node/persistent_walls)
+  object_id_walls_refined_only    keep only refined/verified walls (default True)
 """
 
 import math
 import shlex
 import socket
+import subprocess
 import time
 from typing import List, Optional, Sequence, Tuple
 
@@ -86,9 +98,23 @@ from task_planner_fsm.states.proc_utils import (
     stop_proc,
     wait_stack_ready,
     wait_services_ready,
+    wait_processes_gone,
     kill_stale_stack,
     SIM_STACK_PATTERNS,
 )
+
+# The navi_wall wall detector + persistent aggregator, launched by ObjectID before
+# the robot starts its coverage route so the motion verifies the walls against the
+# STATIC localization-mode map. Not part of SIM_STACK_PATTERNS (they hold no
+# hardware resources), so they are swept explicitly: an orphan from a
+# previous/crashed run would keep running and, sharing the default node name,
+# publish a SECOND set of walls/markers on /wall_aggregator_node/* — making the
+# walls flicker and the FSM subscription see two alternating snapshots.
+WALL_DETECTION_PATTERNS = [
+    "wall_detection.launch.py",
+    "wall_detection_node",
+    "wall_aggregator_node",
+]
 
 
 class ObjectID(State):
@@ -134,6 +160,11 @@ class ObjectID(State):
         self.generated_waypoints: List[PoseStamped] = []
         self._last_plan_debug = {}
 
+        # Wall detection (navi_wall detector + aggregator) run during the coverage
+        # route; the refined (lidar-verified) walls are harvested into ctx on exit.
+        self._wall_sub = None
+        self._latest_walls = None
+
     # ------------------------------------------------------------------
     # FSM lifecycle
     # ------------------------------------------------------------------
@@ -158,6 +189,8 @@ class ObjectID(State):
         self.latest_localization_xy = None
         self.localization_wait_start = None
         self._pending_grid = None
+        self._wall_sub = None
+        self._latest_walls = None
 
         if not self._start_robot_stack(ctx):
             self.phase = "error"
@@ -175,6 +208,11 @@ class ObjectID(State):
         self._ensure_marker_publisher(ctx)
         self._start_object_id_detection(ctx)
         self._start_optional_yolo_process(ctx)
+        # Bring wall detection up now, before the robot starts its coverage route,
+        # so the wall-following motion verifies the walls. The nav stack runs
+        # rtabmap in localization mode (static /map), so the aggregator's
+        # grid-anchored walls stay put instead of flickering.
+        self._start_wall_detection(ctx)
 
         # Default to sequential NavigateToPose: it is robust to a single hard-to-
         # reach waypoint (it just retries/skips that one), whereas
@@ -245,6 +283,13 @@ class ObjectID(State):
     def on_exit(self, ctx):
         if bool(ctx.get("object_id_clear_markers_on_exit", False)):
             self._clear_markers(ctx)
+        # Capture the lidar-verified (refined/pink) walls the aggregator confirmed
+        # during the coverage route, then tear the detector down. Harvesting here
+        # (the single exit choke point) covers every completion path — sequential
+        # nav, through-poses, mock and dry-run — and the route-done snapshot is
+        # stable because /map is static in localization mode.
+        self._harvest_walls(ctx)
+        self._stop_wall_detection(ctx)
         # Stop the YOLO object-detection launch when leaving the state. The
         # navigation stack ("nav_sim") is intentionally left running for the
         # following states; only the object-ID process is torn down here. This
@@ -585,6 +630,132 @@ class ObjectID(State):
             cmd = shlex.split(cmd)
         node.get_logger().info(f"[{self.name}] Starting YOLO process: {' '.join(cmd)}")
         start_proc(ctx, "object_id_yolo", cmd)
+
+    # ------------------------------------------------------------------
+    # Wall detection (navi_wall): launched before the coverage route so the
+    # robot's motion verifies the walls; harvested into ctx on exit.
+    # ------------------------------------------------------------------
+    def _start_wall_detection(self, ctx):
+        node = ctx["node"]
+        if not bool(ctx.get("object_id_wall_detection_enabled", True)):
+            node.get_logger().info(f"[{self.name}] Wall detection disabled; not launching.")
+            return
+
+        # Subscribe before launching so no early WallArray is missed. The
+        # navi_wall messages are imported lazily so a missing/unbuilt navi_wall
+        # only disables wall detection instead of breaking the whole FSM import.
+        try:
+            from navi_wall.msg import WallArray
+        except Exception as exc:
+            node.get_logger().error(
+                f"[{self.name}] navi_wall messages unavailable ({exc}); wall detection skipped."
+            )
+            return
+
+        topic = str(ctx.get("object_id_walls_topic", "/wall_aggregator_node/persistent_walls"))
+        qos = QoSProfile(depth=10)
+        qos.reliability = ReliabilityPolicy.RELIABLE
+        qos.durability = DurabilityPolicy.VOLATILE
+        self._latest_walls = None
+        self._wall_sub = node.create_subscription(WallArray, topic, self._on_walls, qos)
+
+        # Kill any orphaned detector/aggregator from a previous run before
+        # launching, so exactly one aggregator publishes on /wall_aggregator_node/*
+        # (two would fight over the same node name and topics, flickering the walls).
+        kill_stale_stack(node=node, patterns=WALL_DETECTION_PATTERNS)
+
+        cmd = ctx.get("wall_detection_cmd")
+        if isinstance(cmd, str):
+            cmd = shlex.split(cmd)
+        start_proc(ctx, "wall_detection", cmd)
+        wp = ctx.get("_procs", {}).get("wall_detection")
+        node.get_logger().info(
+            f"[{self.name}] Wall detection started (pid={wp.pid if wp else 'unknown'}); "
+            f"listening on {topic}."
+        )
+
+    def _on_walls(self, msg):
+        # Keep only the freshest snapshot; the aggregator republishes the full
+        # persistent set each cycle, so the last message is authoritative.
+        self._latest_walls = msg
+
+    def _harvest_walls(self, ctx):
+        node = ctx["node"]
+        if not bool(ctx.get("object_id_wall_detection_enabled", True)):
+            return
+
+        msg = self._latest_walls
+        if msg is None:
+            node.get_logger().warn(
+                f"[{self.name}] No walls received from the aggregator during the route; "
+                f"ctx['verified_walls'] left empty."
+            )
+            ctx["verified_walls"] = []
+            ctx["verified_wall_segments"] = []
+            ctx["verified_walls_frame"] = ""
+            return
+
+        # By default keep only the lidar-verified (refined/pink) walls, which are
+        # the ones the aggregator has confirmed against the point cloud.
+        refined_only = bool(ctx.get("object_id_walls_refined_only", True))
+        walls = []
+        segments = []
+        for w in msg.walls:
+            if refined_only and not w.refined:
+                continue
+            start = (w.start.x, w.start.y, w.start.z)
+            end = (w.end.x, w.end.y, w.end.z)
+            walls.append({
+                "start": start,
+                "end": end,
+                "normal": (w.normal.x, w.normal.y, w.normal.z),
+                "d": float(w.d),
+                "length": float(w.length),
+                "height": float(w.height),
+                "z_min": float(w.z_min),
+                "z_max": float(w.z_max),
+                "confidence": float(w.confidence),
+                "inliers": int(w.inliers),
+                "refined": bool(w.refined),
+                "openings": [(p.x, p.y, p.z) for p in w.openings],
+            })
+            segments.append((start, end))
+
+        # Rich per-wall records for states that want normals/height/confidence,
+        # plus a plain endpoint-pair list matching the shape the downstream wall
+        # states already consume (predefined walls / ctx['detected_walls']).
+        ctx["verified_walls"] = walls
+        ctx["verified_wall_segments"] = segments
+        ctx["verified_walls_frame"] = msg.header.frame_id
+        node.get_logger().info(
+            f"[{self.name}] Harvested {len(walls)} "
+            f"{'refined' if refined_only else 'total'} wall(s) into ctx['verified_walls'] "
+            f"(frame '{msg.header.frame_id}', {len(msg.walls)} published by the aggregator)."
+        )
+
+    def _stop_wall_detection(self, ctx):
+        node = ctx.get("node")
+        if self._wall_sub is not None:
+            try:
+                node.destroy_subscription(self._wall_sub)
+            except Exception:
+                pass
+            self._wall_sub = None
+        # Only sweep/confirm if we actually launched it this run.
+        if "wall_detection" not in ctx.get("_procs", {}):
+            return
+        stop_proc(
+            ctx, "wall_detection", timeout=10.0,
+            force_kill_patterns=WALL_DETECTION_PATTERNS,
+        )
+        # Make sure no detector/aggregator survives into the next state (a lingering
+        # aggregator would collide with a future run's instance).
+        if not wait_processes_gone(WALL_DETECTION_PATTERNS, timeout=5.0, node=node):
+            for pattern in WALL_DETECTION_PATTERNS:
+                try:
+                    subprocess.run(["pkill", "-9", "-f", pattern], timeout=2, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Legacy mock mode

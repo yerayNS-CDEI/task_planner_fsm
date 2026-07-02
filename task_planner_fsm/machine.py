@@ -28,6 +28,15 @@ class StateMachine:
             'ros2', 'launch', 'navi_wall', 'exploration.launch.py',
             f'use_sim_time:={sim_value}',
         ])
+        # Wall detection (Tier-A detector + Tier-C persistent aggregator). Started
+        # by ObjectID before the robot moves, so its wall-following coverage motion
+        # verifies/refines the walls against the STATIC localization-mode map (no
+        # flicker); torn down when ObjectID exits. (aggregate defaults to true in
+        # the launch file.)
+        self.ctx.setdefault('wall_detection_cmd', [
+            'ros2', 'launch', 'navi_wall', 'wall_detection.launch.py',
+            f'use_sim_time:={sim_value}',
+        ])
         install_global_cleanup(self.ctx)
         self.current_state.on_enter(self.ctx)
         self.ctx["is_initial_entry"] = False
