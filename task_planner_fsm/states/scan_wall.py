@@ -13,6 +13,7 @@ from std_srvs.srv import Trigger
 import subprocess, os, signal
 from math import atan2, sin, cos
 import time
+import requests
 
 class ScanWall(State):
     def __init__(self, name):
@@ -52,6 +53,15 @@ class ScanWall(State):
         self.force_mode_stop_client = None
         self.force_mode_active = False
 
+        # GPR (GP Proceq8800) HTTP API: connect + run a LINE_SCAN measurement
+        # while the wheel is pressed against the wall. Real robot only (mirrors
+        # force_mode gating); ctx overrides allow bench testing. See gpr_api memory.
+        self.gpr_base_url = "http://192.168.42.33:9000"
+        self.gpr_serial = "GP88-007-0081"
+        self.gpr_timeout = 30.0
+        self.gpr_measurement_active = False
+        self.gpr_line_active = False
+
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering scanning state.")
@@ -76,6 +86,8 @@ class ScanWall(State):
         self.column_retract_commanded = False
         self.sweep_target_point = None
         self.force_mode_active = False
+        self.gpr_measurement_active = False
+        self.gpr_line_active = False
         ctx["error_triggered"] = False
 
         self.column.reset()
@@ -241,6 +253,107 @@ class ScanWall(State):
         node.get_logger().info(f"[{self.name}] Stopping force mode.")
         fut = self.force_mode_stop_client.call_async(Trigger.Request())
         fut.add_done_callback(lambda f: self._log_force_mode_result(node, f, "stop"))
+
+    # ------------------------------------------------------------------
+    # GPR (GP Proceq8800) HTTP API — real robot only
+    # ------------------------------------------------------------------
+    def _gpr_enabled(self, ctx):
+        """GPR runs only on the real robot (like force_mode). An explicit
+        ``gpr_enabled`` ctx flag overrides this for bench testing."""
+        return bool(ctx.get("gpr_enabled", not bool(ctx.get("sim", False))))
+
+    def _gpr_request(self, ctx, method, path, json_body=None):
+        """Issue one GPR HTTP request (blocking). Returns the response, or None on
+        a connection/timeout error. Any 2xx is success (starts return 200, stops
+        return 204); errors carry a ``{"error":{"code","message"}}`` body."""
+        node = ctx["node"]
+        base_url = ctx.get("gpr_base_url", self.gpr_base_url).rstrip("/")
+        url = f"{base_url}{path}"
+        try:
+            resp = requests.request(
+                method, url, json=json_body,
+                timeout=ctx.get("gpr_timeout", self.gpr_timeout),
+            )
+        except requests.exceptions.RequestException as e:
+            node.get_logger().error(f"[{self.name}] GPR {method} {path} failed: {e}")
+            return None
+        if resp.status_code >= 400:
+            node.get_logger().error(
+                f"[{self.name}] GPR {method} {path} -> HTTP {resp.status_code}: "
+                f"{resp.text.strip()[:200]}"
+            )
+        else:
+            node.get_logger().info(
+                f"[{self.name}] GPR {method} {path} -> HTTP {resp.status_code}"
+            )
+        return resp
+
+    def _gpr_connect(self, ctx):
+        """Connect to the probe. 200 = connected, 406 = already connected (both OK).
+        Measurement calls 403 unless connected first, so a failure here aborts the
+        scan (a sweep with no GPR data is pointless).
+
+        TODO (auto-connect): /probe/connect also accepts an optional ``ip`` field.
+        Without it, the connection request must be **accepted manually on the GP
+        App (iPad)** before this returns — so the scan is not fully autonomous yet.
+        Once the probe is assigned a static IP, pass ``ip`` here (e.g. from
+        ``ctx.get("gpr_ip")``) so the connection completes without operator input.
+        """
+        node = ctx["node"]
+        serial = ctx.get("gpr_serial", self.gpr_serial)
+        body = {"serialNumber": serial}
+        # gpr_ip is intentionally unset for now (no static IP assigned to the probe).
+        gpr_ip = ctx.get("gpr_ip")
+        if gpr_ip:
+            body["ip"] = gpr_ip
+        node.get_logger().info(f"[{self.name}] GPR: connecting to probe {serial}.")
+        resp = self._gpr_request(ctx, "POST", "/probe/connect", body)
+        if resp is not None and (resp.status_code < 400 or resp.status_code == 406):
+            node.get_logger().info(f"[{self.name}] GPR probe connected.")
+            return True
+        node.get_logger().error(f"[{self.name}] GPR probe connection failed; aborting scan.")
+        ctx["error_triggered"] = True
+        return False
+
+    def _gpr_start_measurement_and_line(self, ctx):
+        """Connect, create a LINE_SCAN measurement, then start the line. Called
+        once per line right after the GPR wheel is pressed against the wall. Any
+        start-path failure aborts the scan via ``error_triggered``."""
+        if not self._gpr_enabled(ctx):
+            return
+        node = ctx["node"]
+        if not self._gpr_connect(ctx):
+            return
+        line_no = ctx.get("current_line_idx", 0) + 1
+        body = {"type": "LINE_SCAN", "name": f"scan_wall line {line_no}"}
+        resp = self._gpr_request(ctx, "POST", "/measurement/start", body)
+        if resp is None or resp.status_code >= 400:
+            node.get_logger().error(f"[{self.name}] GPR start measurement failed; aborting scan.")
+            ctx["error_triggered"] = True
+            return
+        self.gpr_measurement_active = True
+        resp = self._gpr_request(ctx, "POST", "/measurement/line/start")
+        if resp is None or resp.status_code >= 400:
+            node.get_logger().error(f"[{self.name}] GPR start line failed; aborting scan.")
+            ctx["error_triggered"] = True
+            return
+        self.gpr_line_active = True
+        node.get_logger().info(f"[{self.name}] GPR measurement + line started.")
+
+    def _gpr_stop_line_and_measurement(self, ctx):
+        """Stop the line then the measurement. Best-effort: logs failures but does
+        not abort (the sweep is already done). Guarded by flags so it is a safe
+        no-op if the line/measurement was never started."""
+        if not self._gpr_enabled(ctx):
+            return
+        node = ctx["node"]
+        if self.gpr_line_active:
+            self._gpr_request(ctx, "POST", "/measurement/line/stop")
+            self.gpr_line_active = False
+        if self.gpr_measurement_active:
+            self._gpr_request(ctx, "POST", "/measurement/stop")
+            self.gpr_measurement_active = False
+            node.get_logger().info(f"[{self.name}] GPR line + measurement stopped.")
 
     # ------------------------------------------------------------------
     # Column height from the map-frame line z
@@ -424,6 +537,12 @@ class ScanWall(State):
             if ctx.get("error_triggered"):
                 return
 
+            # GPR: connect, create the LINE_SCAN measurement and start the line now
+            # that the wheel is pressed against the wall (real robot only).
+            self._gpr_start_measurement_and_line(ctx)
+            if ctx.get("error_triggered"):
+                return
+
             wall_data = ctx.get("target_scan_wall", None)
             prev_target_point = ctx.get("target_scan_point", None)
 
@@ -497,7 +616,8 @@ class ScanWall(State):
         result = future.result().result
         status = future.result().status
 
-        node.get_logger().info(f"[{self.name}] Scanning finished. Stopping force mode + arm processes for safety...")
+        node.get_logger().info(f"[{self.name}] Scanning finished. Stopping GPR, force mode + arm processes for safety...")
+        self._gpr_stop_line_and_measurement(ctx)   # stop line + measurement before releasing the press
         self._stop_force_mode(ctx)      # release the press before the arm retracts
         self._stop_arm_processes(ctx)
         time.sleep(2)   # delay to avoid errors in the arm goals
@@ -599,7 +719,9 @@ class ScanWall(State):
                 ctx["scan_done"] = True
 
     def on_exit(self, ctx):
-        ## Safety net: release force mode (real) and stop sensor + alignment nodes.
+        ## Safety net: stop any running GPR measurement, release force mode (real)
+        ## and stop sensor + alignment nodes.
+        self._gpr_stop_line_and_measurement(ctx)
         self._stop_force_mode(ctx)
         self._stop_arm_processes(ctx)
 
