@@ -1,6 +1,11 @@
 from ..state import State
 from example_interfaces.srv import SetBool
 
+NEXT_STATE_OPTIONS = [
+    "NavigateToTarget",
+    "Error",
+]
+
 class BasePlacementComputation(State):
     def __init__(self, name):
         super().__init__(name)
@@ -12,25 +17,26 @@ class BasePlacementComputation(State):
         node.get_logger().info(f"[{self.name}] Calling the service /base_placement_computation")
         ctx["base_placement_computed"] = False
         ctx["error_triggered"] = False
+        self._user_choice = None
 
         self.client = node.create_client(SetBool, "/base_placement_computation")
         request = SetBool.Request()
         request.data = True
-        
+
         if not self.client.wait_for_service(timeout_sec=2.0):
             node.get_logger().error(f"[{self.name}] Service /base_placement_computation not available.")
             ctx["error_triggered"] = True
             return
-        
+
         self.future = self.client.call_async(request)
 
-    def run(self, ctx):     
+    def run(self, ctx):
         node = ctx["node"]
 
         if self.future is None:
             node.get_logger().info(f"[{self.name}] Future is None.")
             return
-        
+
         if self.future.done():
             result = self.future.result()
             if result and result.success:
@@ -42,8 +48,6 @@ class BasePlacementComputation(State):
             self.future = None
 
     def check_transition(self, ctx):
-        if ctx.get("base_placement_computed"):
-            return "NavigateToTarget"
-        if ctx.get("error_triggered"):
-            return "Error"
-        return None
+        if not ctx.get("base_placement_computed") and not ctx.get("error_triggered"):
+            return None
+        return self.select_next_state(ctx, NEXT_STATE_OPTIONS)
