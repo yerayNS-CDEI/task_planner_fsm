@@ -1,105 +1,76 @@
+import time
+
 import rclpy
 from rclpy.node import Node
 from example_interfaces.srv import SetBool
-import time
+
+# Mock services for the pokeye FSM workflow. Each entry maps a service name to
+# the success message returned. Every handler simply waits `DELAY` seconds and
+# replies success=True, so the FSM's happy path can be exercised end-to-end
+# without the real subsystems running.
+SERVICES = {
+    "/receive_nav2_map": "Nav2 map received successfully.",
+    "/get_semantic_map": "Semantic map received successfully.",
+    "/wait_for_data": "Data received successfully.",
+    "/target_selection": "Target selected successfully.",
+    "/manipulator_folding": "Manipulator folded successfully.",
+    "/base_placement_computation": "Base placement computed successfully.",
+    "/navigate_to_target": "Target reached successfully.",
+    "/manipulator_reachability": "Manipulator reachability computed successfully.",
+    "/nearby_point_selection": "Nearby point selected successfully.",
+    "/manipulator_unfolding": "Manipulator unfolded successfully.",
+    "/drill_approach": "Drill approach completed successfully.",
+    "/start_suction_drill": "Suction and drill started successfully.",
+    "/drill": "Drilling completed successfully.",
+    "/take_out_drill": "Drill taken out successfully.",
+    "/stop_suction_drill": "Suction and drill stopped successfully.",
+    "/drill_retract": "Drill retracted successfully.",
+    "/sample_scanning": "Sample scanned successfully.",
+    "/storing_to_database": "Data stored to database successfully.",
+    "/home_position": "Home position reached successfully.",
+}
+
+DELAY = 1.0  # seconds each mock service waits before replying
+
 
 class MockServer(Node):
     def __init__(self):
-        super().__init__('mock_server')
-        self.srv = self.create_service(SetBool, '/start_mapping', self.handle_request_mapping)
-        self.get_logger().info("Server /start_mapping ready.")
-        self.get_logger().info("\033[1;32mUse: ros2 service call /start_mapping example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
+        super().__init__("mock_server")
+        # Keep a reference to every service so they are not garbage collected.
+        # (Node.services is a read-only property, so use a private name.)
+        self._services = []
+        for service_name, success_message in SERVICES.items():
+            srv = self.create_service(
+                SetBool,
+                service_name,
+                self._make_handler(service_name, success_message),
+            )
+            self._services.append(srv)
+            self.get_logger().info(f"Server {service_name} ready.")
+            self.get_logger().info(
+                f'\033[1;32mUse: ros2 service call {service_name} '
+                'example_interfaces/srv/SetBool "{data: true}"\033[0m'
+            )
 
-        self.srv = self.create_service(SetBool, '/start_geometry_reconstruction', self.handle_request_geometry_reconstruction)
-        self.get_logger().info("Server /start_geometry_reconstruction ready.")
-        self.get_logger().info("\033[1;32mUse: ros2 service call /start_geometry_reconstruction example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
+    def _make_handler(self, service_name, success_message):
+        def handler(request, response):
+            self.get_logger().info(f"Received request on {service_name}.")
+            self.get_logger().info(f"Waiting {DELAY} seconds.")
+            time.sleep(DELAY)
+            response.success = True
+            response.message = success_message
+            return response
 
-        self.srv = self.create_service(SetBool, '/compute_areas_of_interest', self.handle_request_areas_of_interest)
-        self.get_logger().info("Server /compute_areas_of_interest ready.")
-        self.get_logger().info("\033[1;32mUse: ros2 service call /compute_areas_of_interest example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
+        return handler
 
-        self.srv = self.create_service(SetBool, '/object_id_sim', self.handle_request_object_id_sim)
-        self.get_logger().info("Server /object_id_sim ready.")
-        self.get_logger().info("\033[1;32mUse: ros2 service call /object_id_sim example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
-
-        self.srv = self.create_service(SetBool, '/wall_lines_computation', self.handle_request_wall_lines_computation)
-        self.get_logger().info("Server /wall_lines_computation ready.")
-        self.get_logger().info("\033[1;32mUse: ros2 service call /wall_lines_computation example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
-
-        self.srv = self.create_service(SetBool, '/sensor_data_processing', self.handle_request_sensor_data_processing)
-        self.get_logger().info("Server /sensor_data_processing ready.")
-        self.get_logger().info("\033[1;32mUse: ros2 service call /sensor_data_processing example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
-
-        self.srv = self.create_service(SetBool, '/send_data_to_pokeye', self.handle_request_send_data_to_pokeye)
-        self.get_logger().info("Server /send_data_to_pokeye ready.")
-        self.get_logger().info("\033[1;32mUse: ros2 service call /send_data_to_pokeye example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
-
-    def handle_request_mapping(self, request, response):
-        self.get_logger().info("Received request to start mapping.")
-        delay = 1   # seconds
-        self.get_logger().info(f"Waiting {delay} seconds.")
-        time.sleep(delay)
-        response.success = True
-        response.message = "Map generated succesfully."
-        return response
-    
-    def handle_request_geometry_reconstruction(self, request, response):
-        self.get_logger().info("Received request to start geometry reconstruction.")
-        delay = 1   # seconds
-        self.get_logger().info(f"Waiting {delay} seconds.")
-        time.sleep(delay)
-        response.success = True
-        response.message = "Geometry reconstructed succesfully."
-        return response
-    
-    def handle_request_areas_of_interest(self, request, response):
-        self.get_logger().info("Received request to start areas of interest computation.")
-        delay = 1   # seconds
-        self.get_logger().info(f"Waiting {delay} seconds.")
-        time.sleep(delay)
-        response.success = True
-        response.message = "Areas of interest computed succesfully."
-        return response
-    
-    def handle_request_object_id_sim(self, request, response):
-        self.get_logger().info("Received request to start object ID.")
-        delay = 1   # seconds
-        self.get_logger().info(f"Waiting {delay} seconds.")
-        time.sleep(delay)
-        response.success = True
-        response.message = "Object ID completed succesfully."
-        return response
-
-    def handle_request_wall_lines_computation(self, request, response):
-        self.get_logger().info("Received request to start wall lines computation.")
-        delay = 1   # seconds
-        self.get_logger().info(f"Waiting {delay} seconds.")
-        time.sleep(delay)
-        response.success = True
-        response.message = "Wall lines computed succesfully."
-        return response
-    
-    def handle_request_sensor_data_processing(self, request, response):
-        self.get_logger().info("Received request to start sensor data processing.")
-        delay = 1   # seconds
-        self.get_logger().info(f"Waiting {delay} seconds.")
-        time.sleep(delay)
-        response.success = True
-        response.message = "Sensor data processed succesfully."
-        return response
-
-    def handle_request_send_data_to_pokeye(self, request, response):
-        self.get_logger().info("Received request to send data to Pokeye.")
-        delay = 1   # seconds
-        self.get_logger().info(f"Waiting {delay} seconds.")
-        time.sleep(delay)
-        response.success = True
-        response.message = "Data sent to Pokeye succesfully."
-        return response
 
 def main(args=None):
     rclpy.init(args=args)
     node = MockServer()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
