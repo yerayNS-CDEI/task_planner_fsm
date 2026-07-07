@@ -1,7 +1,7 @@
 from ..state import State
 from example_interfaces.srv import SetBool
 
-class WallLinesComputation(State):
+class TakeOutDrill(State):
     def __init__(self, name):
         super().__init__(name)
         self.client = None
@@ -9,16 +9,16 @@ class WallLinesComputation(State):
 
     def on_enter(self, ctx):
         node = ctx["node"]
-        node.get_logger().info(f"[{self.name}] Calling the service /wall_lines_computation")
-        ctx["interest_areas_ready"] = False
+        node.get_logger().info(f"[{self.name}] Calling the service /take_out_drill")
+        ctx["take_out_drill_success"] = False
         ctx["error_triggered"] = False
 
-        self.client = node.create_client(SetBool, "/wall_lines_computation")
+        self.client = node.create_client(SetBool, "/take_out_drill")
         request = SetBool.Request()
         request.data = True
         
         if not self.client.wait_for_service(timeout_sec=2.0):
-            node.get_logger().error(f"[{self.name}] Service /wall_lines_computation not available.")
+            node.get_logger().error(f"[{self.name}] Service /take_out_drill not available.")
             ctx["error_triggered"] = True
             return
         
@@ -34,17 +34,16 @@ class WallLinesComputation(State):
         if self.future.done():
             result = self.future.result()
             if result and result.success:
-                node.get_logger().info(f"[{self.name}] Wall lines computed correctly.")
-                ctx["wall_lines_located"] = True
-                ctx["wall_lines_data"] = ctx.get("walls_data")
+                node.get_logger().info(f"[{self.name}] Take out drill completed.")
+                ctx["take_out_drill_success"] = True
             else:
-                node.get_logger().error(f"[{self.name}] Error while computing wall lines.")
+                node.get_logger().error(f"[{self.name}] Error while receiving data.")
                 ctx["error_triggered"] = True
             self.future = None
 
     def check_transition(self, ctx):
-        if ctx.get("wall_lines_located"):
-            return "GeometryReconstruction"
+        if ctx.get("take_out_drill_success"):
+            return "SuctionDrillStop"
         if ctx.get("error_triggered"):
             return "Error"
         return None

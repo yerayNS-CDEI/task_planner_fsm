@@ -1,7 +1,7 @@
 from ..state import State
 from example_interfaces.srv import SetBool
 
-class HomePosition(State):
+class SuctionDrillStart(State):
     def __init__(self, name):
         super().__init__(name)
         self.client = None
@@ -9,16 +9,16 @@ class HomePosition(State):
 
     def on_enter(self, ctx):
         node = ctx["node"]
-        node.get_logger().info(f"[{self.name}] Calling the service /home_position")
-        ctx["home_position_reached"] = False
+        node.get_logger().info(f"[{self.name}] Calling the service /start_suction_drill")
+        ctx["start_suction_drill_success"] = False
         ctx["error_triggered"] = False
 
-        self.client = node.create_client(SetBool, "/home_position")
+        self.client = node.create_client(SetBool, "/start_suction_drill")
         request = SetBool.Request()
         request.data = True
         
         if not self.client.wait_for_service(timeout_sec=2.0):
-            node.get_logger().error(f"[{self.name}] Service /home_position not available.")
+            node.get_logger().error(f"[{self.name}] Service /start_suction_drill not available.")
             ctx["error_triggered"] = True
             return
         
@@ -34,16 +34,16 @@ class HomePosition(State):
         if self.future.done():
             result = self.future.result()
             if result and result.success:
-                node.get_logger().info(f"[{self.name}] Home position reached.")
-                ctx["home_position_reached"] = True
+                node.get_logger().info(f"[{self.name}] Suction and drill start completed.")
+                ctx["start_suction_drill_success"] = True
             else:
                 node.get_logger().error(f"[{self.name}] Error while receiving data.")
                 ctx["error_triggered"] = True
             self.future = None
 
     def check_transition(self, ctx):
-        if ctx.get("home_position_reached"):
-            return "Finished"
+        if ctx.get("start_suction_drill_success"):
+            return "Drilling"
         if ctx.get("error_triggered"):
             return "Error"
         return None

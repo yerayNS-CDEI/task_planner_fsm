@@ -4,7 +4,7 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 
-class WallTargetSelection(State):     # necessari afegir un nou context per saber si hi ha scannable walls??
+class TargetSelection(State):     # necessari afegir un nou context per saber si hi ha scannable walls??
     def __init__(self, name):
         super().__init__(name)
         self.current_position = None
@@ -186,7 +186,10 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
 
     def check_transition(self, ctx):
         if ctx.get("target_selected"):
-            return "NavigateToTarget"
+            if ctx.get("far_drill_point_selected"):
+                return "ManipulatorFolding"
+            if ctx.get("nearby_drill_point_selected"):
+                return "ApproachDrillPoint"
         if ctx.get("error_triggered"):
             return "Error"
         return None

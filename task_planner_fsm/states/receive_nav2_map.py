@@ -1,7 +1,7 @@
 from ..state import State
 from example_interfaces.srv import SetBool
 
-class AreasOfInterest(State):
+class ReceiveNav2Map(State):
     def __init__(self, name):
         super().__init__(name)
         self.client = None
@@ -9,16 +9,16 @@ class AreasOfInterest(State):
 
     def on_enter(self, ctx):
         node = ctx["node"]
-        node.get_logger().info(f"[{self.name}] Calling the service /compute_areas_of_interest")
-        ctx["interest_areas_ready"] = False
+        node.get_logger().info(f"[{self.name}] Calling the service /receive_nav2_map")
+        ctx["nav2_map_ready"] = False
         ctx["error_triggered"] = False
 
-        self.client = node.create_client(SetBool, "/compute_areas_of_interest")
+        self.client = node.create_client(SetBool, "/receive_nav2_map")
         request = SetBool.Request()
         request.data = True
         
         if not self.client.wait_for_service(timeout_sec=2.0):
-            node.get_logger().error(f"[{self.name}] Service /compute_areas_of_interest not available.")
+            node.get_logger().error(f"[{self.name}] Service /receive_nav2_map not available.")
             ctx["error_triggered"] = True
             return
         
@@ -34,18 +34,16 @@ class AreasOfInterest(State):
         if self.future.done():
             result = self.future.result()
             if result and result.success:
-                node.get_logger().info(f"[{self.name}] Areas of interest computed correctly.")
-                ctx["interest_areas_ready"] = True
-                ctx["aoi_data"] = ctx.get("walls_data")
-                ctx["scan_phase"] = 2
+                node.get_logger().info(f"[{self.name}] Nav2 map received correctly.")
+                ctx["nav2_map_ready"] = True
             else:
-                node.get_logger().error(f"[{self.name}] Error while computing areas.")
+                node.get_logger().error(f"[{self.name}] Error while receiving Nav2 map.")
                 ctx["error_triggered"] = True
             self.future = None
 
     def check_transition(self, ctx):
-        if ctx.get("interest_areas_ready"):
-            return "WallDiscretization"
+        if ctx.get("nav2_map_ready"):
+            return "GetSemanticMap"
         if ctx.get("error_triggered"):
             return "Error"
         return None

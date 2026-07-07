@@ -27,5 +27,5 @@ class Initialization(State):
 
     def check_transition(self, ctx):
         if ctx.get("start"):
-            return "CreateMap"
+            return "ReceiveNav2Map"
         return None
