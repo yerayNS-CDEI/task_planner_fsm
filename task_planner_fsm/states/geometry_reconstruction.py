@@ -249,6 +249,12 @@ class GeometryReconstruction(State):
 
         ctx["detected_walls"] = detected_walls
         ctx["detected_columns"] = columns
+        # Per-wall outward normals (from YAML) drive interior-side scanning. The
+        # map-detection path provides none, so align the length with None entries
+        # (build_wall_data then falls back to p1->p2 winding for those).
+        normals = ctx.get("detected_wall_normals") or []
+        if len(normals) != len(detected_walls):
+            ctx["detected_wall_normals"] = [None] * len(detected_walls)
         ctx["walls_detected"] = True
 
         node.get_logger().info(
@@ -308,13 +314,17 @@ class GeometryReconstruction(State):
             return None
 
         detected_walls = []
+        detected_normals = []
         for w in raw_walls:
             z = float(w.get("z_min", self.default_wall_z))
             p1, p2 = w["p1"], w["p2"]
             detected_walls.append(
                 ((float(p1[0]), float(p1[1]), z), (float(p2[0]), float(p2[1]), z))
             )
+            # Outward normal (RViz arrow) so scanning uses the interior side.
+            detected_normals.append(w.get("normal"))
 
+        ctx["detected_wall_normals"] = detected_normals
         node.get_logger().info(
             f"[{self.name}] Loaded {len(detected_walls)} wall(s) from '{yaml_path}'."
         )
@@ -588,6 +598,11 @@ class GeometryReconstruction(State):
                 entry["z_min"] = float(w["z_min"])
             if w.get("z_max") is not None:
                 entry["z_max"] = float(w["z_max"])
+            # Outward wall normal (RViz arrow, points OUT of the building). Used to
+            # scan from the interior side; None -> fall back to p1->p2 winding.
+            n = w.get("normal")
+            if n and len(n) >= 2:
+                entry["normal"] = (float(n[0]), float(n[1]))
             walls.append(entry)
         return walls
 

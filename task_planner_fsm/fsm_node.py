@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -9,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import rclpy
 from geometry_msgs.msg import Point, Pose, Quaternion
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -50,10 +51,7 @@ from task_planner_fsm.states.proc_utils import (
     wait_services_ready,
 )
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
-from task_planner_fsm.utils.wall_geometry import (
-    ee_rpy_deg_from_inward_normal,
-    inward_normal_from_wall_points,
-)
+from task_planner_fsm.utils.wall_geometry import build_wall_data
 
 FSM_STATE_ORDER = [
     "Initialization",
@@ -158,12 +156,19 @@ NAV_SIM_REQUIRED_START_STATES = {
     if s not in {"Finished", "Error"}
 }
 
+# Fallback walls, only used when navi_wall's detected_walls.yaml cannot be
+# loaded during bootstrap. The default wall source is the YAML (see
+# _load_bootstrap_walls / GeometryReconstruction._load_detected_walls_from_yaml).
 PREDEFINED_WALLS = [
     ((4.0, 0.0, 2.0), (4.0, -3.0, 3.0)),
     ((9.0, 0.0, 0.19), (9.0, -4.5, 2.0)),
     ((10.0, -4.5, 0.2), (10.0, 0.0, 3.0)),
     ((4.0, 2.0, 0.2), (8.0, 2.0, 3.0)),
 ]
+
+# Endpoint z used for YAML walls that don't carry a z_min (mirrors
+# GeometryReconstruction.default_wall_z).
+BOOTSTRAP_WALL_DEFAULT_Z = 0.0
 
 
 class RobotFSMNode(Node):
@@ -289,6 +294,16 @@ class RobotFSMNode(Node):
         self.create_subscription(Bool, "/arm/execution_status", self.execution_status_callback, 10)
         self.create_subscription(Bool, "/planner/goal_failed", self.planner_goal_failed_callback, 10)
         self.create_subscription(Bool, "/map_done", self.mapping_callback, 10)
+        # Nav2 global costmap (latched) so states can project scan goals onto the
+        # nearest cell the base can actually occupy. See costmap_utils.
+        costmap_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            OccupancyGrid, "/global_costmap/costmap", self.global_costmap_callback, costmap_qos
+        )
 
         # Timer
         self.timer = self.create_timer(1.0, self.machine.step)
@@ -330,57 +345,29 @@ class RobotFSMNode(Node):
         p2: Tuple[float, float, float],
         offset: float = 0.6,
         scan_lines_z: Optional[List[float]] = None,
+        outward_normal: Optional[Tuple[float, float]] = None,
     ) -> Dict[str, Tuple]:
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        length = math.hypot(dx, dy)
-        if length == 0:
-            raise ValueError("Wall points must be different.")
-
-        dx /= length
-        dy /= length
-
-        # Clock-wise normal for the exterior scan side.
-        nx = dy
-        ny = -dx
-
-        scan_start = (
-            p1[0] + offset * dx + nx * offset,
-            p1[1] + offset * dy + ny * offset,
-            p1[2],
+        return build_wall_data(
+            p1, p2, offset=offset, scan_lines_z=scan_lines_z, outward_normal=outward_normal
         )
-        scan_end = (
-            p2[0] - offset * dx + nx * offset,
-            p2[1] - offset * dy + ny * offset,
-            p2[2],
-        )
-
-        inward_normal = inward_normal_from_wall_points(p1, p2)
-        ee_rpy_deg = ee_rpy_deg_from_inward_normal(inward_normal)
-
-        # Horizontal scan lines (heights), bottom-first. Default to a single line
-        # at the wall's scan-line z, preserving single-pass behaviour.
-        if scan_lines_z:
-            scan_lines_z = sorted(float(z) for z in scan_lines_z)
-        else:
-            scan_lines_z = [float(scan_start[2])]
-
-        return {
-            "original": (tuple(p1), tuple(p2)),
-            "scan_line": (scan_start, scan_end),
-            "inward_normal": inward_normal,
-            "ee_rpy_deg": ee_rpy_deg,
-            "scan_lines_z": scan_lines_z,
-        }
 
     def _prompt_walls_data(self) -> List[Dict[str, Tuple]]:
-        print("[FSM Bootstrap] Available predefined walls:")
-        for i, (p1, p2) in enumerate(PREDEFINED_WALLS, start=1):
-            print(f"  {i}: p1={p1}, p2={p2}")
+        available_walls = self._load_bootstrap_walls()
 
-        max_walls = len(PREDEFINED_WALLS)
+        # The selection number below (1..N) is the same 1-based order the RViz
+        # 'detected_wall_labels' markers use ("W1", "W2", ...), so picking N here
+        # scans the wall labelled "W{N}" in RViz. The YAML id is shown too for
+        # cross-referencing detected_walls.yaml.
+        print("[FSM Bootstrap] Available walls (number matches the green 'W#' label in RViz):")
+        for i, (wall_id, (p1, p2), _n) in enumerate(available_walls, start=1):
+            print(f"  {i}: W{i}  (yaml id={wall_id})  p1={p1}, p2={p2}")
+
+        max_walls = len(available_walls)
         num_walls = self._prompt_int(
-            ">> Number of walls to include for this run (1-3)", 1, max_walls, max_walls
+            f">> Number of walls to include for this run (1-{max_walls})",
+            1,
+            max_walls,
+            max_walls,
         )
 
         default_indices = list(range(1, num_walls + 1))
@@ -411,10 +398,124 @@ class RobotFSMNode(Node):
 
             walls_data = []
             for idx in selected_indices:
-                p1, p2 = PREDEFINED_WALLS[idx - 1]
+                _wall_id, (p1, p2), outward_normal = available_walls[idx - 1]
                 scan_lines_z = self._prompt_wall_lines(idx)
-                walls_data.append(self._build_wall_data(p1, p2, scan_lines_z=scan_lines_z))
+                walls_data.append(
+                    self._build_wall_data(
+                        p1, p2, scan_lines_z=scan_lines_z, outward_normal=outward_normal
+                    )
+                )
             return walls_data
+
+    def _load_bootstrap_walls(self) -> List[Tuple[object, Tuple[Tuple, Tuple]]]:
+        """Selectable walls for a direct (bootstrap) start, loaded from
+        navi_wall's ``detected_walls.yaml`` as ``((x, y, z), (x, y, z))``
+        map-frame endpoint pairs — the same source and shape GeometryReconstruction
+        feeds into ComputeWallPoints. Falls back to ``PREDEFINED_WALLS`` only when
+        the YAML is missing/empty so a demo run without navi_wall still works.
+        """
+        detections_dir = self._resolve_detections_dir()
+        yaml_path = (
+            os.path.join(detections_dir, "detected_walls.yaml")
+            if detections_dir is not None
+            else None
+        )
+        raw_walls = self._load_walls_from_yaml(yaml_path) if yaml_path else []
+        if not raw_walls:
+            self.get_logger().warn(
+                f"[FSM Bootstrap] No walls from detected_walls.yaml "
+                f"({yaml_path or 'navi_wall rgb_detections dir not found'}); "
+                f"falling back to hardcoded PREDEFINED_WALLS."
+            )
+            return [(i, (p1, p2), None) for i, (p1, p2) in enumerate(PREDEFINED_WALLS)]
+
+        walls = []
+        for order, w in enumerate(raw_walls):
+            z = float(w.get("z_min", BOOTSTRAP_WALL_DEFAULT_Z))
+            p1, p2 = w["p1"], w["p2"]
+            wall_id = w.get("id", order)
+            walls.append(
+                (
+                    wall_id,
+                    ((float(p1[0]), float(p1[1]), z), (float(p2[0]), float(p2[1]), z)),
+                    w.get("normal"),
+                )
+            )
+        self.get_logger().info(
+            f"[FSM Bootstrap] Loaded {len(walls)} wall(s) from '{yaml_path}'."
+        )
+        return walls
+
+    def _resolve_detections_dir(self) -> Optional[str]:
+        """Locate the navi_wall ``rgb_detections`` directory.
+
+        Order: explicit override param -> package share folder -> dev fallback to
+        the source checkout under ``<ws>/src``. Returns the first existing
+        directory, or None. Mirrors GeometryReconstruction._resolve_detections_dir.
+        """
+        candidates = []
+
+        override = self.ctx.get("geometry_reconstruction_rgb_detections_dir")
+        if override:
+            candidates.append(os.path.expanduser(str(override)))
+
+        try:
+            from ament_index_python.packages import get_package_share_directory
+
+            share = get_package_share_directory("navi_wall")
+            candidates.append(os.path.join(share, "rgb_detections"))
+            if os.sep + "install" + os.sep in share:
+                ws = share.split(os.sep + "install" + os.sep, 1)[0]
+                for pkg_dir in ("navi-wall", "navi_wall"):
+                    candidates.append(os.path.join(ws, "src", pkg_dir, "rgb_detections"))
+        except Exception as exc:
+            self.get_logger().warn(
+                f"[FSM Bootstrap] Could not resolve navi_wall share directory: {exc}"
+            )
+
+        for cand in candidates:
+            if cand and os.path.isdir(cand):
+                return cand
+        return None
+
+    def _load_walls_from_yaml(self, yaml_path: str) -> List[Dict]:
+        """Parse navi_wall's ``detected_walls.yaml`` into ``{'p1','p2','z_min','z_max'}``
+        entries. Mirrors GeometryReconstruction._load_walls_from_yaml.
+        """
+        if not yaml_path or not os.path.isfile(yaml_path):
+            return []
+        try:
+            import yaml
+
+            with open(yaml_path, "r") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as exc:
+            self.get_logger().warn(
+                f"[FSM Bootstrap] Could not parse '{yaml_path}': {exc}"
+            )
+            return []
+
+        walls = []
+        for w in data.get("walls", []) or []:
+            p1 = w.get("p1")
+            p2 = w.get("p2")
+            if not p1 or not p2:
+                continue
+            entry = {
+                "id": w.get("id", len(walls)),
+                "p1": (float(p1[0]), float(p1[1])),
+                "p2": (float(p2[0]), float(p2[1])),
+            }
+            if w.get("z_min") is not None:
+                entry["z_min"] = float(w["z_min"])
+            if w.get("z_max") is not None:
+                entry["z_max"] = float(w["z_max"])
+            # Outward wall normal (RViz arrow) so scanning uses the interior side.
+            n = w.get("normal")
+            if n and len(n) >= 2:
+                entry["normal"] = (float(n[0]), float(n[1]))
+            walls.append(entry)
+        return walls
 
     def _prompt_wall_lines(self, wall_idx: int) -> List[float]:
         """Prompt for the number of horizontal lines and their z heights.
@@ -921,6 +1022,17 @@ class RobotFSMNode(Node):
         self.ctx["base_position"] = msg.pose.pose.position
         self.ctx["base_orientation"] = msg.pose.pose.orientation
         self.ctx["odom_received"] = True
+
+    def global_costmap_callback(self, msg: OccupancyGrid):
+        first = self.ctx.get("global_costmap") is None
+        self.ctx["global_costmap"] = msg
+        if first:
+            info = msg.info
+            self.get_logger().info(
+                f"[FSM] Global costmap received: {info.width}x{info.height} @ "
+                f"{info.resolution:.3f} m, origin=({info.origin.position.x:.2f}, "
+                f"{info.origin.position.y:.2f})."
+            )
 
     def joint_state_callback(self, msg):
         self.current_joint_state = msg
