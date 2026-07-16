@@ -596,6 +596,15 @@ class ScanWall(State):
             self.started = True
             return
 
+        # TODO(wall-surface obstacles): the sweep assumes a flat wall — the moving
+        # sensor plate can hit surface features the 2D costmap never sees: small
+        # bumps, wall-mounted fixtures, or columns/pilasters protruding near the
+        # wall at plate height. Consider (a) checking the 3D map/octomap along the
+        # scan line at line_z and splitting segments around protrusions (like
+        # reachable_wall_segments does for base obstacles), and (b) reacting
+        # online to sudden distance-sensor jumps during the sweep (plate
+        # approaching a protrusion) by pausing/retracting instead of pressing on.
+
         # --- Split the line into reachable segments; gaps get skipped. ---
         if self._segments is None:
             segments = reachable_wall_segments(ctx, self._sweep_from, self._sweep_to)
