@@ -174,11 +174,17 @@ class GeometryReconstruction(State):
             )
 
         if self.publish_markers and self.marker_pub is None:
-            marker_qos = QoSProfile(depth=1)
+            # depth > 1 so late subscribers (RViz) replay BOTH the wall markers
+            # and the reachable-segment markers later published on this same
+            # publisher (see costmap_utils.publish_wall_segment_markers).
+            marker_qos = QoSProfile(depth=5)
             marker_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
             self.marker_pub = node.create_publisher(
                 MarkerArray, "/geometry_reconstruction/wall_markers", marker_qos
             )
+        # Share with other states/utils so segment markers reuse this publisher.
+        if self.marker_pub is not None:
+            ctx["wall_marker_pub"] = self.marker_pub
 
         # Optional mock reconstruction service: when enabled, call the mock
         # server and wait for it in run() Step 1 (exercises the FSM workflow
@@ -783,11 +789,14 @@ class GeometryReconstruction(State):
         now = node.get_clock().now().to_msg()
         array = MarkerArray()
 
-        # Clear any markers from a previous run.
+        # Clear any markers from a previous run. DELETEALL ignores ns/id, but the
+        # id must not collide with the LINE_LIST below (both default to id 0 in
+        # the same ns, which trips RViz's duplicate-marker check).
         clear = Marker()
         clear.header.frame_id = "map"
         clear.header.stamp = now
         clear.ns = "detected_walls"
+        clear.id = 9999
         clear.action = Marker.DELETEALL
         array.markers.append(clear)
 

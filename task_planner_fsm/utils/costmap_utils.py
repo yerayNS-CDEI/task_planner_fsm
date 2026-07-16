@@ -355,18 +355,23 @@ def reachable_wall_segments(ctx, p1, p2):
 
 def publish_wall_segment_markers(ctx, segments):
     """Latched RViz markers for the reachable sweep segments (green bars slightly
-    above the floor) on /fsm/wall_segment_markers (set display durability to
-    Transient Local). Gaps between bars are the skipped, unreachable portions."""
+    above the floor), in the ``wall_segments`` namespace. Gaps between bars are
+    the skipped, unreachable portions. Reuses GeometryReconstruction's wall
+    marker publisher (/geometry_reconstruction/wall_markers) so walls and their
+    segments share one RViz display; creates it only when bootstrapping past
+    that state. Set the display durability to Transient Local."""
     node = ctx["node"]
-    pub = ctx.get("_wall_segment_marker_pub")
+    pub = ctx.get("wall_marker_pub")
     if pub is None:
         qos = QoSProfile(
-            depth=1,
+            depth=5,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        pub = node.create_publisher(MarkerArray, "/fsm/wall_segment_markers", qos)
-        ctx["_wall_segment_marker_pub"] = pub
+        pub = node.create_publisher(
+            MarkerArray, "/geometry_reconstruction/wall_markers", qos
+        )
+        ctx["wall_marker_pub"] = pub
 
     m = Marker()
     m.header.frame_id = "map"
