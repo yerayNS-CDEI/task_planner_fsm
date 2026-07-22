@@ -170,6 +170,70 @@ def _pgrep(pattern: str) -> List[int]:
         return []
 
 
+def graceful_rtabmap_save(
+    node=None,
+    timeout: float = 180.0,
+    poll_interval: float = 1.0,
+    pattern: str = 'rtabmap_slam',
+) -> bool:
+    """SIGINT the rtabmap SLAM node alone and block until it has exited.
+
+    rtabmap only persists its map database (the visual-word dictionary + the
+    optimized graph) when its process receives **SIGINT** and shuts down
+    cleanly -- SIGTERM/SIGKILL skip the save entirely, leaving a database with
+    nodes/features but an empty Word table (``VWDictionary ... dict size=0`` on
+    reload), or a truncated/unopenable file. On a large (>1 GB) map this save
+    can take well over a minute on the Jetson, far longer than the ~10 s
+    escalation window used when we tear the whole launch down.
+
+    So before stopping the launch we signal *only* the SLAM node (matched by
+    ``rtabmap_slam`` in its command line -- the odometry/sync/viz nodes live in
+    ``rtabmap_odom``/``rtabmap_sync``/``rtabmap_viz`` and are left for the normal
+    teardown) and wait for the process to disappear, which is our proof the
+    database has been flushed to disk. Signalling just this pid means neither
+    ``stop_proc``'s escalation nor ``ros2 launch``'s own SIGKILL timer can kill
+    rtabmap before the save completes.
+
+    Returns True if rtabmap exited within ``timeout`` (or was not running),
+    False if it was still alive when the timeout elapsed.
+    """
+    pids = _pgrep(pattern)
+    if not pids:
+        if node:
+            node.get_logger().info(
+                "[shutdown] No rtabmap SLAM node found; nothing to save."
+            )
+        return True
+
+    if node:
+        node.get_logger().info(
+            f"[shutdown] Sending SIGINT to rtabmap SLAM (pids={pids}) and waiting "
+            f"up to {timeout:.0f}s for the database save to finish..."
+        )
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGINT)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _pgrep(pattern):
+            if node:
+                node.get_logger().info(
+                    "[shutdown] rtabmap SLAM exited cleanly; database saved."
+                )
+            return True
+        time.sleep(poll_interval)
+
+    if node:
+        node.get_logger().warn(
+            f"[shutdown] rtabmap SLAM still alive after {timeout:.0f}s; proceeding "
+            f"with teardown -- the database may be incomplete."
+        )
+    return False
+
+
 def wait_processes_gone(
     patterns: Iterable[str],
     timeout: float = 25.0,
@@ -351,6 +415,14 @@ def wait_services_ready(
 def stop_all(ctx: dict) -> None:
     node = ctx.get("node")
     node.get_logger().info(f"Stopping all managed processes. Keys:{ctx.get('_procs', {}).keys()}")
+    # Save rtabmap's database BEFORE force-killing anything. This path runs on
+    # Ctrl+C / atexit (the FSM equivalent of pressing the UI's "Stop Mapping"
+    # button), and the stop_proc loop below would otherwise SIGKILL / pkill the
+    # SLAM node mid-save on a large map, leaving a database with 0 words
+    # ("VWDictionary dict size=0"). SIGINT the SLAM node alone and wait for it to
+    # flush first; it is a no-op when no rtabmap node is running.
+    save_timeout = float(ctx.get("create_map_rtabmap_save_timeout", 180.0))
+    graceful_rtabmap_save(node=node, timeout=save_timeout)
     for k in list(ctx.get("_procs", {}).keys()):
         stop_proc(ctx, k, force_kill_patterns=SIM_STACK_PATTERNS)
 

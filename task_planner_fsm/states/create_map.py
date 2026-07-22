@@ -33,6 +33,7 @@ from task_planner_fsm.states.proc_utils import (
     wait_stack_ready,
     wait_processes_gone,
     kill_stale_stack,
+    graceful_rtabmap_save,
     SIM_STACK_PATTERNS,
 )
 
@@ -233,8 +234,23 @@ class CreateMap(State):
         if self.driver is not None and bool(ctx.get("create_map_clear_markers_on_exit", False)):
             self.driver.clear_markers()
 
-        # Stop the exploration launch first (normally already self-exited), then
-        # the persistent mapping + nav2 stack.
+        # Let rtabmap persist its database BEFORE we touch any launch. It only
+        # saves on SIGINT and, on a >1 GB map, that flush (visual-word dictionary
+        # + optimized graph) can take well over a minute -- far longer than the
+        # whole-group SIGINT->SIGTERM->SIGKILL escalation below (or ros2 launch's
+        # own ~10 s SIGKILL timer) would allow. Killing it mid-save leaves a
+        # database with 0 words (VWDictionary "dict size=0" on reload) or a
+        # truncated, unopenable file. This mirrors the UI's "Stop Mapping" button,
+        # which SIGINTs the launch and never force-kills rtabmap so the save can
+        # finish. We do it FIRST -- before the stop_proc calls below, whose
+        # force_kill_patterns (SIM_STACK_PATTERNS) include 'rtabmap' and would
+        # otherwise be able to pkill the SLAM node while it is still writing.
+        save_timeout = float(ctx.get("create_map_rtabmap_save_timeout", 180.0))
+        graceful_rtabmap_save(node=node, timeout=save_timeout)
+
+        # Now stop the exploration launch (normally already self-exited); rtabmap
+        # is already saved and gone, so the force-kill patterns can no longer
+        # touch a live SLAM node.
         stop_proc(ctx, "explore", timeout=10.0, force_kill_patterns=SIM_STACK_PATTERNS)
 
         # Graceful, whole-process-group shutdown of the mapping launch
