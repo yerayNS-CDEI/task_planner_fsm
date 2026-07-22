@@ -1,9 +1,5 @@
 from ..state import State
-from ..utils.wall_geometry import (
-    ee_rpy_deg_from_inward_normal,
-    inward_normal_from_wall_points,
-)
-import math
+from ..utils.wall_geometry import build_wall_data
 
 class ComputeWallPoints(State):
     def __init__(self, name):
@@ -37,54 +33,19 @@ class ComputeWallPoints(State):
         ``ctx["detected_walls"]`` as ``((x, y, z), (x, y, z))`` map-frame pairs.
         """
         available = []
-        for p1, p2 in ctx.get("detected_walls", []):
-            available.append(("detected", (tuple(p1), tuple(p2))))
+        detected = ctx.get("detected_walls", [])
+        normals = ctx.get("detected_wall_normals", [])
+        for i, (p1, p2) in enumerate(detected):
+            n = normals[i] if i < len(normals) else None
+            available.append(("detected", (tuple(p1), tuple(p2)), n))
         for p1, p2 in self.predefined_walls:
-            available.append(("predefined", (tuple(p1), tuple(p2))))
+            available.append(("predefined", (tuple(p1), tuple(p2)), None))
         return available
-    
-    def _build_wall_data(self, p1, p2, offset=0.6, scan_lines_z=None):
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        length = math.hypot(dx, dy)
-        if length == 0:
-            raise ValueError("Wall points must be different.")
-        dx /= length
-        dy /= length
 
-        # Vector perpendicular normalizado (CW rotation → interior/right face)
-        nx = dy
-        ny = -dx
-
-        # Puntos desplazados hacia fuera (scan exterior)
-        scan_start = (
-            p1[0] + offset * dx + nx * offset,
-            p1[1] + offset * dy + ny * offset,
-            p1[2]
+    def _build_wall_data(self, p1, p2, offset=0.6, scan_lines_z=None, outward_normal=None):
+        return build_wall_data(
+            p1, p2, offset=offset, scan_lines_z=scan_lines_z, outward_normal=outward_normal
         )
-        scan_end = (
-            p2[0] - offset * dx + nx * offset,
-            p2[1] - offset * dy + ny * offset,
-            p2[2]
-        )
-
-        inward_normal = inward_normal_from_wall_points(p1, p2)
-        ee_rpy_deg = ee_rpy_deg_from_inward_normal(inward_normal)
-
-        # Horizontal scan lines (heights), bottom-first. Default to a single line
-        # at the wall's scan-line z, preserving the previous single-pass behaviour.
-        if scan_lines_z:
-            scan_lines_z = sorted(float(z) for z in scan_lines_z)
-        else:
-            scan_lines_z = [float(scan_start[2])]
-
-        return {
-            "original": (tuple(p1), tuple(p2)),
-            "scan_line": (scan_start, scan_end),
-            "inward_normal": inward_normal,
-            "ee_rpy_deg": ee_rpy_deg,
-            "scan_lines_z": scan_lines_z,
-        }
 
     def _parse_indices(self, raw_text):
         tokens = raw_text.replace(",", " ").split()
@@ -124,7 +85,7 @@ class ComputeWallPoints(State):
         if not self.started:
             available_walls = self._build_available_walls(ctx)
             print(f"[{self.name}] Available walls:")
-            for i, (source, (p1, p2)) in enumerate(available_walls, 1):
+            for i, (source, (p1, p2), _n) in enumerate(available_walls, 1):
                 tag = "[map]" if source == "detected" else "[predefined]"
                 print(f"  {i}: {tag} p1={p1}, p2={p2}")
 
@@ -152,8 +113,13 @@ class ComputeWallPoints(State):
                     if idx < 1 or idx > max_walls:
                         raise ValueError(f"Wall index {idx} out of range (1-{max_walls}).")
                     p1, p2 = available_walls[idx - 1][1]
+                    outward_normal = available_walls[idx - 1][2]
                     scan_lines_z = self._prompt_wall_lines(idx)
-                    walls_data.append(self._build_wall_data(p1, p2, scan_lines_z=scan_lines_z))
+                    walls_data.append(
+                        self._build_wall_data(
+                            p1, p2, scan_lines_z=scan_lines_z, outward_normal=outward_normal
+                        )
+                    )
 
             except ValueError as e:
                 print(f"[{self.name}] Invalid input: {e}")

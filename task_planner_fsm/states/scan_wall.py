@@ -1,9 +1,17 @@
 from ..state import State
 from ..utils.column_control import ColumnController
+from ..utils.costmap_utils import (
+    COSTMAP_WAIT_TIMEOUT_S,
+    base_standoff_goal,
+    nav_bt_xml,
+    reachable_wall_segments,
+    publish_wall_segment_markers,
+)
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseStamped
 from rclpy.action import ActionClient
 from rclpy.action import GoalResponse, CancelResponse
+from action_msgs.msg import GoalStatus
 from rclpy.task import Future
 from rclpy.duration import Duration
 import rclpy.time
@@ -11,8 +19,10 @@ from arm_control.srv import SendPosition
 from ur_msgs.srv import SetForceMode
 from std_srvs.srv import Trigger
 import subprocess, os, signal
+import math
 from math import atan2, sin, cos
 import time
+import requests
 
 class ScanWall(State):
     def __init__(self, name):
@@ -44,13 +54,37 @@ class ScanWall(State):
         self.arm_retracted = False
         self.retract_verbose = False
         self.column_retract_commanded = False
-        self.sweep_target_point = None   # endpoint the current sweep drives to
+        self._costmap_wait_start = None  # per-line costmap-readiness poll timer
+        self._sweep_qz = 0.0
+        self._sweep_qw = 1.0
+
+        # Reachability-first sweep: the scan line is split into the sub-segments
+        # where a base cell exists within arm reach (reachable_wall_segments);
+        # each segment is swept press->release, unreachable gaps are skipped by
+        # transiting (sensors off) to the next segment.
+        self._segments = None        # [((sx,sy,z),(ex,ey,z)), ...] robot-end first
+        self._seg_idx = 0
+        self._seg_phase = "transit"  # transit | transit_wait | sweep_setup | sweep_wait
+        self._segments_ok = 0        # segments actually swept on this line
+        self._last_swept_point = None
+        self._nav_status = None      # set by _on_nav_result / rejection
+        self._sweep_from = None      # wall end the sweep starts from (robot's end)
+        self._sweep_to = None        # wall end the sweep heads toward
 
         # Force mode (real robot only): press the GPR wheel against the wall (Z)
         # while the distance-sensor alignment holds the plate orientation.
         self.force_mode_start_client = None
         self.force_mode_stop_client = None
         self.force_mode_active = False
+
+        # GPR (GP Proceq8800) HTTP API: connect + run a LINE_SCAN measurement
+        # while the wheel is pressed against the wall. Real robot only (mirrors
+        # force_mode gating); ctx overrides allow bench testing. See gpr_api memory.
+        self.gpr_base_url = "http://192.168.42.33:9000"
+        self.gpr_serial = "GP88-007-0081"
+        self.gpr_timeout = 30.0
+        self.gpr_measurement_active = False
+        self.gpr_line_active = False
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -74,8 +108,18 @@ class ScanWall(State):
         self.arm_retracted = False
         self.retract_verbose = False
         self.column_retract_commanded = False
-        self.sweep_target_point = None
+        self._costmap_wait_start = None
+        self._segments = None
+        self._seg_idx = 0
+        self._seg_phase = "transit"
+        self._segments_ok = 0
+        self._last_swept_point = None
+        self._nav_status = None
+        self._sweep_from = None
+        self._sweep_to = None
         self.force_mode_active = False
+        self.gpr_measurement_active = False
+        self.gpr_line_active = False
         ctx["error_triggered"] = False
 
         self.column.reset()
@@ -243,6 +287,108 @@ class ScanWall(State):
         fut.add_done_callback(lambda f: self._log_force_mode_result(node, f, "stop"))
 
     # ------------------------------------------------------------------
+    # GPR (GP Proceq8800) HTTP API — real robot only
+    # ------------------------------------------------------------------
+    def _gpr_enabled(self, ctx):
+        """GPR runs only on the real robot (like force_mode). An explicit
+        ``gpr_enabled`` ctx flag overrides this for bench testing."""
+        return bool(ctx.get("gpr_enabled", not bool(ctx.get("sim", False))))
+
+    def _gpr_request(self, ctx, method, path, json_body=None):
+        """Issue one GPR HTTP request (blocking). Returns the response, or None on
+        a connection/timeout error. Any 2xx is success (starts return 200, stops
+        return 204); errors carry a ``{"error":{"code","message"}}`` body."""
+        node = ctx["node"]
+        base_url = ctx.get("gpr_base_url", self.gpr_base_url).rstrip("/")
+        url = f"{base_url}{path}"
+        try:
+            resp = requests.request(
+                method, url, json=json_body,
+                timeout=ctx.get("gpr_timeout", self.gpr_timeout),
+            )
+        except requests.exceptions.RequestException as e:
+            node.get_logger().error(f"[{self.name}] GPR {method} {path} failed: {e}")
+            return None
+        if resp.status_code >= 400:
+            node.get_logger().error(
+                f"[{self.name}] GPR {method} {path} -> HTTP {resp.status_code}: "
+                f"{resp.text.strip()[:200]}"
+            )
+        else:
+            node.get_logger().info(
+                f"[{self.name}] GPR {method} {path} -> HTTP {resp.status_code}"
+            )
+        return resp
+
+    def _gpr_connect(self, ctx):
+        """Connect to the probe. 200 = connected, 406 = already connected (both OK).
+        Measurement calls 403 unless connected first, so a failure here aborts the
+        scan (a sweep with no GPR data is pointless).
+
+        TODO (auto-connect): /probe/connect also accepts an optional ``ip`` field.
+        Without it, the connection request must be **accepted manually on the GP
+        App (iPad)** before this returns — so the scan is not fully autonomous yet.
+        Once the probe is assigned a static IP, pass ``ip`` here (e.g. from
+        ``ctx.get("gpr_ip")``) so the connection completes without operator input.
+        """
+        node = ctx["node"]
+        serial = ctx.get("gpr_serial", self.gpr_serial)
+        body = {"serialNumber": serial}
+        # gpr_ip is intentionally unset for now (no static IP assigned to the probe).
+        gpr_ip = ctx.get("gpr_ip")
+        if gpr_ip:
+            body["ip"] = gpr_ip
+        node.get_logger().info(f"[{self.name}] GPR: connecting to probe {serial}.")
+        resp = self._gpr_request(ctx, "POST", "/probe/connect", body)
+        if resp is not None and (resp.status_code < 400 or resp.status_code == 406):
+            node.get_logger().info(f"[{self.name}] GPR probe connected.")
+            return True
+        node.get_logger().error(f"[{self.name}] GPR probe connection failed; aborting scan.")
+        ctx["error_triggered"] = True
+        return False
+
+    def _gpr_start_measurement_and_line(self, ctx):
+        """Connect, create a LINE_SCAN measurement, then start the line. Called
+        once per line right after the GPR wheel is pressed against the wall. Any
+        start-path failure aborts the scan via ``error_triggered``."""
+        if not self._gpr_enabled(ctx):
+            return
+        node = ctx["node"]
+        if not self._gpr_connect(ctx):
+            return
+        line_no = ctx.get("current_line_idx", 0) + 1
+        seg_no = self._seg_idx + 1
+        body = {"type": "LINE_SCAN", "name": f"scan_wall line {line_no} seg {seg_no}"}
+        resp = self._gpr_request(ctx, "POST", "/measurement/start", body)
+        if resp is None or resp.status_code >= 400:
+            node.get_logger().error(f"[{self.name}] GPR start measurement failed; aborting scan.")
+            ctx["error_triggered"] = True
+            return
+        self.gpr_measurement_active = True
+        resp = self._gpr_request(ctx, "POST", "/measurement/line/start")
+        if resp is None or resp.status_code >= 400:
+            node.get_logger().error(f"[{self.name}] GPR start line failed; aborting scan.")
+            ctx["error_triggered"] = True
+            return
+        self.gpr_line_active = True
+        node.get_logger().info(f"[{self.name}] GPR measurement + line started.")
+
+    def _gpr_stop_line_and_measurement(self, ctx):
+        """Stop the line then the measurement. Best-effort: logs failures but does
+        not abort (the sweep is already done). Guarded by flags so it is a safe
+        no-op if the line/measurement was never started."""
+        if not self._gpr_enabled(ctx):
+            return
+        node = ctx["node"]
+        if self.gpr_line_active:
+            self._gpr_request(ctx, "POST", "/measurement/line/stop")
+            self.gpr_line_active = False
+        if self.gpr_measurement_active:
+            self._gpr_request(ctx, "POST", "/measurement/stop")
+            self.gpr_measurement_active = False
+            node.get_logger().info(f"[{self.name}] GPR line + measurement stopped.")
+
+    # ------------------------------------------------------------------
     # Column height from the map-frame line z
     # ------------------------------------------------------------------
     def _lookup_ee_world_z(self, ctx):
@@ -407,23 +553,8 @@ class ScanWall(State):
     def _run_scan(self, ctx):
         node = ctx["node"]
 
+        # --- One-time per-line setup: sweep direction + fixed heading. ---
         if not self.started:
-            node.get_logger().info(f"[{self.name}] Initiating wall scan maneuver...")
-            self.started = True
-
-            # Activate sensor alignment now that the arm is located.
-            if not self._start_arm_processes(ctx):
-                return
-
-            node.get_logger().info(f"[{self.name}] Waiting 10s for arm processes to stabilise...")
-            time.sleep(10.0)
-
-            # Real robot: now that the plate is aligning, press the GPR against the
-            # wall for this line sweep (sim has no force_mode controller -> no-op).
-            self._start_force_mode(ctx)
-            if ctx.get("error_triggered"):
-                return
-
             wall_data = ctx.get("target_scan_wall", None)
             prev_target_point = ctx.get("target_scan_point", None)
 
@@ -432,15 +563,17 @@ class ScanWall(State):
                 ctx["error_triggered"] = True
                 return
 
-            # Sweep to the wall end opposite the robot's current end. Updating
-            # target_scan_point after each sweep (see result_callback) makes the
-            # next line scan the other direction (serpentine), so the base
-            # actually moves on every line.
-            if all(abs(prev_target_point[i] - wall_data[0][i]) < 1e-6 for i in range(2)):
-                target_point = wall_data[1]
-            else:
-                target_point = wall_data[0]
-            self.sweep_target_point = target_point
+            # Serpentine: sweep from the wall end the robot is at toward the
+            # other end. Nearest-endpoint match — the current point may be a
+            # clamped reachable-segment endpoint, not the raw wall end.
+            d0 = math.hypot(prev_target_point[0] - wall_data[0][0],
+                            prev_target_point[1] - wall_data[0][1])
+            d1 = math.hypot(prev_target_point[0] - wall_data[1][0],
+                            prev_target_point[1] - wall_data[1][1])
+            near_end, far_end = (
+                (wall_data[0], wall_data[1]) if d0 <= d1 else (wall_data[1], wall_data[0])
+            )
+            self._sweep_from, self._sweep_to = near_end, far_end
 
             # Keep a FIXED base heading for the whole wall (computed on the first
             # line). The omnidirectional base then strafes back and forth without
@@ -448,80 +581,255 @@ class ScanWall(State):
             # at line 0 so a new wall picks up its own heading.
             heading = ctx.get("scan_heading_yaw")
             if heading is None or ctx.get("current_line_idx", 0) == 0:
-                heading = atan2(
-                    target_point[1] - prev_target_point[1],
-                    target_point[0] - prev_target_point[0],
-                )
+                heading = atan2(far_end[1] - near_end[1], far_end[0] - near_end[0])
                 ctx["scan_heading_yaw"] = heading
-            qz = sin(heading / 2.0)
-            qw = cos(heading / 2.0)
+            self._sweep_qz = sin(heading / 2.0)
+            self._sweep_qw = cos(heading / 2.0)
 
-            # Construct PoseStamped goal
-            goal_msg = NavigateToPose.Goal()
-            goal_msg.pose.header.frame_id = "map"
-            goal_msg.pose.header.stamp = node.get_clock().now().to_msg()
-            goal_msg.pose.pose.position.x = target_point[0]
-            goal_msg.pose.pose.position.y = target_point[1]
-            goal_msg.pose.pose.position.z = 0.0
-            goal_msg.pose.pose.orientation.z = qz
-            goal_msg.pose.pose.orientation.w = qw
+            node.get_logger().info(
+                f"[{self.name}] Initiating wall scan maneuver "
+                f"({near_end[0]:.2f}, {near_end[1]:.2f}) -> ({far_end[0]:.2f}, {far_end[1]:.2f})."
+            )
+            # Hand back to the tick loop so the costmap subscription can populate
+            # before segmentation (the executor is single-threaded).
+            self._costmap_wait_start = None
+            self.started = True
+            return
 
-            nav_client = ctx.get("nav_client", None)
-            if nav_client is None:
-                node.get_logger().error(f"[{self.name}] Navigation client not found.")
+        # TODO(wall-surface obstacles): the sweep assumes a flat wall — the moving
+        # sensor plate can hit surface features the 2D costmap never sees: small
+        # bumps, wall-mounted fixtures, or columns/pilasters protruding near the
+        # wall at plate height. Consider (a) checking the 3D map/octomap along the
+        # scan line at line_z and splitting segments around protrusions (like
+        # reachable_wall_segments does for base obstacles), and (b) reacting
+        # online to sudden distance-sensor jumps during the sweep (plate
+        # approaching a protrusion) by pausing/retracting instead of pressing on.
+
+        # --- Split the line into reachable segments; gaps get skipped. ---
+        if self._segments is None:
+            segments = reachable_wall_segments(ctx, self._sweep_from, self._sweep_to)
+            if segments is None:  # costmap not received yet — bounded poll
+                now = time.time()
+                if self._costmap_wait_start is None:
+                    node.get_logger().info(
+                        f"[{self.name}] Waiting for the global costmap to segment the "
+                        f"scan line (up to {COSTMAP_WAIT_TIMEOUT_S:.0f}s)..."
+                    )
+                    self._costmap_wait_start = now
+                    return
+                if now - self._costmap_wait_start < COSTMAP_WAIT_TIMEOUT_S:
+                    return
+                node.get_logger().warn(
+                    f"[{self.name}] No costmap after {COSTMAP_WAIT_TIMEOUT_S:.0f}s; "
+                    f"sweeping the whole line unsegmented."
+                )
+                segments = [(tuple(self._sweep_from), tuple(self._sweep_to))]
+            if not segments:
+                node.get_logger().error(
+                    f"[{self.name}] No reachable portion of this scan line (no base cell "
+                    f"within arm reach anywhere along it); cannot scan this wall."
+                )
                 ctx["error_triggered"] = True
                 return
+            self._segments = segments
+            self._seg_idx = 0
+            self._seg_phase = "transit"
+            self._segments_ok = 0
+            publish_wall_segment_markers(ctx, segments)
+            node.get_logger().info(
+                f"[{self.name}] Scan line split into {len(segments)} reachable segment(s): "
+                + "; ".join(
+                    f"({s[0]:.2f}, {s[1]:.2f})->({e[0]:.2f}, {e[1]:.2f})" for s, e in segments
+                )
+            )
+            return
 
-            self._send_goal_future = nav_client.send_goal_async(goal_msg)
-            self._send_goal_future.add_done_callback(self.goal_response_callback)
-            self.goal_sent = True
-            self.waiting = True
+        # --- All segments processed: finalize the line. ---
+        if self._seg_idx >= len(self._segments):
+            self._finalize_line(ctx)
+            return
 
-        elif self.waiting and self._send_goal_future.done():
-            goal_handle = self._send_goal_future.result()
-            if not goal_handle.accepted:
-                node.get_logger().error(f"[{self.name}] Goal was rejected.")
-                ctx["error_triggered"] = True
+        seg_start, seg_end = self._segments[self._seg_idx]
+
+        if self._seg_phase == "transit":
+            # Reposition (sensors off, no press) to the segment start. Skipped
+            # when the base is already there — e.g. the first segment right
+            # after NavigateToTarget, or contiguous serpentine turnarounds.
+            pos = ctx.get("base_position")
+            skip_tol = float(ctx.get("segment_transit_skip_tol", 0.4))
+            goal_xy = base_standoff_goal(ctx, self.name, seg_start)
+            if pos is not None and math.hypot(pos.x - goal_xy[0], pos.y - goal_xy[1]) <= skip_tol:
+                node.get_logger().info(
+                    f"[{self.name}] Base already at segment {self._seg_idx + 1} start; "
+                    f"skipping transit."
+                )
+                self._seg_phase = "sweep_setup"
                 return
-            node.get_logger().info(f"[{self.name}] Goal accepted. Waiting for result...")
-            self._get_result_future = goal_handle.get_result_async()
-            self._get_result_future.add_done_callback(lambda fut: self.result_callback(fut, ctx))
+            node.get_logger().info(
+                f"[{self.name}] Transit to segment {self._seg_idx + 1}/{len(self._segments)} "
+                f"start ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) (sensors off)."
+            )
+            if not self._send_base_goal(ctx, goal_xy):
+                return
+            self._seg_phase = "transit_wait"
+            return
 
-            self.waiting = False  # Dejar de esperar, ya está lanzado
+        if self._seg_phase == "transit_wait":
+            if self._nav_status is None:
+                return
+            if self._nav_status == GoalStatus.STATUS_SUCCEEDED:
+                self._seg_phase = "sweep_setup"
+            else:
+                node.get_logger().warn(
+                    f"[{self.name}] Transit to segment {self._seg_idx + 1} failed "
+                    f"(status={self._nav_status}); skipping this segment."
+                )
+                self._seg_idx += 1
+                self._seg_phase = "transit"
+            return
 
-    def goal_response_callback(self, future):
-        pass
+        if self._seg_phase == "sweep_setup":
+            node.get_logger().info(
+                f"[{self.name}] Segment {self._seg_idx + 1}/{len(self._segments)}: "
+                f"activating alignment + press for the sweep."
+            )
+            # Activate sensor alignment now that the base is at the segment start.
+            if not self._start_arm_processes(ctx):
+                return
+            node.get_logger().info(f"[{self.name}] Waiting 10s for arm processes to stabilise...")
+            time.sleep(10.0)
 
-    def result_callback(self, future, ctx):
+            # Real robot: press the GPR against the wall for this segment sweep
+            # (sim has no force_mode controller -> no-op).
+            self._start_force_mode(ctx)
+            if ctx.get("error_triggered"):
+                return
+
+            # GPR: connect, create the LINE_SCAN measurement and start the line
+            # now that the wheel is pressed (real robot only).
+            self._gpr_start_measurement_and_line(ctx)
+            if ctx.get("error_triggered"):
+                return
+
+            goal_xy = base_standoff_goal(ctx, self.name, seg_end)
+            node.get_logger().info(
+                f"[{self.name}] Sweeping segment {self._seg_idx + 1} to "
+                f"({goal_xy[0]:.2f}, {goal_xy[1]:.2f})."
+            )
+            if not self._send_base_goal(ctx, goal_xy):
+                return
+            self._seg_phase = "sweep_wait"
+            return
+
+        if self._seg_phase == "sweep_wait":
+            if self._nav_status is None:
+                return
+            status = self._nav_status
+            # Release hardware/process state first (safety), regardless of outcome.
+            node.get_logger().info(
+                f"[{self.name}] Segment sweep finished (status={status}). Stopping GPR, "
+                f"force mode + arm processes..."
+            )
+            self._gpr_stop_line_and_measurement(ctx)   # stop line + measurement before releasing the press
+            self._stop_force_mode(ctx)      # release the press before the arm retracts
+            self._stop_arm_processes(ctx)
+            time.sleep(2)   # delay to avoid errors in the arm goals
+
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                self._segments_ok += 1
+                self._last_swept_point = seg_end
+            else:
+                node.get_logger().warn(
+                    f"[{self.name}] Segment {self._seg_idx + 1} sweep did not succeed "
+                    f"(status={status}); skipping to the next segment."
+                )
+            self._seg_idx += 1
+            self._seg_phase = "transit"
+            return
+
+    def _finalize_line(self, ctx):
+        """All segments of the current line processed. The line counts as scanned
+        when at least one segment swept; otherwise flag an error (completing
+        would silently drop the wall)."""
         node = ctx["node"]
-        result = future.result().result
-        status = future.result().status
+        if self._segments_ok == 0:
+            node.get_logger().error(
+                f"[{self.name}] No segment of this line could be swept; the wall was "
+                f"not scanned. Flagging error instead of completing."
+            )
+            ctx["error_triggered"] = True
+            return
 
-        node.get_logger().info(f"[{self.name}] Scanning finished. Stopping force mode + arm processes for safety...")
-        self._stop_force_mode(ctx)      # release the press before the arm retracts
-        self._stop_arm_processes(ctx)
-        time.sleep(2)   # delay to avoid errors in the arm goals
-
-        # The robot is now at the end it swept to; record it so the next line
-        # sweeps back toward the opposite end.
-        if self.sweep_target_point is not None:
-            ctx["target_scan_point"] = self.sweep_target_point
+        # The robot is at the last swept segment end; record it so the next line
+        # sweeps back toward the opposite wall end (serpentine).
+        if self._last_swept_point is not None:
+            ctx["target_scan_point"] = tuple(self._last_swept_point)
 
         # Advance to the next horizontal line on this wall. more_lines drives
         # both the self-loop and whether this was the last line of the wall.
         ctx["current_line_idx"] = ctx.get("current_line_idx", 0) + 1
         lines = ctx.get("current_wall_scan_lines", [])
         self.more_lines = ctx["current_line_idx"] < len(lines)
-        if self.more_lines:
-            node.get_logger().info(
-                f"[{self.name}] Line done. {len(lines) - ctx['current_line_idx']} more line(s) "
-                f"on this wall; will retract arm then re-enter for next height."
+        node.get_logger().info(
+            f"[{self.name}] Line done ({self._segments_ok}/{len(self._segments)} segment(s) "
+            f"swept)."
+            + (
+                f" {len(lines) - ctx['current_line_idx']} more line(s) on this wall; "
+                f"will retract arm then re-enter for next height."
+                if self.more_lines else " Last line of this wall."
             )
-
+        )
         # The base sweep is done; hand control to the post-scan retraction phase.
         # walls_left is only decremented once that phase completes (see
         # _run_post_scan), so the column retract on the last line is not skipped.
         self.scan_swept = True
+
+    # ------------------------------------------------------------------
+    # Base goal plumbing (segment transit + sweep goals)
+    # ------------------------------------------------------------------
+    def _send_base_goal(self, ctx, goal_xy):
+        """Send a NavigateToPose goal at the fixed sweep heading. The result
+        lands in ``self._nav_status`` (a GoalStatus value, or -1 on
+        rejection/exception); ``None`` while in flight."""
+        node = ctx["node"]
+        nav_client = ctx.get("nav_client", None)
+        if nav_client is None:
+            node.get_logger().error(f"[{self.name}] Navigation client not found.")
+            ctx["error_triggered"] = True
+            return False
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = "map"
+        goal_msg.pose.header.stamp = node.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = float(goal_xy[0])
+        goal_msg.pose.pose.position.y = float(goal_xy[1])
+        goal_msg.pose.pose.position.z = 0.0
+        goal_msg.pose.pose.orientation.z = self._sweep_qz
+        goal_msg.pose.pose.orientation.w = self._sweep_qw
+        # No base-reversing recoveries (BackOutFromObstacle/BackUp): backing the
+        # base out mid-sweep ruins the scan geometry — fail fast to the FSM.
+        goal_msg.behavior_tree = nav_bt_xml(ctx, self.name)
+        self._nav_status = None
+        self._send_goal_future = nav_client.send_goal_async(goal_msg)
+        self._send_goal_future.add_done_callback(self._on_goal_response)
+        return True
+
+    def _on_goal_response(self, future):
+        try:
+            handle = future.result()
+        except Exception:
+            self._nav_status = -1
+            return
+        if not handle.accepted:
+            self._nav_status = -1
+            return
+        self._result_future = handle.get_result_async()
+        self._result_future.add_done_callback(self._on_nav_result)
+
+    def _on_nav_result(self, future):
+        try:
+            self._nav_status = future.result().status
+        except Exception:
+            self._nav_status = -1
 
     def _run_post_scan(self, ctx):
         """Retract the arm from the wall (re-send the pose); on the wall's last
@@ -599,7 +907,9 @@ class ScanWall(State):
                 ctx["scan_done"] = True
 
     def on_exit(self, ctx):
-        ## Safety net: release force mode (real) and stop sensor + alignment nodes.
+        ## Safety net: stop any running GPR measurement, release force mode (real)
+        ## and stop sensor + alignment nodes.
+        self._gpr_stop_line_and_measurement(ctx)
         self._stop_force_mode(ctx)
         self._stop_arm_processes(ctx)
 
