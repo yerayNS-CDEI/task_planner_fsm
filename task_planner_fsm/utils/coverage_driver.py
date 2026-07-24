@@ -640,7 +640,11 @@ class CoverageDriver:
         tf_buffer = ctx.get("tf_buffer")
         if tf_buffer is None:
             return None
-        for base_frame in ("base_link", "base_footprint", "turret_footprint", "base", "chassis"):
+        # turret_footprint first: the omni Nav2 config drives that frame, so
+        # progress/pose reads must match it rather than base_link (offset by the
+        # turret mount). Keep in sync with NavigateToTarget.nav_base_frame.
+        primary = str(ctx.get("nav_base_frame", "turret_footprint"))
+        for base_frame in (primary, "base_footprint", "base_link", "base", "chassis"):
             try:
                 if tf_buffer.can_transform("map", base_frame, rclpy.time.Time(), Duration(seconds=0.2)):
                     tf = tf_buffer.lookup_transform("map", base_frame, rclpy.time.Time(), Duration(seconds=0.5))
