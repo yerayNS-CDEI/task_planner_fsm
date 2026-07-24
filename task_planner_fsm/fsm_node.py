@@ -8,7 +8,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import rclpy
-from geometry_msgs.msg import Point, Pose, Quaternion
+from geometry_msgs.msg import Point, Pose, Quaternion, WrenchStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry, OccupancyGrid
 from rclpy.action import ActionClient
@@ -51,7 +51,7 @@ from task_planner_fsm.states.proc_utils import (
     wait_services_ready,
 )
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
-from task_planner_fsm.utils.wall_geometry import build_wall_data
+from task_planner_fsm.utils.wall_geometry import build_wall_data, left_scan_endpoint
 
 FSM_STATE_ORDER = [
     "Initialization",
@@ -294,6 +294,22 @@ class RobotFSMNode(Node):
         self.create_subscription(Bool, "/arm/execution_status", self.execution_status_callback, 10)
         self.create_subscription(Bool, "/planner/goal_failed", self.planner_goal_failed_callback, 10)
         self.create_subscription(Bool, "/map_done", self.mapping_callback, 10)
+        # TCP force/torque sensor (ur_ros2_driver's force_torque_sensor_broadcaster).
+        # ScanWall uses the wall-normal (arm_tool0 Z) force to detect when the GPR
+        # wheel touches the wall before starting the measurement and the base sweep.
+        # The broadcaster publishes best-effort, so subscribe best-effort (a reliable
+        # subscription would drop every message).
+        ft_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(
+            WrenchStamped,
+            "/force_torque_sensor_broadcaster/wrench",
+            self.ft_data_callback,
+            ft_qos,
+        )
         # Nav2 global costmap (latched) so states can project scan goals onto the
         # nearest cell the base can actually occupy. See costmap_utils.
         costmap_qos = QoSProfile(
@@ -303,6 +319,18 @@ class RobotFSMNode(Node):
         )
         self.create_subscription(
             OccupancyGrid, "/global_costmap/costmap", self.global_costmap_callback, costmap_qos
+        )
+        # Chassis-parking status from sim_controller (latched, transient_local so a
+        # late subscriber gets the current value). True while a /sim_controller/park_now
+        # maneuver runs, false when the chassis is aligned with the turret. ScanWall
+        # parks the base to face the wall before the sweep and waits on this flag.
+        parking_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            Bool, "/sim_controller/parking_active", self.parking_active_callback, parking_qos
         )
 
         # Timer
@@ -655,10 +683,9 @@ class RobotFSMNode(Node):
 
     def _closest_scan_line_to_point(
         self, walls_data: List[Dict[str, Tuple]], point_xy: Tuple[float, float]
-    ) -> Tuple[Optional[Tuple], Optional[Tuple]]:
+    ) -> Optional[Dict[str, Tuple]]:
         min_dist = float("inf")
-        selected_line = None
-        selected_point = None
+        selected_wall = None
 
         for wall in walls_data:
             scan_line = wall.get("scan_line")
@@ -668,10 +695,9 @@ class RobotFSMNode(Node):
                 dist = ((point_xy[0] - pt[0]) ** 2 + (point_xy[1] - pt[1]) ** 2) ** 0.5
                 if dist < min_dist:
                     min_dist = dist
-                    selected_line = scan_line
-                    selected_point = pt
+                    selected_wall = wall
 
-        return selected_line, selected_point
+        return selected_wall
 
     def _ensure_reference_target_from_walls(self, selected_base: Optional[Tuple[float, float]] = None):
         if self.ctx.get("target_scan_wall") and self.ctx.get("target_scan_point"):
@@ -681,19 +707,20 @@ class RobotFSMNode(Node):
         if not walls_data:
             return
 
-        selected_line = None
-        selected_point = None
+        selected_wall = None
         if selected_base is not None:
-            selected_line, selected_point = self._closest_scan_line_to_point(walls_data, selected_base)
+            selected_wall = self._closest_scan_line_to_point(walls_data, selected_base)
+        if selected_wall is None:
+            selected_wall = walls_data[0]
 
-        if selected_line is None or selected_point is None:
-            selected_line = walls_data[0].get("scan_line")
-            if selected_line and len(selected_line) == 2:
-                selected_point = selected_line[0]
-
-        if selected_line and selected_point:
+        selected_line = selected_wall.get("scan_line")
+        if selected_line and len(selected_line) == 2:
+            # Start from the LEFT scan endpoint so the base's left flank (sensor
+            # plate side) faces the wall, matching WallTargetSelection.
             self.ctx["target_scan_wall"] = selected_line
-            self.ctx["target_scan_point"] = selected_point
+            self.ctx["target_scan_point"] = left_scan_endpoint(
+                selected_line, selected_wall.get("inward_normal")
+            )
 
     def _prompt_phase1_target(self):
         walls_data = self.ctx.get("walls_data", [])
@@ -1053,8 +1080,18 @@ class RobotFSMNode(Node):
     def planner_goal_failed_callback(self, msg: Bool):
         self.ctx["planner_goal_failed"] = msg.data
 
+    def ft_data_callback(self, msg: WrenchStamped):
+        # Latest TCP wrench (tool0 frame). ScanWall reads ctx["ft_wrench"].force.z
+        # to know when the GPR wheel is pressed against the wall.
+        self.ctx["ft_wrench"] = msg.wrench
+
     def mapping_callback(self, msg):
         self.ctx["map_ready"] = msg.data
+
+    def parking_active_callback(self, msg: Bool):
+        # Latched chassis-parking flag from sim_controller. ScanWall waits for the
+        # active->inactive transition to know the base has aligned with the turret.
+        self.ctx["parking_active"] = bool(msg.data)
 
 
 def main(args=None):
