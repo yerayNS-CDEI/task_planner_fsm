@@ -39,9 +39,14 @@ class ColumnController:
         # Physical / tuning parameters (mirrors ExhaustiveScan defaults).
         self.column_min_height_m = 0.0
         self.column_max_height_m = 0.9
-        # Highest map-frame z the arm reaches at column=0 in the unfolded pose.
-        # Column extension is only needed for line heights above this.
-        self.arm_reachable_z_max = 1.1
+        # Highest map-frame z the EE reaches at column=0 in the unfolded pose.
+        # Column extension is only needed for line heights above this. This is a
+        # MAP-FRAME (ground) z, so it must include the arm-base mounting height:
+        # arm_base_link sits ~0.78 m above base_link (0.05 m column_joint origin +
+        # 0.73 m column_link->arm_base_link mount) plus ~1.1 m of upward arm reach
+        # from arm_base_link in this pose => ~1.88 m. Used only as the fallback
+        # when the EE TF lookup fails; the TF path measures ee_z in map directly.
+        self.arm_reachable_z_max = 1.88
         self.column_tolerance_m = 0.01
         self.column_wait_timeout_s = 40.0
         self.column_move_time_s = 7.0
