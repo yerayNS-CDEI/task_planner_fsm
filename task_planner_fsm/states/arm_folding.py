@@ -101,8 +101,12 @@ class ArmFolding(State):
                 node.get_logger().info(f"[{self.name}] Gazebo simulation: skipping dashboard play command.")
                 self.dashboard_sent = True
             else:
-                node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
-                success, message = send_dashboard_play_command()
+                robot_ip = str(ctx.get("robot_ip", "192.168.1.102"))
+                robot_port = int(ctx.get("robot_port", 29999))
+                node.get_logger().info(
+                    f"[{self.name}] Sending dashboard play command to UR robot at {robot_ip}:{robot_port}..."
+                )
+                success, message = send_dashboard_play_command(host=robot_ip, port=robot_port)
                 if success:
                     node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
                     self.dashboard_sent = True
