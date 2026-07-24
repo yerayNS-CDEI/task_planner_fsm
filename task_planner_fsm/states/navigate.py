@@ -5,9 +5,12 @@ from ..utils.costmap_utils import (
     nav_bt_xml,
     reachable_wall_segments,
     publish_wall_segment_markers,
+    set_arm_footprint_enabled,
 )
 import rclpy
+import rclpy.time
 from rclpy.action import ActionClient
+from rclpy.duration import Duration
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseStamped, Twist
 from rclpy.task import Future
@@ -35,6 +38,10 @@ class NavigateToTarget(State):
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering navigation state.")
+        # Drive to the wall with the arm-aware (dynamic hull) footprint; it is
+        # switched to a base-only circle on arrival (result_callback) so the arm
+        # footprint touching the wall can't stall the final approach.
+        set_arm_footprint_enabled(ctx, True)
         ctx["navigation_success"] = False
         ctx["error_triggered"] = False
         self.goal_sent = False
@@ -212,11 +219,15 @@ class NavigateToTarget(State):
                 return
             # Residual error below Nav2's own goal tolerance cannot be fixed by
             # re-sending the goal (Nav2 "succeeds" instantly without moving), so
-            # close-range errors are servoed out directly over /cmd_vel — the
+            # close-range errors could be servoed out directly over /cmd_vel — the
             # base is omnidirectional, a straight strafe+rotate is safe this
-            # close to the verified-free standoff cell.
+            # close to the verified-free standoff cell. Disabled by default
+            # (fine_correction_enabled) because the open-loop /cmd_vel servo was
+            # seen oscillating (overshoot past the goal and back); when off,
+            # sub-tolerance misses fall through to the Nav2 goal retry below.
+            servo_enabled = bool(ctx.get("fine_correction_enabled", False))
             max_servo_err = float(ctx.get("fine_correction_max_err", 0.7))
-            if pos_err <= max_servo_err:
+            if servo_enabled and pos_err <= max_servo_err:
                 node.get_logger().info(
                     f"[{self.name}] Fine-correcting base pose over /cmd_vel "
                     f"(pos err {pos_err:.2f} m, yaw err {yaw_err:.2f} rad)."
@@ -241,9 +252,9 @@ class NavigateToTarget(State):
             ctx["error_triggered"] = True
 
     # EE scan standoff baked into the scan line by _build_wall_data (offset=0.6).
-    SCAN_OFFSET_M = 0.6
+    SCAN_OFFSET_M = 0.4
     # Default base-center distance from the wall face (> robot_radius+inflation).
-    DEFAULT_BASE_STANDOFF_M = 1.1
+    DEFAULT_BASE_STANDOFF_M = 1.3
     # Pose-verification gate before hand-off to ArmUnfolding/WallParallel: the
     # base must actually be at the standoff pose, not just "nav reported done".
     # ctx/ROS params nav_pos_tolerance / nav_yaw_tolerance / nav_pose_max_retries
@@ -355,13 +366,14 @@ class NavigateToTarget(State):
             return
 
         # P-servo: map-frame error rotated into the base frame (Twist is body-frame).
-        pos = ctx["base_position"]
-        ori = ctx["base_orientation"]
-        yaw = atan2(
-            2.0 * (ori.w * ori.z + ori.x * ori.y),
-            1.0 - 2.0 * (ori.y * ori.y + ori.z * ori.z),
-        )
-        ex, ey = self._goal_xy[0] - pos.x, self._goal_xy[1] - pos.y
+        pose = self._base_pose_map(ctx)
+        if pose is None:
+            self._stop_fine_correction(ctx, publish_stop=True)
+            node.get_logger().error(f"[{self.name}] Lost base pose during fine correction.")
+            ctx["error_triggered"] = True
+            return
+        px, py, yaw = pose
+        ex, ey = self._goal_xy[0] - px, self._goal_xy[1] - py
         ex_b = cos(yaw) * ex + sin(yaw) * ey
         ey_b = -sin(yaw) * ex + cos(yaw) * ey
         dyaw = atan2(sin(self._goal_yaw - yaw), cos(self._goal_yaw - yaw))
@@ -375,21 +387,63 @@ class NavigateToTarget(State):
         cmd.angular.z = clamp(self.SERVO_KP_ANG * dyaw, self.SERVO_MAX_ANG)
         ctx["_cmd_vel_pub"].publish(cmd)
 
+    # Base frames tried (in order) when looking up the map-frame base pose.
+    # Fallback frame order when nav_base_frame is unavailable. turret_footprint
+    # first: the omni Nav2 config drives that frame, so it must win over base_link.
+    BASE_FRAMES = ("turret_footprint", "base_footprint", "base_link", "base", "chassis")
+
+    def _base_pose_map(self, ctx):
+        """Current base pose (x, y, yaw) in the map frame from TF, or None.
+
+        The Nav2 goal is expressed in the map frame, so verification must read
+        the base pose in the map frame too. ctx["base_position"] comes from
+        /rtabmap/odom (the odom frame); comparing it against a map-frame goal is
+        off by the whole map->odom correction and makes the gate fail even when
+        Nav2 genuinely reached the goal, so use TF and never fall back to odom.
+
+        Read the SAME frame Nav2 uses as its robot_base_frame (nav2_params_omni:
+        turret_footprint). turret_footprint is the ground-projected *turret*
+        heading and rotates independently of base_link, so measuring base_link
+        instead adds the turret's mount offset + rotation to every error (the
+        ~90 deg yaw miss and the extra XY residual that push the gate to fail
+        even though Nav2 genuinely reached the goal). Override the frame with the
+        nav_base_frame ctx/ROS param to match the launched Nav2 config.
+        """
+        tf_buffer = ctx.get("tf_buffer")
+        if tf_buffer is None:
+            return None
+        primary = str(ctx.get("nav_base_frame", "turret_footprint"))
+        frames = (primary,) + tuple(f for f in self.BASE_FRAMES if f != primary)
+        for base_frame in frames:
+            try:
+                if not tf_buffer.can_transform(
+                    "map", base_frame, rclpy.time.Time(), Duration(seconds=0.2)
+                ):
+                    continue
+                tf = tf_buffer.lookup_transform(
+                    "map", base_frame, rclpy.time.Time(), Duration(seconds=0.5)
+                )
+            except Exception:
+                continue
+            t = tf.transform.translation
+            q = tf.transform.rotation
+            yaw = atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+            )
+            return float(t.x), float(t.y), yaw
+        return None
+
     def _pose_error(self, ctx):
         """(position error m, |yaw error| rad) between the current base pose and
         the last sent goal, or (None, None) when no pose source is available."""
         if self._goal_xy is None:
             return None, None
-        pos = ctx.get("base_position")
-        ori = ctx.get("base_orientation")
-        if pos is None or ori is None:
+        pose = self._base_pose_map(ctx)
+        if pose is None:
             return None, None
-        pos_err = math.hypot(pos.x - self._goal_xy[0], pos.y - self._goal_xy[1])
-        # Yaw from quaternion (z, w are enough for a planar base).
-        yaw = atan2(
-            2.0 * (ori.w * ori.z + ori.x * ori.y),
-            1.0 - 2.0 * (ori.y * ori.y + ori.z * ori.z),
-        )
+        x, y, yaw = pose
+        pos_err = math.hypot(x - self._goal_xy[0], y - self._goal_xy[1])
         yaw_err = abs(atan2(sin(yaw - self._goal_yaw), cos(yaw - self._goal_yaw)))
         return pos_err, yaw_err
 
@@ -415,6 +469,11 @@ class NavigateToTarget(State):
         node.get_logger().info(
             f"[{self.name}] Navigation finished (status={status}); verifying base pose."
         )
+        # Arrived at (or near) the base goal: drop the arm from the Nav2 footprint
+        # so the arm-inclusive hull crossing the wall can't block the final
+        # approach / fine-correction / nav retries. The arm is folded here, so a
+        # base-only circle is the true collision envelope anyway.
+        set_arm_footprint_enabled(ctx, False)
         # Verification happens in run() (single-threaded executor tick), where
         # the goal can be re-sent if the base is off the standoff pose.
         self._nav_status = status
