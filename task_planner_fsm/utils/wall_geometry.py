@@ -44,6 +44,29 @@ def ee_rpy_deg_from_inward_normal(normal: Vec3) -> Vec3:
     return (0.0, pitch, yaw)
 
 
+def left_scan_endpoint(scan_line, inward_normal):
+    """Return the scan-line endpoint on the robot's LEFT as it faces the wall.
+
+    The sensor plate unfolds to the robot's left (+y in the REP-103 body frame), so
+    every wall must be swept left-to-right to keep the left flank toward the wall.
+    "Rightward" along the wall is ``rotate(inward_normal, -90 deg) = (ny, -nx)``, so
+    the left endpoint is the one with the smaller projection onto it. Always starting
+    the sweep here makes the downstream along-wall heading (near->far) face the left
+    flank at the wall, regardless of where the robot approached from.
+
+    Falls back to ``scan_line[0]`` when the inward normal is missing (legacy walls
+    with no detected normal); left-vs-right facing is then not guaranteed.
+    """
+    p0, p1 = scan_line[0], scan_line[1]
+    if inward_normal is None:
+        return p0
+    nx, ny = float(inward_normal[0]), float(inward_normal[1])
+    rx, ry = ny, -nx  # rightward along the wall, as seen facing it
+    proj0 = p0[0] * rx + p0[1] * ry
+    proj1 = p1[0] * rx + p1[1] * ry
+    return p0 if proj0 <= proj1 else p1
+
+
 def build_wall_data(p1, p2, offset: float = 0.6, scan_lines_z=None, outward_normal=None):
     """Build scan geometry for one wall.
 
