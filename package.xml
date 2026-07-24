@@ -9,6 +9,7 @@
 
   <exec_depend>ur_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>navi_wall</exec_depend>
 
   <test_depend>ament_copyright</test_depend>

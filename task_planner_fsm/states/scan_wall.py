@@ -18,6 +18,8 @@ import rclpy.time
 from arm_control.srv import SendPosition
 from ur_msgs.srv import SetForceMode
 from std_srvs.srv import Trigger
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter as ParameterMsg, ParameterValue, ParameterType
 import subprocess, os, signal
 import math
 from math import atan2, sin, cos
@@ -32,6 +34,28 @@ class ScanWall(State):
         self.goal_sent = False
         self.waiting = False
         self.more_lines = False     # set when the wall has further lines to scan
+
+        # Base parking: align the diff-drive chassis with the turret's (wall-facing)
+        # heading via sim_controller's /sim_controller/park_now service. The turret is
+        # squared to the wall by NavigateToTarget (Nav2 drives turret_footprint), but the
+        # chassis wheels sit at an arbitrary heading, so park to face the whole robot at
+        # the wall. Parking runs PER SEGMENT, right after the base reaches the segment
+        # start and just before the sweep (see the "park" seg-phase in _run_scan): doing
+        # it there means no base repositioning follows the alignment to undo it. The arm
+        # is already in the unfolded_fsm pose by then; the turret joint compensates to
+        # hold the arm world-stationary while the chassis rotates.
+        # park_now is live-gated by the controller's enable_park_service parameter
+        # (kept false by default): this state flips it true via /set_parameters just
+        # for the maneuver, then false again. Driven by _park_phase through
+        # enable -> request -> settle -> disable. See _run_parking.
+        self.park_client = None            # ~/park_now Trigger client (created once)
+        self.park_enable_client = None     # /set_parameters client (created once)
+        self.park_done = False
+        self._park_phase = "enable"
+        self.park_future = None
+        self.park_param_future = None
+        self._park_saw_active = False
+        self._park_wait_start = None
 
         # Pre-approach (base fixed): column to line height + unfolded_fsm pose.
         self.column = ColumnController(self.name)
@@ -64,7 +88,7 @@ class ScanWall(State):
         # transiting (sensors off) to the next segment.
         self._segments = None        # [((sx,sy,z),(ex,ey,z)), ...] robot-end first
         self._seg_idx = 0
-        self._seg_phase = "transit"  # transit | transit_wait | sweep_setup | sweep_wait
+        self._seg_phase = "transit"  # transit|transit_wait|park|sweep_setup|press_settle|sweep_wait
         self._segments_ok = 0        # segments actually swept on this line
         self._last_swept_point = None
         self._nav_status = None      # set by _on_nav_result / rejection
@@ -76,6 +100,17 @@ class ScanWall(State):
         self.force_mode_start_client = None
         self.force_mode_stop_client = None
         self.force_mode_active = False
+
+        # Wall-contact gate (real robot only): before starting the GPR and moving
+        # the base, wait until force_mode has driven the GPR wheel against the wall,
+        # detected via the TCP force/torque sensor (ur_ros2_driver's
+        # /force_torque_sensor_broadcaster/wrench). The press is along task-frame
+        # Z (arm_tool0), and the broadcaster reports the wrench in the arm_tool0
+        # frame, so wrench.force.z is the wall-normal press force. Pressing into the
+        # wall reads negative on Z, so contact = Fz reaching the commanded press
+        # (~-5 N). See _wall_contact_ready.
+        self.ft_topic = "/force_torque_sensor_broadcaster/wrench"
+        self._press_settle_start = None
 
         # GPR (GP Proceq8800) HTTP API: connect + run a LINE_SCAN measurement
         # while the wheel is pressed against the wall. Real robot only (mirrors
@@ -94,6 +129,12 @@ class ScanWall(State):
         self.goal_sent = False
         self.waiting = False
         self.more_lines = False
+        self.park_done = False
+        self._park_phase = "enable"
+        self.park_future = None
+        self.park_param_future = None
+        self._park_saw_active = False
+        self._park_wait_start = None
         self.pose_sent = False
         self.pose_reached = False
         self.column_commanded = False
@@ -118,6 +159,7 @@ class ScanWall(State):
         self._sweep_from = None
         self._sweep_to = None
         self.force_mode_active = False
+        self._press_settle_start = None
         self.gpr_measurement_active = False
         self.gpr_line_active = False
         ctx["error_triggered"] = False
@@ -176,7 +218,8 @@ class ScanWall(State):
                           "-p", "autostart:=true", "-p", "publish_rate:=5.0", "-p", "batch_size:=2"]
             sensor_name = "arduino_sensors_sim"
         else:
-            sensor_cmd = ["ros2", "run", "arm_control", "arduino_sensors"]
+            sensor_cmd = ["ros2", "run", "arm_control", "arduino_sensors", 
+                          "--ros-args", "-p", "autostart:=true",]
             sensor_name = "arduino_sensors"
         arm_procs = [
             ("arduino_sensors_proc", sensor_cmd, sensor_name),
@@ -238,7 +281,7 @@ class ScanWall(State):
         req.selection_vector_z = True          # Z compliant; all others stiff
         req.wrench.force.z = 5.0
         req.type = 2                           # NO_TRANSFORM (task frame as given)
-        req.speed_limits.linear.z = 0.05
+        req.speed_limits.linear.z = 0.1
         req.deviation_limits = [0.1, 0.1, 0.15, 0.1, 0.1, 0.1]
         req.damping_factor = 0.025
         req.gain_scaling = 0.5
@@ -287,12 +330,79 @@ class ScanWall(State):
         fut.add_done_callback(lambda f: self._log_force_mode_result(node, f, "stop"))
 
     # ------------------------------------------------------------------
+    # Wall-contact detection from the TCP force/torque sensor
+    # ------------------------------------------------------------------
+    def _measured_press_force(self, ctx):
+        """Latest wall-normal press force (N, signed) from the TCP FT sensor, or
+        None if no reading has arrived yet. The press is commanded along task-frame
+        Z (arm_tool0), which force_torque_sensor_broadcaster reports in the arm_tool0
+        frame, so ``wrench.force.z`` is the wall-normal component. Pressing into the
+        wall produces a negative Z reaction, so the value drops toward the commanded
+        press (~-5 N) on contact."""
+        wrench = ctx.get("ft_wrench")
+        if wrench is None:
+            return None
+        return float(wrench.force.z)
+
+    def _wall_contact_ready(self, ctx):
+        """Return True once the GPR wheel is pressed against the wall, or
+        immediately when there is nothing to wait for (sim has no FT sensor and
+        force_mode is a no-op, or the press was never started). Returns False while
+        still waiting so the caller can hand control back to the tick loop.
+
+        Contact is detected from the TCP force/torque sensor
+        (``self.ft_topic``): force_mode drives the plate along task-frame Z until
+        the sensor's Z force reaches the commanded press, which is the moment the
+        sensor plate meets the wall. Pressing into the wall reads *negative* on Z,
+        so contact is Fz <= a negative threshold (default -5 N) — a signed check
+        (not magnitude) so the noisy/oscillating idle band around 0 never trips it.
+        A bounded timeout lets the sweep proceed anyway if contact is never
+        reported, so a mis-reading FT sensor cannot deadlock the run. Tunable via
+        the ``scan_wall_touch_force_n`` / ``scan_wall_touch_force_timeout_s`` ctx
+        params.
+        """
+        node = ctx["node"]
+        # Nothing to wait for in sim (no FT sensor) or if the press never started.
+        if bool(ctx.get("sim", False)) or not self.force_mode_active:
+            return True
+
+        threshold = float(ctx.get("scan_wall_touch_force_n", -5.0))
+        timeout_s = float(ctx.get("scan_wall_touch_force_timeout_s", 120.0))
+
+        now = time.time()
+        if self._press_settle_start is None:
+            self._press_settle_start = now
+            node.get_logger().info(
+                f"[{self.name}] Waiting for the GPR wheel to touch the wall "
+                f"(Fz <= {threshold:.1f} N on {self.ft_topic}, up to {timeout_s:.0f}s)..."
+            )
+
+        force_z = self._measured_press_force(ctx)
+        if force_z is not None and force_z <= threshold:
+            node.get_logger().info(
+                f"[{self.name}] Wall contact detected (Fz={force_z:.2f} N <= "
+                f"{threshold:.1f} N); starting GPR + base sweep."
+            )
+            return True
+
+        if now - self._press_settle_start >= timeout_s:
+            reading = "no FT reading" if force_z is None else f"Fz={force_z:.2f} N"
+            node.get_logger().warn(
+                f"[{self.name}] Wall contact not confirmed after {timeout_s:.0f}s "
+                f"({reading} > {threshold:.1f} N); proceeding with the sweep anyway."
+            )
+            return True
+        return False
+
+    # ------------------------------------------------------------------
     # GPR (GP Proceq8800) HTTP API — real robot only
     # ------------------------------------------------------------------
     def _gpr_enabled(self, ctx):
-        """GPR runs only on the real robot (like force_mode). An explicit
-        ``gpr_enabled`` ctx flag overrides this for bench testing."""
-        return bool(ctx.get("gpr_enabled", not bool(ctx.get("sim", False))))
+        """GPR is DISABLED for now: the probe is not yet on the real robot's
+        network topology, so scans run without it. Re-enable by setting the
+        ``gpr_enabled`` ctx flag True (bench testing or once the probe is wired
+        in). Previously defaulted to on for the real robot (``not sim``)."""
+        return bool(ctx.get("gpr_enabled", False))
 
     def _gpr_request(self, ctx, method, path, json_body=None):
         """Issue one GPR HTTP request (blocking). Returns the response, or None on
@@ -402,8 +512,8 @@ class ScanWall(State):
         ]
         for frame in ee_frames:
             try:
-                if tf_buffer.can_transform("map", frame, rclpy.time.Time(), Duration(seconds=0.2)):
-                    tf = tf_buffer.lookup_transform("map", frame, rclpy.time.Time(), Duration(seconds=0.5))
+                if tf_buffer.can_transform("map", frame, rclpy.time.Time(), Duration(seconds=1.0)):
+                    tf = tf_buffer.lookup_transform("map", frame, rclpy.time.Time(), Duration(seconds=1.0))
                     return float(tf.transform.translation.z)
             except Exception:
                 continue
@@ -433,6 +543,213 @@ class ScanWall(State):
             f"column_now={column_current:.3f}m -> target={target:.3f}m (clamped {clamped:.3f}m)."
         )
         return clamped
+
+    # ------------------------------------------------------------------
+    # Base parking (Phase 0): align the chassis with the wall-facing turret
+    # ------------------------------------------------------------------
+    def _send_park_enabled(self, ctx, value):
+        """Flip the controller's enable_park_service parameter via /set_parameters.
+
+        park_now is live-gated by that parameter (always created but only acts while
+        it is true), so ScanWall sets it true just for the maneuver and false again
+        afterwards. Returns the call future, or None if the parameter service is
+        unavailable.
+        """
+        node = ctx["node"]
+        set_param_srv = ctx.get("park_set_param_service", "/sim_controller/set_parameters")
+        if self.park_enable_client is None:
+            self.park_enable_client = node.create_client(SetParameters, set_param_srv)
+        if not self.park_enable_client.wait_for_service(timeout_sec=2.0):
+            node.get_logger().warn(
+                f"[{self.name}] Parameter service '{set_param_srv}' unavailable; "
+                f"cannot toggle enable_park_service."
+            )
+            return None
+        req = SetParameters.Request()
+        pmsg = ParameterMsg()
+        pmsg.name = "enable_park_service"
+        pmsg.value = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=bool(value))
+        req.parameters = [pmsg]
+        return self.park_enable_client.call_async(req)
+
+    def _param_set_ok(self, ctx, future, label):
+        """True if a /set_parameters future succeeded; logs and returns False on an
+        exception or a rejected result."""
+        node = ctx["node"]
+        try:
+            results = future.result().results
+        except Exception as e:
+            node.get_logger().warn(
+                f"[{self.name}] set enable_park_service ({label}) call failed: {e}"
+            )
+            return False
+        ok = bool(results) and all(r.successful for r in results)
+        if not ok:
+            reason = results[0].reason if results else "no result"
+            node.get_logger().warn(
+                f"[{self.name}] set enable_park_service ({label}) rejected: {reason}"
+            )
+        return ok
+
+    def _reset_park_state(self):
+        """Reset the per-maneuver parking sub-state so _run_parking starts a fresh
+        enable->request->settle->disable cycle for the next segment."""
+        self.park_done = False
+        self._park_phase = "enable"
+        self.park_future = None
+        self.park_param_future = None
+        self._park_saw_active = False
+        self._park_wait_start = None
+
+    def _run_parking(self, ctx):
+        """Align the diff-drive chassis with the turret before the sweep.
+
+        After NavigateToTarget the Nav2-driven turret faces the wall, but the
+        chassis wheels sit at an arbitrary heading (and each sweep strafes by
+        rotating the chassis further). sim_controller's /sim_controller/park_now
+        service rotates the chassis to the turret's current world heading while the
+        turret joint compensates to hold the turret (and the mounted arm)
+        world-stationary, so the whole robot ends up squared to the wall before the
+        arm extends.
+
+        park_now is live-gated by the controller's enable_park_service parameter
+        (kept false by default), so the maneuver runs as a small sequence:
+        ``enable`` (set the parameter true) -> ``request`` (call park_now) ->
+        ``settle`` (wait on the latched /sim_controller/parking_active flag:
+        active->inactive = aligned, or a short grace if it never goes active) ->
+        ``disable`` (set the parameter false again). Best-effort at every step: a
+        missing service or a failed/rejected call skips gracefully so the scan still
+        runs. Sets self.park_done when finished or skipped.
+        """
+        node = ctx["node"]
+
+        # Opt-out hook (e.g. benches without the base controller).
+        if not bool(ctx.get("scan_wall_park_base", True)):
+            self.park_done = True
+            return
+
+        # --- Phase 0a: enable the live-gated park service for this maneuver. ---
+        if self._park_phase == "enable":
+            self.park_param_future = self._send_park_enabled(ctx, True)
+            if self.park_param_future is None:
+                self.park_done = True  # no param service -> skip (parameter stays false)
+                return
+            node.get_logger().info(
+                f"[{self.name}] Parking: enabling park service before aligning the base."
+            )
+            self._park_phase = "enable_wait"
+            return
+
+        if self._park_phase == "enable_wait":
+            if not self.park_param_future.done():
+                return
+            if not self._param_set_ok(ctx, self.park_param_future, "enable"):
+                # Couldn't enable -> park_now would refuse; skip. The parameter is
+                # unchanged (still false), so no revert is needed.
+                self.park_done = True
+                self.park_param_future = None
+                return
+            self.park_param_future = None
+            self._park_phase = "request"
+            return
+
+        # --- Phase 0b: request the maneuver. ---
+        if self._park_phase == "request":
+            park_service = ctx.get("park_service", "/sim_controller/park_now")
+            if self.park_client is None:
+                self.park_client = node.create_client(Trigger, park_service)
+            if not self.park_client.wait_for_service(timeout_sec=2.0):
+                node.get_logger().warn(
+                    f"[{self.name}] Park service '{park_service}' unavailable; skipping "
+                    f"base alignment (scan proceeds)."
+                )
+                self._park_phase = "disable"  # revert the parameter we just enabled
+                return
+            node.get_logger().info(
+                f"[{self.name}] Parking: aligning the chassis to the turret (wall) heading."
+            )
+            self.park_future = self.park_client.call_async(Trigger.Request())
+            self._park_saw_active = False
+            self._park_wait_start = time.time()
+            self._park_phase = "accept_wait"
+            return
+
+        if self._park_phase == "accept_wait":
+            if not self.park_future.done():
+                return
+            try:
+                resp = self.park_future.result()
+                if not resp.success:
+                    node.get_logger().warn(
+                        f"[{self.name}] Park request not accepted ({resp.message}); "
+                        f"proceeding without base alignment."
+                    )
+                    self._park_phase = "disable"
+                    self.park_future = None
+                    return
+                node.get_logger().info(f"[{self.name}] Park started: {resp.message}")
+            except Exception as e:
+                node.get_logger().warn(
+                    f"[{self.name}] Park service call failed ({e}); proceeding without "
+                    f"base alignment."
+                )
+                self._park_phase = "disable"
+                self.park_future = None
+                return
+            self.park_future = None
+            self._park_phase = "settle"
+            return
+
+        # --- Phase 0c: wait for the maneuver to finish (latched parking_active). ---
+        if self._park_phase == "settle":
+            grace_s = float(ctx.get("scan_wall_park_grace_s", 5.0))
+            timeout_s = float(ctx.get("scan_wall_park_timeout_s", 120.0))
+            active = ctx.get("parking_active")
+            elapsed = time.time() - self._park_wait_start
+
+            if elapsed > timeout_s:
+                node.get_logger().warn(
+                    f"[{self.name}] Parking did not confirm after {timeout_s:.0f}s; "
+                    f"proceeding with the sweep anyway."
+                )
+                self._park_phase = "disable"
+                return
+            if active:
+                self._park_saw_active = True
+                return
+            # active is False or None here.
+            if self._park_saw_active:
+                node.get_logger().info(f"[{self.name}] Chassis aligned to the wall.")
+                self._park_phase = "disable"
+                return
+            if elapsed >= grace_s:
+                node.get_logger().info(
+                    f"[{self.name}] Chassis already aligned (parking never went active)."
+                )
+                self._park_phase = "disable"
+            return
+
+        # --- Phase 0d: disable the park service again, then finish. ---
+        if self._park_phase == "disable":
+            self.park_param_future = self._send_park_enabled(ctx, False)
+            if self.park_param_future is None:
+                node.get_logger().warn(
+                    f"[{self.name}] Could not disable park service (param service gone); "
+                    f"leaving enable_park_service as-is."
+                )
+                self.park_done = True
+                return
+            self._park_phase = "disable_wait"
+            return
+
+        if self._park_phase == "disable_wait":
+            if not self.park_param_future.done():
+                return
+            self._param_set_ok(ctx, self.park_param_future, "disable")  # best-effort log
+            self.park_param_future = None
+            node.get_logger().info(f"[{self.name}] Parking done; park service disabled.")
+            self.park_done = True
+            return
 
     # ------------------------------------------------------------------
     # Pre-approach (base fixed)
@@ -536,6 +853,9 @@ class ScanWall(State):
             return
 
         # Phase A: pre-approach (base fixed, sensors off).
+        # NOTE: chassis parking is NOT done here. It runs per segment, right after the
+        # base reaches the segment start and just before the sweep (the "park" seg-phase
+        # in _run_scan), so no base repositioning follows the alignment and undoes it.
         if not self.preapproach_done:
             self._run_pre_approach(ctx)
             return
@@ -663,7 +983,8 @@ class ScanWall(State):
                     f"[{self.name}] Base already at segment {self._seg_idx + 1} start; "
                     f"skipping transit."
                 )
-                self._seg_phase = "sweep_setup"
+                self._reset_park_state()
+                self._seg_phase = "park"
                 return
             node.get_logger().info(
                 f"[{self.name}] Transit to segment {self._seg_idx + 1}/{len(self._segments)} "
@@ -678,7 +999,8 @@ class ScanWall(State):
             if self._nav_status is None:
                 return
             if self._nav_status == GoalStatus.STATUS_SUCCEEDED:
-                self._seg_phase = "sweep_setup"
+                self._reset_park_state()
+                self._seg_phase = "park"
             else:
                 node.get_logger().warn(
                     f"[{self.name}] Transit to segment {self._seg_idx + 1} failed "
@@ -686,6 +1008,18 @@ class ScanWall(State):
                 )
                 self._seg_idx += 1
                 self._seg_phase = "transit"
+            return
+
+        if self._seg_phase == "park":
+            # Square the diff-drive chassis to the wall now that the base has reached the
+            # segment start (transit done/skipped). Parking is the LAST base motion before
+            # the sweep — nothing navigates the base back to the segment start afterwards —
+            # so the alignment is preserved. The arm is already in the unfolded_fsm pose;
+            # the turret joint compensates to hold it world-stationary while the chassis
+            # rotates. Driven by _run_parking's enable->request->settle->disable sequence.
+            self._run_parking(ctx)
+            if self.park_done:
+                self._seg_phase = "sweep_setup"
             return
 
         if self._seg_phase == "sweep_setup":
@@ -705,8 +1039,20 @@ class ScanWall(State):
             if ctx.get("error_triggered"):
                 return
 
-            # GPR: connect, create the LINE_SCAN measurement and start the line
-            # now that the wheel is pressed (real robot only).
+            # Do NOT start the GPR or move the base yet: force_mode is still
+            # driving the plate toward the wall. Wait in press_settle until the TCP
+            # FT sensor reports contact, so the measurement + sweep begin only once
+            # the sensor plate is actually pressed against the wall.
+            self._press_settle_start = None
+            self._seg_phase = "press_settle"
+            return
+
+        if self._seg_phase == "press_settle":
+            if not self._wall_contact_ready(ctx):
+                return
+
+            # Wheel is pressed against the wall. GPR: connect, create the LINE_SCAN
+            # measurement and start the line now (real robot only).
             self._gpr_start_measurement_and_line(ctx)
             if ctx.get("error_triggered"):
                 return
