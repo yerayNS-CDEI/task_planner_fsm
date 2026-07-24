@@ -14,7 +14,13 @@ from typing import Optional, Tuple
 
 from rclpy.duration import Duration
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool
 from visualization_msgs.msg import Marker, MarkerArray
+
+# Topic the dynamic_footprint_publisher listens on to switch the Nav2 footprint
+# between the arm-aware hull (True) and a base-only circle (False). Must match
+# the publisher's enable_arm_topic param.
+ARM_FOOTPRINT_TOPIC = "/dynamic_footprint/enable_arm_expansion"
 
 # How long a state polls for the global costmap to cover a scan target before
 # giving up and sending the goal anyway (with the fixed-standoff fallback).
@@ -38,6 +44,17 @@ COSTMAP_WAIT_TIMEOUT_S = 20.0
 DEFAULT_COST_THRESHOLD = 80
 DEFAULT_MAX_OFFSET = 1.3
 
+# Minimum base-center distance from the wall FACE (m). Hard clamp applied on top
+# of the nearest-free search: even when a cheaper (free) costmap cell exists
+# closer to the wall, the base goal is pushed out to AT LEAST this distance. This
+# is the reliable knob when the global costmap has little/no inflation gradient,
+# so "free" starts right at the lethal band and base_goal_cost_threshold has no
+# effect (the first cell below any threshold is already against the wall).
+# Override per launch with the ``min_base_standoff`` ctx/ROS param; 0 disables
+# the clamp (pure nearest-free). Always capped by arm reach: the enforced
+# distance can never exceed scan_offset + base_goal_max_offset.
+DEFAULT_MIN_STANDOFF = 1.0
+
 
 def _search_knobs(ctx) -> Tuple[int, float]:
     """(cost_threshold, max_offset) for the nearest-free search, ctx-overridable.
@@ -48,6 +65,50 @@ def _search_knobs(ctx) -> Tuple[int, float]:
     return (
         min(98, int(ctx.get("base_goal_cost_threshold", DEFAULT_COST_THRESHOLD))),
         float(ctx.get("base_goal_max_offset", DEFAULT_MAX_OFFSET)),
+    )
+
+
+def _min_standoff(ctx) -> float:
+    """Minimum base-to-wall-face distance (m) for the nearest-free clamp, ctx-overridable."""
+    return max(0.0, float(ctx.get("min_base_standoff", DEFAULT_MIN_STANDOFF)))
+
+
+def set_arm_footprint_enabled(ctx, enabled: bool) -> None:
+    """Command the dynamic footprint publisher to include the arm in the Nav2
+    footprint (``True``) or fall back to a base-only circular footprint (``False``).
+
+    Parked at a wall the arm-inclusive hull crosses the wall, so Nav2's collision
+    check refuses to move the base and the final approach / fine-correction /
+    retries stall. Switching to the base circle on arrival lets the base finish
+    its approach and the wall sweep move; the arm is folded during transit so the
+    base circle is the true envelope there anyway.
+
+    Latched (transient_local) so the publisher picks up the last command even if
+    it (re)subscribes later. A no-op-safe fire-and-forget: if the publisher isn't
+    running (use_dynamic_footprint:=false), nothing consumes the topic.
+
+    The publisher/topic name is overridable with the ``arm_footprint_topic``
+    ctx/ROS param (must match the publisher's ``enable_arm_topic``).
+    """
+    node = ctx["node"]
+    pub = ctx.get("_arm_footprint_pub")
+    if pub is None:
+        topic = str(ctx.get("arm_footprint_topic", ARM_FOOTPRINT_TOPIC))
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        pub = node.create_publisher(Bool, topic, qos)
+        ctx["_arm_footprint_pub"] = pub
+        ctx["_arm_footprint_state"] = None
+    if ctx.get("_arm_footprint_state") == bool(enabled):
+        return  # already in that state; avoid redundant chatter
+    pub.publish(Bool(data=bool(enabled)))
+    ctx["_arm_footprint_state"] = bool(enabled)
+    node.get_logger().info(
+        f"[footprint] Nav2 footprint -> "
+        f"{'arm-aware (dynamic hull)' if enabled else 'base-only circle'}."
     )
 
 
@@ -152,20 +213,22 @@ def nearest_free_along(
     max_dist: float = 2.5,
     step: float = 0.05,
     cost_threshold: int = 25,
+    min_dist: float = 0.0,
 ) -> Optional[Tuple[float, float, float]]:
     """Walk from (x, y) along (dir_x, dir_y) and return the first known cell whose
     cost is below ``cost_threshold`` (i.e. the base can stand there).
 
     Returns ``(fx, fy, dist)`` or ``None`` if no free cell is found within
     ``max_dist`` (or the direction/costmap is unusable). ``dist`` is how far the
-    point was pushed out.
+    point was pushed out. The walk starts at ``min_dist`` (default 0), so any cell
+    closer than that is skipped even if free — used to enforce a minimum standoff.
     """
     norm = math.hypot(dir_x, dir_y)
     if costmap is None or norm < 1e-9:
         return None
     ux, uy = dir_x / norm, dir_y / norm
 
-    d = 0.0
+    d = max(0.0, min_dist)
     while d <= max_dist + 1e-9:
         px, py = x + ux * d, y + uy * d
         cost = _cost_at(costmap, px, py)
@@ -255,6 +318,7 @@ def nearest_free_2d(
     max_radius: float = 2.0,
     step: float = 0.05,
     cost_threshold: int = 50,
+    min_radius: float = 0.0,
 ) -> Optional[Tuple[float, float, float]]:
     """Nearest costmap cell below ``cost_threshold`` in ANY direction (ring search).
 
@@ -262,11 +326,13 @@ def nearest_free_2d(
     runs parallel to a perpendicular wall and never escapes its inflation. When
     ``interior_dir`` is given, only cells in that half-plane are accepted so the base
     stays on the scanning (interior) side of the wall rather than jumping outside.
+    The ring search starts at ``min_radius`` (default ``step``), so cells closer than
+    that are skipped even if free — used to enforce a minimum standoff.
     Returns ``(fx, fy, dist)`` or None.
     """
     if costmap is None:
         return None
-    r = step
+    r = max(step, min_radius)
     while r <= max_radius + 1e-9:
         n = max(8, int(2.0 * math.pi * r / step))
         for k in range(n):
@@ -395,7 +461,7 @@ def base_standoff_goal(
     ctx,
     state_name: str,
     target_point,
-    default_standoff: float = 1.1,
+    default_standoff: float = 1.6,
     scan_offset: float = 0.6,
 ) -> Tuple[float, float]:
     """Turn a wall scan point into a base Nav2 goal the planner can reach.
@@ -404,9 +470,12 @@ def base_standoff_goal(
     exterior normal (-inward_normal) to the nearest costmap cell the base can
     occupy. The search is capped at ``base_goal_max_offset`` so the goal never
     drifts beyond arm reach, and accepts cells up to ``base_goal_cost_threshold``
-    (both ctx/ROS-param overridable; see module defaults). Fallbacks, in order:
-    fixed ``base_wall_standoff`` when the costmap is unavailable/all-blocked
-    within the cap; the raw scan point when the inward normal is missing.
+    (both ctx/ROS-param overridable; see module defaults). A hard ``min_base_standoff``
+    clamp guarantees the goal is never closer than that distance to the wall face,
+    even when a free cell exists closer (the reliable knob when the costmap has no
+    inflation gradient). Fallbacks, in order: fixed ``base_wall_standoff`` when the
+    costmap is unavailable/all-blocked within the cap; the raw scan point when the
+    inward normal is missing.
 
     ``base_wall_standoff`` in ctx overrides ``default_standoff``.
     """
@@ -425,21 +494,38 @@ def base_standoff_goal(
 
     costmap = ctx.get("global_costmap")
     cost_threshold, max_offset = _search_knobs(ctx)
+    # Minimum push from the scan point so the base sits >= min_standoff off the
+    # wall face (scan point is already scan_offset off it). Capped at arm reach
+    # (max_offset): the base can never both clear min_standoff and stay within
+    # reach if min_standoff > scan_offset + max_offset, so honour reach and warn.
+    min_standoff = _min_standoff(ctx)
+    min_push = max(0.0, min_standoff - scan_offset)
+    if min_push > max_offset:
+        node.get_logger().warn(
+            f"[{state_name}] min_base_standoff {min_standoff:.2f} m exceeds arm reach "
+            f"(scan_offset {scan_offset:.2f} + base_goal_max_offset {max_offset:.2f} = "
+            f"{scan_offset + max_offset:.2f} m); clamping the standoff to arm reach."
+        )
+        min_push = max_offset
     # 1) Straight out along the interior normal (keeps the base squarely in front
     #    of the scan point). 2) If that's blocked (e.g. a corner with a
     #    perpendicular wall), search all directions on the interior half-plane.
+    #    Both searches start at min_push so a closer free cell is never returned.
     hit = nearest_free_along(costmap, tx, ty, ox, oy,
-                             max_dist=max_offset, cost_threshold=cost_threshold)
+                             max_dist=max_offset, cost_threshold=cost_threshold,
+                             min_dist=min_push)
     mode = "along-normal"
     if hit is None:
         hit = nearest_free_2d(costmap, tx, ty, interior_dir=(ox, oy),
-                              max_radius=max_offset, cost_threshold=cost_threshold)
+                              max_radius=max_offset, cost_threshold=cost_threshold,
+                              min_radius=min_push)
         mode = "2D corner search"
     if hit is not None:
         gx, gy, dist = hit
         node.get_logger().info(
             f"[{state_name}] Nearest-free base goal ({mode}): scan point "
-            f"({tx:.2f}, {ty:.2f}) -> ({gx:.2f}, {gy:.2f}), {dist:.2f} m into free space."
+            f"({tx:.2f}, {ty:.2f}) -> ({gx:.2f}, {gy:.2f}), {dist:.2f} m into free space "
+            f"(>= {min_standoff:.2f} m min standoff)."
         )
         publish_base_goal_markers(ctx, (tx, ty), (gx, gy), mode)
         return (gx, gy)
@@ -463,7 +549,12 @@ def base_standoff_goal(
             f"(base_goal_max_offset, the arm-reach cap) on the interior side"
         )
 
+    # Honour the min-standoff clamp here too, but never push the base past arm
+    # reach (scan_offset + max_offset), else the fixed fallback would place a goal
+    # the arm can't scan from.
     base_standoff = float(ctx.get("base_wall_standoff", default_standoff))
+    base_standoff = max(base_standoff, min_standoff)
+    base_standoff = min(base_standoff, scan_offset + max_offset)
     extra = max(0.0, base_standoff - scan_offset)
     gx, gy = tx + ox * extra, ty + oy * extra
     node.get_logger().warn(
