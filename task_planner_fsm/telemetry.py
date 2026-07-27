@@ -3,83 +3,114 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List
 
 
+# Horseshoe layout for the linear pokeye drill workflow (mirrors the reference
+# state diagram). Nodes are 220x92 in the RViz panel; columns are spaced 320px.
+# The perception/navigation chain runs LEFT->RIGHT across the top row, turns the
+# corner down the right-hand column, and the drill sequence runs RIGHT->LEFT back
+# along the bottom row, so states that follow each other are physically adjacent
+# and the forward chain never crosses itself.
+#
+# Note: the reference diagram draws "Arm folding" (ManipulatorFolding) twice --
+# once in the top row (TargetSelection -> ManipulatorFolding -> BasePlacement)
+# and once bottom-left (StoringToDatabase -> ManipulatorFolding -> HomePosition).
+# The panel renders one node per state, so it lives in the top row here; the
+# once-per-run "fold and go home" edges are therefore the only longer ones.
+#
+# Error is an isolated sink (no edges are routed to it) that lights up when
+# active; it floats on the left, clear of both rows. Coordinates are the
+# top-left corner of each node.
 _NODE_POSITIONS = {
-    "Initialization": (40, 40),
-    "CreateMap": (360, 40),
-    "ObjectID": (680, 40),
-    "WallLinesComputation": (1000, 40),
-    "GeometryReconstruction": (1320, 40),
-    "ComputeWallPoints": (1640, 40),
-    "WallTargetSelection": (360, 240),
-    "NavigateToTarget": (680, 240),
-    "ArmUnfolding": (1000, 240),
-    "ScanWall": (1320, 240),
-    "ScanFloor": (1320, 440),
-    "ScanCeiling": (1320, 640),
-    "SensorDataProcessing": (1640, 240),
-    "SendDataToPokeye": (1960, 440),
-    "ArmFolding": (2280, 240),
-    # "AreasOfInterest": (1320, 440),
-    # "WallDiscretization": (1640, 440),
-    # "BasePlacement": (1960, 440),
-    # "ExhaustiveScan": (1320, 640),
-    "HomePosition": (2280, 440),
-    "Finished": (2280, 640),
-    "Error": (2280, 40),
+    # Top row (L->R): perception, navigation & base placement
+    "Initialization": (40, 200),
+    "ReceiveNav2Map": (360, 200),
+    "GetSemanticMap": (680, 200),
+    "WaitForData": (1000, 200),
+    "TargetSelection": (1320, 200),
+    "ManipulatorFolding": (1640, 200),
+    "BasePlacementComputation": (1960, 200),
+    "NavigateToTarget": (2280, 200),
+    "ManipulatorReachability": (2600, 200),
+    "NearbyPointSelection": (2920, 40),  # raised above the row
+    "ManipulatorUnfolding": (3240, 200),
+    # Right column (top -> bottom): approach & start drilling
+    "DrillApproach": (3240, 480),
+    "SuctionDrillStart": (3240, 760),
+    # Bottom row (R->L): drilling operation & return
+    "Drilling": (2920, 760),
+    "TakeOutDrill": (2600, 760),
+    "SuctionDrillStop": (2280, 760),
+    "DrillRetract": (1960, 760),
+    "SampleScanning": (1640, 760),
+    "StoringToDatabase": (1320, 760),
+    "HomePosition": (1000, 760),
+    "Finished": (680, 760),
+    # Isolated failure sink
+    "Error": (40, 480),
 }
 
+# Transitions taken from each state's NEXT_STATE_OPTIONS / check_transition.
+# ``kind`` is informational only (the panel does not style edges by kind).
+# ``-> Error`` edges are intentionally omitted to keep the graph readable; every
+# non-terminal state can fail to Error, which is shown as a standalone node.
 _DEFAULT_EDGES = [
-    ("Initialization", "CreateMap", "forward"),
-    ("CreateMap", "ObjectID", "forward"),
-    ("ObjectID", "WallLinesComputation", "forward"),
-    ("WallLinesComputation", "GeometryReconstruction", "forward"),
-    ("GeometryReconstruction", "ComputeWallPoints", "forward"),
-    ("ComputeWallPoints", "WallTargetSelection", "forward"),
-    ("WallTargetSelection", "NavigateToTarget", "forward"),
-    ("NavigateToTarget", "ArmUnfolding", "forward"),
-    ("ArmUnfolding", "ScanWall", "phase1"),
-    ("ScanWall", "SensorDataProcessing", "forward"),
-    ("ScanWall", "ScanWall", "loop"),
-    ("SensorDataProcessing", "ArmFolding", "forward"),
-    ("SensorDataProcessing", "SendDataToPokeye", "forward"),
-    ("SendDataToPokeye", "ArmFolding", "forward"),
-    ("ArmFolding", "WallTargetSelection", "loop"),
-    # ("ArmUnfolding", "ExhaustiveScan", "phase2"),
-    # ("ArmFolding", "AreasOfInterest", "phase1_complete"),
-    # ("AreasOfInterest", "WallDiscretization", "forward"),
-    # ("WallDiscretization", "BasePlacement", "forward"),
-    # ("BasePlacement", "WallTargetSelection", "loop"),
-    # ("ArmFolding", "BasePlacement", "recovery"),
-    # ("ExhaustiveScan", "ArmFolding", "forward"),
-    ("ArmUnfolding", "ScanFloor", "phase2"),
-    ("ScanFloor", "SensorDataProcessing", "phase2"),
-    ("ArmUnfolding", "ScanCeiling", "phase3"),
-    ("ScanCeiling", "SensorDataProcessing", "phase3"),
-    ("ArmFolding", "HomePosition", "scan_complete"),
+    ("Initialization", "ReceiveNav2Map", "forward"),
+    ("ReceiveNav2Map", "GetSemanticMap", "forward"),
+    ("GetSemanticMap", "WaitForData", "forward"),
+    ("WaitForData", "TargetSelection", "forward"),
+    ("TargetSelection", "DrillApproach", "branch"),
+    ("TargetSelection", "ManipulatorFolding", "branch"),
+    ("ManipulatorFolding", "BasePlacementComputation", "forward"),
+    ("ManipulatorFolding", "HomePosition", "branch"),
+    ("BasePlacementComputation", "NavigateToTarget", "forward"),
+    ("NavigateToTarget", "ManipulatorReachability", "forward"),
+    ("ManipulatorReachability", "ManipulatorUnfolding", "branch"),
+    ("ManipulatorReachability", "NearbyPointSelection", "branch"),
+    ("ManipulatorReachability", "BasePlacementComputation", "loop"),
+    ("NearbyPointSelection", "ManipulatorUnfolding", "branch"),
+    ("NearbyPointSelection", "TargetSelection", "loop"),
+    ("ManipulatorUnfolding", "DrillApproach", "forward"),
+    ("DrillApproach", "SuctionDrillStart", "forward"),
+    ("SuctionDrillStart", "Drilling", "forward"),
+    ("Drilling", "TakeOutDrill", "forward"),
+    ("Drilling", "TargetSelection", "loop"),
+    ("TakeOutDrill", "SuctionDrillStop", "forward"),
+    ("SuctionDrillStop", "DrillRetract", "forward"),
+    ("DrillRetract", "SampleScanning", "forward"),
+    ("SampleScanning", "StoringToDatabase", "forward"),
+    ("SampleScanning", "DrillApproach", "loop"),
+    ("StoringToDatabase", "TargetSelection", "loop"),
+    ("StoringToDatabase", "WaitForData", "loop"),
+    ("StoringToDatabase", "ManipulatorFolding", "branch"),
     ("HomePosition", "Finished", "forward"),
 ]
 
+# Only phase_1 (blue), phase_2 (green) and terminal (red) get distinct colors in
+# the panel; anything else ("shared") renders as the default beige.
 _GROUPS = {
+    # Perception / setup
     "Initialization": "phase_1",
-    "CreateMap": "phase_1",
-    "ObjectID": "phase_1",
-    "WallLinesComputation": "phase_1",
-    "GeometryReconstruction": "phase_1",
-    "ComputeWallPoints": "phase_1",
-    "WallTargetSelection": "shared",
+    "ReceiveNav2Map": "phase_1",
+    "GetSemanticMap": "phase_1",
+    "WaitForData": "phase_1",
+    # Navigation & base placement
+    "TargetSelection": "shared",
+    "ManipulatorFolding": "shared",
+    "BasePlacementComputation": "shared",
     "NavigateToTarget": "shared",
-    "ArmUnfolding": "shared",
-    "ScanWall": "phase_1",
-    "ScanFloor": "phase_2",
-    "ScanCeiling": "phase_3",
-    "SensorDataProcessing": "shared",
-    "SendDataToPokeye": "shared",
-    "ArmFolding": "shared",
-    # "AreasOfInterest": "phase_2",
-    # "WallDiscretization": "phase_2",
-    # "BasePlacement": "phase_2",
-    # "ExhaustiveScan": "phase_2",
-    "HomePosition": "phase_3",
+    "ManipulatorReachability": "shared",
+    "NearbyPointSelection": "shared",
+    "HomePosition": "shared",
+    # Drilling operation
+    "ManipulatorUnfolding": "phase_2",
+    "DrillApproach": "phase_2",
+    "SuctionDrillStart": "phase_2",
+    "Drilling": "phase_2",
+    "TakeOutDrill": "phase_2",
+    "SuctionDrillStop": "phase_2",
+    "DrillRetract": "phase_2",
+    "SampleScanning": "phase_2",
+    "StoringToDatabase": "phase_2",
+    # Terminal
     "Finished": "terminal",
     "Error": "terminal",
 }
