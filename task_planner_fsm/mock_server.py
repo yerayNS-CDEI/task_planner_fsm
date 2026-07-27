@@ -18,7 +18,8 @@ SERVICES = {
     "/navigate_to_target": "Target reached successfully.",
     "/manipulator_reachability": "Manipulator reachability computed successfully.",
     "/nearby_point_selection": "Nearby point selected successfully.",
-    "/manipulator_unfolding": "Manipulator unfolded successfully.",
+    # ManipulatorUnfolding no longer calls a service — it commands the gantry
+    # controller directly (like ManipulatorFolding), so no mock is needed here.
     "/drill_approach": "Drill approach completed successfully.",
     "/start_suction_drill": "Suction and drill started successfully.",
     "/drill": "Drilling completed successfully.",
