@@ -31,8 +31,9 @@ class SensorDataProcessing(State):
         
         self.future = self.client.call_async(request)
 
-    def run(self, ctx):     
+    def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Processing the scan sensor data")
 
         if self.future is None:
             node.get_logger().info(f"[{self.name}] Future is None.")

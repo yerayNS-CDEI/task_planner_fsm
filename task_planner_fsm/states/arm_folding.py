@@ -90,6 +90,7 @@ class ArmFolding(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Folding the arm back to the transport pose")
 
         if ctx.get("error_triggered") or self.movement_done:
             return

@@ -32,6 +32,7 @@ class ArmUnfolding(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Unfolding the arm into the scanning pose")
 
         if ctx.get("error_triggered") or self.movement_done:
             return

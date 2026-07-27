@@ -76,6 +76,7 @@ class ComputeWallPoints(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Computing wall scan points")
         if self.step_count >= self.MAX_STEPS:
             if not ctx.get("error_triggered"):
                 print(f"[{self.name}] ERROR: The maximum time was exceeded.")

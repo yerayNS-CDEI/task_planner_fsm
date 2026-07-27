@@ -306,7 +306,7 @@ class ScanWall(State):
                 SetForceMode, "/force_mode_controller/start_force_mode")
         if not self.force_mode_start_client.wait_for_service(timeout_sec=5.0):
             node.get_logger().error(f"[{self.name}] start_force_mode service unavailable.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "force-mode controller service unavailable")
             return
         node.get_logger().info(f"[{self.name}] Starting force mode (GPR press 5N on Z).")
         fut = self.force_mode_start_client.call_async(self._build_force_mode_request())
@@ -449,12 +449,13 @@ class ScanWall(State):
         if gpr_ip:
             body["ip"] = gpr_ip
         node.get_logger().info(f"[{self.name}] GPR: connecting to probe {serial}.")
+        self.set_activity(ctx, "Connecting to the GPR probe", publish=True)
         resp = self._gpr_request(ctx, "POST", "/probe/connect", body)
         if resp is not None and (resp.status_code < 400 or resp.status_code == 406):
             node.get_logger().info(f"[{self.name}] GPR probe connected.")
             return True
         node.get_logger().error(f"[{self.name}] GPR probe connection failed; aborting scan.")
-        ctx["error_triggered"] = True
+        self.fail(ctx, "GPR probe connection failed")
         return False
 
     def _gpr_start_measurement_and_line(self, ctx):
@@ -469,16 +470,18 @@ class ScanWall(State):
         line_no = ctx.get("current_line_idx", 0) + 1
         seg_no = self._seg_idx + 1
         body = {"type": "LINE_SCAN", "name": f"scan_wall line {line_no} seg {seg_no}"}
+        self.set_activity(ctx, "Starting the GPR line-scan measurement", publish=True)
         resp = self._gpr_request(ctx, "POST", "/measurement/start", body)
         if resp is None or resp.status_code >= 400:
             node.get_logger().error(f"[{self.name}] GPR start measurement failed; aborting scan.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "GPR failed to start the measurement")
             return
         self.gpr_measurement_active = True
+        self.set_activity(ctx, "Starting the GPR scan line", publish=True)
         resp = self._gpr_request(ctx, "POST", "/measurement/line/start")
         if resp is None or resp.status_code >= 400:
             node.get_logger().error(f"[{self.name}] GPR start line failed; aborting scan.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "GPR failed to start the scan line")
             return
         self.gpr_line_active = True
         node.get_logger().info(f"[{self.name}] GPR measurement + line started.")
@@ -490,6 +493,8 @@ class ScanWall(State):
         if not self._gpr_enabled(ctx):
             return
         node = ctx["node"]
+        if self.gpr_line_active or self.gpr_measurement_active:
+            self.set_activity(ctx, "Stopping the GPR line and measurement", publish=True)
         if self.gpr_line_active:
             self._gpr_request(ctx, "POST", "/measurement/line/stop")
             self.gpr_line_active = False
@@ -793,7 +798,7 @@ class ScanWall(State):
                     response = self.pose_future.result()
                     if not response.success:
                         node.get_logger().error(f"[{self.name}] Pre-approach pose rejected: {response.message}")
-                        ctx["error_triggered"] = True
+                        self.fail(ctx, f"arm rejected the scanning pose ({response.message})")
                         return
                     node.get_logger().info(f"[{self.name}] Pre-approach pose accepted: {response.message}")
                 except Exception as e:
@@ -806,7 +811,7 @@ class ScanWall(State):
             if ctx.get("planner_goal_failed"):
                 ctx["planner_goal_failed"] = False
                 node.get_logger().error(f"[{self.name}] Planner reported failure during pre-approach.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "arm planner failed to reach the scanning pose")
                 return
 
             if ctx.get("execution_status") is True:
@@ -834,7 +839,7 @@ class ScanWall(State):
         if not self.column.reached_target(node, ctx):
             if self.column.timed_out(node):
                 node.get_logger().error(f"[{self.name}] Column did not reach target in time.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "column did not reach the target height in time")
             return
 
         self.preapproach_done = True
@@ -857,6 +862,7 @@ class ScanWall(State):
         # base reaches the segment start and just before the sweep (the "park" seg-phase
         # in _run_scan), so no base repositioning follows the alignment and undoes it.
         if not self.preapproach_done:
+            self.set_activity(ctx, "Moving arm and column to the wall-scanning pose")
             self._run_pre_approach(ctx)
             return
 
@@ -867,6 +873,7 @@ class ScanWall(State):
 
         # Phase C: post-scan retraction (arm pulls back, column retracts on last line).
         if not self.postscan_done:
+            self.set_activity(ctx, "Retracting the arm after the wall sweep")
             self._run_post_scan(ctx)
             return
 
@@ -880,7 +887,7 @@ class ScanWall(State):
 
             if not wall_data or not prev_target_point:
                 node.get_logger().error(f"[{self.name}] Missing wall data or target point.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "missing wall data or target point")
                 return
 
             # Serpentine: sweep from the wall end the robot is at toward the
@@ -949,7 +956,7 @@ class ScanWall(State):
                     f"[{self.name}] No reachable portion of this scan line (no base cell "
                     f"within arm reach anywhere along it); cannot scan this wall."
                 )
-                ctx["error_triggered"] = True
+                self.fail(ctx, "no reachable portion of the scan line within arm reach")
                 return
             self._segments = segments
             self._seg_idx = 0
@@ -970,8 +977,15 @@ class ScanWall(State):
             return
 
         seg_start, seg_end = self._segments[self._seg_idx]
+        seg_no, seg_total = self._seg_idx + 1, len(self._segments)
 
         if self._seg_phase == "transit":
+            self.set_activity(
+                ctx,
+                f"Repositioning base to wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
             # Reposition (sensors off, no press) to the segment start. Skipped
             # when the base is already there — e.g. the first segment right
             # after NavigateToTarget, or contiguous serpentine turnarounds.
@@ -1017,12 +1031,28 @@ class ScanWall(State):
             # so the alignment is preserved. The arm is already in the unfolded_fsm pose;
             # the turret joint compensates to hold it world-stationary while the chassis
             # rotates. Driven by _run_parking's enable->request->settle->disable sequence.
+            self.set_activity(
+                ctx,
+                f"Parking chassis to square it against wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
             self._run_parking(ctx)
             if self.park_done:
                 self._seg_phase = "sweep_setup"
             return
 
         if self._seg_phase == "sweep_setup":
+            # Force mode is a real-robot-only press (no controller exists in sim),
+            # so only mention it when it will actually run.
+            self.set_activity(
+                ctx,
+                "Enabling wall-parallel controller"
+                if bool(ctx.get("sim", False))
+                else "Enabling wall-parallel controller and starting force-mode press",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
             node.get_logger().info(
                 f"[{self.name}] Segment {self._seg_idx + 1}/{len(self._segments)}: "
                 f"activating alignment + press for the sweep."
@@ -1048,6 +1078,16 @@ class ScanWall(State):
             return
 
         if self._seg_phase == "press_settle":
+            # In sim there is no force-mode press or FT wall-contact wait; this
+            # phase just falls through, so describe the plate alignment instead.
+            self.set_activity(
+                ctx,
+                "Aligning the sensor plate to the wall"
+                if bool(ctx.get("sim", False))
+                else "Stretching the arm against the wall with force-mode control",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
             if not self._wall_contact_ready(ctx):
                 return
 
@@ -1062,12 +1102,24 @@ class ScanWall(State):
                 f"[{self.name}] Sweeping segment {self._seg_idx + 1} to "
                 f"({goal_xy[0]:.2f}, {goal_xy[1]:.2f})."
             )
+            self.set_activity(
+                ctx,
+                f"Sweeping wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
             if not self._send_base_goal(ctx, goal_xy):
                 return
             self._seg_phase = "sweep_wait"
             return
 
         if self._seg_phase == "sweep_wait":
+            self.set_activity(
+                ctx,
+                f"Sweeping wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
             if self._nav_status is None:
                 return
             status = self._nav_status

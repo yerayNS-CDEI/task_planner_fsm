@@ -215,6 +215,7 @@ class GeometryReconstruction(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Reconstructing the wall geometry")
 
         # ── Step 1: wait for the geometry-reconstruction service to finish. ──
         if not ctx.get("reconstruction_ready"):

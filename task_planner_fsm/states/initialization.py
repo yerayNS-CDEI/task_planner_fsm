@@ -17,6 +17,7 @@ class Initialization(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Initializing the task planner")
 
         if ctx.get("start"):
             node.get_logger().info(f"[{self.name}] Signal received. Initializing FSM.")

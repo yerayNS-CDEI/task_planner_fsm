@@ -73,7 +73,16 @@ class CreateMap(State):
             f"[{self.name}] Mapping + nav2 stack started (pid={p.pid if p else 'unknown'})."
         )
 
+    _PHASE_ACTIVITY = {
+        "starting": "Starting the mapping and navigation stack",
+        "exploring": "Exploring the environment to build the map",
+        "densify": "Refining the map with a coverage sweep",
+    }
+
     def run(self, ctx):
+        activity = self._PHASE_ACTIVITY.get(self.phase)
+        if activity is not None:
+            self.set_activity(ctx, activity)
         if self.phase == self.STARTING:
             self._run_starting(ctx)
         elif self.phase == self.EXPLORING:

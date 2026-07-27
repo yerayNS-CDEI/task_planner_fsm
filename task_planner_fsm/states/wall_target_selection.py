@@ -47,6 +47,7 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Selecting the next wall to scan")
 
         if self.step_count >= self.MAX_STEPS:
             if not ctx.get("error_triggered"):

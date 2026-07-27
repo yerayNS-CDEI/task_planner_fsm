@@ -80,6 +80,7 @@ class NavigateToTarget(State):
     def run(self, ctx):
         node = ctx["node"]
         # nav_client: ActionClient = ctx["nav_client"]
+        self.set_activity(ctx, "Navigating to a scan point")
 
         # if self.result_received:
         #     # Check result status
@@ -97,7 +98,7 @@ class NavigateToTarget(State):
 
             if not wall_data or not target_point:
                 node.get_logger().error(f"[{self.name}] Missing wall data or target point in context.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "missing wall data or target point")
                 return
             
             if len(wall_data) != 2:
@@ -183,7 +184,7 @@ class NavigateToTarget(State):
             goal_handle = self._send_goal_future.result()
             if not goal_handle.accepted:
                 node.get_logger().warn(f"[{self.name}] Navigation goal was rejected!")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "Nav2 rejected the navigation goal")
                 return
             node.get_logger().info(f"[{self.name}] Goal accepted. Waiting for result...")
             self._get_result_future = goal_handle.get_result_async()
@@ -209,6 +210,14 @@ class NavigateToTarget(State):
                 )
                 self.navigation_done = True
                 return
+            if pos_err is not None and pos_err <= pos_tol and yaw_err > yaw_tol:
+                self.set_activity(
+                    ctx, "Spinning turret to align the base heading along the wall"
+                )
+            elif pos_err is not None:
+                self.set_activity(
+                    ctx, "Correcting base pose to reach the scan standoff point"
+                )
             if pos_err <= pos_tol and yaw_err <= yaw_tol:
                 node.get_logger().info(
                     f"[{self.name}] Base pose verified at standoff goal "
@@ -249,7 +258,11 @@ class NavigateToTarget(State):
                 f"correction(s) (pos err {pos_err:.2f} m, yaw err {yaw_err:.2f} rad). "
                 f"Not starting the scan from a bad pose."
             )
-            ctx["error_triggered"] = True
+            self.fail(
+                ctx,
+                f"base never reached the standoff pose (off by {pos_err:.2f} m / "
+                f"{yaw_err:.2f} rad after {max_retries} retries)",
+            )
 
     # EE scan standoff baked into the scan line by _build_wall_data (offset=0.6).
     SCAN_OFFSET_M = 0.4

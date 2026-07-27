@@ -264,6 +264,7 @@ class ObjectID(State):
         self.phase = "waiting_grid"
 
     def run(self, ctx):
+        self.set_activity(ctx, "Identifying walls and objects in the map")
         if self.phase == "mock_waiting":
             self._run_mock_object_id(ctx)
             return

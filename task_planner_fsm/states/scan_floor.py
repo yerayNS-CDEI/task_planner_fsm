@@ -172,7 +172,17 @@ class ScanFloor(State):
     # ------------------------------------------------------------------
     # Main tick
     # ------------------------------------------------------------------
+    _PHASE_ACTIVITY = {
+        "PLAN": "Planning the floor-coverage path",
+        "GO_TO_START": "Driving to the floor-scan start point",
+        "ARM_UNDER": "Lowering the arm under the chassis to scan the floor",
+        "TRAVERSE": "Sweeping the floor along the coverage path",
+    }
+
     def run(self, ctx):
+        activity = self._PHASE_ACTIVITY.get(self.phase)
+        if activity is not None:
+            self.set_activity(ctx, activity)
         if self.phase == self.PLAN:
             self._run_plan(ctx)
         elif self.phase == self.GO_TO_START:
