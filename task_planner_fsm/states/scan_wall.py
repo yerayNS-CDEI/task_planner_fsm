@@ -8,7 +8,9 @@ from ..utils.costmap_utils import (
     publish_wall_segment_markers,
 )
 from nav2_msgs.action import NavigateToPose
-from geometry_msgs.msg import PoseStamped
+from nav2_msgs.msg import SpeedLimit
+from geometry_msgs.msg import PoseStamped, Twist
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.action import ActionClient
 from rclpy.action import GoalResponse, CancelResponse
 from action_msgs.msg import GoalStatus
@@ -91,9 +93,28 @@ class ScanWall(State):
         self._seg_phase = "transit"  # transit|transit_wait|park|sweep_setup|press_settle|sweep_wait
         self._segments_ok = 0        # segments actually swept on this line
         self._last_swept_point = None
-        self._nav_status = None      # set by _on_nav_result / rejection
+        self._nav_status = None      # set by _on_nav_result / rejection / crawl tick
         self._sweep_from = None      # wall end the sweep starts from (robot's end)
         self._sweep_to = None        # wall end the sweep heads toward
+
+        # Sweep crawl: the active scan drags the base at a slow, constant velocity
+        # over /cmd_vel instead of a Nav2 goal, so the arm's contact/alignment
+        # controllers can keep the plate on the wall without being "left behind".
+        # (Nav2's DWB sweep can't hold a stable ~0.05 m/s: it trips
+        # SimpleProgressChecker (needs 0.1 m/s) and sits below trans_stopped_velocity.)
+        # Transit between segments still uses the Nav2 goal at normal speed.
+        self._sweep_crawl_target = None    # (x, y) base-standoff goal in map frame
+        self._sweep_crawl_deadline = None
+        self._sweep_crawl_timer = None
+
+        # Nav2 slow-sweep route (default): cap DWB to a crawl speed via a Nav2
+        # SpeedLimit and relax the progress checker so the sub-0.1 m/s sweep is
+        # not aborted as "no progress". Both are scoped to the sweep and restored
+        # afterwards. Set ctx["sweep_use_crawl"]=True to use the /cmd_vel crawl
+        # instead (exact speed, but no DWB collision checking during the drag).
+        self._speed_limit_pub = None
+        self._controller_param_client = None
+        self._sweep_speed_applied = False
 
         # Force mode (real robot only): press the GPR wheel against the wall (Z)
         # while the distance-sensor alignment holds the plate orientation.
@@ -158,6 +179,10 @@ class ScanWall(State):
         self._nav_status = None
         self._sweep_from = None
         self._sweep_to = None
+        self._stop_sweep_crawl(ctx)   # clear any stale timer from a re-entry
+        self._sweep_crawl_target = None
+        self._sweep_crawl_deadline = None
+        self._restore_sweep_speed(ctx)   # clear any stale slow-sweep limit from a re-entry
         self.force_mode_active = False
         self._press_settle_start = None
         self.gpr_measurement_active = False
@@ -1057,6 +1082,12 @@ class ScanWall(State):
                 f"[{self.name}] Segment {self._seg_idx + 1}/{len(self._segments)}: "
                 f"activating alignment + press for the sweep."
             )
+            # Nav2 route: cap the base to a crawl speed + relax the progress checker
+            # NOW, so the async param change has propagated by the time the base
+            # sweeps (the 10 s arm-stabilise wait below covers it). Skipped when the
+            # /cmd_vel crawl is selected (it sets its own speed).
+            if not bool(ctx.get("sweep_use_crawl", False)):
+                self._apply_sweep_speed(ctx)
             # Activate sensor alignment now that the base is at the segment start.
             if not self._start_arm_processes(ctx):
                 return
@@ -1108,7 +1139,11 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            if not self._send_base_goal(ctx, goal_xy):
+            # Nav2 route (default): slow Nav2 sweep, speed already capped in
+            # sweep_setup. Alternative (ctx["sweep_use_crawl"]): a /cmd_vel drag.
+            if bool(ctx.get("sweep_use_crawl", False)):
+                self._start_sweep_crawl(ctx, goal_xy)
+            elif not self._send_base_goal(ctx, goal_xy):
                 return
             self._seg_phase = "sweep_wait"
             return
@@ -1120,9 +1155,12 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
+            # The crawl timer sets self._nav_status on arrival/timeout.
             if self._nav_status is None:
                 return
             status = self._nav_status
+            self._stop_sweep_crawl(ctx, publish_stop=True)   # ensure base is stopped
+            self._restore_sweep_speed(ctx)   # clear the slow-sweep cap for the next transit
             # Release hardware/process state first (safety), regardless of outcome.
             node.get_logger().info(
                 f"[{self.name}] Segment sweep finished (status={status}). Stopping GPR, "
@@ -1229,6 +1267,238 @@ class ScanWall(State):
         except Exception:
             self._nav_status = -1
 
+    # ------------------------------------------------------------------
+    # Sweep crawl: slow constant-velocity drag over /cmd_vel
+    # ------------------------------------------------------------------
+    # Default drag speed found most stable for wall scanning (the arm's contact
+    # controllers keep up). Override per run via ctx["sweep_crawl_speed"].
+    SWEEP_CRAWL_SPEED_MS = 0.05
+    SWEEP_CRAWL_RATE_HZ = 10.0        # /cmd_vel publish rate (base drivers stop on stale cmd)
+    SWEEP_ARRIVE_TOL_M = 0.05         # stop when the base is within this of the goal
+    SWEEP_KP_YAW = 0.9                # P-hold on the fixed sweep heading
+    SWEEP_MAX_YAW_RATE = 0.3          # rad/s cap on the heading hold
+    SWEEP_CRAWL_TIMEOUT_PAD_S = 20.0  # grace beyond nominal (dist / speed) before aborting
+
+    # Base frames tried when reading the map-frame base pose (turret_footprint
+    # first: it is the frame the omni Nav2 config drives). Mirrors NavigateToTarget.
+    BASE_FRAMES = ("turret_footprint", "base_footprint", "base_link", "base", "chassis")
+
+    def _base_xy_yaw_map(self, ctx):
+        """Current base pose (x, y, yaw) in the map frame from TF, or None.
+
+        The sweep segments are map-frame, so progress must be measured in map too
+        (ctx["base_position"] is the odom frame and would be off by map->odom).
+        """
+        tf_buffer = ctx.get("tf_buffer")
+        if tf_buffer is None:
+            return None
+        primary = str(ctx.get("nav_base_frame", "turret_footprint"))
+        frames = (primary,) + tuple(f for f in self.BASE_FRAMES if f != primary)
+        for frame in frames:
+            try:
+                if not tf_buffer.can_transform(
+                    "map", frame, rclpy.time.Time(), Duration(seconds=0.2)
+                ):
+                    continue
+                tf = tf_buffer.lookup_transform(
+                    "map", frame, rclpy.time.Time(), Duration(seconds=0.5)
+                )
+            except Exception:
+                continue
+            t = tf.transform.translation
+            q = tf.transform.rotation
+            yaw = atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+            return float(t.x), float(t.y), yaw
+        return None
+
+    def _start_sweep_crawl(self, ctx, target_xy):
+        """Begin dragging the base to ``target_xy`` (map-frame base standoff) at a
+        slow constant velocity. Drives ``self._nav_status`` like a Nav2 goal:
+        None while in flight, STATUS_SUCCEEDED on arrival, -1 on timeout/lost pose,
+        so the existing sweep_wait completion logic is reused unchanged."""
+        node = ctx["node"]
+        if ctx.get("_cmd_vel_pub") is None:
+            ctx["_cmd_vel_pub"] = node.create_publisher(Twist, "/cmd_vel", 10)
+        self._stop_sweep_crawl(ctx)   # no duplicate timers
+        self._sweep_crawl_target = (float(target_xy[0]), float(target_xy[1]))
+        self._nav_status = None
+
+        speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
+        pose = self._base_xy_yaw_map(ctx)
+        dist = (
+            math.hypot(self._sweep_crawl_target[0] - pose[0],
+                       self._sweep_crawl_target[1] - pose[1])
+            if pose else 0.0
+        )
+        self._sweep_crawl_deadline = (
+            time.time() + dist / max(speed, 1e-3) + self.SWEEP_CRAWL_TIMEOUT_PAD_S
+        )
+        node.get_logger().info(
+            f"[{self.name}] Sweep crawl to ({self._sweep_crawl_target[0]:.2f}, "
+            f"{self._sweep_crawl_target[1]:.2f}) at {speed:.3f} m/s ({dist:.2f} m)."
+        )
+        self._sweep_crawl_timer = node.create_timer(
+            1.0 / self.SWEEP_CRAWL_RATE_HZ, lambda: self._sweep_crawl_tick(ctx)
+        )
+
+    def _stop_sweep_crawl(self, ctx, publish_stop=False):
+        timer = getattr(self, "_sweep_crawl_timer", None)
+        if timer is not None:
+            timer.cancel()
+            ctx["node"].destroy_timer(timer)
+            self._sweep_crawl_timer = None
+        if publish_stop and ctx.get("_cmd_vel_pub") is not None:
+            ctx["_cmd_vel_pub"].publish(Twist())   # zero twist
+
+    def _sweep_crawl_tick(self, ctx):
+        """Timer callback: publish a constant-speed Twist toward the target and
+        stop (set _nav_status) on arrival / timeout / lost pose."""
+        if self._nav_status is not None:
+            return
+        node = ctx["node"]
+        speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
+        tol = float(ctx.get("sweep_arrive_tol", self.SWEEP_ARRIVE_TOL_M))
+
+        pose = self._base_xy_yaw_map(ctx)
+        if pose is None:
+            node.get_logger().error(f"[{self.name}] Lost base pose during sweep crawl.")
+            self._stop_sweep_crawl(ctx, publish_stop=True)
+            self._nav_status = -1
+            return
+        px, py, yaw = pose
+        ex, ey = self._sweep_crawl_target[0] - px, self._sweep_crawl_target[1] - py
+        dist = math.hypot(ex, ey)
+
+        if dist <= tol:
+            self._stop_sweep_crawl(ctx, publish_stop=True)
+            node.get_logger().info(
+                f"[{self.name}] Sweep crawl reached the segment end ({dist:.3f} m)."
+            )
+            self._nav_status = GoalStatus.STATUS_SUCCEEDED
+            return
+        if time.time() > self._sweep_crawl_deadline:
+            self._stop_sweep_crawl(ctx, publish_stop=True)
+            node.get_logger().warn(
+                f"[{self.name}] Sweep crawl timed out ({dist:.3f} m from the end)."
+            )
+            self._nav_status = -1
+            return
+
+        # Constant-magnitude velocity toward the target, rotated into the base
+        # frame (Twist is body-frame), plus a P-hold on the fixed sweep heading so
+        # the omni base strafes along the wall without turning.
+        vx_w, vy_w = speed * ex / dist, speed * ey / dist
+        cmd = Twist()
+        cmd.linear.x = cos(yaw) * vx_w + sin(yaw) * vy_w
+        cmd.linear.y = -sin(yaw) * vx_w + cos(yaw) * vy_w
+        target_yaw = 2.0 * atan2(self._sweep_qz, self._sweep_qw)
+        dyaw = atan2(sin(target_yaw - yaw), cos(target_yaw - yaw))
+        cmd.angular.z = max(-self.SWEEP_MAX_YAW_RATE,
+                            min(self.SWEEP_MAX_YAW_RATE, self.SWEEP_KP_YAW * dyaw))
+        ctx["_cmd_vel_pub"].publish(cmd)
+
+    # ------------------------------------------------------------------
+    # Nav2 slow-sweep: cap DWB speed + relax the progress checker
+    # ------------------------------------------------------------------
+    # Absolute base-speed cap during the sweep (0.0 => no limit). Found most
+    # stable at 0.05 m/s; override via ctx["sweep_speed_limit"].
+    SWEEP_SPEED_LIMIT_MS = 0.05
+    # Relaxed progress checker so a sub-0.1 m/s sweep is not aborted as "no
+    # progress" (must move SWEEP_PROGRESS_RADIUS_M within SWEEP_PROGRESS_TIME_S).
+    SWEEP_PROGRESS_RADIUS_M = 0.10
+    SWEEP_PROGRESS_TIME_S = 15.0
+    # Restored after the sweep (the nav2_params_omni.yaml progress_checker defaults).
+    DEFAULT_PROGRESS_RADIUS_M = 0.50
+    DEFAULT_PROGRESS_TIME_S = 5.0
+
+    def _publish_speed_limit(self, ctx, speed_ms):
+        """Absolute base-speed cap for the Nav2 controller (0.0 => no limit).
+        Latched so the controller_server picks it up even if it subscribed late."""
+        node = ctx["node"]
+        if self._speed_limit_pub is None:
+            qos = QoSProfile(depth=1)
+            qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+            self._speed_limit_pub = node.create_publisher(
+                SpeedLimit, ctx.get("speed_limit_topic", "/speed_limit"), qos)
+        msg = SpeedLimit()
+        msg.header.stamp = node.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
+        msg.percentage = False
+        msg.speed_limit = float(speed_ms)
+        self._speed_limit_pub.publish(msg)
+
+    def _set_progress_checker(self, ctx, radius_m, time_s):
+        """Relax/restore the controller_server progress checker at runtime."""
+        node = ctx["node"]
+        srv = ctx.get("controller_set_param_service", "/controller_server/set_parameters")
+        if self._controller_param_client is None:
+            self._controller_param_client = node.create_client(SetParameters, srv)
+        if not self._controller_param_client.wait_for_service(timeout_sec=2.0):
+            node.get_logger().warn(
+                f"[{self.name}] '{srv}' unavailable; cannot adjust the progress checker "
+                f"(the slow sweep may be aborted as 'no progress')."
+            )
+            return
+        checker = ctx.get("progress_checker_name", "progress_checker")
+        req = SetParameters.Request()
+        req.parameters = [
+            ParameterMsg(
+                name=f"{checker}.required_movement_radius",
+                value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
+                                     double_value=float(radius_m))),
+            ParameterMsg(
+                name=f"{checker}.movement_time_allowance",
+                value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
+                                     double_value=float(time_s))),
+        ]
+        fut = self._controller_param_client.call_async(req)
+        fut.add_done_callback(
+            lambda f: self._log_param_result(ctx, f, f"progress checker r={radius_m}m t={time_s}s")
+        )
+
+    def _log_param_result(self, ctx, future, label):
+        node = ctx["node"]
+        try:
+            results = future.result().results
+            if bool(results) and all(r.successful for r in results):
+                node.get_logger().info(f"[{self.name}] {label}: applied.")
+            else:
+                reason = results[0].reason if results else "no result"
+                node.get_logger().warn(
+                    f"[{self.name}] {label}: rejected ({reason}). If your Nav2 build does not "
+                    f"reconfigure the progress checker at runtime, relax it in nav2_params_omni.yaml."
+                )
+        except Exception as e:
+            node.get_logger().warn(f"[{self.name}] {label}: set_parameters call failed ({e}).")
+
+    def _apply_sweep_speed(self, ctx):
+        """Scope a slow base speed to the sweep: cap DWB + relax the progress
+        checker. Applied in sweep_setup (the 10 s arm-stabilise wait lets the
+        async param change propagate before the base moves)."""
+        node = ctx["node"]
+        speed = float(ctx.get("sweep_speed_limit", self.SWEEP_SPEED_LIMIT_MS))
+        node.get_logger().info(f"[{self.name}] Slow sweep: capping base to {speed:.3f} m/s.")
+        self._publish_speed_limit(ctx, speed)
+        self._set_progress_checker(
+            ctx,
+            float(ctx.get("sweep_progress_radius", self.SWEEP_PROGRESS_RADIUS_M)),
+            float(ctx.get("sweep_progress_time", self.SWEEP_PROGRESS_TIME_S)),
+        )
+        self._sweep_speed_applied = True
+
+    def _restore_sweep_speed(self, ctx):
+        """Undo _apply_sweep_speed: clear the speed cap and restore the progress
+        checker. Idempotent no-op if nothing was applied."""
+        if not self._sweep_speed_applied:
+            return
+        self._publish_speed_limit(ctx, 0.0)   # 0.0 => no limit
+        self._set_progress_checker(
+            ctx,
+            float(ctx.get("progress_radius_default", self.DEFAULT_PROGRESS_RADIUS_M)),
+            float(ctx.get("progress_time_default", self.DEFAULT_PROGRESS_TIME_S)),
+        )
+        self._sweep_speed_applied = False
+
     def _run_post_scan(self, ctx):
         """Retract the arm from the wall (re-send the pose); on the wall's last
         line also retract the column. Sets self.finished when complete."""
@@ -1305,8 +1575,11 @@ class ScanWall(State):
                 ctx["scan_done"] = True
 
     def on_exit(self, ctx):
-        ## Safety net: stop any running GPR measurement, release force mode (real)
-        ## and stop sensor + alignment nodes.
+        ## Safety net: stop the base, clear any slow-sweep speed cap, stop any
+        ## running GPR measurement, release force mode (real) and stop sensor +
+        ## alignment nodes.
+        self._stop_sweep_crawl(ctx, publish_stop=True)
+        self._restore_sweep_speed(ctx)
         self._gpr_stop_line_and_measurement(ctx)
         self._stop_force_mode(ctx)
         self._stop_arm_processes(ctx)
