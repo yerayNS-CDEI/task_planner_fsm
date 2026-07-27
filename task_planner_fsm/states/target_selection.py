@@ -1,5 +1,5 @@
 from ..state import State
-from example_interfaces.srv import SetBool
+import math
 
 NEXT_STATE_OPTIONS = [
     "DrillApproach",
@@ -10,43 +10,79 @@ NEXT_STATE_OPTIONS = [
 class TargetSelection(State):
     def __init__(self, name):
         super().__init__(name)
-        self.client = None
-        self.future = None
 
     def on_enter(self, ctx):
         node = ctx["node"]
-        node.get_logger().info(f"[{self.name}] Calling the service /target_selection")
+        node.get_logger().info(f"[{self.name}] Selecting the nearest drilling target...")
         ctx["target_selected"] = False
         ctx["error_triggered"] = False
         self._user_choice = None
-
-        self.client = node.create_client(SetBool, "/target_selection")
-        request = SetBool.Request()
-        request.data = True
-
-        if not self.client.wait_for_service(timeout_sec=2.0):
-            node.get_logger().error(f"[{self.name}] Service /target_selection not available.")
-            ctx["error_triggered"] = True
-            return
-
-        self.future = self.client.call_async(request)
+        # Indices of drilling locations already selected on previous visits.
+        # Persist across revisits (setdefault, NOT reset) so the same location is
+        # never chosen twice -- otherwise the FSM would keep picking the same
+        # nearest point and loop forever.
+        ctx.setdefault("completed_drill_indices", [])
 
     def run(self, ctx):
         node = ctx["node"]
 
-        if self.future is None:
-            node.get_logger().info(f"[{self.name}] Future is None.")
+        # Robot's current position, from /rtabmap/odom (see fsm_node).
+        base = ctx.get("base_position")
+        if base is None:
+            node.get_logger().warn(f"[{self.name}] Waiting for odometry (base_position)...")
             return
 
-        if self.future.done():
-            result = self.future.result()
-            if result and result.success:
-                node.get_logger().info(f"[{self.name}] Target selected.")
-                ctx["target_selected"] = True
-            else:
-                node.get_logger().error(f"[{self.name}] Error while receiving data.")
-                ctx["error_triggered"] = True
-            self.future = None
+        locations = ctx.get("drill_locations", [])
+        if not locations:
+            node.get_logger().error(f"[{self.name}] No drill_locations found in context.")
+            ctx["error_triggered"] = True
+            return
+
+        completed = set(ctx.get("completed_drill_indices", []))
+        robot_x = float(base.x)
+        robot_y = float(base.y)
+
+        # Pick the closest location (2D distance in the map plane) that has not
+        # been selected yet.
+        min_dist = float("inf")
+        selected_idx = -1
+        selected_point = None
+        for idx, loc in enumerate(locations):
+            if idx in completed:
+                continue
+            dist = math.hypot(robot_x - loc[0], robot_y - loc[1])
+            if dist < min_dist:
+                min_dist = dist
+                selected_idx = idx
+                selected_point = loc
+
+        if selected_idx == -1:
+            # Every location has been drilled; nothing left to select. Flag it so
+            # the FSM stops instead of spinning on an empty selection forever.
+            node.get_logger().warn(
+                f"[{self.name}] All {len(locations)} drilling location(s) already "
+                f"selected; none left to drill."
+            )
+            ctx["error_triggered"] = True
+            return
+
+        # Remember this location so it is not selected again.
+        completed.add(selected_idx)
+        ctx["completed_drill_indices"] = sorted(completed)
+        ctx["current_drill_index"] = selected_idx
+        ctx["current_drill_target"] = selected_point
+        ctx["target_selected"] = True
+
+        remaining = len(locations) - len(completed)
+        node.get_logger().info(
+            f"[{self.name}] Selected drilling location #{selected_idx} at "
+            f"({selected_point[0]:.3f}, {selected_point[1]:.3f}, {selected_point[2]:.3f}) "
+            f"| distance {min_dist:.3f} m | {remaining} location(s) remaining."
+        )
+
+        publish_markers = ctx.get("publish_drill_markers")
+        if publish_markers:
+            publish_markers(ctx)
 
     def check_transition(self, ctx):
         if not ctx.get("target_selected") and not ctx.get("error_triggered"):

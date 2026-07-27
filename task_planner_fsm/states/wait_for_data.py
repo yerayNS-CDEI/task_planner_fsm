@@ -1,5 +1,4 @@
 from ..state import State
-from example_interfaces.srv import SetBool
 
 NEXT_STATE_OPTIONS = [
     "TargetSelection",
@@ -9,43 +8,73 @@ NEXT_STATE_OPTIONS = [
 class WaitForData(State):
     def __init__(self, name):
         super().__init__(name)
-        self.client = None
-        self.future = None
+        # Guards the one-shot interactive prompt so run() asks the operator only
+        # once (run() is called every FSM tick).
+        self.started = False
 
     def on_enter(self, ctx):
         node = ctx["node"]
-        node.get_logger().info(f"[{self.name}] Calling the service /wait_for_data")
+        node.get_logger().info(
+            f"[{self.name}] Waiting for drilling data (operator input)."
+        )
         ctx["data_ready"] = False
         ctx["error_triggered"] = False
+        ctx["drill_locations"] = []
+        ctx["num_drill_locations"] = 0
         self._user_choice = None
+        self.started = False
 
-        self.client = node.create_client(SetBool, "/wait_for_data")
-        request = SetBool.Request()
-        request.data = True
+    def _parse_floats(self, raw_text):
+        tokens = raw_text.replace(",", " ").split()
+        return [float(tok) for tok in tokens]
 
-        if not self.client.wait_for_service(timeout_sec=2.0):
-            node.get_logger().error(f"[{self.name}] Service /wait_for_data not available.")
-            ctx["error_triggered"] = True
-            return
+    def _prompt_drill_locations(self):
+        """Prompt the operator for the number of drilling locations and each
+        location's (x, y, z) coordinates.
 
-        self.future = self.client.call_async(request)
+        Returns the list of ``(x, y, z)`` tuples. Raises ValueError on invalid
+        input so the caller can report it and re-prompt on the next tick.
+        """
+        num_locations = int(input(">> Number of drilling locations? (>=1) ").strip())
+        if num_locations < 1:
+            raise ValueError("Number of drilling locations must be >= 1.")
+
+        locations = []
+        for idx in range(1, num_locations + 1):
+            coords = self._parse_floats(
+                input(f">> Location {idx} coordinates (x y z): ").strip()
+            )
+            if len(coords) != 3:
+                raise ValueError(
+                    f"Location {idx}: expected 3 coordinates (x y z), got {len(coords)}."
+                )
+            locations.append(tuple(coords))
+        return locations
 
     def run(self, ctx):
         node = ctx["node"]
 
-        if self.future is None:
-            node.get_logger().info(f"[{self.name}] Future is None.")
+        if self.started:
             return
 
-        if self.future.done():
-            result = self.future.result()
-            if result and result.success:
-                node.get_logger().info(f"[{self.name}] Data received correctly.")
-                ctx["data_ready"] = True
-            else:
-                node.get_logger().error(f"[{self.name}] Error while receiving data.")
-                ctx["error_triggered"] = True
-            self.future = None
+        try:
+            locations = self._prompt_drill_locations()
+        except ValueError as e:
+            print(f"[{self.name}] Invalid input: {e}")
+            return
+
+        self.started = True
+        ctx["drill_locations"] = locations
+        ctx["num_drill_locations"] = len(locations)
+        ctx["data_ready"] = True
+
+        node.get_logger().info(
+            f"[{self.name}] {len(locations)} drilling location(s) received:"
+        )
+        for idx, (x, y, z) in enumerate(locations, 1):
+            node.get_logger().info(
+                f"  Location {idx}: ({x:.3f}, {y:.3f}, {z:.3f})"
+            )
 
     def check_transition(self, ctx):
         if not ctx.get("data_ready") and not ctx.get("error_triggered"):
