@@ -4,10 +4,12 @@ import sys
 from typing import Dict, Optional
 
 import rclpy
+import tf2_ros
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
+from visualization_msgs.msg import Marker, MarkerArray
 
 from task_planner_fsm.machine import StateMachine
 from task_planner_fsm.states import (
@@ -101,6 +103,15 @@ class RobotFSMNode(Node):
         self.fsm_graph_pub = self.create_publisher(String, "/fsm/graph", current_qos)
         self.fsm_status_pub = self.create_publisher(String, "/fsm/status", current_qos)
         self.fsm_event_pub = self.create_publisher(String, "/fsm/event", event_qos)
+        self.drill_markers_pub = self.create_publisher(
+            MarkerArray, "/fsm/drill_points", current_qos
+        )
+
+        # TF buffer + listener, shared with states via ctx["tf_buffer"] (the key
+        # coverage_driver already expects). Used by ManipulatorUnfolding to turn a
+        # map-frame drill point into gantry (turret-frame) joint targets.
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # Shared context for the FSM. This is intentionally minimal for the first
         # workflow-only version; each state reads/writes its own flags via
@@ -111,6 +122,7 @@ class RobotFSMNode(Node):
             "error_triggered": False,
             "last_state": None,
             "sim": bool(sim),
+            "tf_buffer": self.tf_buffer,
             # TargetSelection still branches on scan_phase (legacy remnant). Phases
             # are no longer a concept in this FSM; default to 1 so it runs the
             # single-pass target-selection path.
@@ -123,6 +135,7 @@ class RobotFSMNode(Node):
             "set_fsm_status": self.set_fsm_status,
             "publish_fsm_status": self.publish_fsm_status,
             "publish_fsm_event": self.publish_fsm_event,
+            "publish_drill_markers": self.publish_drill_markers,
         }
 
         # Bridge externally-set ROS parameter overrides into ctx so per-state
@@ -262,6 +275,79 @@ class RobotFSMNode(Node):
             "stamp": stamp,
         }
         self._publish_json(self.fsm_event_pub, payload)
+
+    def publish_drill_markers(self, ctx: Dict) -> None:
+        """Publish a MarkerArray to /fsm/drill_points showing all drill locations.
+
+        Colors:
+          - pending   : gray
+          - current   : yellow (just selected)
+          - completed : green
+        """
+        locations = ctx.get("drill_locations") or []
+        if not locations:
+            return
+
+        map_frame = str(ctx.get("map_frame", "map"))
+        current_idx = ctx.get("current_drill_index", -1)
+        completed = set(ctx.get("completed_drill_indices") or [])
+        stamp = self.get_clock().now().to_msg()
+
+        array = MarkerArray()
+
+        # Clear all previously published markers in these namespaces.
+        for ns in ("drill_sphere", "drill_label"):
+            delete = Marker()
+            delete.header.frame_id = map_frame
+            delete.header.stamp = stamp
+            delete.ns = ns
+            delete.action = Marker.DELETEALL
+            array.markers.append(delete)
+
+        for idx, loc in enumerate(locations):
+            is_current = (idx == current_idx)
+            is_done = (idx in completed) and not is_current
+
+            if is_current:
+                r, g, b, a = 1.0, 0.9, 0.0, 1.0   # yellow
+            elif is_done:
+                r, g, b, a = 0.2, 0.9, 0.2, 0.8   # green
+            else:
+                r, g, b, a = 0.6, 0.6, 0.6, 0.7   # gray
+
+            sphere = Marker()
+            sphere.header.frame_id = map_frame
+            sphere.header.stamp = stamp
+            sphere.ns = "drill_sphere"
+            sphere.id = idx
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position.x = float(loc[0])
+            sphere.pose.position.y = float(loc[1])
+            sphere.pose.position.z = float(loc[2])
+            sphere.pose.orientation.w = 1.0
+            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.12
+            sphere.color.r, sphere.color.g, sphere.color.b, sphere.color.a = r, g, b, a
+            array.markers.append(sphere)
+
+            label = Marker()
+            label.header.frame_id = map_frame
+            label.header.stamp = stamp
+            label.ns = "drill_label"
+            label.id = idx
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = float(loc[0])
+            label.pose.position.y = float(loc[1])
+            label.pose.position.z = float(loc[2]) + 0.15
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.10
+            label.color.r = label.color.g = label.color.b = 1.0
+            label.color.a = 0.9
+            label.text = str(idx)
+            array.markers.append(label)
+
+        self.drill_markers_pub.publish(array)
 
     def start_callback(self, msg: Bool):
         self.ctx["start"] = msg.data
