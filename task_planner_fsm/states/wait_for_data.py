@@ -1,7 +1,8 @@
-from ..state import State
+from ..state import State, ask
 
 NEXT_STATE_OPTIONS = [
     "TargetSelection",
+    "ManipulatorFolding",
     "Error",
 ]
 
@@ -21,6 +22,11 @@ class WaitForData(State):
         ctx["error_triggered"] = False
         ctx["drill_locations"] = []
         ctx["num_drill_locations"] = 0
+        # Set when oliwall reports it is done and asks for no further drilling.
+        ctx["drilling_complete"] = False
+        # A fresh batch renumbers the locations, so the indices TargetSelection
+        # ticked off for the previous batch no longer refer to these points.
+        ctx["completed_drill_indices"] = []
         self._user_choice = None
         self.started = False
 
@@ -28,21 +34,27 @@ class WaitForData(State):
         tokens = raw_text.replace(",", " ").split()
         return [float(tok) for tok in tokens]
 
-    def _prompt_drill_locations(self):
+    def _prompt_drill_locations(self, node):
         """Prompt the operator for the number of drilling locations and each
         location's (x, y, z) coordinates.
 
-        Returns the list of ``(x, y, z)`` tuples. Raises ValueError on invalid
-        input so the caller can report it and re-prompt on the next tick.
+        Returns the list of ``(x, y, z)`` tuples -- EMPTY when the operator enters
+        0, meaning oliwall finished its wall without requesting more drilling, so
+        pokeye has nothing left to do either. Raises ValueError on invalid input so
+        the caller can report it and re-prompt on the next tick.
         """
-        num_locations = int(input(">> Number of drilling locations? (>=1) ").strip())
-        if num_locations < 1:
-            raise ValueError("Number of drilling locations must be >= 1.")
+        num_locations = int(
+            ask(node, self.name, "Number of drilling locations? (>=1, or 0 if oliwall is finished)")
+        )
+        if num_locations < 0:
+            raise ValueError("Number of drilling locations cannot be negative.")
+        if num_locations == 0:
+            return []
 
         locations = []
         for idx in range(1, num_locations + 1):
             coords = self._parse_floats(
-                input(f">> Location {idx} coordinates (x y z): ").strip()
+                ask(node, self.name, f"Location {idx} coordinates (x y z):")
             )
             if len(coords) != 3:
                 raise ValueError(
@@ -58,15 +70,25 @@ class WaitForData(State):
             return
 
         try:
-            locations = self._prompt_drill_locations()
+            locations = self._prompt_drill_locations(node)
         except ValueError as e:
-            print(f"[{self.name}] Invalid input: {e}")
+            node.get_logger().warn(f"[{self.name}] Invalid input: {e}")
             return
 
         self.started = True
         ctx["drill_locations"] = locations
         ctx["num_drill_locations"] = len(locations)
         ctx["data_ready"] = True
+
+        if not locations:
+            # oliwall is done and needs no more holes: pokeye stops waiting, folds
+            # the gantry and goes home instead of continuing into TargetSelection.
+            ctx["drilling_complete"] = True
+            node.get_logger().info(
+                f"[{self.name}] oliwall reported no further drilling locations; "
+                f"finishing the pokeye run."
+            )
+            return
 
         node.get_logger().info(
             f"[{self.name}] {len(locations)} drilling location(s) received:"
@@ -79,4 +101,8 @@ class WaitForData(State):
     def check_transition(self, ctx):
         if not ctx.get("data_ready") and not ctx.get("error_triggered"):
             return None
+        if ctx.get("drilling_complete") and not ctx.get("error_triggered"):
+            # No drilling left to do -- route straight to folding (and from there
+            # home) without asking the operator to pick a state.
+            return "ManipulatorFolding"
         return self.select_next_state(ctx, NEXT_STATE_OPTIONS)

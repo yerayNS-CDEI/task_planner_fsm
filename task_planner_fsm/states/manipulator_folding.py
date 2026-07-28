@@ -15,6 +15,14 @@ NEXT_STATE_OPTIONS = [
 # (must match the `joints:` list in config/diffdrive_controllers.yaml).
 GANTRY_JOINTS = ["stage1_lift_joint", "stage2_lift_joint", "stage3_rotate_joint", "stage4_horizontal_joint"]
 
+# Coming from either of these states means there is no drilling left to do --
+# StoringToDatabase after the last location was drilled, or WaitForData when
+# oliwall reported it needs no more holes -- so this is the final fold of the run
+# and the robot heads home right after it. Arriving from TargetSelection instead
+# is the mid-run fold before the base is repositioned, which keeps the operator's
+# next-state choice.
+FINAL_FOLD_PREDECESSORS = ("StoringToDatabase", "WaitForData")
+
 
 class ManipulatorFolding(State):
     def __init__(self, name):
@@ -25,6 +33,7 @@ class ManipulatorFolding(State):
         self.phase = "idle"
         self.wait_start = None
         self.settle_start = None
+        self.final_fold = False
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -35,6 +44,12 @@ class ManipulatorFolding(State):
         self.wait_start = time.time()
         self.settle_start = None
         self.latest_joints = None
+
+        # A retry re-enters this state with last_state == our own name, so keep
+        # the decision made on the original entry.
+        last_state = ctx.get("last_state")
+        if last_state != self.name:
+            self.final_fold = last_state in FINAL_FOLD_PREDECESSORS
 
         # robo_drill gantry_position_controller (a ForwardCommandController) takes
         # a Float64MultiArray on this topic; joint order is
@@ -63,6 +78,11 @@ class ManipulatorFolding(State):
         node.get_logger().info(
             f"[{self.name}] Folding gantry to origin {tuple(self.home)} via {self.topic}."
         )
+        if self.final_fold:
+            node.get_logger().info(
+                f"[{self.name}] Drilling work is over (came from {last_state}); "
+                f"returning home once the gantry is folded."
+            )
 
     def _on_joint_states(self, msg):
         self.latest_joints = dict(zip(msg.name, msg.position))
@@ -163,4 +183,8 @@ class ManipulatorFolding(State):
     def check_transition(self, ctx):
         if not ctx.get("manipulator_folding_success") and not ctx.get("error_triggered"):
             return None
+        if self.final_fold and not ctx.get("error_triggered"):
+            # Nothing left to drill and the gantry is folded: go home without
+            # asking the operator to pick a state.
+            return "HomePosition"
         return self.select_next_state(ctx, NEXT_STATE_OPTIONS)

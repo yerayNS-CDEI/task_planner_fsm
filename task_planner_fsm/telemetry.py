@@ -57,6 +57,8 @@ _DEFAULT_EDGES = [
     ("ReceiveNav2Map", "GetSemanticMap", "forward"),
     ("GetSemanticMap", "WaitForData", "forward"),
     ("WaitForData", "TargetSelection", "forward"),
+    # oliwall finished without asking for more holes: fold and go home.
+    ("WaitForData", "ManipulatorFolding", "branch"),
     ("TargetSelection", "DrillApproach", "branch"),
     ("TargetSelection", "ManipulatorFolding", "branch"),
     ("ManipulatorFolding", "BasePlacementComputation", "forward"),
