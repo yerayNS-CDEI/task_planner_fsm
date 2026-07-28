@@ -17,7 +17,8 @@ SERVICES = {
     "/base_placement_computation": "Base placement computed successfully.",
     "/navigate_to_target": "Target reached successfully.",
     "/manipulator_reachability": "Manipulator reachability computed successfully.",
-    "/nearby_point_selection": "Nearby point selected successfully.",
+    # NearbyPointSelection no longer calls a service — it searches the vicinity of
+    # the drill point with the gantry IK, so no mock is needed here.
     # ManipulatorUnfolding no longer calls a service — it commands the gantry
     # controller directly (like ManipulatorFolding), so no mock is needed here.
     "/drill_approach": "Drill approach completed successfully.",
