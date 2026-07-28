@@ -75,12 +75,12 @@ ROTATE_ORIGIN_Z0 = STAGE2_ORIGIN_Z + STAGE3_ORIGIN_Z                   # 0.523
 
 # Default drill_tip offset in the stage4_horizontal_link frame (matches URDF
 # drill_tip_x/y/z; the tip's rpy only sets orientation, not this position).
-TIP_OFFSET_DEFAULT: Vec3 = (0.05, -0.20, 0.0)
+TIP_OFFSET_DEFAULT: Vec3 = (0.05, -0.54, 0.0)
 
 # Joint limits [lower, upper] from pokeye_base.urdf.
 LIFT1_LIMITS = (-0.47, 0.40)
 LIFT2_LIMITS = (0.0, 1.0)
-HORIZONTAL_LIMITS = (-0.196, 0.196)
+HORIZONTAL_LIMITS = (-0.32, 0.32)
 ROTATE_LIMITS = (-math.pi, math.pi)
 
 # Achievable range of the combined lift1+lift2 travel.
