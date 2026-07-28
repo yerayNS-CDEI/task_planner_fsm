@@ -29,7 +29,8 @@ SERVICES = {
     "/drill_retract": "Drill retracted successfully.",
     "/sample_scanning": "Sample scanned successfully.",
     "/storing_to_database": "Data stored to database successfully.",
-    "/home_position": "Home position reached successfully.",
+    # HomePosition no longer calls a service — it drives the base back to the
+    # start pose through the nav2 NavigateToPose action.
 }
 
 DELAY = 1.0  # seconds each mock service waits before replying
