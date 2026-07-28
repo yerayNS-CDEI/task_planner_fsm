@@ -49,6 +49,7 @@ from task_planner_fsm.states.proc_utils import (
     stop_all,
     wait_stack_ready,
     wait_services_ready,
+    ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
 )
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
 from task_planner_fsm.utils.wall_geometry import build_wall_data, left_scan_endpoint
@@ -811,6 +812,9 @@ class RobotFSMNode(Node):
                     f"use_sim_time:={sim_value}",
                     "hybrid_sim:=false",
                     f"planner_backend:={planner_backend}",
+                    # Push out launch's own SIGKILL deadline so ros2_control survives
+                    # long enough to retract the column on shutdown.
+                    *ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
                 ],
             )
             time.sleep(2.0)

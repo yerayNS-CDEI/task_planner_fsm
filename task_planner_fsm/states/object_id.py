@@ -100,6 +100,8 @@ from task_planner_fsm.states.proc_utils import (
     wait_services_ready,
     wait_processes_gone,
     kill_stale_stack,
+    stop_timeout_for,
+    ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
     SIM_STACK_PATTERNS,
 )
 
@@ -564,6 +566,9 @@ class ObjectID(State):
                     f"robot_ip:={robot_ip}", "database_name:=rtabmap_fsm", "headless:=true",
                     f"planner_backend:={planner_backend}",
                     f"use_sim_time:={sim_value}",
+                    # Push out launch's own SIGKILL deadline so ros2_control survives
+                    # long enough to retract the column on shutdown.
+                    *ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
                 ],
             )
 
@@ -589,7 +594,8 @@ class ObjectID(State):
             )
             if not wait_stack_ready(ctx, required_topics, timeout=ready_timeout):
                 node.get_logger().error(f"[{self.name}] Navigation + localization stack did not become ready.")
-                stop_proc(ctx, "nav_sim", timeout=10.0, force_kill_patterns=SIM_STACK_PATTERNS)
+                stop_proc(ctx, "nav_sim", timeout=stop_timeout_for("nav_sim"),
+                          force_kill_patterns=SIM_STACK_PATTERNS)
                 ctx["error_triggered"] = True
                 return False
 
@@ -604,7 +610,8 @@ class ObjectID(State):
                 )
                 if not wait_services_ready(ctx, collision_services, timeout=collision_timeout):
                     node.get_logger().error(f"[{self.name}] Collision checking service did not come up.")
-                    stop_proc(ctx, "nav_sim", timeout=10.0, force_kill_patterns=SIM_STACK_PATTERNS)
+                    stop_proc(ctx, "nav_sim", timeout=stop_timeout_for("nav_sim"),
+                              force_kill_patterns=SIM_STACK_PATTERNS)
                     ctx["error_triggered"] = True
                     return False
 

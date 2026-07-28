@@ -49,6 +49,33 @@ SIM_STACK_PATTERNS = GAZEBO_PATTERNS + SENSOR_DRIVER_PATTERNS + [
     'rviz2',
 ]
 
+# Launch keys whose process tree contains ros2_control -- and therefore the
+# column hardware interface, which retracts the column inside its on_deactivate.
+ROBOT_STACK_KEYS = {"nav_sim"}
+
+# Teardown budget for those launches. The column retraction keeps pumping the
+# Modbus heartbeat for up to ~15 s while the column travels (see
+# ColumnHardwareInterface::on_deactivate in navi-wall); with the usual 10 s grace
+# our own escalation cuts the drive off mid-travel and the column is left
+# extended, which then also breaks the next run.
+ROBOT_STACK_STOP_TIMEOUT = 25.0
+
+# ``ros2 launch`` runs its own SIGINT -> SIGTERM -> SIGKILL escalation on every
+# node it spawned (5 s + 5 s by default), so a default-configured launch SIGKILLs
+# ros2_control roughly 10 s into shutdown -- before the column has finished
+# retracting, and a SIGKILLed hardware interface never gets to run on_deactivate
+# at all. rclcpp treats SIGTERM as just another shutdown request, so only the
+# SIGKILL deadline needs to move; pass this to every launch owning the column.
+# Our own escalation above (SIGTERM at 25 s, SIGKILL at 30 s) still bounds the
+# teardown, so this cannot hang the FSM.
+ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS = ["sigkill_timeout:=30"]
+
+
+def stop_timeout_for(key: str) -> float:
+    """Graceful-shutdown budget to give the launch registered under ``key``."""
+    return ROBOT_STACK_STOP_TIMEOUT if key in ROBOT_STACK_KEYS else 10.0
+
+
 def start_proc(ctx: dict, key: str, cmd: list[str]) -> None:
     procs: Dict[str, subprocess.Popen] = ctx.setdefault("_procs", {})
     if key in procs and procs[key] and procs[key].poll() is None:
@@ -424,7 +451,9 @@ def stop_all(ctx: dict) -> None:
     save_timeout = float(ctx.get("create_map_rtabmap_save_timeout", 180.0))
     graceful_rtabmap_save(node=node, timeout=save_timeout)
     for k in list(ctx.get("_procs", {}).keys()):
-        stop_proc(ctx, k, force_kill_patterns=SIM_STACK_PATTERNS)
+        # Launches that own ros2_control get a longer grace so the column
+        # hardware interface can finish retracting the column before we escalate.
+        stop_proc(ctx, k, timeout=stop_timeout_for(k), force_kill_patterns=SIM_STACK_PATTERNS)
 
 def install_global_cleanup(ctx: dict):
     # Solo instalar una vez
