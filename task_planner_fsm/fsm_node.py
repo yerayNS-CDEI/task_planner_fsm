@@ -360,6 +360,14 @@ class RobotFSMNode(Node):
 
 
 def main(args=None):
+    # Under `ros2 run` / `ros2 launch` stdout is a pipe, so Python block-buffers
+    # it and plain print() output only appears once several KB have piled up.
+    # Line buffering makes it show up as it happens, next to the logger output.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass  # not a regular text stream (e.g. already wrapped); nothing to do
+
     # Parse custom arguments before initializing rclpy
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(

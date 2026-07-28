@@ -1,3 +1,24 @@
+import sys
+
+
+def ask(node, state_name, question):
+    """Ask the operator a question on stdin and return the stripped answer.
+
+    The question is emitted through the ROS logger and the prompt marker through
+    stderr -- deliberately NOT as the ``input()`` prompt. The FSM is normally run
+    under ``ros2 run``/``ros2 launch``, where stdout is a pipe and therefore
+    block-buffered, so a bare ``input()`` prompt (no trailing newline) is never
+    flushed: the operator sees nothing and a state blocked on input looks like a
+    hung FSM. Logger records and the flushed stderr marker always reach the
+    console, next to the rest of the FSM output.
+    """
+    node.get_logger().info(f"[{state_name}] {question}")
+    sys.stdout.flush()
+    sys.stderr.write(f"[{state_name}] >> ")
+    sys.stderr.flush()
+    return input().strip()
+
+
 class State:
     def __init__(self, name):
         self.name = name
@@ -34,9 +55,11 @@ class State:
         for i, option in enumerate(options, 1):
             node.get_logger().info(f"  {i}. {option}")
         while True:
-            raw = input(f"[{self.name}] Enter choice (1-{len(options)}): ").strip()
+            raw = ask(node, self.name, f"Enter choice (1-{len(options)}):")
             if raw.isdigit() and 1 <= int(raw) <= len(options):
                 self._user_choice = options[int(raw) - 1]
                 node.get_logger().info(f"[{self.name}] Transitioning to '{self._user_choice}'")
                 return self._user_choice
-            print(f"  Invalid choice. Enter a number between 1 and {len(options)}.")
+            node.get_logger().warn(
+                f"[{self.name}] Invalid choice. Enter a number between 1 and {len(options)}."
+            )
