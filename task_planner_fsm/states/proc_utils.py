@@ -389,14 +389,66 @@ def wait_stack_ready(
         node.get_logger().error(f"[stack-ready] Timed out after {timeout}s; no publisher on: {pending}")
     return False
 
-def _list_services(timeout: float = 4.0) -> set:
-    """Set of service names currently visible in the ROS graph, via the ros2 CLI."""
+def _list_services(timeout: float = 4.0) -> Dict[str, str]:
+    """Map of service name -> type for every service visible in the ROS graph.
+
+    NOTE: a name here does NOT mean a server exists. ``ros2 service list`` reports
+    every service name in the graph, including names that only ever had *clients*
+    (the planner's collision clients are enough to make the name show up). Use it
+    to resolve a service's type, never as a readiness check — see
+    ``wait_services_ready``.
+    """
     try:
-        r = subprocess.run(['ros2', 'service', 'list'],
+        r = subprocess.run(['ros2', 'service', 'list', '-t'],
                            capture_output=True, text=True, timeout=timeout)
-        return {line.strip() for line in r.stdout.splitlines() if line.strip()}
     except Exception:
-        return set()
+        return {}
+    services = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # "-t" formats as "/name [pkg/srv/Type]"; keep the bare name too so a
+        # missing type never hides an otherwise-present service.
+        name, _, types = line.partition(' [')
+        services[name.strip()] = types.strip(' []').split(',')[0].strip()
+    return services
+
+
+def _server_available(ctx: dict, service_name: str, service_type: str) -> bool:
+    """True only if an actual server for `service_name` is reachable.
+
+    Creates (and caches in `ctx`) an rclpy client and asks rcl whether a server
+    matched it. Unlike a graph-name lookup this cannot be satisfied by other
+    nodes' clients, and unlike a service *call* it needs no spinning executor —
+    ``Client.service_is_ready()`` is a pure graph query, so it is safe on the
+    FSM's blocking startup path.
+    """
+    node = ctx.get("node")
+    if node is None or not service_type:
+        return False
+    clients = ctx.setdefault("_readiness_clients", {})
+    client = clients.get(service_name)
+    if client is None:
+        try:
+            from rosidl_runtime_py.utilities import get_service
+            client = node.create_client(get_service(service_type), service_name)
+        except Exception as exc:
+            node.get_logger().warn(
+                f"[stack-ready] Cannot probe '{service_name}' (type '{service_type}'): {exc}"
+            )
+            return False
+        clients[service_name] = client
+    return client.service_is_ready()
+
+
+def _destroy_readiness_clients(ctx: dict) -> None:
+    node = ctx.get("node")
+    for client in ctx.pop("_readiness_clients", {}).values():
+        try:
+            node.destroy_client(client)
+        except Exception:
+            pass
 
 
 def wait_services_ready(
@@ -405,38 +457,52 @@ def wait_services_ready(
     timeout: float = 60.0,
     poll_interval: float = 2.0,
 ) -> bool:
-    """Block until every service in `required_services` is present in the graph.
+    """Block until every service in `required_services` has a live *server*.
 
     Complements ``wait_stack_ready`` for parts of the stack that expose no topic
     to gate on — notably the collision-checking service, which loses a startup
     race under load often enough that the FSM must wait for it explicitly instead
     of proceeding while the planner silently runs without collision validation.
 
-    Uses the ``ros2 service list`` CLI so it works even while the FSM node's own
-    executor is blocked inside this call. Returns True if all services appeared
-    within `timeout`, False otherwise.
+    Presence of the name in the graph is deliberately NOT the criterion: the arm
+    planner creates its collision clients at construction, which publishes the
+    name to the graph even when the collision node is hung in its constructor and
+    has advertised nothing. Gating on the name let the FSM declare the stack ready
+    ~1s in while every later collision check timed out. Probe for a matched server
+    instead. Returns True if all services appeared within `timeout`, else False.
     """
     node = ctx.get("node")
     pending = list(required_services)
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        available = _list_services()
-        still_pending = []
-        for svc in pending:
-            if svc in available:
-                if node:
-                    node.get_logger().info(f"[stack-ready] service '{svc}' is available.")
-            else:
-                still_pending.append(svc)
-        pending = still_pending
-        if not pending:
-            return True
+    try:
+        while time.time() < deadline:
+            graph = _list_services()
+            still_pending = []
+            for svc in pending:
+                if _server_available(ctx, svc, graph.get(svc, "")):
+                    if node:
+                        node.get_logger().info(f"[stack-ready] service '{svc}' has a live server.")
+                else:
+                    still_pending.append(svc)
+            pending = still_pending
+            if not pending:
+                return True
+            if node:
+                node.get_logger().info(f"[stack-ready] Still waiting for service server(s): {pending}")
+            time.sleep(poll_interval)
         if node:
-            node.get_logger().info(f"[stack-ready] Still waiting for service(s): {pending}")
-        time.sleep(poll_interval)
-    if node:
-        node.get_logger().error(f"[stack-ready] Timed out after {timeout}s; missing service(s): {pending}")
-    return False
+            unserved = [svc for svc in pending if svc in _list_services()]
+            node.get_logger().error(
+                f"[stack-ready] Timed out after {timeout}s; no server for service(s): {pending}."
+            )
+            if unserved:
+                node.get_logger().error(
+                    f"[stack-ready] {unserved} exist in the graph as client-only names, i.e. the "
+                    f"node that should serve them is hung or dead — check its process and log."
+                )
+        return False
+    finally:
+        _destroy_readiness_clients(ctx)
 
 
 def stop_all(ctx: dict) -> None:
