@@ -6,6 +6,7 @@ from ..utils.costmap_utils import (
     nav_bt_xml,
     reachable_wall_segments,
     publish_wall_segment_markers,
+    wall_parallel_goal,
 )
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import SpeedLimit
@@ -1322,12 +1323,18 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            # Reposition (sensors off, no press) to the segment start. Skipped
-            # when the base is already there — e.g. the first segment right
-            # after NavigateToTarget, or contiguous serpentine turnarounds.
+            # Slide along the wall to the segment start (sensors on, no press). The
+            # goal is made wall-parallel first: the arm is out, Nav2 plans against a
+            # base-only footprint, and the distance to the wall belongs to the arm's
+            # Z approach — the base keeps whatever standoff it already has. Skipped
+            # when it is already there: the first segment right after
+            # NavigateToTarget, or contiguous serpentine turnarounds.
             pos = ctx.get("base_position")
             skip_tol = float(ctx.get("segment_transit_skip_tol", 0.4))
             goal_xy = base_standoff_goal(ctx, self.name, seg_start)
+            goal_xy = wall_parallel_goal(
+                ctx, self.name, goal_xy, (pos.x, pos.y) if pos is not None else None
+            )
             if pos is not None and math.hypot(pos.x - goal_xy[0], pos.y - goal_xy[1]) <= skip_tol:
                 node.get_logger().info(
                     f"[{self.name}] Base already at segment {self._seg_idx + 1} start; "
@@ -1338,7 +1345,7 @@ class ScanWall(State):
                 return
             node.get_logger().info(
                 f"[{self.name}] Transit to segment {self._seg_idx + 1}/{len(self._segments)} "
-                f"start ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) (sensors off)."
+                f"start ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) (no press)."
             )
             if not self._send_base_goal(ctx, goal_xy):
                 return

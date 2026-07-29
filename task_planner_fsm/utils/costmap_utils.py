@@ -563,3 +563,80 @@ def base_standoff_goal(
     )
     publish_base_goal_markers(ctx, (tx, ty), (gx, gy), "fixed-standoff fallback")
     return (gx, gy)
+
+
+def wall_parallel_goal(ctx, state_name: str, goal_xy, current_xy) -> Tuple[float, float]:
+    """Strip the wall-ward component of a base goal, keeping only the slide ALONG
+    the wall.
+
+    ScanWall moves between wall segments with the arm already stretched out in the
+    unfolded_fsm pose, but Nav2 plans those moves against a base-only footprint
+    (NavigateToTarget switches the arm-inclusive hull off on arrival, see
+    set_arm_footprint_enabled), so a goal that is perfectly legal for the base can
+    still drive the sensor plate into the wall. The fix is a division of labour:
+    the base only ever slides parallel to the wall at whatever standoff it arrived
+    with, and the distance to the wall belongs to the ARM, which measures it with
+    the plate sensors and closes it along its own Z axis (ScanWall's arm_approach
+    seg-phase).
+
+    Goals that move AWAY from the wall are left alone — that direction can never
+    pinch the arm. Projected goals are re-validated against the costmap and pushed
+    further out along the exterior normal if they land somewhere the base cannot
+    stand; when even that fails the projected goal is returned anyway, so Nav2
+    rejects it and the caller skips the segment rather than driving into the wall.
+
+    Returns ``goal_xy`` unchanged when the wall normal or the current pose is
+    unknown. The RViz markers are re-published with the ORIGINAL goal in the red
+    'scan point' slot and the projected one in the green goal slot, so the
+    correction is visible on /fsm/base_goal_markers.
+    """
+    node = ctx["node"]
+    outward = _outward_dir(ctx)
+    if outward is None or current_xy is None:
+        node.get_logger().warn(
+            f"[{state_name}] Cannot make the base goal wall-parallel "
+            f"({'no wall normal' if outward is None else 'no base pose'}); sending it "
+            f"as-is — the stretched arm may close in on the wall."
+        )
+        return (float(goal_xy[0]), float(goal_xy[1]))
+
+    ox, oy = outward
+    gx, gy = float(goal_xy[0]), float(goal_xy[1])
+    cx, cy = float(current_xy[0]), float(current_xy[1])
+
+    # Displacement projected on the exterior normal: negative means the goal pulls
+    # the base toward the wall face, which is the component we drop.
+    normal_comp = (gx - cx) * ox + (gy - cy) * oy
+    if normal_comp >= -1e-3:
+        return (gx, gy)
+
+    px, py = gx - ox * normal_comp, gy - oy * normal_comp
+
+    costmap = ctx.get("global_costmap")
+    cost_threshold, max_offset = _search_knobs(ctx)
+    if costmap is not None:
+        cost = _cost_at(costmap, px, py)
+        if cost is None or not (0 <= cost < cost_threshold):
+            hit = nearest_free_along(costmap, px, py, ox, oy,
+                                     max_dist=max_offset, cost_threshold=cost_threshold)
+            if hit is None:
+                node.get_logger().warn(
+                    f"[{state_name}] Wall-parallel goal ({px:.2f}, {py:.2f}) is not "
+                    f"standable and nothing free lies further out within "
+                    f"{max_offset:.2f} m; sending it anyway so Nav2 rejects it rather "
+                    f"than the base closing in on the wall."
+                )
+            else:
+                px, py, pushed = hit
+                node.get_logger().info(
+                    f"[{state_name}] Wall-parallel goal was blocked; pushed "
+                    f"{pushed:.2f} m further out to ({px:.2f}, {py:.2f})."
+                )
+
+    node.get_logger().info(
+        f"[{state_name}] Base goal made wall-parallel: ({gx:.2f}, {gy:.2f}) -> "
+        f"({px:.2f}, {py:.2f}); dropped {abs(normal_comp):.2f} m of approach toward "
+        f"the wall (the arm covers that itself)."
+    )
+    publish_base_goal_markers(ctx, (gx, gy), (px, py), "wall-parallel transit")
+    return (px, py)
