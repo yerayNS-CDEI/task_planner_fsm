@@ -17,7 +17,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 import tf2_ros
 from rclpy.duration import Duration
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float32MultiArray, String
 
 from task_planner_fsm.machine import StateMachine
 from task_planner_fsm.states import (
@@ -310,6 +310,16 @@ class RobotFSMNode(Node):
             "/force_torque_sensor_broadcaster/wrench",
             self.ft_data_callback,
             ft_qos,
+        )
+        # Sensor-plate ranges from arm_control's arduino_sensors(_sim): six floats
+        # in metres, [C/U1, A/U2, B/U3] ultrasonic then [S1, S2, S3] ToF. The
+        # wall_parallel_controller consumes the same topic for its plane fit, but it
+        # only logs the resulting mean and is not running between segments, so
+        # ScanWall reads the raw frame instead: it drives the arm's Z approach to the
+        # wall and the retraction that clears the plate before the base slides to the
+        # next segment.
+        self.create_subscription(
+            Float32MultiArray, "/distance_sensors", self.distance_sensors_callback, 10
         )
         # Nav2 global costmap (latched) so states can project scan goals onto the
         # nearest cell the base can actually occupy. See costmap_utils.
@@ -1088,6 +1098,15 @@ class RobotFSMNode(Node):
         # Latest TCP wrench (tool0 frame). ScanWall reads ctx["ft_wrench"].force.z
         # to know when the GPR wheel is pressed against the wall.
         self.ctx["ft_wrench"] = msg.wrench
+
+    def distance_sensors_callback(self, msg: Float32MultiArray):
+        # Latest plate ranges + arrival time. ScanWall averages the valid ones to
+        # decide how far the arm must travel along its Z axis to sit at the
+        # commanded standoff from the wall; the timestamp lets it reject a frame
+        # left over from a reader that has since been stopped.
+        if len(msg.data) == 6:
+            self.ctx["plate_distances"] = [float(v) for v in msg.data]
+            self.ctx["plate_distances_stamp"] = time.time()
 
     def mapping_callback(self, msg):
         self.ctx["map_ready"] = msg.data

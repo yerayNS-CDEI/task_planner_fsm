@@ -28,6 +28,20 @@ from math import atan2, sin, cos
 import time
 import requests
 
+# Validity window (m) for each of the six plate ranges, in the publish order of
+# arm_control's arduino_sensors(_sim): [C/U1, A/U2, B/U3] ultrasonic then
+# [S1, S2, S3] ToF. Copied from wall_parallel_controller's valid_lo/valid_hi so
+# both nodes agree on which readings mean anything — keep them in sync. Mind the
+# ToF ceiling: at the standoff the base parks at, the plate is normally further
+# out than 0.258 m, so the reading that sizes the arm's approach is ultrasonic-only.
+PLATE_SENSOR_VALID_LO = (0.02, 0.02, 0.02, 0.011, 0.011, 0.011)
+PLATE_SENSOR_VALID_HI = (3.90, 3.90, 3.90, 0.258, 0.258, 0.258)
+
+# Oldest /distance_sensors frame (s) still trusted as a live measurement. The
+# reader publishes at ~5 Hz, so anything older means it died or was stopped.
+PLATE_DISTANCE_MAX_AGE_S = 3.0
+
+
 class ScanWall(State):
     def __init__(self, name):
         super().__init__(name)
@@ -88,9 +102,26 @@ class ScanWall(State):
         # where a base cell exists within arm reach (reachable_wall_segments);
         # each segment is swept press->release, unreachable gaps are skipped by
         # transiting (sensors off) to the next segment.
+        #
+        # Base and arm own different axes. The base only ever slides PARALLEL to
+        # the wall, at whatever standoff it arrived with (wall_parallel_goal strips
+        # the wall-ward component off every transit goal); the distance to the wall
+        # belongs to the arm, which measures it with the plate sensors and travels
+        # along its own Z axis. Hence the phase order per segment:
+        #   transit_clear(_wait)  retract the plate to a safe gap before the base moves
+        #   transit(_wait)   slide along the wall to the segment start
+        #   park             square the chassis against the wall
+        #   sweep_setup      cap the base speed for the sweep
+        #   arm_approach(_wait)  extend the arm to scan_wall_plate_offset from the wall
+        #   press_prepare    alignment controller + force-mode press
+        #   press_settle     wait for the FT sensor to confirm wall contact
+        #   sweep_wait       the actual scan
         self._segments = None        # [((sx,sy,z),(ex,ey,z)), ...] robot-end first
         self._seg_idx = 0
-        self._seg_phase = "transit"  # transit|transit_wait|park|sweep_setup|press_settle|sweep_wait
+        self._seg_phase = "transit_clear"
+        self._arm_goal_pub = None        # /arm/goal_pose publisher (created once)
+        self._arm_goal_start = None      # planner wait deadline for the Z move
+        self._plate_wait_start = None    # bounded wait for the first plate reading
         self._segments_ok = 0        # segments actually swept on this line
         self._last_swept_point = None
         self._nav_status = None      # set by _on_nav_result / rejection / crawl tick
@@ -173,7 +204,9 @@ class ScanWall(State):
         self._costmap_wait_start = None
         self._segments = None
         self._seg_idx = 0
-        self._seg_phase = "transit"
+        self._seg_phase = "transit_clear"
+        self._arm_goal_start = None
+        self._plate_wait_start = None
         self._segments_ok = 0
         self._last_swept_point = None
         self._nav_status = None
@@ -203,11 +236,14 @@ class ScanWall(State):
                 ctx["error_triggered"] = True
                 return
 
-        # NOTE: the alignment processes (distance sensors + wall_parallel_controller)
-        # and, on the real robot, force_mode are intentionally NOT started here. They
-        # are activated only once the arm is pre-positioned at the line height and the
-        # base is about to actively scan (see _start_arm_processes / _start_force_mode,
-        # called from the scan phase).
+        # NOTE: nothing that touches the arm is started here. The distance-sensor
+        # reader comes up at the end of the pre-approach, once the arm is unfolded at
+        # the line height, because every base move from then on is sized by a
+        # measured plate clearance (_start_distance_sensors). The
+        # wall_parallel_controller and, on the real robot, force_mode start later
+        # still — only after the arm's own Z approach has finished, since that node
+        # streams IK setpoints and would fight the approach goal
+        # (_start_wall_alignment / _start_force_mode, from the press_prepare phase).
 
     # ------------------------------------------------------------------
     # Per-line resolution
@@ -232,26 +268,45 @@ class ScanWall(State):
     # ------------------------------------------------------------------
     # Arm process control (scan phase only)
     # ------------------------------------------------------------------
-    def _start_arm_processes(self, ctx):
-        """Activate the distance-sensor reader + wall_parallel_controller for the
-        active scan. Sim uses the simulated sensors; real uses the Arduino reader.
+    def _start_distance_sensors(self, ctx):
+        """Activate the distance-sensor reader alone. Sim uses the simulated
+        sensors; real uses the Arduino reader.
+
+        Split out of the alignment controller and started as soon as the arm is
+        unfolded, because its /distance_sensors frames are what size every arm Z
+        move — including the retraction that clears the plate BEFORE the base
+        slides to the next segment, which happens long before the controller runs.
         """
-        node = ctx["node"]
         use_sim = bool(ctx.get("sim", False))
         if use_sim:
             sensor_cmd = ["ros2", "run", "arm_control", "arduino_sensors_sim", "--ros-args",
                           "-p", "autostart:=true", "-p", "publish_rate:=5.0", "-p", "batch_size:=2"]
             sensor_name = "arduino_sensors_sim"
         else:
-            sensor_cmd = ["ros2", "run", "arm_control", "arduino_sensors", 
+            sensor_cmd = ["ros2", "run", "arm_control", "arduino_sensors",
                           "--ros-args", "-p", "autostart:=true",]
             sensor_name = "arduino_sensors"
-        arm_procs = [
-            ("arduino_sensors_proc", sensor_cmd, sensor_name),
+        return self._start_arm_procs(
+            ctx, [("arduino_sensors_proc", sensor_cmd, sensor_name)]
+        )
+
+    def _start_wall_alignment(self, ctx):
+        """Activate the wall_parallel_controller for the sweep.
+
+        Deliberately NOT started with the sensors: the controller streams IK
+        setpoints continuously, so while it runs nothing else may command the arm.
+        It comes up only after the arm's Z approach has finished (press_prepare),
+        never during the approach or a transit.
+        """
+        return self._start_arm_procs(ctx, [
             ("wall_parallel_proc",
-             ["ros2", "run", "arm_control", "wall_parallel_controller", "--ros-args", "-p", "control_rate:=2.0"],
+             ["ros2", "run", "arm_control", "wall_parallel_controller", "--ros-args",
+              "-p", "control_rate:=2.0"],
              "wall_parallel_controller"),
-        ]
+        ])
+
+    def _start_arm_procs(self, ctx, arm_procs):
+        node = ctx["node"]
         for proc_key, cmd_args, proc_name in arm_procs:
             if ctx.get(proc_key) and ctx[proc_key].poll() is None:
                 node.get_logger().info(f"[{self.name}] '{proc_name}' ya estaba activo (pid={ctx[proc_key].pid}).")
@@ -275,12 +330,17 @@ class ScanWall(State):
                     return False
         return True
 
-    def _stop_arm_processes(self, ctx):
+    def _stop_arm_processes(self, ctx, keep_sensors=False):
+        """Stop the alignment controller and, unless ``keep_sensors``, the reader.
+
+        Between segments the reader stays up: the plate distance is still needed to
+        retract the arm before the base slides along the wall.
+        """
         node = ctx["node"]
-        for proc_key, proc_name in [
-            ("arduino_sensors_proc", "distance sensors"),
-            ("wall_parallel_proc",   "wall_parallel_controller"),
-        ]:
+        procs = [("wall_parallel_proc", "wall_parallel_controller")]
+        if not keep_sensors:
+            procs.append(("arduino_sensors_proc", "distance sensors"))
+        for proc_key, proc_name in procs:
             proc = ctx.get(proc_key)
             if proc and proc.poll() is None:
                 node.get_logger().info(f"[{self.name}] Deteniendo '{proc_name}'...")
@@ -293,9 +353,211 @@ class ScanWall(State):
             ctx[proc_key] = None
 
     # ------------------------------------------------------------------
+    # Arm Z moves: the ARM, not the base, owns the distance to the wall
+    # ------------------------------------------------------------------
+    def _plate_wall_distance(self, ctx):
+        """Mean plate-to-wall distance (m) from the last /distance_sensors frame,
+        or None when there is no usable reading.
+
+        Averages whichever of the six ranges are inside their validity window.
+        A single valid reading is enough — wall_parallel_controller insists on
+        three because it fits a *plane*, but a plain standoff needs no fit.
+        """
+        readings = ctx.get("plate_distances")
+        stamp = ctx.get("plate_distances_stamp")
+        if not readings or len(readings) != 6 or stamp is None:
+            return None
+        if time.time() - float(stamp) > PLATE_DISTANCE_MAX_AGE_S:
+            return None
+        valid = [
+            d
+            for d, lo, hi in zip(readings, PLATE_SENSOR_VALID_LO, PLATE_SENSOR_VALID_HI)
+            if math.isfinite(d) and lo < d < hi
+        ]
+        if not valid:
+            return None
+        return sum(valid) / len(valid)
+
+    def _tool0_pose(self, ctx):
+        """(translation, rotation) of the plate TCP in the arm planning frame, or
+        None. Read from TF rather than /end_effector_pose: that topic ticks at 1 Hz
+        and goes stale, which is exactly why wall_parallel_controller reads TF too.
+        """
+        tf_buffer = ctx.get("tf_buffer")
+        if tf_buffer is None:
+            return None
+        base_frame = str(ctx.get("arm_base_frame", "arm_base"))
+        tool_frame = str(ctx.get("arm_tool_frame", "arm_tool0"))
+        try:
+            if not tf_buffer.can_transform(
+                base_frame, tool_frame, rclpy.time.Time(), Duration(seconds=1.0)
+            ):
+                return None
+            tf = tf_buffer.lookup_transform(
+                base_frame, tool_frame, rclpy.time.Time(), Duration(seconds=1.0)
+            )
+        except Exception as e:
+            ctx["node"].get_logger().warn(
+                f"[{self.name}] {base_frame}->{tool_frame} lookup failed: {e}"
+            )
+            return None
+        return tf.transform.translation, tf.transform.rotation
+
+    @staticmethod
+    def _tool_z_axis(q):
+        """Unit +Z axis of a quaternion-oriented frame, in the parent frame (the
+        third column of its rotation matrix). That axis is the one the plate
+        sensors measure along and the one force_mode presses along, so an arm move
+        along it is a pure approach to / retreat from the wall face."""
+        return (
+            2.0 * (q.x * q.z + q.w * q.y),
+            2.0 * (q.y * q.z - q.w * q.x),
+            1.0 - 2.0 * (q.x * q.x + q.y * q.y),
+        )
+
+    def _send_arm_z_goal(self, ctx, advance):
+        """Send the arm a pose goal ``advance`` metres along the plate's +Z axis
+        from where it is now, orientation untouched. Positive advances move toward
+        the wall, negative retract. Returns True once published.
+
+        Goes out on /arm/goal_pose — the legacy planner_node's Cartesian goal topic,
+        which plans in the arm_base frame and reports back on the same
+        /execution_status + /planner/goal_failed pair the pre-approach waits on.
+        Note the legacy backend has no LIN planner: it runs IK and plans in joint
+        space, so the EE path is only approximately straight. Fine over the few
+        centimetres these moves cover.
+        """
+        node = ctx["node"]
+        pose = self._tool0_pose(ctx)
+        if pose is None:
+            node.get_logger().error(
+                f"[{self.name}] No arm TF available; cannot place the Z goal."
+            )
+            return False
+        p, q = pose
+        zx, zy, zz = self._tool_z_axis(q)
+
+        if self._arm_goal_pub is None:
+            topic = str(ctx.get("arm_goal_pose_topic", "/arm/goal_pose"))
+            self._arm_goal_pub = node.create_publisher(PoseStamped, topic, 10)
+
+        msg = PoseStamped()
+        msg.header.frame_id = str(ctx.get("arm_base_frame", "arm_base"))
+        msg.header.stamp = node.get_clock().now().to_msg()
+        msg.pose.position.x = p.x + zx * advance
+        msg.pose.position.y = p.y + zy * advance
+        msg.pose.position.z = p.z + zz * advance
+        msg.pose.orientation = q
+        # Same handshake the named-pose pre-approach uses: the planner flips
+        # /execution_status when the motion completes, /planner/goal_failed if it
+        # cannot plan. Clear both before publishing so a stale flag is not read as
+        # this goal's result.
+        ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
+        self._arm_goal_pub.publish(msg)
+        node.get_logger().info(
+            f"[{self.name}] Arm Z goal: {advance:+.3f} m along the plate normal -> "
+            f"({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f}, "
+            f"{msg.pose.position.z:.3f}) in {msg.header.frame_id}."
+        )
+        return True
+
+    def _send_arm_to_clearance(self, ctx, target, contact_default=False):
+        """Move the plate so it ends up ``target`` metres off the wall.
+
+        Returns "sent" once a goal is out, "skip" when the move is unnecessary or
+        cannot be sized, or "wait" while still waiting for a first sensor frame.
+
+        With ``contact_default`` the plate is assumed to be ON the wall when no
+        reading is usable — true after a force-mode press, where the ranges sit
+        below their valid_lo floor. Everywhere else a missing reading means no
+        move at all: retracting blind is survivable, but advancing blind is not,
+        and the two share this path.
+        """
+        node = ctx["node"]
+        d = self._plate_wall_distance(ctx)
+        if d is None:
+            if contact_default:
+                d = 0.0
+                node.get_logger().info(
+                    f"[{self.name}] No valid plate reading (expected: the plate is "
+                    f"pressed against the wall); assuming 0.00 m for the retraction."
+                )
+            else:
+                timeout = float(ctx.get("scan_wall_plate_reading_timeout_s", 15.0))
+                now = time.time()
+                if self._plate_wait_start is None:
+                    self._plate_wait_start = now
+                    node.get_logger().info(
+                        f"[{self.name}] Waiting up to {timeout:.0f}s for a plate "
+                        f"distance reading on /distance_sensors..."
+                    )
+                    return "wait"
+                if now - self._plate_wait_start < timeout:
+                    return "wait"
+                node.get_logger().warn(
+                    f"[{self.name}] No plate distance after {timeout:.0f}s; skipping "
+                    f"the arm Z move rather than travelling blind toward the wall."
+                )
+                self._plate_wait_start = None   # so the next segment waits afresh
+                return "skip"
+
+        self._plate_wait_start = None
+        advance = d - float(target)
+        max_step = float(ctx.get("scan_wall_arm_z_max_step", 0.6))
+        if abs(advance) > max_step:
+            node.get_logger().warn(
+                f"[{self.name}] Arm Z move of {advance:+.3f} m exceeds the "
+                f"{max_step:.2f} m safety step; clamping."
+            )
+            advance = math.copysign(max_step, advance)
+        if abs(advance) < 0.01:
+            node.get_logger().info(
+                f"[{self.name}] Plate already {d:.3f} m off the wall (target "
+                f"{target:.2f} m); no arm move needed."
+            )
+            return "skip"
+
+        node.get_logger().info(
+            f"[{self.name}] Plate measured {d:.3f} m off the wall; moving the arm "
+            f"{advance:+.3f} m to sit at {target:.2f} m."
+        )
+        return "sent" if self._send_arm_z_goal(ctx, advance) else "skip"
+
+    def _arm_goal_settled(self, ctx):
+        """True once the planner reports the Z move finished, failed, or ran out of
+        time. Failures are logged and swallowed: the press and its own bounded
+        contact wait degrade gracefully, so a planner hiccup should not strand the
+        whole wall."""
+        node = ctx["node"]
+        timeout = float(ctx.get("scan_wall_arm_goal_timeout_s", 60.0))
+        now = time.time()
+        if self._arm_goal_start is None:
+            self._arm_goal_start = now
+
+        if ctx.get("planner_goal_failed"):
+            ctx["planner_goal_failed"] = False
+            node.get_logger().warn(
+                f"[{self.name}] Planner could not reach the arm Z goal; continuing "
+                f"from the current pose."
+            )
+            return True
+        if ctx.get("execution_status") is True:
+            ctx["execution_status"] = False
+            node.get_logger().info(f"[{self.name}] Arm Z move complete.")
+            return True
+        if now - self._arm_goal_start >= timeout:
+            node.get_logger().warn(
+                f"[{self.name}] Arm Z move did not report completion after "
+                f"{timeout:.0f}s; continuing anyway."
+            )
+            return True
+        return False
+
+    # ------------------------------------------------------------------
     # Force mode (real robot only): GPR press against the wall
     # ------------------------------------------------------------------
-    def _build_force_mode_request(self):
+    def _build_force_mode_request(self, ctx):
         """Press the GPR (offset -0.08 m in tool0 X) against the wall with 5 N
         along the task-frame Z; only Z is compliant so the sensor alignment keeps
         full control of orientation."""
@@ -307,7 +569,13 @@ class ScanWall(State):
         req.wrench.force.z = 5.0
         req.type = 2                           # NO_TRANSFORM (task frame as given)
         req.speed_limits.linear.z = 0.1
-        req.deviation_limits = [0.1, 0.1, 0.15, 0.1, 0.1, 0.1]
+        # The Z deviation limit is what the press is allowed to travel, so it must
+        # cover the gap the arm's approach deliberately leaves (scan_wall_plate_offset)
+        # plus a margin. Sized from that knob rather than fixed: raising the offset
+        # without raising this would leave force_mode short of the wall, and
+        # _wall_contact_ready would burn its timeout and sweep without contact.
+        press_reach = float(ctx.get("scan_wall_plate_offset", 0.20)) + 0.05
+        req.deviation_limits = [0.1, 0.1, max(0.15, press_reach), 0.1, 0.1, 0.1]
         req.damping_factor = 0.025
         req.gain_scaling = 0.5
         return req
@@ -334,7 +602,7 @@ class ScanWall(State):
             self.fail(ctx, "force-mode controller service unavailable")
             return
         node.get_logger().info(f"[{self.name}] Starting force mode (GPR press 5N on Z).")
-        fut = self.force_mode_start_client.call_async(self._build_force_mode_request())
+        fut = self.force_mode_start_client.call_async(self._build_force_mode_request(ctx))
         fut.add_done_callback(lambda f: self._log_force_mode_result(node, f, "start"))
         self.force_mode_active = True
 
@@ -867,6 +1135,12 @@ class ScanWall(State):
                 self.fail(ctx, "column did not reach the target height in time")
             return
 
+        # The arm is out and at line height, so from here on every base move needs a
+        # measured plate clearance — including the very first transit. Bring the
+        # reader up now and leave it up for the whole line; the alignment controller
+        # still waits until the sweep (see _start_wall_alignment).
+        self._start_distance_sensors(ctx)
+
         self.preapproach_done = True
         node.get_logger().info(f"[{self.name}] Pre-approach complete. Arm in scanning position.")
 
@@ -985,7 +1259,7 @@ class ScanWall(State):
                 return
             self._segments = segments
             self._seg_idx = 0
-            self._seg_phase = "transit"
+            self._seg_phase = "transit_clear"
             self._segments_ok = 0
             publish_wall_segment_markers(ctx, segments)
             node.get_logger().info(
@@ -1003,6 +1277,43 @@ class ScanWall(State):
 
         seg_start, seg_end = self._segments[self._seg_idx]
         seg_no, seg_total = self._seg_idx + 1, len(self._segments)
+
+        if self._seg_phase == "transit_clear":
+            # Pull the plate back before ANY base motion. The arm has been stretched
+            # out since the pre-approach, and the transit slides the whole robot
+            # sideways along the wall — at the gap the previous sweep left (roughly
+            # zero, the plate was pressed against the wall) that drags the plate
+            # along the surface. Retract to scan_wall_transit_plate_offset first.
+            self.set_activity(
+                ctx,
+                f"Retracting the arm clear of the wall before moving to segment "
+                f"{seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            target = float(ctx.get("scan_wall_transit_plate_offset", 0.40))
+            # After a sweep the plate sits against the wall with its ranges below
+            # their valid floor, so a missing reading there means "in contact", not
+            # "unknown" — but only from the second segment on. Before the first
+            # transit nothing has touched the wall yet and no such assumption holds.
+            outcome = self._send_arm_to_clearance(
+                ctx, target, contact_default=self._segments_ok > 0
+            )
+            if outcome == "wait":
+                return
+            if outcome == "sent":
+                self._arm_goal_start = None
+                self._seg_phase = "transit_clear_wait"
+                return
+            self._seg_phase = "transit"
+            return
+
+        if self._seg_phase == "transit_clear_wait":
+            if not self._arm_goal_settled(ctx):
+                return
+            self._arm_goal_start = None
+            self._seg_phase = "transit"
+            return
 
         if self._seg_phase == "transit":
             self.set_activity(
@@ -1046,7 +1357,7 @@ class ScanWall(State):
                     f"(status={self._nav_status}); skipping this segment."
                 )
                 self._seg_idx += 1
-                self._seg_phase = "transit"
+                self._seg_phase = "transit_clear"
             return
 
         if self._seg_phase == "park":
@@ -1068,6 +1379,53 @@ class ScanWall(State):
             return
 
         if self._seg_phase == "sweep_setup":
+            self.set_activity(
+                ctx,
+                f"Preparing the sweep of wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            # Nav2 route: cap the base to a crawl speed + relax the progress checker
+            # NOW, so the async param change has propagated by the time the base
+            # sweeps (the arm approach + stabilise wait below cover it). Skipped when
+            # the /cmd_vel crawl is selected (it sets its own speed).
+            if not bool(ctx.get("sweep_use_crawl", False)):
+                self._apply_sweep_speed(ctx)
+            self._seg_phase = "arm_approach"
+            return
+
+        if self._seg_phase == "arm_approach":
+            # The base is parked and will not move again until the sweep, so the arm
+            # closes the remaining distance itself: measure the plate standoff and
+            # travel along the plate's Z axis until only scan_wall_plate_offset is
+            # left for force_mode to press through. Runs BEFORE the alignment
+            # controller comes up — that node streams IK setpoints continuously, so
+            # nothing else may command the arm while it runs.
+            self.set_activity(
+                ctx,
+                f"Extending the arm toward wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            target = float(ctx.get("scan_wall_plate_offset", 0.20))
+            outcome = self._send_arm_to_clearance(ctx, target)
+            if outcome == "wait":
+                return
+            if outcome == "sent":
+                self._arm_goal_start = None
+                self._seg_phase = "arm_approach_wait"
+                return
+            self._seg_phase = "press_prepare"
+            return
+
+        if self._seg_phase == "arm_approach_wait":
+            if not self._arm_goal_settled(ctx):
+                return
+            self._arm_goal_start = None
+            self._seg_phase = "press_prepare"
+            return
+
+        if self._seg_phase == "press_prepare":
             # Force mode is a real-robot-only press (no controller exists in sim),
             # so only mention it when it will actually run.
             self.set_activity(
@@ -1082,14 +1440,12 @@ class ScanWall(State):
                 f"[{self.name}] Segment {self._seg_idx + 1}/{len(self._segments)}: "
                 f"activating alignment + press for the sweep."
             )
-            # Nav2 route: cap the base to a crawl speed + relax the progress checker
-            # NOW, so the async param change has propagated by the time the base
-            # sweeps (the 10 s arm-stabilise wait below covers it). Skipped when the
-            # /cmd_vel crawl is selected (it sets its own speed).
-            if not bool(ctx.get("sweep_use_crawl", False)):
-                self._apply_sweep_speed(ctx)
-            # Activate sensor alignment now that the base is at the segment start.
-            if not self._start_arm_processes(ctx):
+            # The reader has been up since the pre-approach; this is a no-op unless it
+            # died. The alignment controller starts only now, with the arm already at
+            # its approach pose and no other goal in flight.
+            if not self._start_distance_sensors(ctx):
+                return
+            if not self._start_wall_alignment(ctx):
                 return
             node.get_logger().info(f"[{self.name}] Waiting 10s for arm processes to stabilise...")
             time.sleep(10.0)
@@ -1168,7 +1524,11 @@ class ScanWall(State):
             )
             self._gpr_stop_line_and_measurement(ctx)   # stop line + measurement before releasing the press
             self._stop_force_mode(ctx)      # release the press before the arm retracts
-            self._stop_arm_processes(ctx)
+            # Keep the reader running: the next segment's transit_clear needs the
+            # plate distance to retract the arm before the base moves. Only the
+            # alignment controller has to go, so the retraction goal is not fighting
+            # its IK stream.
+            self._stop_arm_processes(ctx, keep_sensors=True)
             time.sleep(2)   # delay to avoid errors in the arm goals
 
             if status == GoalStatus.STATUS_SUCCEEDED:
@@ -1180,7 +1540,7 @@ class ScanWall(State):
                     f"(status={status}); skipping to the next segment."
                 )
             self._seg_idx += 1
-            self._seg_phase = "transit"
+            self._seg_phase = "transit_clear"
             return
 
     def _finalize_line(self, ctx):
