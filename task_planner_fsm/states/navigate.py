@@ -265,9 +265,9 @@ class NavigateToTarget(State):
             )
 
     # EE scan standoff baked into the scan line by _build_wall_data (offset=0.6).
-    SCAN_OFFSET_M = 0.4
+    SCAN_OFFSET_M = 0.2
     # Default base-center distance from the wall face (> robot_radius+inflation).
-    DEFAULT_BASE_STANDOFF_M = 1.3
+    DEFAULT_BASE_STANDOFF_M = 1.0
     # Pose-verification gate before hand-off to ArmUnfolding/WallParallel: the
     # base must actually be at the standoff pose, not just "nav reported done".
     # ctx/ROS params nav_pos_tolerance / nav_yaw_tolerance / nav_pose_max_retries

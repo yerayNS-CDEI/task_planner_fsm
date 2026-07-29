@@ -24,7 +24,7 @@ ARM_FOOTPRINT_TOPIC = "/dynamic_footprint/enable_arm_expansion"
 
 # How long a state polls for the global costmap to cover a scan target before
 # giving up and sending the goal anyway (with the fixed-standoff fallback).
-COSTMAP_WAIT_TIMEOUT_S = 20.0
+COSTMAP_WAIT_TIMEOUT_S = 2.0
 
 # Nearest-free search knobs, overridable per launch via ROS params of the same
 # name (fsm_node bridges any param override into ctx).
@@ -41,7 +41,7 @@ COSTMAP_WAIT_TIMEOUT_S = 20.0
 #   cruised 1.45-1.50 m off the scan line through an inflated stretch).
 #   Corner-blocked wall ends are handled by segmentation trimming, not by
 #   inflating this cap.
-DEFAULT_COST_THRESHOLD = 80
+DEFAULT_COST_THRESHOLD = 90
 DEFAULT_MAX_OFFSET = 1.3
 
 # Minimum base-center distance from the wall FACE (m). Hard clamp applied on top
@@ -53,7 +53,7 @@ DEFAULT_MAX_OFFSET = 1.3
 # Override per launch with the ``min_base_standoff`` ctx/ROS param; 0 disables
 # the clamp (pure nearest-free). Always capped by arm reach: the enforced
 # distance can never exceed scan_offset + base_goal_max_offset.
-DEFAULT_MIN_STANDOFF = 1.0
+DEFAULT_MIN_STANDOFF = 0.75
 
 
 def _search_knobs(ctx) -> Tuple[int, float]:
