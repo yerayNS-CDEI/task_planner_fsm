@@ -40,6 +40,7 @@ class BasePlacementComputation(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Computing where to park the base alongside the wall")
 
         if ctx.get("base_placement_computed") or ctx.get("error_triggered"):
             return
@@ -47,12 +48,13 @@ class BasePlacementComputation(State):
         target = ctx.get("current_drill_target")
         if target is None:
             node.get_logger().error(f"[{self.name}] No current_drill_target in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no drilling target selected")
             return
 
         base = ctx.get("base_position")
         if base is None:
             node.get_logger().warn(f"[{self.name}] Waiting for odometry (base_position)...")
+            self.set_activity(ctx, "Waiting for odometry before computing the base pose")
             return
 
         wall_x, wall_y = float(target[0]), float(target[1])
@@ -74,7 +76,11 @@ class BasePlacementComputation(State):
                 f"detected_walls.yaml matches the current map (set 'detected_walls_yaml' "
                 f"to override)."
             )
-            ctx["error_triggered"] = True
+            self.fail(
+                ctx,
+                f"the drill point ({wall_x:.2f}, {wall_y:.2f}) matches no wall in "
+                f"detected_walls.yaml",
+            )
             return
 
         # Along-wall unit direction straight from the wall endpoints.
@@ -85,7 +91,10 @@ class BasePlacementComputation(State):
             node.get_logger().error(
                 f"[{self.name}] Associated wall {wall.get('id')} has degenerate endpoints."
             )
-            ctx["error_triggered"] = True
+            self.fail(
+                ctx,
+                f"the associated wall (id={wall.get('id')}) has degenerate endpoints",
+            )
             return
         ux, uy = ux / u_len, uy / u_len
         # Outward normal toward the robot, taken as the perpendicular of the

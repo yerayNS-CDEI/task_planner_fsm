@@ -11,6 +11,7 @@ class Finished(State):
         pass
 
     def run(self, ctx):
+        self.set_activity(ctx, "All drilling tasks completed; robot idle")
         if not self.verbose:
             print(f"[{self.name}] All tasks completed.")
             self.verbose = True

@@ -52,6 +52,9 @@ class Drilling(State):
         self.latest_joints = None
         self.control_timer = None
         self.outcome = None  # None | "reached" | "not_drillable" | "error"
+        # Concrete cause recorded by _control_step when outcome == "error"; run()
+        # hands it to self.fail so the panel shows why drilling was abandoned.
+        self.error_reason = None
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -87,6 +90,7 @@ class Drilling(State):
         # ── Per-run state ──
         self.latest_joints = None
         self.outcome = None
+        self.error_reason = None
         self.phase = "feeding"  # "feeding" | "retracting"
         self.started = False
         self.enter_time = time.time()
@@ -166,6 +170,10 @@ class Drilling(State):
                         f"[{self.name}] Gantry not ready after {self.command_timeout:.0f}s "
                         f"(joint states / gantry_position_controller subscriber missing)."
                     )
+                    self.error_reason = (
+                        f"the gantry was not ready after {self.command_timeout:.0f} s "
+                        f"(no joint states or no gantry_position_controller)"
+                    )
                     self.outcome = "error"
                 else:
                     node.get_logger().warn(
@@ -189,6 +197,10 @@ class Drilling(State):
                 node.get_logger().error(
                     f"[{self.name}] Stage 4 already at its travel limit "
                     f"({self.start_slide:.3f} m); cannot drill. Check the approach pose."
+                )
+                self.error_reason = (
+                    f"the drill slide is already at its travel limit "
+                    f"({self.start_slide:.3f} m), leaving no depth to drill"
                 )
                 self.outcome = "error"
                 return
@@ -316,11 +328,54 @@ class Drilling(State):
                     f"drilling complete."
                 )
                 self._logged_outcome = True
+            self.set_activity(
+                ctx,
+                f"Hole drilled to {self.final_depth * 1000:.0f} mm",
+                progress_current=int(round(self.final_depth * 1000)),
+                progress_total=int(round(self.achievable_depth * 1000)),
+            )
             ctx["drill_success"] = True
         elif self.outcome == "not_drillable":
+            self.set_activity(
+                ctx,
+                "Material is not drillable; the bit has been pulled clear of the wall",
+                level="warn",
+            )
             ctx["material_not_drillable"] = True
         elif self.outcome == "error":
-            ctx["error_triggered"] = True
+            self.fail(ctx, self.error_reason or "the drilling feed could not be run")
+        else:
+            self._report_progress(ctx)
+
+    def _report_progress(self, ctx):
+        """Describe the live feed/retract for the panel (the motion itself is driven
+        by the high-rate _control_step timer, not by run())."""
+        if not self.started:
+            self.set_activity(ctx, "Waiting for the gantry before drilling")
+            return
+
+        slide_joint = self.joint_names[SLIDE_IDX]
+        actual = (self.latest_joints or {}).get(slide_joint)
+
+        if self.phase == "retracting":
+            self.set_activity(
+                ctx,
+                "Material is not drillable; pulling the bit clear of the wall",
+                level="warn",
+            )
+            return
+
+        if actual is None:
+            self.set_activity(ctx, "Drilling into the wall")
+            return
+        depth_mm = abs(float(actual) - self.start_slide) * 1000.0
+        total_mm = self.achievable_depth * 1000.0
+        self.set_activity(
+            ctx,
+            f"Drilling into the wall ({depth_mm:.0f} / {total_mm:.0f} mm)",
+            progress_current=int(round(depth_mm)),
+            progress_total=int(round(total_mm)),
+        )
 
     def check_transition(self, ctx):
         if ctx.get("error_triggered"):

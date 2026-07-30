@@ -25,17 +25,19 @@ class TargetSelection(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Selecting the nearest drilling target")
 
         # Robot's current position, from /rtabmap/odom (see fsm_node).
         base = ctx.get("base_position")
         if base is None:
             node.get_logger().warn(f"[{self.name}] Waiting for odometry (base_position)...")
+            self.set_activity(ctx, "Waiting for odometry before picking a target")
             return
 
         locations = ctx.get("drill_locations", [])
         if not locations:
             node.get_logger().error(f"[{self.name}] No drill_locations found in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no drilling locations available to choose from")
             return
 
         completed = set(ctx.get("completed_drill_indices", []))
@@ -63,7 +65,10 @@ class TargetSelection(State):
                 f"[{self.name}] All {len(locations)} drilling location(s) already "
                 f"selected; none left to drill."
             )
-            ctx["error_triggered"] = True
+            self.fail(
+                ctx,
+                f"all {len(locations)} drilling location(s) are already selected",
+            )
             return
 
         # Remember this location so it is not selected again.
@@ -74,6 +79,13 @@ class TargetSelection(State):
         ctx["target_selected"] = True
 
         remaining = len(locations) - len(completed)
+        self.set_activity(
+            ctx,
+            f"Selected drilling point {len(completed)}/{len(locations)} "
+            f"at ({selected_point[0]:.2f}, {selected_point[1]:.2f}, {selected_point[2]:.2f})",
+            progress_current=len(completed),
+            progress_total=len(locations),
+        )
         node.get_logger().info(
             f"[{self.name}] Selected drilling location #{selected_idx} at "
             f"({selected_point[0]:.3f}, {selected_point[1]:.3f}, {selected_point[2]:.3f}) "

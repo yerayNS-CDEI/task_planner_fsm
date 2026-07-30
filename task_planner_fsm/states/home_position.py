@@ -26,10 +26,14 @@ class HomePosition(State):
         self.goal_sent = False
         self.nav_done = False
         self.nav_failed = False
+        # Concrete cause recorded by the action callbacks; run() hands it to
+        # self.fail so the panel shows why the drive home gave up.
+        self.nav_fail_reason = None
         self._send_goal_future = None
         self._get_result_future = None
         self._goal_handle = None
         self._last_distance_log = None
+        self._distance_remaining = None
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -41,10 +45,12 @@ class HomePosition(State):
         self.goal_sent = False
         self.nav_done = False
         self.nav_failed = False
+        self.nav_fail_reason = None
         self._send_goal_future = None
         self._get_result_future = None
         self._goal_handle = None
         self._last_distance_log = None
+        self._distance_remaining = None
 
         action_name = str(ctx.get("nav_action_name", "/navigate_to_pose"))
         if self.nav_client is None:
@@ -56,7 +62,10 @@ class HomePosition(State):
             node.get_logger().error(
                 f"[{self.name}] {action_name} action server not available after {server_timeout:.0f}s."
             )
-            ctx["error_triggered"] = True
+            self.fail(
+                ctx,
+                f"the {action_name} action server was unavailable after {server_timeout:.0f} s",
+            )
             return
 
     def run(self, ctx):
@@ -66,6 +75,7 @@ class HomePosition(State):
             return
 
         if not self.goal_sent:
+            self.set_activity(ctx, "Sending the base goal to the home pose")
             self._send_goal(ctx)
             return
 
@@ -73,10 +83,21 @@ class HomePosition(State):
             node = ctx["node"]
             if self.nav_failed:
                 node.get_logger().error(f"[{self.name}] Navigation failed to reach the home pose.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, self.nav_fail_reason or "nav2 could not reach the home pose")
             else:
                 node.get_logger().info(f"[{self.name}] Home position reached.")
+                self.set_activity(ctx, "Robot is back at its home pose")
                 ctx["home_position_reached"] = True
+            return
+
+        if self._distance_remaining is not None:
+            self.set_activity(
+                ctx,
+                f"Driving the robot back home "
+                f"({self._distance_remaining:.1f} m remaining)",
+            )
+        else:
+            self.set_activity(ctx, "Driving the robot back home")
 
     def _home_pose(self, ctx):
         """Build the map-frame home goal from context.
@@ -135,12 +156,14 @@ class HomePosition(State):
             goal_handle = future.result()
         except Exception as e:
             node.get_logger().error(f"[{self.name}] Goal request failed: {e}")
+            self.nav_fail_reason = f"the home goal request failed ({e})"
             self.nav_failed = True
             self.nav_done = True
             return
 
         if not goal_handle.accepted:
             node.get_logger().error(f"[{self.name}] Home goal was rejected.")
+            self.nav_fail_reason = "nav2 rejected the home goal"
             self.nav_failed = True
             self.nav_done = True
             return
@@ -158,11 +181,13 @@ class HomePosition(State):
             status = int(future.result().status)
         except Exception as e:
             node.get_logger().error(f"[{self.name}] Navigation result failed: {e}")
+            self.nav_fail_reason = f"the navigation result could not be read ({e})"
             self.nav_failed = True
             self.nav_done = True
             return
         if status != GoalStatus.STATUS_SUCCEEDED:
             node.get_logger().warn(f"[{self.name}] Navigation ended with status {status}.")
+            self.nav_fail_reason = f"nav2 ended the home goal with status {status}"
             self.nav_failed = True
         self.nav_done = True
 
@@ -171,6 +196,8 @@ class HomePosition(State):
         distance = getattr(feedback_msg.feedback, "distance_remaining", None)
         if distance is None:
             return
+        # Rendered into the panel summary by run() on the next tick.
+        self._distance_remaining = distance
         # Log at most ~once per metre of progress to avoid flooding.
         if self._last_distance_log is None or abs(self._last_distance_log - distance) >= 1.0:
             self._last_distance_log = distance

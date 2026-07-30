@@ -77,6 +77,11 @@ class NearbyPointSelection(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        radius = float(ctx.get("nearby_point_radius_m", 0.30))
+        self.set_activity(
+            ctx,
+            f"Searching for a drillable point within {radius:.2f} m of the original",
+        )
 
         if ctx.get("nearby_point_selected") or ctx.get("error_triggered"):
             return
@@ -84,7 +89,7 @@ class NearbyPointSelection(State):
         origin = ctx.get("nearby_point_origin")
         if origin is None:
             node.get_logger().error(f"[{self.name}] No current_drill_target in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no drilling target to search around")
             return
 
         # In-wall-plane axes: the along-wall direction and the vertical.
@@ -94,6 +99,7 @@ class NearbyPointSelection(State):
                 ctx,
                 waiting_msg="Waiting for the wall map / odometry to fix the along-wall direction...",
                 fail_msg="Could not determine the along-wall direction (no wall map and no odometry).",
+                fail_reason="neither the wall map nor odometry gave an along-wall direction",
             )
             return
 
@@ -107,6 +113,7 @@ class NearbyPointSelection(State):
                 ctx,
                 waiting_msg="Waiting for TF to the gantry frame...",
                 fail_msg="TF to the gantry frame never became available.",
+                fail_reason="TF to the gantry frame never became available",
             )
             return
 
@@ -114,8 +121,12 @@ class NearbyPointSelection(State):
         ctx["nearby_point_selected"] = True
 
         if found is None:
-            radius = float(ctx.get("nearby_point_radius_m", 0.30))
             ctx["nearby_point_found"] = False
+            self.set_activity(
+                ctx,
+                f"No drillable point within {radius:.2f} m; skipping this target",
+                level="warn",
+            )
             node.get_logger().warn(
                 f"[{self.name}] No drillable point found within {radius:.2f} m of "
                 f"({origin[0]:.3f}, {origin[1]:.3f}, {origin[2]:.3f}); giving up on this target."
@@ -123,6 +134,10 @@ class NearbyPointSelection(State):
             return
 
         point, distance, result = found
+        self.set_activity(
+            ctx,
+            f"Moved the drilling point {distance:.2f} m along the wall to a reachable spot",
+        )
         ctx["current_drill_target"] = point
         ctx["nearby_point_last_pick"] = point
         ctx["nearby_points_tried"] = list(ctx.get("nearby_points_tried", [])) + [point]
@@ -206,7 +221,7 @@ class NearbyPointSelection(State):
         tf_buffer = ctx.get("tf_buffer")
         if tf_buffer is None:
             node.get_logger().error(f"[{self.name}] No tf_buffer in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no TF buffer is available to locate the gantry frame")
             return None
 
         map_frame = str(ctx.get("map_frame", "map"))
@@ -331,15 +346,16 @@ class NearbyPointSelection(State):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
-    def _wait_or_fail(self, ctx, *, waiting_msg, fail_msg):
+    def _wait_or_fail(self, ctx, *, waiting_msg, fail_msg, fail_reason):
         """Retry on the next tick until ``nearby_point_compute_timeout`` runs out."""
         node = ctx["node"]
         timeout = float(ctx.get("nearby_point_compute_timeout", 15.0))
         if time.time() - self.compute_start > timeout:
             node.get_logger().error(f"[{self.name}] {fail_msg} (after {timeout:.0f}s).")
-            ctx["error_triggered"] = True
+            self.fail(ctx, f"{fail_reason} after {timeout:.0f} s")
         else:
             node.get_logger().warn(f"[{self.name}] {waiting_msg}", throttle_duration_sec=2.0)
+            self.set_activity(ctx, waiting_msg.rstrip("."))
 
     def check_transition(self, ctx):
         if not ctx.get("nearby_point_selected") and not ctx.get("error_triggered"):

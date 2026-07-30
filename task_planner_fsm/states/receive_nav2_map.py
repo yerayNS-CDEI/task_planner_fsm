@@ -25,13 +25,14 @@ class ReceiveNav2Map(State):
 
         if not self.client.wait_for_service(timeout_sec=2.0):
             node.get_logger().error(f"[{self.name}] Service /receive_nav2_map not available.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "the /receive_nav2_map service is unavailable")
             return
 
         self.future = self.client.call_async(request)
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Requesting the Nav2 map of the environment")
 
         if self.future is None:
             node.get_logger().info(f"[{self.name}] Future is None.")
@@ -44,7 +45,7 @@ class ReceiveNav2Map(State):
                 ctx["nav2_map_ready"] = True
             else:
                 node.get_logger().error(f"[{self.name}] Error while receiving Nav2 map.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "the /receive_nav2_map service reported a failure")
             self.future = None
 
     def check_transition(self, ctx):

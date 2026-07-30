@@ -41,6 +41,9 @@ class TakeOutDrill(State):
         self.latest_joints = None
         self.control_timer = None
         self.outcome = None  # None | "reached" | "error"
+        # Concrete cause recorded by _control_step when outcome == "error"; run()
+        # hands it to self.fail so the panel shows why the withdraw gave up.
+        self.error_reason = None
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -68,6 +71,7 @@ class TakeOutDrill(State):
         # ── Per-run state ──
         self.latest_joints = None
         self.outcome = None
+        self.error_reason = None
         self.started = False
         self.enter_time = time.time()
         self.held = None
@@ -131,6 +135,10 @@ class TakeOutDrill(State):
                         f"[{self.name}] Gantry not ready after {self.command_timeout:.0f}s "
                         f"(joint states / gantry_position_controller subscriber missing)."
                     )
+                    self.error_reason = (
+                        f"the gantry was not ready after {self.command_timeout:.0f} s "
+                        f"(no joint states or no gantry_position_controller)"
+                    )
                     self.outcome = "error"
                 else:
                     node.get_logger().warn(
@@ -190,6 +198,10 @@ class TakeOutDrill(State):
                 f"[{self.name}] Stage 4 did not reach the withdraw target "
                 f"(at {actual:.3f} m, target {self.target_slide:.3f} m) after the full stroke."
             )
+            self.error_reason = (
+                f"the drill slide stopped at {actual:.3f} m instead of the withdraw "
+                f"target {self.target_slide:.3f} m"
+            )
             self.outcome = "error"
             return
 
@@ -199,9 +211,14 @@ class TakeOutDrill(State):
             if not self._logged_outcome:
                 node.get_logger().info(f"[{self.name}] Drill bit clear of the wall.")
                 self._logged_outcome = True
+            self.set_activity(ctx, "Drill bit is clear of the wall")
             ctx["take_out_drill_success"] = True
         elif self.outcome == "error":
-            ctx["error_triggered"] = True
+            self.fail(ctx, self.error_reason or "the drill bit could not be withdrawn")
+        elif not self.started:
+            self.set_activity(ctx, "Waiting for the gantry before withdrawing the bit")
+        else:
+            self.set_activity(ctx, "Withdrawing the drill bit from the wall")
 
     def check_transition(self, ctx):
         if ctx.get("error_triggered"):

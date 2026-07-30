@@ -27,13 +27,14 @@ class StoringToDatabase(State):
 
         if not self.client.wait_for_service(timeout_sec=2.0):
             node.get_logger().error(f"[{self.name}] Service /storing_to_database not available.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "the /storing_to_database service is unavailable")
             return
 
         self.future = self.client.call_async(request)
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Storing the drilling results in the database")
 
         if self.future is None:
             node.get_logger().info(f"[{self.name}] Future is None.")
@@ -46,7 +47,7 @@ class StoringToDatabase(State):
                 ctx["storing_to_database_success"] = True
             else:
                 node.get_logger().error(f"[{self.name}] Error while receiving data.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "the /storing_to_database service reported a failure")
             self.future = None
 
     def check_transition(self, ctx):

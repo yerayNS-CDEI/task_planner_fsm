@@ -89,6 +89,7 @@ class ManipulatorFolding(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Folding the gantry back to its origin")
 
         if ctx.get("manipulator_folding_success") or ctx.get("error_triggered"):
             return
@@ -102,12 +103,17 @@ class ManipulatorFolding(State):
                         f"[{self.name}] No subscriber on {self.topic} after {timeout:.0f}s; "
                         f"is gantry_position_controller running?"
                     )
-                    ctx["error_triggered"] = True
+                    self.fail(
+                        ctx,
+                        f"no gantry_position_controller listening on {self.topic} after "
+                        f"{timeout:.0f} s",
+                    )
                 else:
                     node.get_logger().warn(
                         f"[{self.name}] Waiting for gantry_position_controller on {self.topic}...",
                         throttle_duration_sec=2.0,
                     )
+                    self.set_activity(ctx, "Waiting for the gantry controller to come up")
                 return
 
             msg = Float64MultiArray()
@@ -123,6 +129,7 @@ class ManipulatorFolding(State):
 
         # ── Phase 2: wait until the gantry joints settle at the origin. ──
         if self.phase == "settling":
+            self.set_activity(ctx, "Waiting for the gantry to reach its folded pose")
             settle_timeout = float(ctx.get("gantry_settle_timeout", 30.0))
             elapsed = time.time() - self.settle_start
 
@@ -164,7 +171,11 @@ class ManipulatorFolding(State):
                     f"[{self.name}] Gantry did not reach origin within {settle_timeout:.0f}s "
                     f"(max joint error {worst:.4f} > {self.tol}); positions: {detail}."
                 )
-                ctx["error_triggered"] = True
+                self.fail(
+                    ctx,
+                    f"the gantry did not reach its folded pose within {settle_timeout:.0f} s "
+                    f"(max joint error {worst:.4f} > {self.tol})",
+                )
             else:
                 node.get_logger().warn(
                     f"[{self.name}] Waiting for gantry to reach origin "
@@ -176,9 +187,10 @@ class ManipulatorFolding(State):
         node = ctx["node"]
         if elapsed > timeout:
             node.get_logger().error(f"[{self.name}] {fail_msg}")
-            ctx["error_triggered"] = True
+            self.fail(ctx, fail_msg)
         else:
             node.get_logger().warn(f"[{self.name}] {waiting_msg}", throttle_duration_sec=2.0)
+            self.set_activity(ctx, "Waiting for gantry joint feedback")
 
     def check_transition(self, ctx):
         if not ctx.get("manipulator_folding_success") and not ctx.get("error_triggered"):

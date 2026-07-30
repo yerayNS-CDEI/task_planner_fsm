@@ -128,32 +128,60 @@ class StateMachine:
         node = self.ctx["node"]
         state_name = self.current_state.name
 
+        # States describe the concrete cause via self.fail(ctx, reason) /
+        # ctx["error_reason"]; fold it into the human-readable text and clear it
+        # so a later, unrelated failure can't reuse a stale reason.
+        detail = self.ctx.pop("error_reason", None)
+        cause = str(detail).strip() if detail else ""
+        because = f" due to {cause}" if cause else ""
+
         if state_name == "Error" or "Error" not in self.states:
             return "Error", "error_fallback"
 
         if not self._retried_current_state:
             self._retried_current_state = True
             self.ctx["error_triggered"] = False
+            summary = f"{state_name} failed{because}; retrying once"
             node.get_logger().warn(
-                f"[FSM] {reason} in '{state_name}'. Retrying this state once before 'Error'."
+                f"[FSM] {reason} in '{state_name}'{because}. Retrying this state once before 'Error'."
             )
+            self._set_state_status(
+                state_name,
+                phase="retrying",
+                summary=summary,
+                data={"reason": reason, "cause": cause},
+                level="warn",
+            )
+            self._publish_state_status(state_name)
             self._publish_event(
                 "retry",
                 state_name=state_name,
-                summary=f"Retrying {state_name} once",
-                details={"reason": reason},
+                summary=summary,
+                details={"reason": reason, "cause": cause},
                 level="warn",
             )
             return state_name, f"retry_once:{reason}"
 
+        summary = f"{state_name} failed{because}; going to Error"
+        # Handed to the Error state so the panel keeps showing the cause instead
+        # of the generic "Entered Error" that the transition would otherwise set.
+        self.ctx["fsm_error_summary"] = summary
         node.get_logger().error(
-            f"[FSM] {reason} in '{state_name}' after retry. Transitioning to 'Error'."
+            f"[FSM] {reason} in '{state_name}'{because} after retry. Transitioning to 'Error'."
         )
+        self._set_state_status(
+            state_name,
+            phase="failed",
+            summary=summary,
+            data={"reason": reason, "cause": cause},
+            level="error",
+        )
+        self._publish_state_status(state_name)
         self._publish_event(
             "error",
             state_name=state_name,
-            summary=f"{state_name} failed after retry",
-            details={"reason": reason},
+            summary=summary,
+            details={"reason": reason, "cause": cause},
             level="error",
         )
         self._retried_current_state = False
@@ -180,6 +208,10 @@ class StateMachine:
         self.current_state = self.states[next_state]
         if next_state != previous_state:
             self._retried_current_state = False
+            # Drop the previous state's segment/point progress so the panel's
+            # Progress field doesn't carry a stale "2 / 3" into a state that
+            # never reports progress.
+            self.ctx.get("_fsm_status", {}).pop("progress", None)
         self.ctx["is_initial_entry"] = False
         self._state_enter_time_monotonic = time.monotonic()
         self.current_state.on_enter(self.ctx)

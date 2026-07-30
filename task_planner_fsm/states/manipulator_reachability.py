@@ -56,6 +56,7 @@ class ManipulatorReachability(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Checking the gantry can reach the drilling point")
 
         if ctx.get("manipulator_reachability_computed") or ctx.get("error_triggered"):
             return
@@ -63,7 +64,7 @@ class ManipulatorReachability(State):
         target = ctx.get("current_drill_target")
         if target is None:
             node.get_logger().error(f"[{self.name}] No current_drill_target in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no drilling target selected")
             return
 
         # Robot's current pose (from /rtabmap/odom, see fsm_node).
@@ -71,6 +72,7 @@ class ManipulatorReachability(State):
         orientation = ctx.get("base_orientation")
         if base is None or orientation is None:
             node.get_logger().warn(f"[{self.name}] Waiting for odometry (base pose)...")
+            self.set_activity(ctx, "Waiting for odometry before checking reachability")
             return
 
         # ── 1. Coarse base-frame check ─────────────────────────────────────
@@ -89,6 +91,11 @@ class ManipulatorReachability(State):
                 f"[{self.name}] Drill point OUT OF COARSE REACH (base-frame offset "
                 f"x={dx_base:.3f} [max {MAX_REACH_X_M:.3f}], "
                 f"y={dy_base:.3f} [max {MAX_REACH_Y_M:.3f}]); recomputing base placement."
+            )
+            self.set_activity(
+                ctx,
+                "Drilling point out of gantry reach; repositioning the base",
+                level="warn",
             )
             return
 
@@ -130,6 +137,7 @@ class ManipulatorReachability(State):
                             f"[{self.name}] Waiting for TF {map_frame}->{gantry_frame}...",
                             throttle_duration_sec=2.0,
                         )
+                        self.set_activity(ctx, "Waiting for the turret transform")
                         return  # retry next FSM tick
                 else:
                     pt_map = PointStamped()
@@ -159,6 +167,7 @@ class ManipulatorReachability(State):
                         f"[{self.name}] Waiting for TF {map_frame}->{gantry_frame} ({e})...",
                         throttle_duration_sec=2.0,
                     )
+                    self.set_activity(ctx, "Waiting for the turret transform")
                     return  # retry next FSM tick
 
         reachable = along_wall_ok  # coarse check already passed above
@@ -171,6 +180,7 @@ class ManipulatorReachability(State):
             along_detail = (
                 f", along-wall residual {along_wall_residual:.3f} m" if tf_checked else ""
             )
+            self.set_activity(ctx, "Drilling point is within gantry reach")
             node.get_logger().info(
                 f"[{self.name}] Drill point reachable: base-frame offset "
                 f"|x|={abs(dx_base):.3f}<={MAX_REACH_X_M:.3f} m, "
@@ -184,6 +194,12 @@ class ManipulatorReachability(State):
             old_offset = float(ctx.get("base_along_wall_offset_m", 0.0))
             new_offset = old_offset + along_wall_residual
             ctx["base_along_wall_offset_m"] = new_offset
+            self.set_activity(
+                ctx,
+                f"Drilling point off along the wall by {along_wall_residual:.2f} m; "
+                f"repositioning the base",
+                level="warn",
+            )
             node.get_logger().warn(
                 f"[{self.name}] Drill point mis-aligned along the wall by "
                 f"{along_wall_residual:.3f} m (> {along_tol:.3f} m); "

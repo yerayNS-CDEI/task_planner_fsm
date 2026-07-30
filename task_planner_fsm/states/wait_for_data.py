@@ -67,7 +67,14 @@ class WaitForData(State):
         node = ctx["node"]
 
         if self.started:
+            self.set_activity(ctx, "Drilling locations received from oliwall")
             return
+
+        # The prompt blocks run() on stdin for as long as the operator takes, so
+        # push the description to the panel now rather than after run() returns.
+        self.set_activity(
+            ctx, "Waiting for the operator to enter the drilling locations", publish=True
+        )
 
         try:
             locations = self._prompt_drill_locations(node)

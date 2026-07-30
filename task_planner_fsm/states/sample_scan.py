@@ -26,13 +26,14 @@ class SampleScanning(State):
 
         if not self.client.wait_for_service(timeout_sec=2.0):
             node.get_logger().error(f"[{self.name}] Service /sample_scanning not available.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "the /sample_scanning service is unavailable")
             return
 
         self.future = self.client.call_async(request)
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Scanning the drilled sample")
 
         if self.future is None:
             node.get_logger().info(f"[{self.name}] Future is None.")
@@ -45,7 +46,7 @@ class SampleScanning(State):
                 ctx["sample_scanning_success"] = True
             else:
                 node.get_logger().error(f"[{self.name}] Error while receiving data.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "the /sample_scanning service reported a failure")
             self.future = None
 
     def check_transition(self, ctx):

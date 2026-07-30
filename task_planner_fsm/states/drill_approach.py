@@ -121,7 +121,7 @@ class DrillApproach(State):
         target = ctx.get("current_drill_target")
         if target is None:
             node.get_logger().error(f"[{self.name}] No current_drill_target in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no drilling target selected")
             return None
 
         standoff = float(ctx.get("drill_approach_standoff_m", 0.0))
@@ -135,7 +135,7 @@ class DrillApproach(State):
         tf_buffer = ctx.get("tf_buffer")
         if tf_buffer is None:
             node.get_logger().error(f"[{self.name}] No tf_buffer in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no TF buffer is available to locate the gantry frame")
             return None
 
         dp_map = PointStamped()
@@ -181,7 +181,11 @@ class DrillApproach(State):
                 f"[{self.name}] Drill point mis-aligned along the wall by "
                 f"{result.along_wall_residual:.3f} m (> {along_tol:.3f}); cannot approach."
             )
-            ctx["error_triggered"] = True
+            self.fail(
+                ctx,
+                f"the drilling point is off along the wall by "
+                f"{result.along_wall_residual:.2f} m (> {along_tol:.2f} m)",
+            )
             return None
 
         ideal_slide = result.joints[SLIDE_IDX]
@@ -204,7 +208,10 @@ class DrillApproach(State):
                 f"(tip Y {achieved_tip_y:.3f} < target {dp_turret.point.y + standoff:.3f} m); "
                 f"aborting approach to avoid pressing into the wall."
             )
-            ctx["error_triggered"] = True
+            self.fail(
+                ctx,
+                "the clamped slide would push the drill past the target point into the wall",
+            )
             return None
 
         remaining = achieved_tip_y - (dp_turret.point.y + standoff)  # >= 0: how far short
@@ -224,8 +231,17 @@ class DrillApproach(State):
             )
         return cmd
 
+    _PHASE_ACTIVITY = {
+        "computing": "Computing how far to feed the drill slide",
+        "commanding": "Feeding the drill slide toward the wall",
+        "settling": "Waiting for the drill tip to reach the wall",
+    }
+
     def run(self, ctx):
         node = ctx["node"]
+        activity = self._PHASE_ACTIVITY.get(self.phase)
+        if activity is not None:
+            self.set_activity(ctx, activity)
 
         if ctx.get("drill_approach_success") or ctx.get("error_triggered"):
             return
@@ -242,7 +258,11 @@ class DrillApproach(State):
                         f"[{self.name}] Could not compute the approach target within "
                         f"{compute_timeout:.0f}s (TF/joint states unavailable)."
                     )
-                    ctx["error_triggered"] = True
+                    self.fail(
+                        ctx,
+                        f"the approach target could not be computed within "
+                        f"{compute_timeout:.0f} s (TF/joint states unavailable)",
+                    )
                 return
             self.phase = "commanding"
             self.wait_start = time.time()
@@ -257,12 +277,17 @@ class DrillApproach(State):
                         f"[{self.name}] No subscriber on {self.topic} after {timeout:.0f}s; "
                         f"is gantry_position_controller running?"
                     )
-                    ctx["error_triggered"] = True
+                    self.fail(
+                        ctx,
+                        f"no gantry_position_controller listening on {self.topic} after "
+                        f"{timeout:.0f} s",
+                    )
                 else:
                     node.get_logger().warn(
                         f"[{self.name}] Waiting for gantry_position_controller on {self.topic}...",
                         throttle_duration_sec=2.0,
                     )
+                    self.set_activity(ctx, "Waiting for the gantry controller to come up")
                 return
 
             msg = Float64MultiArray()
@@ -319,7 +344,11 @@ class DrillApproach(State):
                     f"[{self.name}] Gantry did not reach the target within {settle_timeout:.0f}s "
                     f"(max joint error {worst:.4f} > {self.tol}); positions: {detail}."
                 )
-                ctx["error_triggered"] = True
+                self.fail(
+                    ctx,
+                    f"the drill tip did not reach the wall within {settle_timeout:.0f} s "
+                    f"(max joint error {worst:.4f} > {self.tol})",
+                )
             else:
                 node.get_logger().warn(
                     f"[{self.name}] Waiting for the slide to reach the target "
@@ -331,9 +360,10 @@ class DrillApproach(State):
         node = ctx["node"]
         if elapsed > timeout:
             node.get_logger().error(f"[{self.name}] {fail_msg}")
-            ctx["error_triggered"] = True
+            self.fail(ctx, fail_msg)
         else:
             node.get_logger().warn(f"[{self.name}] {waiting_msg}", throttle_duration_sec=2.0)
+            self.set_activity(ctx, "Waiting for gantry joint feedback")
 
     def check_transition(self, ctx):
         if not ctx.get("drill_approach_success") and not ctx.get("error_triggered"):

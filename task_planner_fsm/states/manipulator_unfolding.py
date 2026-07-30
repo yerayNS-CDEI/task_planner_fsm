@@ -88,7 +88,7 @@ class ManipulatorUnfolding(State):
         target = ctx.get("current_drill_target")
         if target is None:
             node.get_logger().error(f"[{self.name}] No current_drill_target in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no drilling target selected")
             return None
 
         retract = float(ctx.get("drill_retract_m", 0.20))
@@ -108,7 +108,7 @@ class ManipulatorUnfolding(State):
         tf_buffer = ctx.get("tf_buffer")
         if tf_buffer is None:
             node.get_logger().error(f"[{self.name}] No tf_buffer in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no TF buffer is available to locate the gantry frame")
             return None
 
         try:
@@ -147,13 +147,17 @@ class ManipulatorUnfolding(State):
                 f"[{self.name}] Drill point mis-aligned along the wall by "
                 f"{result.along_wall_residual:.3f} m (> {along_tol:.3f}); reposition the base."
             )
-            ctx["error_triggered"] = True
+            self.fail(
+                ctx,
+                f"the drilling point is off along the wall by "
+                f"{result.along_wall_residual:.2f} m (> {along_tol:.2f} m)",
+            )
             return None
         if not result.feasible:
             node.get_logger().error(
                 f"[{self.name}] Retracted drill pose not reachable by the gantry: {result.reason}."
             )
-            ctx["error_triggered"] = True
+            self.fail(ctx, f"the gantry cannot reach the drilling pose ({result.reason})")
             return None
 
         node.get_logger().info(
@@ -165,8 +169,17 @@ class ManipulatorUnfolding(State):
         )
         return list(result.joints)
 
+    _PHASE_ACTIVITY = {
+        "computing": "Computing the gantry pose that reaches the drilling point",
+        "commanding": "Commanding the gantry to the retracted drilling pose",
+        "settling": "Waiting for the gantry to reach the retracted drilling pose",
+    }
+
     def run(self, ctx):
         node = ctx["node"]
+        activity = self._PHASE_ACTIVITY.get(self.phase)
+        if activity is not None:
+            self.set_activity(ctx, activity)
 
         if ctx.get("manipulator_unfolding_success") or ctx.get("error_triggered"):
             return
@@ -183,7 +196,11 @@ class ManipulatorUnfolding(State):
                         f"[{self.name}] Could not compute the unfolding target within "
                         f"{compute_timeout:.0f}s (TF/wall map unavailable)."
                     )
-                    ctx["error_triggered"] = True
+                    self.fail(
+                        ctx,
+                        f"the unfolding target could not be computed within "
+                        f"{compute_timeout:.0f} s (TF/wall map unavailable)",
+                    )
                 return
             self.phase = "commanding"
             self.wait_start = time.time()
@@ -198,12 +215,17 @@ class ManipulatorUnfolding(State):
                         f"[{self.name}] No subscriber on {self.topic} after {timeout:.0f}s; "
                         f"is gantry_position_controller running?"
                     )
-                    ctx["error_triggered"] = True
+                    self.fail(
+                        ctx,
+                        f"no gantry_position_controller listening on {self.topic} after "
+                        f"{timeout:.0f} s",
+                    )
                 else:
                     node.get_logger().warn(
                         f"[{self.name}] Waiting for gantry_position_controller on {self.topic}...",
                         throttle_duration_sec=2.0,
                     )
+                    self.set_activity(ctx, "Waiting for the gantry controller to come up")
                 return
 
             msg = Float64MultiArray()
@@ -260,7 +282,11 @@ class ManipulatorUnfolding(State):
                     f"[{self.name}] Gantry did not reach the target within {settle_timeout:.0f}s "
                     f"(max joint error {worst:.4f} > {self.tol}); positions: {detail}."
                 )
-                ctx["error_triggered"] = True
+                self.fail(
+                    ctx,
+                    f"the gantry did not reach the drilling pose within "
+                    f"{settle_timeout:.0f} s (max joint error {worst:.4f} > {self.tol})",
+                )
             else:
                 node.get_logger().warn(
                     f"[{self.name}] Waiting for gantry to reach the target "
@@ -272,9 +298,10 @@ class ManipulatorUnfolding(State):
         node = ctx["node"]
         if elapsed > timeout:
             node.get_logger().error(f"[{self.name}] {fail_msg}")
-            ctx["error_triggered"] = True
+            self.fail(ctx, fail_msg)
         else:
             node.get_logger().warn(f"[{self.name}] {waiting_msg}", throttle_duration_sec=2.0)
+            self.set_activity(ctx, "Waiting for gantry joint feedback")
 
     def check_transition(self, ctx):
         if not ctx.get("manipulator_unfolding_success") and not ctx.get("error_triggered"):

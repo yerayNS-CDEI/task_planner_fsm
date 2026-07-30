@@ -16,10 +16,14 @@ class NavigateToTarget(State):
         self.goal_sent = False
         self.nav_done = False
         self.nav_failed = False
+        # Concrete cause recorded by the action callbacks; run() hands it to
+        # self.fail so the panel shows why navigation gave up.
+        self.nav_fail_reason = None
         self._send_goal_future = None
         self._get_result_future = None
         self._goal_handle = None
         self._last_distance_log = None
+        self._distance_remaining = None
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -31,15 +35,17 @@ class NavigateToTarget(State):
         self.goal_sent = False
         self.nav_done = False
         self.nav_failed = False
+        self.nav_fail_reason = None
         self._send_goal_future = None
         self._get_result_future = None
         self._goal_handle = None
         self._last_distance_log = None
+        self._distance_remaining = None
 
         # Goal computed by BasePlacementComputation (a map-frame PoseStamped).
         if ctx.get("base_goal_pose") is None:
             node.get_logger().error(f"[{self.name}] No base_goal_pose in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no base goal pose was computed")
             return
 
         action_name = str(ctx.get("nav_action_name", "/navigate_to_pose"))
@@ -52,7 +58,10 @@ class NavigateToTarget(State):
             node.get_logger().error(
                 f"[{self.name}] {action_name} action server not available after {server_timeout:.0f}s."
             )
-            ctx["error_triggered"] = True
+            self.fail(
+                ctx,
+                f"the {action_name} action server was unavailable after {server_timeout:.0f} s",
+            )
             return
 
     def run(self, ctx):
@@ -62,6 +71,7 @@ class NavigateToTarget(State):
             return
 
         if not self.goal_sent:
+            self.set_activity(ctx, "Sending the base goal next to the drilling point")
             self._send_goal(ctx)
             return
 
@@ -69,17 +79,31 @@ class NavigateToTarget(State):
             node = ctx["node"]
             if self.nav_failed:
                 node.get_logger().error(f"[{self.name}] Navigation failed to reach the goal.")
-                ctx["error_triggered"] = True
+                self.fail(
+                    ctx,
+                    self.nav_fail_reason or "nav2 could not reach the base goal",
+                )
             else:
                 node.get_logger().info(f"[{self.name}] Goal reached.")
+                self.set_activity(ctx, "Base parked next to the drilling point")
                 ctx["target_reached"] = True
+            return
+
+        if self._distance_remaining is not None:
+            self.set_activity(
+                ctx,
+                f"Driving to the drilling standoff pose "
+                f"({self._distance_remaining:.1f} m remaining)",
+            )
+        else:
+            self.set_activity(ctx, "Driving to the drilling standoff pose")
 
     def _send_goal(self, ctx):
         node = ctx["node"]
         pose = ctx.get("base_goal_pose")
         if pose is None:
             node.get_logger().error(f"[{self.name}] No base_goal_pose in context.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "no base goal pose was computed")
             return
 
         pose.header.stamp = node.get_clock().now().to_msg()
@@ -107,12 +131,14 @@ class NavigateToTarget(State):
             goal_handle = future.result()
         except Exception as e:
             node.get_logger().error(f"[{self.name}] Goal request failed: {e}")
+            self.nav_fail_reason = f"the navigation goal request failed ({e})"
             self.nav_failed = True
             self.nav_done = True
             return
 
         if not goal_handle.accepted:
             node.get_logger().error(f"[{self.name}] Navigation goal was rejected.")
+            self.nav_fail_reason = "nav2 rejected the navigation goal"
             self.nav_failed = True
             self.nav_done = True
             return
@@ -130,11 +156,13 @@ class NavigateToTarget(State):
             status = int(future.result().status)
         except Exception as e:
             node.get_logger().error(f"[{self.name}] Navigation result failed: {e}")
+            self.nav_fail_reason = f"the navigation result could not be read ({e})"
             self.nav_failed = True
             self.nav_done = True
             return
         if status != GoalStatus.STATUS_SUCCEEDED:
             node.get_logger().warn(f"[{self.name}] Navigation ended with status {status}.")
+            self.nav_fail_reason = f"nav2 ended the goal with status {status}"
             self.nav_failed = True
         self.nav_done = True
 
@@ -143,6 +171,8 @@ class NavigateToTarget(State):
         distance = getattr(feedback_msg.feedback, "distance_remaining", None)
         if distance is None:
             return
+        # Rendered into the panel summary by run() on the next tick.
+        self._distance_remaining = distance
         # Log at most ~once per metre of progress to avoid flooding.
         if self._last_distance_log is None or abs(self._last_distance_log - distance) >= 1.0:
             self._last_distance_log = distance

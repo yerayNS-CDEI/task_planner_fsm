@@ -36,13 +36,14 @@ class GetSemanticMap(State):
 
         if not self.client.wait_for_service(timeout_sec=2.0):
             node.get_logger().error(f"[{self.name}] Service /get_semantic_map not available.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "the /get_semantic_map service is unavailable")
             return
 
         self.future = self.client.call_async(request)
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Retrieving the semantic map of the environment")
 
         if self.future is None:
             node.get_logger().info(f"[{self.name}] Future is None.")
@@ -61,10 +62,11 @@ class GetSemanticMap(State):
                     ctx["semantic_map_ready"] = True
                 else:
                     node.get_logger().error(f"[{self.name}] Navigation stack failed to start.")
+                    # _start_robot_stack already recorded the specific cause.
                     ctx["error_triggered"] = True
             else:
                 node.get_logger().error(f"[{self.name}] Error while receiving semantic map.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "the /get_semantic_map service reported a failure")
             self.future = None
 
     def check_transition(self, ctx):
@@ -96,6 +98,11 @@ class GetSemanticMap(State):
         try:
             node.get_logger().info(
                 f"[{self.name}] Launching robo_drill navigation stack (sim:={sim_value})..."
+            )
+            # start_proc + wait_stack_ready block for up to ~90 s inside run(),
+            # so push the description now instead of after run() returns.
+            self.set_activity(
+                ctx, "Starting the navigation and localization stack", publish=True
             )
             # Free hardware resources held by any orphaned driver from a previous
             # run (notably the SICK UDP ports 2115/2116) before relaunching, so the
@@ -129,10 +136,19 @@ class GetSemanticMap(State):
             node.get_logger().info(
                 f"[{self.name}] Waiting up to {ready_timeout:.0f}s for navigation + localization stack..."
             )
+            self.set_activity(
+                ctx,
+                "Waiting for the navigation and localization stack to come up",
+                publish=True,
+            )
             if not wait_stack_ready(ctx, required_topics, timeout=ready_timeout):
                 node.get_logger().error(f"[{self.name}] Navigation + localization stack did not become ready.")
                 stop_proc(ctx, "nav_sim", timeout=10.0, force_kill_patterns=SIM_STACK_PATTERNS)
-                ctx["error_triggered"] = True
+                self.fail(
+                    ctx,
+                    f"the navigation stack did not publish {required_topics} within "
+                    f"{ready_timeout:.0f} s",
+                )
                 return False
 
             node.get_logger().info(f"[{self.name}] Navigation + localization stack is ready.")
@@ -140,5 +156,5 @@ class GetSemanticMap(State):
 
         except Exception as e:
             node.get_logger().error(f"[{self.name}] Could not start navigation + localization process: {e}")
-            ctx["error_triggered"] = True
+            self.fail(ctx, f"the navigation stack could not be launched ({e})")
             return False

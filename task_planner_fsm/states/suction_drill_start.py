@@ -25,13 +25,14 @@ class SuctionDrillStart(State):
 
         if not self.client.wait_for_service(timeout_sec=2.0):
             node.get_logger().error(f"[{self.name}] Service /start_suction_drill not available.")
-            ctx["error_triggered"] = True
+            self.fail(ctx, "the /start_suction_drill service is unavailable")
             return
 
         self.future = self.client.call_async(request)
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Starting the dust suction and the drill motor")
 
         if self.future is None:
             node.get_logger().info(f"[{self.name}] Future is None.")
@@ -44,7 +45,7 @@ class SuctionDrillStart(State):
                 ctx["start_suction_drill_success"] = True
             else:
                 node.get_logger().error(f"[{self.name}] Error while receiving data.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "the /start_suction_drill service reported a failure")
             self.future = None
 
     def check_transition(self, ctx):
