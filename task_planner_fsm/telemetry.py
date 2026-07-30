@@ -4,48 +4,53 @@ from typing import Any, Dict, Iterable, List
 
 
 # Horseshoe layout for the linear pokeye drill workflow (mirrors the reference
-# state diagram). Nodes are 220x92 in the RViz panel; columns are spaced 320px.
-# The perception/navigation chain runs LEFT->RIGHT across the top row, turns the
-# corner down the right-hand column, and the drill sequence runs RIGHT->LEFT back
-# along the bottom row, so states that follow each other are physically adjacent
-# and the forward chain never crosses itself.
+# state diagram), turned on its side so the graph is TALL rather than WIDE and
+# fits a docked RViz side panel. Nodes are 220x92 in the panel; the two columns
+# are spaced 400px (180px gutter for the return edges) and rows 150px (58px of
+# vertical breathing room -- the edge router treats nodes as obstacles inflated
+# by 8px per side, so rows must stay at least ~110px apart).
+#
+# The perception/navigation chain runs TOP->BOTTOM down the left column, turns
+# the corner along the bottom, and the drill sequence runs BOTTOM->TOP back up
+# the right column, so states that follow each other are physically adjacent and
+# the forward chain never crosses itself.
 #
 # Note: the reference diagram draws "Arm folding" (ManipulatorFolding) twice --
-# once in the top row (TargetSelection -> ManipulatorFolding -> BasePlacement)
-# and once bottom-left (StoringToDatabase -> ManipulatorFolding -> HomePosition).
-# The panel renders one node per state, so it lives in the top row here; the
+# once in the forward chain (TargetSelection -> ManipulatorFolding -> BasePlacement)
+# and once on the return path (StoringToDatabase -> ManipulatorFolding -> HomePosition).
+# The panel renders one node per state, so it lives in the left column here; the
 # once-per-run "fold and go home" edges are therefore the only longer ones.
 #
 # Error is an isolated sink (no edges are routed to it) that lights up when
-# active; it floats on the left, clear of both rows. Coordinates are the
+# active; it floats at the top right, clear of both columns. Coordinates are the
 # top-left corner of each node.
 _NODE_POSITIONS = {
-    # Top row (L->R): perception, navigation & base placement
-    "Initialization": (40, 200),
-    "ReceiveNav2Map": (360, 200),
-    "GetSemanticMap": (680, 200),
-    "WaitForData": (1000, 200),
-    "TargetSelection": (1320, 200),
-    "ManipulatorFolding": (1640, 200),
-    "BasePlacementComputation": (1960, 200),
-    "NavigateToTarget": (2280, 200),
-    "ManipulatorReachability": (2600, 200),
-    "NearbyPointSelection": (2920, 40),  # raised above the row
-    "ManipulatorUnfolding": (3240, 200),
-    # Right column (top -> bottom): approach & start drilling
-    "DrillApproach": (3240, 480),
-    "SuctionDrillStart": (3240, 760),
-    # Bottom row (R->L): drilling operation & return
-    "Drilling": (2920, 760),
-    "TakeOutDrill": (2600, 760),
-    "SuctionDrillStop": (2280, 760),
-    "DrillRetract": (1960, 760),
-    "SampleScanning": (1640, 760),
-    "StoringToDatabase": (1320, 760),
-    "HomePosition": (1000, 760),
-    "Finished": (680, 760),
+    # Left column (top -> bottom): perception, navigation & base placement
+    "Initialization": (480, 40),
+    "ReceiveNav2Map": (480, 190),
+    "GetSemanticMap": (480, 340),
+    "WaitForData": (480, 490),
+    "TargetSelection": (480, 640),
+    "ManipulatorFolding": (480, 790),
+    "BasePlacementComputation": (480, 940),
+    "NavigateToTarget": (480, 1090),
+    "ManipulatorReachability": (480, 1240),
+    "NearbyPointSelection": (40, 1390),  # pushed left of the column
+    "ManipulatorUnfolding": (480, 1390),
+    # Bottom of the horseshoe (L->R): approach & start drilling
+    "DrillApproach": (480, 1540),
+    "SuctionDrillStart": (880, 1540),
+    # Right column (bottom -> top): drilling operation & return
+    "Drilling": (880, 1390),
+    "TakeOutDrill": (880, 1240),
+    "SuctionDrillStop": (880, 1090),
+    "DrillRetract": (880, 940),
+    "SampleScanning": (880, 790),
+    "StoringToDatabase": (880, 640),
+    "HomePosition": (880, 490),
+    "Finished": (880, 340),
     # Isolated failure sink
-    "Error": (40, 480),
+    "Error": (880, 40),
 }
 
 # Transitions taken from each state's NEXT_STATE_OPTIONS / check_transition.
@@ -137,7 +142,8 @@ def build_fsm_graph_payload(states: Iterable[str]) -> Dict[str, List[Dict[str, A
     nodes = []
     seen = set()
     for index, state in enumerate(states):
-        x, y = _NODE_POSITIONS.get(state, (index * 180, 0))
+        # Unknown states stack in their own column left of the horseshoe.
+        x, y = _NODE_POSITIONS.get(state, (-360, index * 150))
         nodes.append(
             {
                 "id": state,
