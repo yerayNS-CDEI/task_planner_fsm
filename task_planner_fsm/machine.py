@@ -12,7 +12,31 @@ class StateMachine:
         self.ctx["last_state"] = None   # initialization
         self._retried_current_state = False
         self._state_enter_time_monotonic = time.monotonic()
-        self.ctx.setdefault('mapping_cmd', ['ros2', 'launch', 'navi_wall', 'global_exploration.launch.py', 'headless:=true'])
+        sim_value = 'true' if self.ctx.get('sim', False) else 'false'
+        # Mapping is now two processes managed by CreateMap: a PERSISTENT
+        # mapping + nav2 stack (mapping_cmd) and a SEPARATE, self-terminating
+        # frontier explorer (explore_cmd). Keeping them separate lets the stack
+        # stay alive after exploration finishes, so CreateMap can drive a second
+        # structured densification sweep before tearing everything down.
+        self.ctx.setdefault('mapping_cmd', [
+            'ros2', 'launch', 'navi_wall', 'mapping_stack.launch.py',
+            f'sim:={sim_value}',
+            f'use_sim_time:={sim_value}',
+            'headless:=true',
+        ])
+        self.ctx.setdefault('explore_cmd', [
+            'ros2', 'launch', 'navi_wall', 'exploration.launch.py',
+            f'use_sim_time:={sim_value}',
+        ])
+        # Wall detection (Tier-A detector + Tier-C persistent aggregator). Started
+        # by ObjectID before the robot moves, so its wall-following coverage motion
+        # verifies/refines the walls against the STATIC localization-mode map (no
+        # flicker); torn down when ObjectID exits. (aggregate defaults to true in
+        # the launch file.)
+        self.ctx.setdefault('wall_detection_cmd', [
+            'ros2', 'launch', 'navi_wall', 'wall_detection.launch.py',
+            f'use_sim_time:={sim_value}',
+        ])
         install_global_cleanup(self.ctx)
         self.current_state.on_enter(self.ctx)
         self.ctx["is_initial_entry"] = False
@@ -104,32 +128,60 @@ class StateMachine:
         node = self.ctx["node"]
         state_name = self.current_state.name
 
+        # States describe the concrete cause via self.fail(ctx, reason) /
+        # ctx["error_reason"]; fold it into the human-readable text and clear it
+        # so a later, unrelated failure can't reuse a stale reason.
+        detail = self.ctx.pop("error_reason", None)
+        cause = str(detail).strip() if detail else ""
+        because = f" due to {cause}" if cause else ""
+
         if state_name == "Error" or "Error" not in self.states:
             return "Error", "error_fallback"
 
         if not self._retried_current_state:
             self._retried_current_state = True
             self.ctx["error_triggered"] = False
+            summary = f"{state_name} failed{because}; retrying once"
             node.get_logger().warn(
-                f"[FSM] {reason} in '{state_name}'. Retrying this state once before 'Error'."
+                f"[FSM] {reason} in '{state_name}'{because}. Retrying this state once before 'Error'."
             )
+            self._set_state_status(
+                state_name,
+                phase="retrying",
+                summary=summary,
+                data={"reason": reason, "cause": cause},
+                level="warn",
+            )
+            self._publish_state_status(state_name)
             self._publish_event(
                 "retry",
                 state_name=state_name,
-                summary=f"Retrying {state_name} once",
-                details={"reason": reason},
+                summary=summary,
+                details={"reason": reason, "cause": cause},
                 level="warn",
             )
             return state_name, f"retry_once:{reason}"
 
+        summary = f"{state_name} failed{because}; going to Error"
+        # Handed to the Error state so the panel keeps showing the cause instead
+        # of the generic "Entered Error" that the transition would otherwise set.
+        self.ctx["fsm_error_summary"] = summary
         node.get_logger().error(
-            f"[FSM] {reason} in '{state_name}' after retry. Transitioning to 'Error'."
+            f"[FSM] {reason} in '{state_name}'{because} after retry. Transitioning to 'Error'."
         )
+        self._set_state_status(
+            state_name,
+            phase="failed",
+            summary=summary,
+            data={"reason": reason, "cause": cause},
+            level="error",
+        )
+        self._publish_state_status(state_name)
         self._publish_event(
             "error",
             state_name=state_name,
-            summary=f"{state_name} failed after retry",
-            details={"reason": reason},
+            summary=summary,
+            details={"reason": reason, "cause": cause},
             level="error",
         )
         self._retried_current_state = False
@@ -156,6 +208,10 @@ class StateMachine:
         self.current_state = self.states[next_state]
         if next_state != previous_state:
             self._retried_current_state = False
+            # Drop the previous state's segment/line progress so the panel's
+            # Progress field doesn't carry a stale "2 / 3" into a state that
+            # never reports progress.
+            self.ctx.get("_fsm_status", {}).pop("progress", None)
         self.ctx["is_initial_entry"] = False
         self._state_enter_time_monotonic = time.monotonic()
         self.current_state.on_enter(self.ctx)

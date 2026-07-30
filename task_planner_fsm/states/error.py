@@ -18,7 +18,9 @@ class Error(State):
         ctx["fatal"] = True
 
     def run(self, ctx):
-        pass
+        prev = ctx.get("last_state", "unknown")
+        summary = ctx.get("fsm_error_summary") or f"{prev} failed; robot stopped"
+        self.set_activity(ctx, summary, level="error")
 
     def check_transition(self, ctx):
         return None

@@ -1,4 +1,5 @@
 from ..state import State
+from ..utils.wall_geometry import left_scan_endpoint
 import math
 import rclpy
 from rclpy.node import Node
@@ -28,9 +29,9 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
     #     self.current_position = (pos.x, pos.y)
 
     def _closest_scan_line(self, walls_data, x, y):
+        """Return the wall whose scan line passes closest to (x, y), or None."""
         min_dist = float("inf")
-        selected_line = None
-        selected_point = None
+        selected_wall = None
 
         for wall in walls_data:
             scan_line = wall.get("scan_line")
@@ -40,13 +41,13 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
                 dist = ((x - pt[0]) ** 2 + (y - pt[1]) ** 2) ** 0.5
                 if dist < min_dist:
                     min_dist = dist
-                    selected_line = scan_line
-                    selected_point = pt
+                    selected_wall = wall
 
-        return selected_line, selected_point
+        return selected_wall
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Selecting the next wall to scan")
 
         if self.step_count >= self.MAX_STEPS:
             if not ctx.get("error_triggered"):
@@ -97,14 +98,37 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
                 node.get_logger().error(f"[{self.name}] No wall point selected.")
                 ctx["error_triggered"] = True
                 return
-            
+
+            # The closest endpoint above only picks the wall; always START the sweep
+            # from the LEFT endpoint (as seen facing the wall) so the robot's left
+            # flank -- where the sensor plate unfolds -- faces the wall. Downstream
+            # (NavigateToTarget/ScanWall) derive the heading from start->far end, so
+            # forcing a left-to-right sweep here fixes the base orientation.
+            selected_wall = walls_data[selected_wall_idx]
+            selected_point = left_scan_endpoint(
+                selected_wall["scan_line"], selected_wall.get("inward_normal")
+            )
+
             # Saving computed data
             self.scanned_walls_idx.append(selected_wall_idx)
             ctx["current_wall_index"] = selected_wall_idx
-            ctx["target_scan_wall"] = walls_data[selected_wall_idx]["scan_line"]
+            ctx["target_scan_wall"] = selected_wall["scan_line"]
             ctx["target_scan_point"] = selected_point
             ctx["target_selected"] = True
-            node.get_logger().info(f"[{self.name}] Wall #{selected_wall_idx} selected at point {selected_point}.")
+
+            # Horizontal scan lines (heights) for this wall, bottom-first.
+            # ScanWall consumes them one at a time, self-looping per line.
+            scan_lines_z = walls_data[selected_wall_idx].get("scan_lines_z")
+            if not scan_lines_z:
+                # Fallback to a single line at the wall's scan-line z.
+                scan_lines_z = [walls_data[selected_wall_idx]["scan_line"][0][2]]
+            ctx["current_wall_scan_lines"] = list(scan_lines_z)
+            ctx["current_line_idx"] = 0
+
+            node.get_logger().info(
+                f"[{self.name}] Wall #{selected_wall_idx} selected at point {selected_point}. "
+                f"{len(scan_lines_z)} line(s) at z={[round(z, 3) for z in scan_lines_z]}."
+            )
 
         elif ctx.get("scan_phase") == 2:
             # Robot position (real or simulated)
@@ -157,11 +181,15 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
             ctx["selected_base_idx"] = selected_col_rank
 
             # NavigateToTarget expects target_scan_wall/target_scan_point for orientation.
+            # Use the LEFT scan endpoint so the base parks with its left flank (sensor
+            # plate side) facing the wall, matching the phase-1 convention.
             walls_data = ctx.get("walls_data", [])
-            scan_line, scan_point = self._closest_scan_line(walls_data, selected_point[0], selected_point[1])
-            if scan_line and scan_point:
-                ctx["target_scan_wall"] = scan_line
-                ctx["target_scan_point"] = scan_point
+            selected_wall = self._closest_scan_line(walls_data, selected_point[0], selected_point[1])
+            if selected_wall and selected_wall.get("scan_line"):
+                ctx["target_scan_wall"] = selected_wall["scan_line"]
+                ctx["target_scan_point"] = left_scan_endpoint(
+                    selected_wall["scan_line"], selected_wall.get("inward_normal")
+                )
             else:
                 node.get_logger().warn(
                     f"[{self.name}] Could not infer target_scan_wall from walls_data; "

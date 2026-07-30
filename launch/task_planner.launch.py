@@ -20,19 +20,19 @@ def generate_launch_description():
             name='mock_server',
             output='screen',
         ),
-        Node(
-            package='arm_control',
-            executable='optimal_base_service',
-            name='optimal_base_service',
-            output='screen',
-            parameters=[{'map_relpath': 'resource/rmap.npy'}],
-        ),
-        Node(
-            package='arm_control',
-            executable='wall_discretization_node',
-            name='wall_discretization_node',
-            output='screen',
-        ),
+        # Node(
+        #     package='arm_control',
+        #     executable='optimal_base_service',
+        #     name='optimal_base_service',
+        #     output='screen',
+        #     parameters=[{'map_relpath': 'resource/rmap.npy'}],
+        # ),
+        # Node(
+        #     package='arm_control',
+        #     executable='wall_discretization_node',
+        #     name='wall_discretization_node',
+        #     output='screen',
+        # ),
         # Node(
         #     package='arm_control',
         #     executable='script_command_service_node',

@@ -7,6 +7,11 @@
   <maintainer email="yeray.navarro@estudiantat.upc.edu">ynavarro@cdei.upc.edu</maintainer>
   <license>Apache-2.0</license>
 
+  <exec_depend>ur_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+  <exec_depend>navi_wall</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

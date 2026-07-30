@@ -29,7 +29,8 @@ class HomePosition(State):
                 ctx["error_triggered"] = True
 
     def run(self, ctx):
-        node = ctx["node"]        
+        node = ctx["node"]
+        self.set_activity(ctx, "Returning the robot to the home position")
         nav_client = ctx.get("nav_client")
         if nav_client is None:
             node.get_logger().error(f"[{self.name}] Navigation client not found in context.")

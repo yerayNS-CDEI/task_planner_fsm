@@ -11,7 +11,8 @@
 #include <QFont>
 #include <QFormLayout>
 #include <QGraphicsEllipseItem>
-#include <QGraphicsLineItem>
+#include <QGraphicsPathItem>
+#include <QGraphicsPolygonItem>
 #include <QGraphicsScene>
 #include <QGraphicsSimpleTextItem>
 #include <QGraphicsView>
@@ -22,10 +23,13 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPen>
+#include <QPolygonF>
 #include <QPushButton>
 #include <QSizePolicy>
 #include <QVBoxLayout>
+#include <QVector>
 #include <QWheelEvent>
 #include <QWidget>
 
@@ -83,6 +87,97 @@ QPointF ellipseBoundaryPoint(
     return center;
   }
   return QPointF(center.x() + dx / denom, center.y() + dy / denom);
+}
+
+QPointF unitVector(const QPointF & v)
+{
+  const qreal len = std::hypot(v.x(), v.y());
+  if (len < 1e-6) {
+    return QPointF(0.0, 0.0);
+  }
+  return QPointF(v.x() / len, v.y() / len);
+}
+
+// Returns true when none of the obstacle rectangles is crossed by the path.
+bool pathClearsObstacles(const QPainterPath & path, const QVector<QRectF> & obstacles)
+{
+  constexpr int kSamples = 64;
+  for (int i = 0; i <= kSamples; ++i) {
+    const QPointF point = path.pointAtPercent(static_cast<qreal>(i) / kSamples);
+    for (const auto & rect : obstacles) {
+      if (rect.contains(point)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Routes an edge from one node to another. A straight segment is used when it
+// does not cross any other node; otherwise the edge is bowed perpendicular to
+// the chord, trying both sides with growing offset until a clear route is found.
+QPainterPath buildEdgePath(
+  const QPointF & from_center, const QPointF & to_center,
+  qreal rx, qreal ry, const QVector<QRectF> & obstacles)
+{
+  // Self-transition: draw a small loop above the node.
+  if (std::hypot(to_center.x() - from_center.x(), to_center.y() - from_center.y()) < 1e-6) {
+    const QPointF top(from_center.x(), from_center.y() - ry);
+    QPainterPath loop(top + QPointF(-18.0, 0.0));
+    loop.cubicTo(
+      from_center + QPointF(-70.0, -ry - 80.0),
+      from_center + QPointF(70.0, -ry - 80.0),
+      top + QPointF(18.0, 0.0));
+    return loop;
+  }
+
+  const QPointF straight_start = ellipseBoundaryPoint(from_center, rx, ry, to_center);
+  const QPointF straight_end = ellipseBoundaryPoint(to_center, rx, ry, from_center);
+  QPainterPath straight(straight_start);
+  straight.lineTo(straight_end);
+  if (pathClearsObstacles(straight, obstacles)) {
+    return straight;
+  }
+
+  const QPointF chord = to_center - from_center;
+  const QPointF dir = unitVector(chord);
+  const QPointF normal(-dir.y(), dir.x());
+
+  for (qreal offset = 80.0; offset <= 680.0; offset += 20.0) {
+    for (const qreal side : {1.0, -1.0}) {
+      const QPointF bulge = normal * (side * offset);
+      const QPointF start = ellipseBoundaryPoint(from_center, rx, ry, from_center + bulge);
+      const QPointF end = ellipseBoundaryPoint(to_center, rx, ry, to_center + bulge);
+      const QPointF c1 = start + chord * 0.25 + bulge;
+      const QPointF c2 = end - chord * 0.25 + bulge;
+      QPainterPath curve(start);
+      curve.cubicTo(c1, c2, end);
+      if (pathClearsObstacles(curve, obstacles)) {
+        return curve;
+      }
+    }
+  }
+
+  // No clear curve was found; keep the straight segment (original behaviour).
+  return straight;
+}
+
+// Builds a triangular arrow head pointing along the path's final tangent.
+QPolygonF arrowHeadFor(const QPainterPath & path)
+{
+  const QPointF tip = path.pointAtPercent(1.0);
+  const QPointF before = path.pointAtPercent(0.94);
+  QPointF dir = unitVector(tip - before);
+  if (dir.isNull()) {
+    dir = QPointF(1.0, 0.0);
+  }
+  const QPointF normal(-dir.y(), dir.x());
+  constexpr qreal kLength = 15.0;
+  constexpr qreal kHalfWidth = 7.0;
+  const QPointF base = tip - dir * kLength;
+  QPolygonF head;
+  head << tip << (base + normal * kHalfWidth) << (base - normal * kHalfWidth);
+  return head;
 }
 
 }  // namespace
@@ -341,7 +436,13 @@ void FsmPanel::refreshGraphStyles()
       color = QColor("#1E6F43");
       width = 3.0;
     }
-    edge.item->setPen(QPen(color, width));
+    if (edge.item) {
+      edge.item->setPen(QPen(color, width));
+    }
+    if (edge.arrow) {
+      edge.arrow->setPen(QPen(color, width));
+      edge.arrow->setBrush(QBrush(color));
+    }
   }
 }
 
@@ -429,6 +530,8 @@ void FsmPanel::handleGraphPayload(const QString & payload)
     node_items_.insert(id, rect);
   }
 
+  constexpr qreal kObstacleMargin = 8.0;
+
   const auto edges = root.value("edges").toArray();
   for (const auto & edge_value : edges) {
     const auto edge_obj = edge_value.toObject();
@@ -440,13 +543,29 @@ void FsmPanel::handleGraphPayload(const QString & payload)
 
     const QPointF from_center = node_items_.value(from)->rect().center();
     const QPointF to_center = node_items_.value(to)->rect().center();
-    const QPointF start = ellipseBoundaryPoint(from_center, kRadiusX, kRadiusY, to_center);
-    const QPointF end = ellipseBoundaryPoint(to_center, kRadiusX, kRadiusY, from_center);
-    const QLineF line(start, end);
 
-    auto * line_item = graph_scene_->addLine(line, QPen(QColor("#A0A8B2"), 1.5));
-    line_item->setZValue(0.0);
-    edge_items_.push_back({from, to, line_item});
+    // Every node except this edge's own endpoints is an obstacle to route around.
+    QVector<QRectF> obstacles;
+    obstacles.reserve(node_items_.size());
+    for (auto it = node_items_.cbegin(); it != node_items_.cend(); ++it) {
+      if (it.key() == from || it.key() == to) {
+        continue;
+      }
+      obstacles.push_back(it.value()->rect().adjusted(
+        -kObstacleMargin, -kObstacleMargin, kObstacleMargin, kObstacleMargin));
+    }
+
+    const QPainterPath path =
+      buildEdgePath(from_center, to_center, kRadiusX, kRadiusY, obstacles);
+
+    auto * path_item = graph_scene_->addPath(path, QPen(QColor("#A0A8B2"), 1.5));
+    path_item->setZValue(0.0);
+
+    auto * arrow_item = graph_scene_->addPolygon(
+      arrowHeadFor(path), QPen(QColor("#A0A8B2"), 1.5), QBrush(QColor("#A0A8B2")));
+    arrow_item->setZValue(0.5);
+
+    edge_items_.push_back({from, to, path_item, arrow_item});
   }
 
   refreshGraphStyles();

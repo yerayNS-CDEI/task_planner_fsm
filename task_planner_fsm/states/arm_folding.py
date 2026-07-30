@@ -77,6 +77,11 @@ class ArmFolding(State):
         request = SendPosition.Request()
         request.position_name = self.current_goal
 
+        # Reset execution signals before sending so we wait for a FRESH result
+        # rather than a stale True/failure left over from a previous state.
+        ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
+
         self.future = self.service_client.call_async(request)
         node.get_logger().info(
             f"[{self.name}] Sending service request for position: {self.current_goal} "
@@ -85,6 +90,7 @@ class ArmFolding(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        self.set_activity(ctx, "Folding the arm back to the transport pose")
 
         if ctx.get("error_triggered") or self.movement_done:
             return
@@ -96,8 +102,12 @@ class ArmFolding(State):
                 node.get_logger().info(f"[{self.name}] Gazebo simulation: skipping dashboard play command.")
                 self.dashboard_sent = True
             else:
-                node.get_logger().info(f"[{self.name}] Sending dashboard play command to UR robot...")
-                success, message = send_dashboard_play_command()
+                robot_ip = str(ctx.get("robot_ip", "192.168.1.102"))
+                robot_port = int(ctx.get("robot_port", 29999))
+                node.get_logger().info(
+                    f"[{self.name}] Sending dashboard play command to UR robot at {robot_ip}:{robot_port}..."
+                )
+                success, message = send_dashboard_play_command(host=robot_ip, port=robot_port)
                 if success:
                     node.get_logger().info(f"[{self.name}] Dashboard command successful: {message}")
                     self.dashboard_sent = True
@@ -174,22 +184,10 @@ class ArmFolding(State):
                 self.verbose = True
 
     def check_transition(self, ctx):        
-        if ctx.get("scan_phase") == 1:
-            if self.movement_done and not ctx.get("scan_done"):
-                # print("ARM FOLDING - AF1")
-                return "WallTargetSelection"
-            if self.movement_done and ctx.get("scan_done"):
-                # print("ARM FOLDING - AF2")
-                return "AreasOfInterest"
-        if ctx.get("scan_phase") == 2:
-            if self.movement_done and ctx.get("recompute_base_placement"):
-                return "BasePlacement"
-            if self.movement_done and not ctx.get("exhaustive_scan_done"):
-                # print("ARM FOLDING - AF3")
-                return "WallTargetSelection"
-            if self.movement_done and ctx.get("exhaustive_scan_done"):
-                # print("ARM FOLDING - AF4")
-                return "HomePosition"
+        if self.movement_done and not ctx.get("scan_done"):
+            return "WallTargetSelection"
+        if self.movement_done and ctx.get("scan_done"):
+            return "HomePosition"
         if ctx.get("error_triggered"):
             return "Error"
         

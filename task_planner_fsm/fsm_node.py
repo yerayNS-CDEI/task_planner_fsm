@@ -1,75 +1,96 @@
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
 import rclpy
-from geometry_msgs.msg import Point, Pose, Quaternion
+from geometry_msgs.msg import Point, Pose, Quaternion, WrenchStamped
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 import tf2_ros
 from rclpy.duration import Duration
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float32MultiArray, String
 
 from task_planner_fsm.machine import StateMachine
 from task_planner_fsm.states import (
-    AreasOfInterest,
     ArmFolding,
     ArmUnfolding,
-    BasePlacement,
     ComputeWallPoints,
     CreateMap,
     Error,
-    ExhaustiveScan,
     Finished,
     GeometryReconstruction,
     HomePosition,
     Initialization,
     NavigateToTarget,
     ObjectID,
+    WallLinesComputation,
     ScanWall,
-    WallDiscretization,
     WallTargetSelection,
+    SensorDataProcessing,
+    SendDataToPokeye,
+    ScanCeiling,
+    ScanFloor,
+    # AreasOfInterest,
+    # BasePlacement,
+    # ExhaustiveScan,
+    # WallDiscretization,
 )
-from task_planner_fsm.states.proc_utils import start_proc, stop_all
+from task_planner_fsm.states.proc_utils import (
+    start_proc,
+    stop_all,
+    wait_stack_ready,
+    wait_services_ready,
+    ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
+)
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
-from task_planner_fsm.utils.wall_geometry import (
-    ee_rpy_deg_from_inward_normal,
-    inward_normal_from_wall_points,
-)
+from task_planner_fsm.utils.wall_geometry import build_wall_data, left_scan_endpoint
 
 FSM_STATE_ORDER = [
     "Initialization",
     "CreateMap",
     "ObjectID",
+    "WallLinesComputation",
     "GeometryReconstruction",
     "ComputeWallPoints",
     "WallTargetSelection",
     "NavigateToTarget",
     "ArmUnfolding",
-    "ArmFolding",
     "ScanWall",
-    "AreasOfInterest",
-    "WallDiscretization",
-    "BasePlacement",
-    "ExhaustiveScan",
+    "SensorDataProcessing",
+    "SendDataToPokeye",
+    "ArmFolding",
+    "ScanFloor",
+    "ScanCeiling",
+    # "AreasOfInterest",
+    # "WallDiscretization",
+    # "BasePlacement",
+    # "ExhaustiveScan",
     "HomePosition",
     "Finished",
     "Error",
 ]
 
 PHASE2_DEFAULT_INITIAL_STATES = {
-    "AreasOfInterest",
-    "WallDiscretization",
-    "BasePlacement",
-    "ExhaustiveScan",
+    # "AreasOfInterest",
+    # "WallDiscretization",
+    # "BasePlacement",
+    # "ExhaustiveScan",
+    "ScanFloor",
+    "HomePosition",
+    "Finished",
+}
+
+PHASE3_DEFAULT_INITIAL_STATES = {
+    "ScanCeiling",
     "HomePosition",
     "Finished",
 }
@@ -80,10 +101,10 @@ WALL_DATA_REQUIRED_INITIAL_STATES = {
     "ArmUnfolding",
     "ArmFolding",
     "ScanWall",
-    "AreasOfInterest",
-    "WallDiscretization",
-    "BasePlacement",
-    "ExhaustiveScan",
+    # "AreasOfInterest",
+    # "WallDiscretization",
+    # "BasePlacement",
+    # "ExhaustiveScan",
     "HomePosition",
 }
 
@@ -98,7 +119,7 @@ PHASE2_BASE_REQUIRED_INITIAL_STATES = {
     "ArmUnfolding",
     "ScanWall",
     "ArmFolding",
-    "ExhaustiveScan",
+    # "ExhaustiveScan",
 }
 
 NEEDS_SYNTHETIC_DISCRETIZATION_INITIAL_STATES = {
@@ -107,8 +128,8 @@ NEEDS_SYNTHETIC_DISCRETIZATION_INITIAL_STATES = {
     "ArmUnfolding",
     "ArmFolding",
     "ScanWall",
-    "BasePlacement",
-    "ExhaustiveScan",
+    # "BasePlacement",
+    # "ExhaustiveScan",
     "HomePosition",
 }
 
@@ -116,24 +137,39 @@ NAV_CLIENT_BOOTSTRAP_STATES = {
     "ArmUnfolding",
     "ArmFolding",
     "ScanWall",
-    "AreasOfInterest",
-    "WallDiscretization",
-    "BasePlacement",
-    "ExhaustiveScan",
+    "ScanFloor",
+    # "AreasOfInterest",
+    # "WallDiscretization",
+    # "BasePlacement",
+    # "ExhaustiveScan",
     "HomePosition",
 }
 
+# GeometryReconstruction is the first state of the wall-processing/scanning
+# pipeline: it itself only needs navi_wall's detected_walls.yaml on disk, but it
+# flows straight into ComputeWallPoints -> WallTargetSelection -> NavigateToTarget,
+# which need the navigation + localization stack. In the normal flow that stack is
+# already up (started by ObjectID), so when bootstrapping from GeometryReconstruction
+# (or later) we start it here too.
 NAV_SIM_REQUIRED_START_STATES = {
     s
-    for s in FSM_STATE_ORDER[FSM_STATE_ORDER.index("ComputeWallPoints") :]
+    for s in FSM_STATE_ORDER[FSM_STATE_ORDER.index("GeometryReconstruction") :]
     if s not in {"Finished", "Error"}
 }
 
+# Fallback walls, only used when navi_wall's detected_walls.yaml cannot be
+# loaded during bootstrap. The default wall source is the YAML (see
+# _load_bootstrap_walls / GeometryReconstruction._load_detected_walls_from_yaml).
 PREDEFINED_WALLS = [
-    ((3.0, 0.0, 2.0), (3.0, -3.0, 3.0)),
+    ((4.0, 0.0, 2.0), (4.0, -3.0, 3.0)),
     ((9.0, 0.0, 0.19), (9.0, -4.5, 2.0)),
     ((10.0, -4.5, 0.2), (10.0, 0.0, 3.0)),
+    ((4.0, 2.0, 0.2), (8.0, 2.0, 3.0)),
 ]
+
+# Endpoint z used for YAML walls that don't carry a z_min (mirrors
+# GeometryReconstruction.default_wall_z).
+BOOTSTRAP_WALL_DEFAULT_Z = 0.0
 
 
 class RobotFSMNode(Node):
@@ -144,7 +180,14 @@ class RobotFSMNode(Node):
         scan_phase: Optional[int] = None,
         planner_backend: str = "legacy",
     ):
-        super().__init__("robot_fsm_node")
+        # Auto-declare any parameter passed as an override (e.g. via
+        # `--ros-args -p create_map_sweep_axis:=perpendicular` or a launch file),
+        # so per-state tuning knobs read from ctx below can be set without a
+        # declare_parameter call for each one.
+        super().__init__(
+            "robot_fsm_node",
+            automatically_declare_parameters_from_overrides=True,
+        )
         self.initial_state = initial_state
         self._stdin_warned = False
         self.planner_backend = str(planner_backend).strip().lower()
@@ -198,6 +241,18 @@ class RobotFSMNode(Node):
             "tf_buffer": self.tf_buffer,
         }
 
+        # Bridge externally-set ROS parameter overrides into ctx so per-state
+        # tuning knobs (create_map_*, object_id_*, scan_*, ...) can be configured
+        # at launch. setdefault keeps the explicit ctx values above authoritative
+        # (a param cannot clobber e.g. "node"/"sim"); any other override lands in
+        # ctx under its flat name and is picked up by the matching ctx.get(...).
+        param_overrides = self.get_parameters_by_prefix("")
+        for pname, param in param_overrides.items():
+            if pname == "use_sim_time":
+                continue
+            self.ctx.setdefault(pname, param.value)
+            self.get_logger().info(f"[FSM] ctx param override: {pname}={param.value!r}")
+
         # Build test context for non-default initial state.
         self._bootstrap_context_for_initial_state(initial_state, scan_phase)
 
@@ -207,6 +262,7 @@ class RobotFSMNode(Node):
                 Initialization("Initialization"),
                 CreateMap("CreateMap"),
                 ObjectID("ObjectID"),
+                WallLinesComputation("WallLinesComputation"),
                 GeometryReconstruction("GeometryReconstruction"),
                 ComputeWallPoints("ComputeWallPoints"),
                 WallTargetSelection("WallTargetSelection"),
@@ -214,10 +270,14 @@ class RobotFSMNode(Node):
                 ArmUnfolding("ArmUnfolding"),
                 ArmFolding("ArmFolding"),
                 ScanWall("ScanWall"),
-                AreasOfInterest("AreasOfInterest"),
-                WallDiscretization("WallDiscretization"),
-                BasePlacement("BasePlacement"),
-                ExhaustiveScan("ExhaustiveScan"),
+                ScanFloor("ScanFloor"),
+                ScanCeiling("ScanCeiling"),
+                SensorDataProcessing("SensorDataProcessing"),
+                SendDataToPokeye("SendDataToPokeye"),
+                # AreasOfInterest("AreasOfInterest"),
+                # WallDiscretization("WallDiscretization"),
+                # BasePlacement("BasePlacement"),
+                # ExhaustiveScan("ExhaustiveScan"),
                 HomePosition("HomePosition"),
                 Finished("Finished"),
                 Error("Error"),
@@ -235,6 +295,54 @@ class RobotFSMNode(Node):
         self.create_subscription(Bool, "/arm/execution_status", self.execution_status_callback, 10)
         self.create_subscription(Bool, "/planner/goal_failed", self.planner_goal_failed_callback, 10)
         self.create_subscription(Bool, "/map_done", self.mapping_callback, 10)
+        # TCP force/torque sensor (ur_ros2_driver's force_torque_sensor_broadcaster).
+        # ScanWall uses the wall-normal (arm_tool0 Z) force to detect when the GPR
+        # wheel touches the wall before starting the measurement and the base sweep.
+        # The broadcaster publishes best-effort, so subscribe best-effort (a reliable
+        # subscription would drop every message).
+        ft_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(
+            WrenchStamped,
+            "/force_torque_sensor_broadcaster/wrench",
+            self.ft_data_callback,
+            ft_qos,
+        )
+        # Sensor-plate ranges from arm_control's arduino_sensors(_sim): six floats
+        # in metres, [C/U1, A/U2, B/U3] ultrasonic then [S1, S2, S3] ToF. The
+        # wall_parallel_controller consumes the same topic for its plane fit, but it
+        # only logs the resulting mean and is not running between segments, so
+        # ScanWall reads the raw frame instead: it drives the arm's Z approach to the
+        # wall and the retraction that clears the plate before the base slides to the
+        # next segment.
+        self.create_subscription(
+            Float32MultiArray, "/distance_sensors", self.distance_sensors_callback, 10
+        )
+        # Nav2 global costmap (latched) so states can project scan goals onto the
+        # nearest cell the base can actually occupy. See costmap_utils.
+        costmap_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            OccupancyGrid, "/global_costmap/costmap", self.global_costmap_callback, costmap_qos
+        )
+        # Chassis-parking status from sim_controller (latched, transient_local so a
+        # late subscriber gets the current value). True while a /sim_controller/park_now
+        # maneuver runs, false when the chassis is aligned with the turret. ScanWall
+        # parks the base to face the wall before the sweep and waits on this flag.
+        parking_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            Bool, "/sim_controller/parking_active", self.parking_active_callback, parking_qos
+        )
 
         # Timer
         self.timer = self.create_timer(1.0, self.machine.step)
@@ -271,50 +379,34 @@ class RobotFSMNode(Node):
             return value
 
     def _build_wall_data(
-        self, p1: Tuple[float, float, float], p2: Tuple[float, float, float], offset: float = 0.6
+        self,
+        p1: Tuple[float, float, float],
+        p2: Tuple[float, float, float],
+        offset: float = 0.6,
+        scan_lines_z: Optional[List[float]] = None,
+        outward_normal: Optional[Tuple[float, float]] = None,
     ) -> Dict[str, Tuple]:
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        length = math.hypot(dx, dy)
-        if length == 0:
-            raise ValueError("Wall points must be different.")
-
-        dx /= length
-        dy /= length
-
-        # Clock-wise normal for the exterior scan side.
-        nx = dy
-        ny = -dx
-
-        scan_start = (
-            p1[0] + offset * dx + nx * offset,
-            p1[1] + offset * dy + ny * offset,
-            p1[2],
+        return build_wall_data(
+            p1, p2, offset=offset, scan_lines_z=scan_lines_z, outward_normal=outward_normal
         )
-        scan_end = (
-            p2[0] - offset * dx + nx * offset,
-            p2[1] - offset * dy + ny * offset,
-            p2[2],
-        )
-
-        inward_normal = inward_normal_from_wall_points(p1, p2)
-        ee_rpy_deg = ee_rpy_deg_from_inward_normal(inward_normal)
-
-        return {
-            "original": (tuple(p1), tuple(p2)),
-            "scan_line": (scan_start, scan_end),
-            "inward_normal": inward_normal,
-            "ee_rpy_deg": ee_rpy_deg,
-        }
 
     def _prompt_walls_data(self) -> List[Dict[str, Tuple]]:
-        print("[FSM Bootstrap] Available predefined walls:")
-        for i, (p1, p2) in enumerate(PREDEFINED_WALLS, start=1):
-            print(f"  {i}: p1={p1}, p2={p2}")
+        available_walls = self._load_bootstrap_walls()
 
-        max_walls = len(PREDEFINED_WALLS)
+        # The selection number below (1..N) is the same 1-based order the RViz
+        # 'detected_wall_labels' markers use ("W1", "W2", ...), so picking N here
+        # scans the wall labelled "W{N}" in RViz. The YAML id is shown too for
+        # cross-referencing detected_walls.yaml.
+        print("[FSM Bootstrap] Available walls (number matches the green 'W#' label in RViz):")
+        for i, (wall_id, (p1, p2), _n) in enumerate(available_walls, start=1):
+            print(f"  {i}: W{i}  (yaml id={wall_id})  p1={p1}, p2={p2}")
+
+        max_walls = len(available_walls)
         num_walls = self._prompt_int(
-            ">> Number of walls to include for this run (1-3)", 1, max_walls, max_walls
+            f">> Number of walls to include for this run (1-{max_walls})",
+            1,
+            max_walls,
+            max_walls,
         )
 
         default_indices = list(range(1, num_walls + 1))
@@ -345,9 +437,149 @@ class RobotFSMNode(Node):
 
             walls_data = []
             for idx in selected_indices:
-                p1, p2 = PREDEFINED_WALLS[idx - 1]
-                walls_data.append(self._build_wall_data(p1, p2))
+                _wall_id, (p1, p2), outward_normal = available_walls[idx - 1]
+                scan_lines_z = self._prompt_wall_lines(idx)
+                walls_data.append(
+                    self._build_wall_data(
+                        p1, p2, scan_lines_z=scan_lines_z, outward_normal=outward_normal
+                    )
+                )
             return walls_data
+
+    def _load_bootstrap_walls(self) -> List[Tuple[object, Tuple[Tuple, Tuple]]]:
+        """Selectable walls for a direct (bootstrap) start, loaded from
+        navi_wall's ``detected_walls.yaml`` as ``((x, y, z), (x, y, z))``
+        map-frame endpoint pairs — the same source and shape GeometryReconstruction
+        feeds into ComputeWallPoints. Falls back to ``PREDEFINED_WALLS`` only when
+        the YAML is missing/empty so a demo run without navi_wall still works.
+        """
+        detections_dir = self._resolve_detections_dir()
+        yaml_path = (
+            os.path.join(detections_dir, "detected_walls.yaml")
+            if detections_dir is not None
+            else None
+        )
+        raw_walls = self._load_walls_from_yaml(yaml_path) if yaml_path else []
+        if not raw_walls:
+            self.get_logger().warn(
+                f"[FSM Bootstrap] No walls from detected_walls.yaml "
+                f"({yaml_path or 'navi_wall rgb_detections dir not found'}); "
+                f"falling back to hardcoded PREDEFINED_WALLS."
+            )
+            return [(i, (p1, p2), None) for i, (p1, p2) in enumerate(PREDEFINED_WALLS)]
+
+        walls = []
+        for order, w in enumerate(raw_walls):
+            z = float(w.get("z_min", BOOTSTRAP_WALL_DEFAULT_Z))
+            p1, p2 = w["p1"], w["p2"]
+            wall_id = w.get("id", order)
+            walls.append(
+                (
+                    wall_id,
+                    ((float(p1[0]), float(p1[1]), z), (float(p2[0]), float(p2[1]), z)),
+                    w.get("normal"),
+                )
+            )
+        self.get_logger().info(
+            f"[FSM Bootstrap] Loaded {len(walls)} wall(s) from '{yaml_path}'."
+        )
+        return walls
+
+    def _resolve_detections_dir(self) -> Optional[str]:
+        """Locate the navi_wall ``rgb_detections`` directory.
+
+        Order: explicit override param -> package share folder -> dev fallback to
+        the source checkout under ``<ws>/src``. Returns the first existing
+        directory, or None. Mirrors GeometryReconstruction._resolve_detections_dir.
+        """
+        candidates = []
+
+        override = self.ctx.get("geometry_reconstruction_rgb_detections_dir")
+        if override:
+            candidates.append(os.path.expanduser(str(override)))
+
+        try:
+            from ament_index_python.packages import get_package_share_directory
+
+            share = get_package_share_directory("navi_wall")
+            candidates.append(os.path.join(share, "rgb_detections"))
+            if os.sep + "install" + os.sep in share:
+                ws = share.split(os.sep + "install" + os.sep, 1)[0]
+                for pkg_dir in ("navi-wall", "navi_wall"):
+                    candidates.append(os.path.join(ws, "src", pkg_dir, "rgb_detections"))
+        except Exception as exc:
+            self.get_logger().warn(
+                f"[FSM Bootstrap] Could not resolve navi_wall share directory: {exc}"
+            )
+
+        for cand in candidates:
+            if cand and os.path.isdir(cand):
+                return cand
+        return None
+
+    def _load_walls_from_yaml(self, yaml_path: str) -> List[Dict]:
+        """Parse navi_wall's ``detected_walls.yaml`` into ``{'p1','p2','z_min','z_max'}``
+        entries. Mirrors GeometryReconstruction._load_walls_from_yaml.
+        """
+        if not yaml_path or not os.path.isfile(yaml_path):
+            return []
+        try:
+            import yaml
+
+            with open(yaml_path, "r") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as exc:
+            self.get_logger().warn(
+                f"[FSM Bootstrap] Could not parse '{yaml_path}': {exc}"
+            )
+            return []
+
+        walls = []
+        for w in data.get("walls", []) or []:
+            p1 = w.get("p1")
+            p2 = w.get("p2")
+            if not p1 or not p2:
+                continue
+            entry = {
+                "id": w.get("id", len(walls)),
+                "p1": (float(p1[0]), float(p1[1])),
+                "p2": (float(p2[0]), float(p2[1])),
+            }
+            if w.get("z_min") is not None:
+                entry["z_min"] = float(w["z_min"])
+            if w.get("z_max") is not None:
+                entry["z_max"] = float(w["z_max"])
+            # Outward wall normal (RViz arrow) so scanning uses the interior side.
+            n = w.get("normal")
+            if n and len(n) >= 2:
+                entry["normal"] = (float(n[0]), float(n[1]))
+            walls.append(entry)
+        return walls
+
+    def _prompt_wall_lines(self, wall_idx: int) -> List[float]:
+        """Prompt for the number of horizontal lines and their z heights.
+
+        Returns a list sorted ascending (bottom first). Accepting the defaults
+        (empty input) yields a single line, preserving single-pass behaviour.
+        """
+        num_lines = self._prompt_int(f">> Wall {wall_idx}: number of horizontal lines", 1, 20, 1)
+        default_str = " ".join("0.0" for _ in range(num_lines))
+        while True:
+            raw = self._safe_input(
+                f">> Wall {wall_idx}: z values for the {num_lines} line(s) "
+                f"(e.g. 0.5 1.2 2.0) [{default_str}]: "
+            ).strip()
+            if not raw:
+                return [0.0] * num_lines
+            try:
+                z_values = [float(tok) for tok in raw.replace(",", " ").split()]
+            except ValueError:
+                print(f"Invalid z value list: '{raw}'")
+                continue
+            if len(z_values) != num_lines:
+                print(f"Requested {num_lines} line(s) but provided {len(z_values)} z value(s).")
+                continue
+            return sorted(z_values)
 
     def _make_pose(self, x: float, y: float, z: float) -> Pose:
         pose = Pose()
@@ -462,10 +694,9 @@ class RobotFSMNode(Node):
 
     def _closest_scan_line_to_point(
         self, walls_data: List[Dict[str, Tuple]], point_xy: Tuple[float, float]
-    ) -> Tuple[Optional[Tuple], Optional[Tuple]]:
+    ) -> Optional[Dict[str, Tuple]]:
         min_dist = float("inf")
-        selected_line = None
-        selected_point = None
+        selected_wall = None
 
         for wall in walls_data:
             scan_line = wall.get("scan_line")
@@ -475,10 +706,9 @@ class RobotFSMNode(Node):
                 dist = ((point_xy[0] - pt[0]) ** 2 + (point_xy[1] - pt[1]) ** 2) ** 0.5
                 if dist < min_dist:
                     min_dist = dist
-                    selected_line = scan_line
-                    selected_point = pt
+                    selected_wall = wall
 
-        return selected_line, selected_point
+        return selected_wall
 
     def _ensure_reference_target_from_walls(self, selected_base: Optional[Tuple[float, float]] = None):
         if self.ctx.get("target_scan_wall") and self.ctx.get("target_scan_point"):
@@ -488,19 +718,20 @@ class RobotFSMNode(Node):
         if not walls_data:
             return
 
-        selected_line = None
-        selected_point = None
+        selected_wall = None
         if selected_base is not None:
-            selected_line, selected_point = self._closest_scan_line_to_point(walls_data, selected_base)
+            selected_wall = self._closest_scan_line_to_point(walls_data, selected_base)
+        if selected_wall is None:
+            selected_wall = walls_data[0]
 
-        if selected_line is None or selected_point is None:
-            selected_line = walls_data[0].get("scan_line")
-            if selected_line and len(selected_line) == 2:
-                selected_point = selected_line[0]
-
-        if selected_line and selected_point:
+        selected_line = selected_wall.get("scan_line")
+        if selected_line and len(selected_line) == 2:
+            # Start from the LEFT scan endpoint so the base's left flank (sensor
+            # plate side) faces the wall, matching WallTargetSelection.
             self.ctx["target_scan_wall"] = selected_line
-            self.ctx["target_scan_point"] = selected_point
+            self.ctx["target_scan_point"] = left_scan_endpoint(
+                selected_line, selected_wall.get("inward_normal")
+            )
 
     def _prompt_phase1_target(self):
         walls_data = self.ctx.get("walls_data", [])
@@ -520,8 +751,13 @@ class RobotFSMNode(Node):
         self.ctx["current_wall_index"] = wall_idx
         self.ctx["target_scan_wall"] = target_scan_wall
         self.ctx["target_scan_point"] = target_scan_point
+        self.ctx["current_wall_scan_lines"] = list(
+            walls_data[wall_idx].get("scan_lines_z") or [target_scan_wall[0][2]]
+        )
+        self.ctx["current_line_idx"] = 0
         self.get_logger().info(
-            f"[FSM] Phase-1 bootstrap target set: wall #{wall_idx}, point={target_scan_point}"
+            f"[FSM] Phase-1 bootstrap target set: wall #{wall_idx}, point={target_scan_point}, "
+            f"lines z={self.ctx['current_wall_scan_lines']}"
         )
 
     def _prompt_phase2_base(self):
@@ -583,13 +819,60 @@ class RobotFSMNode(Node):
                     "controller_type:=omni",
                     "database_name:=rtabmap_fsm",
                     "headless:=true",
-                    "use_sim_time:=true",
+                    f"use_sim_time:={sim_value}",
                     "hybrid_sim:=false",
                     f"planner_backend:={planner_backend}",
+                    # Push out launch's own SIGKILL deadline so ros2_control survives
+                    # long enough to retract the column on shutdown.
+                    *ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
                 ],
             )
             time.sleep(2.0)
             self.get_logger().info("[FSM] Navigation + localization simulation started by bootstrap.")
+
+            # Mirror ObjectID's readiness gates. When the FSM is started at a
+            # non-initial state this bootstrap path replaces ObjectID, so without
+            # these checks it would race ahead while the stack — in particular the
+            # collision-checking service — is still coming up, and the planner
+            # would silently plan without collision validation.
+            # /clock is only published when sim time is running, so it must NOT
+            # be required on the real robot (sim:=false) — otherwise
+            # wait_stack_ready blocks on '/clock' forever and eventually times
+            # out. Mirror ObjectID's conditional gating here.
+            default_ready_topics = ["/tf", "/joint_states", "/rtabmap/odom"]
+            if self.ctx.get("sim", False):
+                default_ready_topics = ["/clock"] + default_ready_topics
+            required_topics = self.ctx.get(
+                "stack_ready_topics",
+                default_ready_topics,
+            )
+            ready_timeout = float(self.ctx.get("stack_ready_timeout", 90.0))
+            self.get_logger().info(
+                f"[FSM] Waiting (up to {ready_timeout:.0f}s) for navigation + localization stack to become ready..."
+            )
+            if not wait_stack_ready(self.ctx, required_topics, timeout=ready_timeout):
+                self.ctx["error_triggered"] = True
+                self.get_logger().error(
+                    "[FSM] Navigation + localization stack did not become ready during bootstrap."
+                )
+                return
+
+            if planner_backend == "legacy":
+                collision_services = self.ctx.get(
+                    "collision_ready_services",
+                    ["/collision/check_collision_pose"],
+                )
+                collision_timeout = float(self.ctx.get("collision_ready_timeout", 60.0))
+                self.get_logger().info(
+                    f"[FSM] Waiting (up to {collision_timeout:.0f}s) for collision checking service to come up..."
+                )
+                if not wait_services_ready(self.ctx, collision_services, timeout=collision_timeout):
+                    self.ctx["error_triggered"] = True
+                    self.get_logger().error(
+                        "[FSM] Collision checking service did not come up during bootstrap; "
+                        "the planner would run without collision validation."
+                    )
+                    return
         except Exception as exc:
             self.ctx["error_triggered"] = True
             self.get_logger().error(
@@ -781,6 +1064,17 @@ class RobotFSMNode(Node):
         self.ctx["base_orientation"] = msg.pose.pose.orientation
         self.ctx["odom_received"] = True
 
+    def global_costmap_callback(self, msg: OccupancyGrid):
+        first = self.ctx.get("global_costmap") is None
+        self.ctx["global_costmap"] = msg
+        if first:
+            info = msg.info
+            self.get_logger().info(
+                f"[FSM] Global costmap received: {info.width}x{info.height} @ "
+                f"{info.resolution:.3f} m, origin=({info.origin.position.x:.2f}, "
+                f"{info.origin.position.y:.2f})."
+            )
+
     def joint_state_callback(self, msg):
         self.current_joint_state = msg
 
@@ -800,8 +1094,27 @@ class RobotFSMNode(Node):
     def planner_goal_failed_callback(self, msg: Bool):
         self.ctx["planner_goal_failed"] = msg.data
 
+    def ft_data_callback(self, msg: WrenchStamped):
+        # Latest TCP wrench (tool0 frame). ScanWall reads ctx["ft_wrench"].force.z
+        # to know when the GPR wheel is pressed against the wall.
+        self.ctx["ft_wrench"] = msg.wrench
+
+    def distance_sensors_callback(self, msg: Float32MultiArray):
+        # Latest plate ranges + arrival time. ScanWall averages the valid ones to
+        # decide how far the arm must travel along its Z axis to sit at the
+        # commanded standoff from the wall; the timestamp lets it reject a frame
+        # left over from a reader that has since been stopped.
+        if len(msg.data) == 6:
+            self.ctx["plate_distances"] = [float(v) for v in msg.data]
+            self.ctx["plate_distances_stamp"] = time.time()
+
     def mapping_callback(self, msg):
         self.ctx["map_ready"] = msg.data
+
+    def parking_active_callback(self, msg: Bool):
+        # Latched chassis-parking flag from sim_controller. ScanWall waits for the
+        # active->inactive transition to know the base has aligned with the turret.
+        self.ctx["parking_active"] = bool(msg.data)
 
 
 def main(args=None):
