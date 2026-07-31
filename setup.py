@@ -23,5 +23,6 @@ setup(
         'scripts/fsm_node',
         'scripts/mock_server',
         'scripts/goal_status_listener',
+        'scripts/wbc_sweep_controller',
     ],
 )

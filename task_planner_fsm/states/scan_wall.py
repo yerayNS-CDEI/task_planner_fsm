@@ -19,6 +19,8 @@ from rclpy.task import Future
 from rclpy.duration import Duration
 import rclpy.time
 from arm_control.srv import SendPosition
+from controller_manager_msgs.srv import SwitchController
+from std_msgs.msg import String
 from ur_msgs.srv import SetForceMode
 from std_srvs.srv import Trigger
 from rcl_interfaces.srv import SetParameters
@@ -148,6 +150,18 @@ class ScanWall(State):
         self._controller_param_client = None
         self._sweep_speed_applied = False
 
+        # Whole-body sweep (ctx["sweep_use_wbc"], sim only): instead of a base
+        # goal plus an independent plate-alignment controller, one control law
+        # over base + arm follows the wall the sensors actually see. Runs as its
+        # own process (task_planner_fsm/wbc/sweep_node.py, ~50 Hz — far too fast
+        # for this 1 Hz tick loop) and reports on /wbc_sweep/status, which lands
+        # in self._nav_status so sweep_wait needs no special case for it.
+        self._wbc_status_sub = None
+        self._wbc_started_at = None
+        self._wbc_ever_started = False
+        self._wbc_failure = None      # the node's own failure text, for the log
+        self._switch_client = None
+
         # Force mode (real robot only): press the GPR wheel against the wall (Z)
         # while the distance-sensor alignment holds the plate orientation.
         self.force_mode_start_client = None
@@ -214,6 +228,8 @@ class ScanWall(State):
         self._sweep_from = None
         self._sweep_to = None
         self._stop_sweep_crawl(ctx)   # clear any stale timer from a re-entry
+        self._stop_wbc_sweep(ctx)     # ... and any stale whole-body sweep process
+        self._wbc_failure = None
         self._sweep_crawl_target = None
         self._sweep_crawl_deadline = None
         self._restore_sweep_speed(ctx)   # clear any stale slow-sweep limit from a re-entry
@@ -1395,8 +1411,9 @@ class ScanWall(State):
             # Nav2 route: cap the base to a crawl speed + relax the progress checker
             # NOW, so the async param change has propagated by the time the base
             # sweeps (the arm approach + stabilise wait below cover it). Skipped when
-            # the /cmd_vel crawl is selected (it sets its own speed).
-            if not bool(ctx.get("sweep_use_crawl", False)):
+            # the /cmd_vel crawl or the whole-body sweep is selected — neither goes
+            # through the Nav2 controller at all.
+            if not bool(ctx.get("sweep_use_crawl", False)) and not self._wbc_enabled(ctx):
                 self._apply_sweep_speed(ctx)
             self._seg_phase = "arm_approach"
             return
@@ -1435,11 +1452,14 @@ class ScanWall(State):
         if self._seg_phase == "press_prepare":
             # Force mode is a real-robot-only press (no controller exists in sim),
             # so only mention it when it will actually run.
+            whole_body = self._wbc_enabled(ctx)
             self.set_activity(
                 ctx,
-                "Enabling wall-parallel controller"
-                if bool(ctx.get("sim", False))
-                else "Enabling wall-parallel controller and starting force-mode press",
+                "Preparing the whole-body sweep"
+                if whole_body
+                else ("Enabling wall-parallel controller"
+                      if bool(ctx.get("sim", False))
+                      else "Enabling wall-parallel controller and starting force-mode press"),
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
@@ -1452,10 +1472,16 @@ class ScanWall(State):
             # its approach pose and no other goal in flight.
             if not self._start_distance_sensors(ctx):
                 return
-            if not self._start_wall_alignment(ctx):
-                return
-            node.get_logger().info(f"[{self.name}] Waiting 10s for arm processes to stabilise...")
-            time.sleep(10.0)
+            # The whole-body sweep owns plate parallelism itself, from the same six
+            # ranges — running wall_parallel_controller alongside it would put two
+            # controllers on the arm, which is the coupling the whole-body law
+            # exists to remove. No IK stream to settle either, so no stabilise wait.
+            if not whole_body:
+                if not self._start_wall_alignment(ctx):
+                    return
+                node.get_logger().info(
+                    f"[{self.name}] Waiting 10s for arm processes to stabilise...")
+                time.sleep(10.0)
 
             # Real robot: press the GPR against the wall for this segment sweep
             # (sim has no force_mode controller -> no-op).
@@ -1491,19 +1517,27 @@ class ScanWall(State):
             if ctx.get("error_triggered"):
                 return
 
-            goal_xy = base_standoff_goal(ctx, self.name, seg_end)
-            node.get_logger().info(
-                f"[{self.name}] Sweeping segment {self._seg_idx + 1} to "
-                f"({goal_xy[0]:.2f}, {goal_xy[1]:.2f})."
-            )
             self.set_activity(
                 ctx,
                 f"Sweeping wall segment {seg_no}/{seg_total}",
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            # Nav2 route (default): slow Nav2 sweep, speed already capped in
-            # sweep_setup. Alternative (ctx["sweep_use_crawl"]): a /cmd_vel drag.
+            # Whole-body route: the sweep is defined by the WALL segment, not by a
+            # base pose — the controller follows the surface it senses and stops on
+            # arc length. Nav2 route (default): slow Nav2 sweep to the base standoff
+            # opposite the segment end, speed already capped in sweep_setup.
+            # Alternative (ctx["sweep_use_crawl"]): a /cmd_vel drag.
+            if self._wbc_enabled(ctx):
+                if not self._start_wbc_sweep(ctx, seg_start, seg_end):
+                    return
+                self._seg_phase = "sweep_wait"
+                return
+            goal_xy = base_standoff_goal(ctx, self.name, seg_end)
+            node.get_logger().info(
+                f"[{self.name}] Sweeping segment {self._seg_idx + 1} to "
+                f"({goal_xy[0]:.2f}, {goal_xy[1]:.2f})."
+            )
             if bool(ctx.get("sweep_use_crawl", False)):
                 self._start_sweep_crawl(ctx, goal_xy)
             elif not self._send_base_goal(ctx, goal_xy):
@@ -1518,11 +1552,20 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            # The crawl timer sets self._nav_status on arrival/timeout.
+            # The crawl timer / the whole-body node's status set self._nav_status
+            # on arrival, failure or timeout.
+            if self._wbc_enabled(ctx):
+                self._wbc_sweep_tick(ctx)
             if self._nav_status is None:
                 return
             status = self._nav_status
+            if self._wbc_failure:
+                node.get_logger().warn(
+                    f"[{self.name}] Whole-body sweep reported: {self._wbc_failure}"
+                )
+                self._wbc_failure = None
             self._stop_sweep_crawl(ctx, publish_stop=True)   # ensure base is stopped
+            self._stop_wbc_sweep(ctx)        # ... including the whole-body node
             self._restore_sweep_speed(ctx)   # clear the slow-sweep cap for the next transit
             # Release hardware/process state first (safety), regardless of outcome.
             node.get_logger().info(
@@ -1866,6 +1909,196 @@ class ScanWall(State):
         )
         self._sweep_speed_applied = False
 
+    # ------------------------------------------------------------------
+    # Whole-body sweep: one control law over base + arm (sim)
+    # ------------------------------------------------------------------
+    # Wall-clock grace on top of the node's own deadline. The node times its own
+    # sweep out and reports "failed"; this only catches a node that never came up
+    # or died before it could say anything.
+    WBC_STARTUP_GRACE_S = 60.0
+    WBC_STATUS_TOPIC = "/wbc_sweep/status"
+
+    def _wbc_enabled(self, ctx):
+        """True when this sweep should be whole-body rather than a base goal.
+
+        Opt-in through ``ctx["sweep_use_wbc"]`` and, by default, SIM ONLY. On the
+        real robot the UR ``force_mode_controller`` only runs alongside the
+        passthrough trajectory controller, never alongside the streaming velocity
+        controller the whole-body loop needs — so enabling it there means giving
+        up the hardware press in exchange for a software one, which is a separate
+        decision. ``ctx["wbc_allow_real"]`` makes it explicit.
+        """
+        if not bool(ctx.get("sweep_use_wbc", False)):
+            return False
+        if bool(ctx.get("sim", False)) or bool(ctx.get("wbc_allow_real", False)):
+            return True
+        ctx["node"].get_logger().warn(
+            f"[{self.name}] sweep_use_wbc is set but this is the real robot: force_mode "
+            f"cannot run with the streaming velocity controller. Falling back to the Nav2 "
+            f"sweep (set wbc_allow_real to override)."
+        )
+        return False
+
+    def _start_wbc_sweep(self, ctx, seg_start, seg_end):
+        """Launch the whole-body sweep for one segment and watch its status.
+
+        Drives ``self._nav_status`` exactly like a Nav2 goal — None in flight,
+        STATUS_SUCCEEDED on arrival, -1 on failure — so ``sweep_wait`` handles
+        the outcome with the same code either way.
+        """
+        node = ctx["node"]
+        if self._wbc_status_sub is None:
+            self._wbc_status_sub = node.create_subscription(
+                String, str(ctx.get("wbc_status_topic", self.WBC_STATUS_TOPIC)),
+                self._on_wbc_status, 10)
+        self._nav_status = None
+        self._wbc_started_at = time.time()
+
+        # Segments carry the row height, but the unsegmented fallback passes the
+        # raw wall endpoints through, so do not assume a third component.
+        line_z = self.current_line_z
+        if line_z is None:
+            line_z = float(seg_start[2]) if len(seg_start) > 2 else 0.0
+        cmd = [
+            "ros2", "run", "task_planner_fsm", "wbc_sweep_controller", "--ros-args",
+            "-p", f"seg_start:=[{float(seg_start[0])}, {float(seg_start[1])}, {line_z}]",
+            "-p", f"seg_end:=[{float(seg_end[0])}, {float(seg_end[1])}, {line_z}]",
+            "-p", f"standoff:={float(ctx.get('scan_wall_plate_offset', 0.20))}",
+            "-p", f"sweep_speed:={float(ctx.get('wbc_sweep_speed', 0.03))}",
+            "-p", f"status_topic:={ctx.get('wbc_status_topic', self.WBC_STATUS_TOPIC)}",
+            # Everything in the loop — control period, data ages, the sweep
+            # deadline — ticks on the node's clock. Gazebo runs well below
+            # real-time on a loaded machine, so in sim that clock must be the
+            # SIM clock or the sweep times out long before the robot has
+            # travelled the segment.
+            "-p", f"use_sim_time:={'true' if bool(ctx.get('sim', False)) else 'false'}",
+        ]
+        # The row height is owned by the column, which was set during the
+        # pre-approach and does not move during a sweep; passing it keeps the arm
+        # holding that height instead of whatever it happens to start at.
+        if self.current_line_z is not None:
+            cmd += ["-p", f"row_z:={float(self.current_line_z)}"]
+        for key, param in (("wbc_control_rate", "control_rate"),
+                           ("wbc_k_standoff", "k_standoff"),
+                           ("wbc_k_align", "k_align"),
+                           ("wbc_arm_qdot_max", "arm_qdot_max")):
+            if ctx.get(key) is not None:
+                cmd += ["-p", f"{param}:={float(ctx[key])}"]
+
+        node.get_logger().info(
+            f"[{self.name}] Whole-body sweep of segment "
+            f"({seg_start[0]:.2f}, {seg_start[1]:.2f}) -> ({seg_end[0]:.2f}, {seg_end[1]:.2f})."
+        )
+        self._wbc_ever_started = True
+        return self._start_arm_procs(ctx, [("wbc_sweep_proc", cmd, "wbc_sweep_controller")])
+
+    def _on_wbc_status(self, msg):
+        """Map the sweep node's status onto the Nav2 goal status sweep_wait reads."""
+        status = str(msg.data)
+        if status.startswith("succeeded"):
+            self._nav_status = GoalStatus.STATUS_SUCCEEDED
+        elif status.startswith("failed"):
+            self._wbc_failure = status
+            self._nav_status = -1
+
+    def _wbc_sweep_tick(self, ctx):
+        """Per-tick watchdog for a sweep whose node stopped talking.
+
+        The node reports its own failures; this covers the cases where it cannot:
+        it crashed on startup, or it was never able to publish at all.
+        """
+        if self._nav_status is not None:
+            return
+        node = ctx["node"]
+        proc = ctx.get("wbc_sweep_proc")
+        if proc is not None and proc.poll() is not None:
+            node.get_logger().error(
+                f"[{self.name}] Whole-body sweep process exited (code {proc.returncode}) "
+                f"without reporting a result; see /tmp/wbc_sweep_controller.log."
+            )
+            self._nav_status = -1
+            return
+        if (self._wbc_started_at is not None
+                and time.time() - self._wbc_started_at > self.WBC_STARTUP_GRACE_S
+                and proc is None):
+            node.get_logger().error(f"[{self.name}] Whole-body sweep never started.")
+            self._nav_status = -1
+
+    def _stop_wbc_sweep(self, ctx):
+        """Stop the sweep node and make sure the arm is back on trajectory control."""
+        node = ctx.get("node")
+        proc = ctx.get("wbc_sweep_proc")
+        if proc is not None and proc.poll() is None:
+            if node is not None:
+                node.get_logger().info(f"[{self.name}] Stopping the whole-body sweep...")
+            try:
+                # SIGINT, not SIGKILL: the node zeroes its commands and hands the
+                # arm's command interfaces back on the way out.
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                proc.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                if node is not None:
+                    node.get_logger().warn(
+                        f"[{self.name}] Whole-body sweep did not exit; SIGKILLed."
+                    )
+            except Exception:
+                pass
+        ctx["wbc_sweep_proc"] = None
+        self._wbc_started_at = None
+        if self._wbc_status_sub is not None and node is not None:
+            node.destroy_subscription(self._wbc_status_sub)
+            self._wbc_status_sub = None
+        # Only worth asking when a sweep actually ran: this is also called on
+        # every state entry as a safety net, and there is nothing to restore
+        # when nothing ever claimed the arm.
+        if proc is not None or self._wbc_ever_started:
+            self._ensure_arm_trajectory_controller(ctx)
+            self._wbc_ever_started = False
+
+    def _ensure_arm_trajectory_controller(self, ctx):
+        """Ask for the arm's trajectory controller back, in case the sweep could not.
+
+        The sweep node claims ``forward_velocity_controller`` and restores the
+        trajectory controller when it shuts down — but a SIGKILLed node cannot,
+        and every later arm goal would then be published into a controller that
+        is not running. Fire-and-forget and BEST_EFFORT, so it is a no-op when
+        the node already put things back.
+        """
+        node = ctx.get("node")
+        if node is None or not bool(ctx.get("sweep_use_wbc", False)):
+            return
+        service = str(ctx.get("controller_manager", "/controller_manager")) + "/switch_controller"
+        if self._switch_client is None:
+            self._switch_client = node.create_client(SwitchController, service)
+        if not self._switch_client.wait_for_service(timeout_sec=2.0):
+            node.get_logger().warn(
+                f"[{self.name}] '{service}' unavailable; cannot verify the arm controller."
+            )
+            return
+        req = SwitchController.Request()
+        req.activate_controllers = [str(ctx.get("arm_trajectory_controller",
+                                                "joint_trajectory_controller"))]
+        req.deactivate_controllers = [str(ctx.get("arm_velocity_controller",
+                                                  "forward_velocity_controller"))]
+        req.strictness = SwitchController.Request.BEST_EFFORT
+        req.activate_asap = True
+        fut = self._switch_client.call_async(req)
+        fut.add_done_callback(lambda f: self._log_switch_result(ctx, f))
+
+    def _log_switch_result(self, ctx, future):
+        node = ctx["node"]
+        try:
+            if future.result().ok:
+                node.get_logger().info(f"[{self.name}] Arm is back on trajectory control.")
+            else:
+                node.get_logger().warn(
+                    f"[{self.name}] Controller switch back to trajectory control was refused; "
+                    f"arm goals may not execute until it is restored."
+                )
+        except Exception as e:
+            node.get_logger().warn(f"[{self.name}] Controller switch call failed ({e}).")
+
     def _run_post_scan(self, ctx):
         """Retract the arm from the wall (re-send the pose); on the wall's last
         line also retract the column. Sets self.finished when complete."""
@@ -1946,6 +2179,7 @@ class ScanWall(State):
         ## running GPR measurement, release force mode (real) and stop sensor +
         ## alignment nodes.
         self._stop_sweep_crawl(ctx, publish_stop=True)
+        self._stop_wbc_sweep(ctx)
         self._restore_sweep_speed(ctx)
         self._gpr_stop_line_and_measurement(ctx)
         self._stop_force_mode(ctx)
