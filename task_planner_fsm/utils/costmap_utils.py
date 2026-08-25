@@ -348,18 +348,96 @@ def nearest_free_2d(
     return None
 
 
+# LETHAL only. On the published 0..100 occupancy scale 100 is an observed
+# obstacle cell, while 99 is INSCRIBED and 98-and-below are the inflation
+# gradient -- and both of those are derived from the robot's own radius, not from
+# geometry. That distinction is the whole ball game here: with robot_radius
+# 0.6 m the wall's inscribed ring reaches 0.6 m out, which is exactly where the
+# scan line sits, so a probe keyed on 99 finds every point on every wall blocked
+# and segmentation returns nothing at all.
+BLOCKED_COST = 100
+# How far back from the scan point, toward the wall, to look for something
+# sticking out of the surface. The plate sweeps between the wall face and the
+# scan line, so this covers its path without reaching the wall's own cells.
+DEFAULT_PROBE_DEPTH = 0.35
+DEFAULT_PROBE_STEP = 0.05
+# How far to back a segment end off from whatever blocked it. The sensor plate
+# is ~0.34 m across, so half of it plus a margin: feasibility says where the
+# plate's CENTRE may sit, and sweeping to that limit puts the plate's edge into
+# the obstacle. Override with ``wall_segment_obstacle_clearance``.
+DEFAULT_OBSTACLE_CLEARANCE = 0.25
+
+
+def _plate_path_clear(ctx, costmap, x: float, y: float) -> bool:
+    """True when nothing sticks out of the wall into the plate's path at (x, y).
+
+    The base-standing test below cannot answer this. ``nearest_free_along``
+    starts its walk AT the scan point and returns the first free cell, so a
+    column on the scan line just pushes the base's standing spot further out and
+    the point still counts as reachable — which is how a swept segment ends up
+    running straight through a column.
+
+    Probes from the scan point back toward the wall (the volume the plate travels
+    through) and rejects the point if any of it is occupied.
+    """
+    if not bool(ctx.get("wall_segment_check_plate_path", True)):
+        return True
+    outward = _outward_dir(ctx)
+    if outward is None:
+        return True
+    step = float(ctx.get("wall_segment_probe_step", DEFAULT_PROBE_STEP))
+    blocked_cost = int(ctx.get("wall_segment_blocked_cost", BLOCKED_COST))
+    # Never probe as far as the wall face itself, whatever depth is configured:
+    # the face is ``scan_offset`` away (that offset is baked into the scan line by
+    # build_wall_data), and reading its lethal cells would reject the whole wall.
+    # The margin also absorbs the disagreement between the mapped wall and the
+    # detected one, which runs to tens of centimetres.
+    scan_offset = float(ctx.get("wall_scan_offset", 0.6))
+    margin = float(ctx.get("wall_segment_face_margin", 0.15))
+    depth = min(float(ctx.get("wall_segment_probe_depth", DEFAULT_PROBE_DEPTH)),
+                max(0.0, scan_offset - margin))
+    d = 0.0
+    while d <= depth + 1e-9:
+        # Negative offset walks toward the wall, into the plate's corridor.
+        cost = _cost_at(costmap, x - outward[0] * d, y - outward[1] * d)
+        if cost is not None and cost >= blocked_cost:
+            return False
+        d += max(step, 1e-3)
+    return True
+
+
 def _point_feasible(ctx, costmap, x: float, y: float) -> bool:
-    """True when the base can stand IN FRONT of scan point (x, y) — a free cell
-    along the exterior normal within arm reach (base_goal_max_offset). Stricter
-    on purpose than base_standoff_goal's fallbacks: a cell merely within radius
-    but off to the side (nearest_free_2d) is useless mid-wall — the plate can't
-    face the wall from there and whatever pushed the search sideways (a corner,
-    a perpendicular wall) blocks the arm anyway."""
+    """True when scan point (x, y) can actually be scanned.
+
+    Two independent conditions, and both are needed:
+
+    * the plate's path to the wall is clear (``_plate_path_clear``) — a column
+      bracketed to the wall blocks the scan even though the base could happily
+      stand behind it;
+    * the base can stand IN FRONT of the point — a free cell along the exterior
+      normal within arm reach (base_goal_max_offset). Stricter on purpose than
+      base_standoff_goal's fallbacks: a cell merely within radius but off to the
+      side (nearest_free_2d) is useless mid-wall — the plate can't face the wall
+      from there and whatever pushed the search sideways (a corner, a
+      perpendicular wall) blocks the arm anyway.
+    """
     cost_threshold, max_offset = _search_knobs(ctx)
+    # Standing room is not the same as WORKING room. base_goal_max_offset is the
+    # arm's raw reach (~1.3 m), but the arm also has to travel from its unfolded
+    # pose to the scanning standoff, and ScanWall clamps that move
+    # (scan_wall_arm_z_max_step). A base pushed far out along the normal — which
+    # is what happens beside a column, where the inflation blocks everything
+    # nearer — leaves an approach longer than the clamp allows, so the segment
+    # is planned, transited to, and then abandoned at the approach. Better to
+    # judge it unscannable here and let the segment start further along, where
+    # the base can actually park close.
+    max_offset = min(max_offset, float(ctx.get("wall_segment_max_base_offset", 0.45)))
     outward = _outward_dir(ctx)
     if outward is None:
         cost = _cost_at(costmap, x, y)
         return cost is not None and 0 <= cost < cost_threshold
+    if not _plate_path_clear(ctx, costmap, x, y):
+        return False
     return nearest_free_along(costmap, x, y, outward[0], outward[1],
                               max_dist=max_offset, cost_threshold=cost_threshold) is not None
 
@@ -399,23 +477,42 @@ def reachable_wall_segments(ctx, p1, p2):
     ts = [min(length, i * length / (n - 1)) for i in range(n)]
     feas = [_point_feasible(ctx, costmap, x1 + ux * t, y1 + uy * t) for t in ts]
 
-    # Merge consecutive feasible samples into [t_a, t_b] runs.
-    segments = []
+    # Merge consecutive feasible samples into runs of sample INDICES, so we can
+    # tell an end that ran into an obstacle from one that simply reached the end
+    # of the line.
+    runs = []
     run_start = None
-    for t, ok in zip(ts, feas):
+    for i, ok in enumerate(feas):
         if ok and run_start is None:
-            run_start = t
+            run_start = i
         elif not ok and run_start is not None:
-            segments.append((run_start, prev_t))
+            runs.append((run_start, i - 1))
             run_start = None
-        prev_t = t
     if run_start is not None:
-        segments.append((run_start, ts[-1]))
+        runs.append((run_start, len(feas) - 1))
+
+    # Back every obstacle-terminated end off by the plate's own half-width. The
+    # feasibility test asks whether the plate can be CENTRED at a sample, so a
+    # run ends at the last centre that clears the obstacle — with the plate's
+    # near edge, half a width further on, already touching it. Sweeping to that
+    # endpoint drives the plate edge-first into the column; backing the boundary
+    # off is what turns "where the plate fits" into "where the plate can sweep".
+    # Ends at the line's own extremities are left alone: nothing is there.
+    clearance = float(ctx.get("wall_segment_obstacle_clearance",
+                              DEFAULT_OBSTACLE_CLEARANCE))
+    segments = []
+    for i0, i1 in runs:
+        a, b = ts[i0], ts[i1]
+        if i0 > 0:
+            a += clearance
+        if i1 < len(ts) - 1:
+            b -= clearance
+        if (b - a) >= min_len:
+            segments.append((a, b))
 
     return [
         ((x1 + ux * a, y1 + uy * a, z), (x1 + ux * b, y1 + uy * b, z))
         for a, b in segments
-        if (b - a) >= min_len
     ]
 
 

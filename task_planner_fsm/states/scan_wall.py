@@ -37,6 +37,11 @@ import requests
 # both nodes agree on which readings mean anything — keep them in sync. Mind the
 # ToF ceiling: at the standoff the base parks at, the plate is normally further
 # out than 0.258 m, so the reading that sizes the arm's approach is ultrasonic-only.
+ARM_JOINT_NAMES = [
+    "arm_shoulder_pan_joint", "arm_shoulder_lift_joint", "arm_elbow_joint",
+    "arm_wrist_1_joint", "arm_wrist_2_joint", "arm_wrist_3_joint",
+]
+
 PLATE_SENSOR_VALID_LO = (0.02, 0.02, 0.02, 0.011, 0.011, 0.011)
 PLATE_SENSOR_VALID_HI = (3.90, 3.90, 3.90, 0.258, 0.258, 0.258)
 
@@ -128,6 +133,17 @@ class ScanWall(State):
         self._segments_ok = 0        # segments actually swept on this line
         self._last_swept_point = None
         self._nav_status = None      # set by _on_nav_result / rejection / crawl tick
+        self._unfolded_joints = None   # arm config of the unfolded pose (known-good)
+        self._nav_goal_handle = None   # in-flight base goal, so it can be cancelled
+        self._preapproach_standoff = None   # plate standoff before arm_approach
+        self._transit_goal = None    # base goal for the pending transit
+        self._folded_for_transit = False   # arm tucked away for the base move
+        # Is the arm actually out in the scanning pose? ArmUnfolding now hands the
+        # arm over FOLDED for wall scans (it would only be folded again for the
+        # first transit), so this state can no longer assume the pre-approach left
+        # it extended. Every path that reaches a sweep has to guarantee an unfold,
+        # and this flag is what makes that checkable rather than assumed.
+        self._arm_unfolded = False
         self._sweep_from = None      # wall end the sweep starts from (robot's end)
         self._sweep_to = None        # wall end the sweep heads toward
 
@@ -225,6 +241,12 @@ class ScanWall(State):
         self._segments_ok = 0
         self._last_swept_point = None
         self._nav_status = None
+        self._unfolded_joints = None
+        self._nav_goal_handle = None
+        self._preapproach_standoff = None
+        self._transit_goal = None
+        self._folded_for_transit = False
+        self._arm_unfolded = False
         self._sweep_from = None
         self._sweep_to = None
         self._stop_sweep_crawl(ctx)   # clear any stale timer from a re-entry
@@ -540,6 +562,198 @@ class ScanWall(State):
             f"{advance:+.3f} m to sit at {target:.2f} m."
         )
         return "sent" if self._send_arm_z_goal(ctx, advance) else "skip"
+
+    # ------------------------------------------------------------------
+    # Named-pose moves for the inter-segment transit (fold / unfold)
+    # ------------------------------------------------------------------
+    def _capture_unfolded_joints(self, ctx):
+        """Remember the arm configuration of the unfolded pose just reached.
+
+        This is the pose to put the arm back into when a sweep ends. It is
+        known-good by construction: the planner just moved the arm here, so it is
+        reachable, outside the mast's keep-out cylinder, and something A* will
+        plan out of. Chasing an equivalent Cartesian standoff instead does not
+        work — the safe window depends on where the base is parked.
+        """
+        node = ctx.get("node")
+        state = getattr(node, "current_joint_state", None)
+        if state is None or not state.name:
+            return
+        try:
+            joints = [float(state.position[state.name.index(n)]) for n in ARM_JOINT_NAMES]
+        except (ValueError, IndexError):
+            return
+        self._unfolded_joints = joints
+
+    def _retreat_standoff(self, ctx):
+        """How far off the wall the sweep should leave the plate.
+
+        Only far enough to clear the surface. Putting the arm somewhere the
+        planner will accept is ``return_joints``' job, not this one.
+        """
+        # Just enough to lift the plate off the wall. Do NOT chase a distance that
+        # also satisfies the arm planner: there is no such distance. Retreat too
+        # little and A* dies on the wall's dilation; retreat too far and wrist_3
+        # ends up inside the robot's own mast (the planner models it as a 0.3 m
+        # cylinder on the arm base axis), which is a start-in-collision refusal.
+        # Where that window sits depends on how far the BASE is from the wall,
+        # not on the plate's standoff, so it cannot be tuned here at all. The
+        # arm is put back into a known-good configuration by return_joints
+        # instead; this only has to clear the surface first.
+        floor = float(ctx.get("scan_wall_transit_plate_offset", 0.40))
+        ceiling = float(ctx.get("scan_wall_max_retreat_standoff", 0.60))
+        measured = self._preapproach_standoff
+        if measured is None:
+            return floor
+        return max(floor, min(ceiling, float(measured)))
+
+    def _fold_for_transit(self, ctx):
+        """Whether to fold the arm away before letting the base transit.
+
+        Nav2 plans transits against a BASE-ONLY circle: NavigateToTarget drops
+        the arm-inclusive hull on arrival, correctly, because the arm is folded
+        at that moment — but ArmUnfolding runs immediately after, and from then
+        on every transit moves a stretched-out arm the footprint knows nothing
+        about. ``wall_parallel_goal`` limits the damage by sliding only PARALLEL
+        to the wall, so the plate holds its standoff and cannot close on the
+        surface. That covers a flat wall and fails exactly where it matters: the
+        gap between two segments is usually a COLUMN, and sliding past it at a
+        constant standoff drives the plate through the very thing that created
+        the gap.
+
+        Folding first makes the base-only circle honest again. It costs two
+        planned arm motions per transit, which is why it is a knob.
+        """
+        return bool(ctx.get("scan_wall_fold_for_transit", True))
+
+    def _send_named_pose(self, ctx, position_name):
+        """Ask the arm for a named pose. True once the request is away."""
+        node = ctx["node"]
+        if not self.position_client.service_is_ready():
+            node.get_logger().warn(f"[{self.name}] Waiting for /send_position service...")
+            return False
+        request = SendPosition.Request()
+        request.position_name = position_name
+        ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
+        self.pose_future = self.position_client.call_async(request)
+        self._arm_goal_start = None
+        node.get_logger().info(f"[{self.name}] Sending the arm to '{position_name}'.")
+        return True
+
+    def _named_pose_settled(self, ctx):
+        """"done" / "failed" / "wait" for a named-pose move.
+
+        Unlike ``_arm_goal_settled`` this reports failure instead of swallowing
+        it. A Z-clearance nudge that does not happen is survivable; a fold that
+        does not happen must stop the transit, or the base moves with the arm
+        out and the footprint says otherwise — the exact situation folding is
+        there to prevent.
+        """
+        node = ctx["node"]
+        if self.pose_future is not None:
+            if not self.pose_future.done():
+                return "wait"
+            try:
+                response = self.pose_future.result()
+                self.pose_future = None
+                if not response.success:
+                    node.get_logger().error(
+                        f"[{self.name}] Arm pose rejected: {response.message}")
+                    return "failed"
+            except Exception as exc:
+                self.pose_future = None
+                node.get_logger().error(f"[{self.name}] Arm pose service failed: {exc}")
+                return "failed"
+
+        # Named poses are full planned motions, not the few-centimetre nudges
+        # _arm_goal_settled waits on, so they get their own (longer) budget.
+        timeout = float(ctx.get("scan_wall_named_pose_timeout_s", 180.0))
+        now = time.time()
+        if self._arm_goal_start is None:
+            self._arm_goal_start = now
+        if ctx.get("planner_goal_failed"):
+            ctx["planner_goal_failed"] = False
+            node.get_logger().error(f"[{self.name}] Planner could not reach the pose.")
+            return "failed"
+        if ctx.get("execution_status") is True:
+            ctx["execution_status"] = False
+            return "done"
+        if now - self._arm_goal_start >= timeout:
+            node.get_logger().error(
+                f"[{self.name}] Arm pose did not complete within {timeout:.0f}s.")
+            return "failed"
+        return "wait"
+
+    def _transit_goal_for(self, ctx, seg_start):
+        """(needed, goal_xy) for the slide to ``seg_start``.
+
+        Computed before the arm is touched so a transit that is not needed —
+        the first segment after NavigateToTarget, or a contiguous turnaround —
+        costs no arm motion at all.
+        """
+        pos = ctx.get("base_position")
+        goal_xy = base_standoff_goal(ctx, self.name, seg_start)
+        if not self._fold_for_transit(ctx):
+            # Only strip the wall-ward component when the arm will still be
+            # stretched out for the move — which is the entire premise of
+            # wall_parallel_goal: Nav2 plans against a base-only footprint, so a
+            # goal that is legal for the base could still drive the plate into
+            # the wall. Fold the arm and that premise is gone, while the cost of
+            # keeping it is real: the base holds whatever standoff it arrived
+            # with, which after a transit can leave the plate beyond the arm's
+            # reach of the wall. Seen in simulation — the base parked 1.28 m out,
+            # the approach needed 0.66 m of extension, the planner refused it and
+            # the segment was lost.
+            goal_xy = wall_parallel_goal(
+                ctx, self.name, goal_xy, (pos.x, pos.y) if pos is not None else None
+            )
+        skip_tol = float(ctx.get("segment_transit_skip_tol", 0.4))
+        needed = not (pos is not None
+                      and math.hypot(pos.x - goal_xy[0], pos.y - goal_xy[1]) <= skip_tol)
+        return needed, goal_xy
+
+    # ------------------------------------------------------------------
+    # Swept-segment memory (survives re-entry into this state)
+    # ------------------------------------------------------------------
+    # on_enter clears _segments and _seg_idx, so without this the state would
+    # re-sweep ground it had already covered every time it was re-entered. The
+    # record lives in ctx rather than on self for exactly that reason. Keyed by
+    # (wall, line height) because a different height is a genuinely different scan
+    # line: same x-span, different z, and it must NOT be skipped.
+    def _swept_key(self, ctx):
+        z = self.current_line_z
+        if z is None:
+            z = self._resolve_current_line_z(ctx)
+        return (int(ctx.get("current_wall_index", 0)), round(float(z), 3))
+
+    def _record_swept(self, ctx, seg_start, seg_end):
+        store = ctx.setdefault("scan_wall_swept_segments", {})
+        store.setdefault(self._swept_key(ctx), []).append(
+            ((float(seg_start[0]), float(seg_start[1])),
+             (float(seg_end[0]), float(seg_end[1]))))
+
+    def _already_swept(self, ctx, seg_start, seg_end):
+        """Has this stretch of wall already been swept on this line?
+
+        Endpoints are matched with a tolerance rather than exactly: segmentation
+        re-runs against a costmap that has moved on, so the same physical stretch
+        comes back shifted by up to the sample step plus the obstacle clearance
+        padding. Compared unordered — a re-entry can pick the opposite serpentine
+        direction, which reverses the segment without changing the ground covered.
+        """
+        if not ctx.get("scan_wall_resume", True):
+            return False
+        tol = float(ctx.get("scan_wall_resume_tolerance", 0.25))
+        s = (float(seg_start[0]), float(seg_start[1]))
+        e = (float(seg_end[0]), float(seg_end[1]))
+        for done_s, done_e in ctx.get("scan_wall_swept_segments", {}).get(
+                self._swept_key(ctx), []):
+            for a, b in ((done_s, done_e), (done_e, done_s)):
+                if (math.hypot(s[0] - a[0], s[1] - a[1]) <= tol
+                        and math.hypot(e[0] - b[0], e[1] - b[1]) <= tol):
+                    return True
+        return False
 
     def _arm_goal_settled(self, ctx):
         """True once the planner reports the Z move finished, failed, or ran out of
@@ -916,6 +1130,22 @@ class ScanWall(State):
         self._park_saw_active = False
         self._park_wait_start = None
 
+    def _begin_park_phase(self):
+        """Enter the "park" phase — unfolding first if the arm is still tucked away.
+
+        Three paths arrive here: the transit was not needed, the transit goal was
+        recomputed as unnecessary, or the transit finished. Since the pre-approach
+        deliberately leaves the arm folded whenever the transit would fold it
+        anyway, none of them may assume the arm is out — and parking leads straight
+        into the sweep, which with a folded arm would drag the plate nowhere near
+        the wall. ``transit_unfold`` comes back through here once the arm is out.
+        """
+        if not self._arm_unfolded:
+            self._seg_phase = "transit_unfold"
+            return
+        self._reset_park_state()
+        self._seg_phase = "park"
+
     def _run_parking(self, ctx):
         """Align the diff-drive chassis with the turret before the sweep.
 
@@ -1078,6 +1308,25 @@ class ScanWall(State):
         """
         node = ctx["node"]
 
+        # --- Phase 0: does the arm need to come out here at all? ---
+        # When the transit folds the arm anyway, unfolding now is pure waste: the
+        # first thing the segment loop does is send folded_fsm again. Leave the arm
+        # where it is and let the loop unfold once, after the base has arrived.
+        # Safe because every path out of "transit_clear" unfolds before it sweeps —
+        # the transit path via transit_unfold, the no-transit path via the
+        # _arm_unfolded check. Nothing downstream may assume the arm is out.
+        # The column still moves below: folded is the safest pose to raise it in.
+        if not self.pose_reached and self._fold_for_transit(ctx):
+            self.current_line_z = self._resolve_current_line_z(ctx)
+            node.get_logger().info(
+                f"[{self.name}] Pre-approach for line z={self.current_line_z:.3f}m "
+                f"(line {ctx.get('current_line_idx', 0) + 1}/"
+                f"{len(ctx.get('current_wall_scan_lines', [self.current_line_z]))}): "
+                f"keeping the arm folded until the base reaches the first segment."
+            )
+            self.pose_reached = True
+            self._arm_unfolded = False
+
         # --- Phase 1: send the arm to the unfolded_fsm pose and wait for it. ---
         if not self.pose_reached:
             # Step 1a: send the named pose.
@@ -1127,6 +1376,8 @@ class ScanWall(State):
             if ctx.get("execution_status") is True:
                 ctx["execution_status"] = False
                 self.pose_reached = True
+                self._arm_unfolded = True
+                self._capture_unfolded_joints(ctx)
                 node.get_logger().info(f"[{self.name}] Arm at unfolded_fsm pose.")
             else:
                 if not self.preapproach_verbose:
@@ -1296,11 +1547,53 @@ class ScanWall(State):
         seg_no, seg_total = self._seg_idx + 1, len(self._segments)
 
         if self._seg_phase == "transit_clear":
+            # Already covered on an earlier visit to this state? Skip it whole —
+            # before any arm or base motion, so a resumed line costs nothing for
+            # the ground it has already scanned. Counted as OK so a line that is
+            # entirely done still finalizes instead of failing as "nothing swept".
+            if self._already_swept(ctx, seg_start, seg_end):
+                node.get_logger().info(
+                    f"[{self.name}] Segment {seg_no}/{seg_total} "
+                    f"({seg_start[0]:.2f}, {seg_start[1]:.2f})->"
+                    f"({seg_end[0]:.2f}, {seg_end[1]:.2f}) was already swept on this "
+                    f"line; resuming past it."
+                )
+                self._segments_ok += 1
+                self._last_swept_point = seg_end
+                self._seg_idx += 1
+                return
+
             # Pull the plate back before ANY base motion. The arm has been stretched
             # out since the pre-approach, and the transit slides the whole robot
             # sideways along the wall — at the gap the previous sweep left (roughly
             # zero, the plate was pressed against the wall) that drags the plate
             # along the surface. Retract to scan_wall_transit_plate_offset first.
+            # Decide whether the base has to move at all BEFORE touching the arm:
+            # a segment that needs no transit should cost no arm motion either.
+            needed, goal_xy = self._transit_goal_for(ctx, seg_start)
+            self._transit_goal = goal_xy
+            if not needed:
+                node.get_logger().info(
+                    f"[{self.name}] Base already at segment {self._seg_idx + 1} start; "
+                    f"skipping transit."
+                )
+                self._begin_park_phase()
+                return
+
+            if self._fold_for_transit(ctx):
+                self.set_activity(
+                    ctx,
+                    f"Folding the arm before moving to segment {seg_no}/{seg_total}",
+                    progress_current=seg_no,
+                    progress_total=seg_total,
+                )
+                if not self._send_named_pose(
+                        ctx, str(ctx.get("scan_wall_fold_pose", "folded_fsm"))):
+                    return
+                self._folded_for_transit = True
+                self._seg_phase = "transit_fold_wait"
+                return
+
             self.set_activity(
                 ctx,
                 f"Retracting the arm clear of the wall before moving to segment "
@@ -1332,6 +1625,60 @@ class ScanWall(State):
             self._seg_phase = "transit"
             return
 
+        if self._seg_phase == "transit_fold_wait":
+            outcome = self._named_pose_settled(ctx)
+            if outcome == "wait":
+                return
+            self._arm_goal_start = None
+            if outcome == "failed":
+                # Skipping a segment costs one stretch of wall. Transiting with
+                # the arm out, against a footprint that says it is not there,
+                # risks the arm — and the fold exists precisely because the gap
+                # ahead is usually the column that split the line in two.
+                node.get_logger().error(
+                    f"[{self.name}] Could not fold the arm; skipping segment "
+                    f"{self._seg_idx + 1} rather than transiting with it extended."
+                )
+                self._folded_for_transit = False
+                self._seg_idx += 1
+                self._seg_phase = "transit_clear"
+                return
+            self._arm_unfolded = False
+            self._seg_phase = "transit"
+            return
+
+        if self._seg_phase == "transit_unfold":
+            self.set_activity(
+                ctx,
+                f"Unfolding the arm at wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            if not self._send_named_pose(ctx, "unfolded_fsm"):
+                return
+            self._seg_phase = "transit_unfold_wait"
+            return
+
+        if self._seg_phase == "transit_unfold_wait":
+            outcome = self._named_pose_settled(ctx)
+            if outcome == "wait":
+                return
+            self._arm_goal_start = None
+            self._folded_for_transit = False
+            if outcome == "done":
+                self._arm_unfolded = True
+                self._capture_unfolded_joints(ctx)
+            if outcome == "failed":
+                node.get_logger().error(
+                    f"[{self.name}] Could not unfold the arm after the transit; "
+                    f"skipping segment {self._seg_idx + 1}."
+                )
+                self._seg_idx += 1
+                self._seg_phase = "transit_clear"
+                return
+            self._begin_park_phase()
+            return
+
         if self._seg_phase == "transit":
             self.set_activity(
                 ctx,
@@ -1339,26 +1686,19 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            # Slide along the wall to the segment start (sensors on, no press). The
-            # goal is made wall-parallel first: the arm is out, Nav2 plans against a
-            # base-only footprint, and the distance to the wall belongs to the arm's
-            # Z approach — the base keeps whatever standoff it already has. Skipped
-            # when it is already there: the first segment right after
-            # NavigateToTarget, or contiguous serpentine turnarounds.
-            pos = ctx.get("base_position")
-            skip_tol = float(ctx.get("segment_transit_skip_tol", 0.4))
-            goal_xy = base_standoff_goal(ctx, self.name, seg_start)
-            goal_xy = wall_parallel_goal(
-                ctx, self.name, goal_xy, (pos.x, pos.y) if pos is not None else None
-            )
-            if pos is not None and math.hypot(pos.x - goal_xy[0], pos.y - goal_xy[1]) <= skip_tol:
-                node.get_logger().info(
-                    f"[{self.name}] Base already at segment {self._seg_idx + 1} start; "
-                    f"skipping transit."
-                )
-                self._reset_park_state()
-                self._seg_phase = "park"
-                return
+            # Slide along the wall to the segment start (sensors on, no press).
+            # The goal was computed — and the "already there" case handled — back
+            # in transit_clear, before any arm motion was spent on it. It is made
+            # wall-parallel so the base keeps whatever standoff it arrived with;
+            # the distance to the wall belongs to the arm's Z approach. With the
+            # arm folded for the transit, the base-only Nav2 footprint is now the
+            # robot's true envelope again.
+            goal_xy = self._transit_goal
+            if goal_xy is None:
+                needed, goal_xy = self._transit_goal_for(ctx, seg_start)
+                if not needed:
+                    self._begin_park_phase()
+                    return
             node.get_logger().info(
                 f"[{self.name}] Transit to segment {self._seg_idx + 1}/{len(self._segments)} "
                 f"start ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) (no press)."
@@ -1372,8 +1712,11 @@ class ScanWall(State):
             if self._nav_status is None:
                 return
             if self._nav_status == GoalStatus.STATUS_SUCCEEDED:
-                self._reset_park_state()
-                self._seg_phase = "park"
+                self._transit_goal = None
+                if self._folded_for_transit:
+                    self._seg_phase = "transit_unfold"
+                    return
+                self._begin_park_phase()
             else:
                 node.get_logger().warn(
                     f"[{self.name}] Transit to segment {self._seg_idx + 1} failed "
@@ -1431,6 +1774,16 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
+            # Remember where the plate is BEFORE this approach. The arm is then in
+            # a configuration the planner has just succeeded from — it got here by
+            # planning — and the sweep barely changes it, since the posture task
+            # holds the arm while the base carries the along-wall travel. So this
+            # standoff is the one the sweep should retreat to afterwards: it puts
+            # the arm back in a pose A* is known to accept, instead of one buried
+            # in the dilated octomap of the wall it has been scanning.
+            measured = self._plate_wall_distance(ctx)
+            if measured is not None:
+                self._preapproach_standoff = measured
             target = float(ctx.get("scan_wall_plate_offset", 0.20))
             outcome = self._send_arm_to_clearance(ctx, target)
             if outcome == "wait":
@@ -1450,6 +1803,27 @@ class ScanWall(State):
             return
 
         if self._seg_phase == "press_prepare":
+            # The approach is allowed to fail — _arm_goal_settled deliberately
+            # swallows planner failures so one hiccup cannot strand a whole wall.
+            # But "continue from the current pose" is only sane if the current
+            # pose is nearly right. Check it, rather than sweeping a wall the
+            # plate is nowhere near: the sweep would drag the base along a
+            # surface it cannot reach, and the standoff-jump abort would kill it
+            # a second later anyway, having already claimed the segment.
+            target = float(ctx.get("scan_wall_plate_offset", 0.20))
+            tolerance = float(ctx.get("scan_wall_approach_tolerance", 0.15))
+            measured = self._plate_wall_distance(ctx)
+            if measured is not None and abs(measured - target) > tolerance:
+                node.get_logger().error(
+                    f"[{self.name}] Arm is {measured:.2f} m off the wall, not the "
+                    f"{target:.2f} m this sweep needs — the approach did not get there. "
+                    f"Skipping segment {self._seg_idx + 1} instead of sweeping out of "
+                    f"reach (is the base parked too far from the wall?)."
+                )
+                self._seg_idx += 1
+                self._seg_phase = "transit_clear"
+                return
+
             # Force mode is a real-robot-only press (no controller exists in sim),
             # so only mention it when it will actually run.
             whole_body = self._wbc_enabled(ctx)
@@ -1584,6 +1958,7 @@ class ScanWall(State):
             if status == GoalStatus.STATUS_SUCCEEDED:
                 self._segments_ok += 1
                 self._last_swept_point = seg_end
+                self._record_swept(ctx, seg_start, seg_end)
             else:
                 node.get_logger().warn(
                     f"[{self.name}] Segment {self._seg_idx + 1} sweep did not succeed "
@@ -1654,10 +2029,26 @@ class ScanWall(State):
         # No base-reversing recoveries (BackOutFromObstacle/BackUp): backing the
         # base out mid-sweep ruins the scan geometry — fail fast to the FSM.
         goal_msg.behavior_tree = nav_bt_xml(ctx, self.name)
+        # Cancel whatever is still running first. These goals carry a custom
+        # behaviour tree, and Nav2 refuses to preempt a goal with a DIFFERENT
+        # tree — it logs "Preemption request was rejected", keeps tracking the
+        # old goal and aborts the new one, so the transit silently never happens.
+        self._cancel_base_goal()
         self._nav_status = None
         self._send_goal_future = nav_client.send_goal_async(goal_msg)
         self._send_goal_future.add_done_callback(self._on_goal_response)
         return True
+
+    def _cancel_base_goal(self):
+        """Cancel the base goal still in flight, if any. Fire and forget."""
+        handle = self._nav_goal_handle
+        self._nav_goal_handle = None
+        if handle is None:
+            return
+        try:
+            handle.cancel_goal_async()
+        except Exception:
+            pass
 
     def _on_goal_response(self, future):
         try:
@@ -1668,10 +2059,12 @@ class ScanWall(State):
         if not handle.accepted:
             self._nav_status = -1
             return
+        self._nav_goal_handle = handle
         self._result_future = handle.get_result_async()
         self._result_future.add_done_callback(self._on_nav_result)
 
     def _on_nav_result(self, future):
+        self._nav_goal_handle = None
         try:
             self._nav_status = future.result().status
         except Exception:
@@ -1964,6 +2357,22 @@ class ScanWall(State):
             "-p", f"seg_start:=[{float(seg_start[0])}, {float(seg_start[1])}, {line_z}]",
             "-p", f"seg_end:=[{float(seg_end[0])}, {float(seg_end[1])}, {line_z}]",
             "-p", f"standoff:={float(ctx.get('scan_wall_plate_offset', 0.20))}",
+            # Retreat far enough that the arm ends the sweep back in a pose the
+            # planner accepts. Measured, not guessed: it is where the plate sat
+            # after the last successful planned move. Floored at the transit
+            # offset so the plate is always at least clear of the wall, and
+            # capped so a wild reading cannot demand a retreat the arm has no
+            # reach for.
+            "-p", f"retreat_standoff:={self._retreat_standoff(ctx):.3f}",
+        ]
+        if self._unfolded_joints:
+            # Where to leave the arm: the configuration the planner itself put it
+            # in for this line. Without it the sweep can only retreat along the
+            # normal, and no standoff exists that both clears the wall's dilation
+            # and keeps wrist_3 out of the mast cylinder.
+            cmd += ["-p", "return_joints:=[" +
+                    ", ".join(f"{q:.4f}" for q in self._unfolded_joints) + "]"]
+        cmd += [
             "-p", f"sweep_speed:={float(ctx.get('wbc_sweep_speed', 0.03))}",
             "-p", f"status_topic:={ctx.get('wbc_status_topic', self.WBC_STATUS_TOPIC)}",
             # Everything in the loop — control period, data ages, the sweep
@@ -2028,6 +2437,7 @@ class ScanWall(State):
         """Stop the sweep node and make sure the arm is back on trajectory control."""
         node = ctx.get("node")
         proc = ctx.get("wbc_sweep_proc")
+        restored_itself = False
         if proc is not None and proc.poll() is None:
             if node is not None:
                 node.get_logger().info(f"[{self.name}] Stopping the whole-body sweep...")
@@ -2036,6 +2446,7 @@ class ScanWall(State):
                 # arm's command interfaces back on the way out.
                 os.killpg(os.getpgid(proc.pid), signal.SIGINT)
                 proc.wait(timeout=10.0)
+                restored_itself = True
             except subprocess.TimeoutExpired:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 if node is not None:
@@ -2049,11 +2460,15 @@ class ScanWall(State):
         if self._wbc_status_sub is not None and node is not None:
             node.destroy_subscription(self._wbc_status_sub)
             self._wbc_status_sub = None
-        # Only worth asking when a sweep actually ran: this is also called on
-        # every state entry as a safety net, and there is nothing to restore
-        # when nothing ever claimed the arm.
-        if proc is not None or self._wbc_ever_started:
+        # Only ask when the sweep node cannot have done it itself. It restores the
+        # trajectory controller in its own SIGINT handler, so firing the switch
+        # anyway asks the controller manager to activate something already active
+        # and deactivate something already inactive — which works, but logs a
+        # wall of warnings that reads like a fault. Keep the safety net for the
+        # case it exists for: a node that was SIGKILLed, or died on its own.
+        if not restored_itself and (proc is not None or self._wbc_ever_started):
             self._ensure_arm_trajectory_controller(ctx)
+        if restored_itself:
             self._wbc_ever_started = False
 
     def _ensure_arm_trajectory_controller(self, ctx):

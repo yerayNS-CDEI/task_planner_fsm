@@ -61,6 +61,40 @@ class BaseLimits:
     w_turret_motor_max: float = 0.5     # max_turret_motor_speed: turret JOINT rate (rad/s)
     wheel_speed_max: float = 0.0        # per-wheel rate (rad/s); 0 disables the rows
 
+    def max_speed_along(self, turret_angle, chassis_angle):
+        """Largest sustainable straight-line speed in a given heading.
+
+        The cap is not one number: it depends on where the robot is going
+        relative to its own body. Driving straight ahead costs only wheel speed
+        and is limited by ``vx_max``; driving sideways has to yaw the chassis and
+        collapses to ``max_lateral_speed``, six times slower. A wall swept with
+        the chassis parked square is the sideways case, which is why that is the
+        one usually quoted — but a chassis parked at an angle can sweep faster,
+        and the reference should say so rather than assume the worst.
+
+        ``turret_angle`` is the travel direction in the TURRET frame (where the
+        commanded twist lives, so it meets the box limits) and ``chassis_angle``
+        the same direction in the CHASSIS frame (which meets the yaw-rate
+        limits). They differ by the turret joint angle. Assumes pure translation:
+        a simultaneous turn eats into the same budget, and the QP's own rows,
+        not this, are what enforce that.
+        """
+        caps = []
+        for angle, along, across in (
+            (turret_angle, self.vx_max, self.vy_max),
+            (chassis_angle, None, self.center_distance * self.w_chassis_max),
+        ):
+            forward, lateral = abs(np.cos(angle)), abs(np.sin(angle))
+            if along is not None and forward > 1e-6:
+                caps.append(along / forward)
+            if lateral > 1e-6:
+                caps.append(across / lateral)
+        if self.w_turret_motor_max > 0.0:
+            lateral = abs(np.sin(chassis_angle))
+            if lateral > 1e-6:
+                caps.append(self.center_distance * self.w_turret_motor_max / lateral)
+        return float(min(caps)) if caps else float("inf")
+
     def max_lateral_speed(self):
         """Largest sustainable chassis-lateral speed (m/s) — the sweep-speed cap.
 

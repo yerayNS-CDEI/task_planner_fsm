@@ -38,11 +38,14 @@ import numpy as np
 import rclpy
 import tf2_ros
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import OccupancyGrid
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray, Float64MultiArray, String
 
+from .avoidance import AvoidanceConfig, ObstacleField, avoidance_rows
 from .base_model import BaseLimits, box_bounds, constraint_rows, wheel_and_turret_rates
 from .kinematics import SerialChain, rotation_error, whole_body_jacobian
 from .qp import Task, joint_limit_bounds, solve_velocity_qp
@@ -71,6 +74,31 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("standoff", 0.20)          # m, plate to wall
         self.declare_parameter("arrive_tolerance", 0.03)  # m of arc length
         self.declare_parameter("timeout_pad", 30.0)       # s beyond length/speed
+        # Where to leave the plate when the sweep ends, so the base can transit
+        # with the arm clear of the wall. Match the FSM's
+        # scan_wall_transit_plate_offset. 0 disables the retreat.
+        self.declare_parameter("retreat_standoff", 0.40)
+        self.declare_parameter("retreat_speed", 0.05)     # m/s along the normal
+        self.declare_parameter("retreat_timeout", 20.0)   # s on the node clock
+        # Arm configuration to finish in, normally the unfolded pose the FSM's
+        # planner last placed the arm in. Retreating along the normal alone
+        # cannot leave the arm somewhere the planner will accept: too little and
+        # A* dies on the wall's dilation, too much and wrist_3 enters the mast's
+        # keep-out cylinder, and the safe window moves with the base's standoff.
+        # Empty disables the return.
+        # Declared with an explicit DOUBLE_ARRAY descriptor, NOT `[]`: rclpy
+        # infers the element type from the default, and an empty list gives it
+        # nothing to infer, so it settles on BYTE_ARRAY and then rejects the
+        # override at startup — the node dies before it can report anything.
+        self.declare_parameter(
+            "return_joints", None,
+            ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE_ARRAY))
+        self.declare_parameter("return_gain", 1.0)        # 1/s toward the target
+        self.declare_parameter("return_tolerance", 0.05)  # rad, per joint
+        self.declare_parameter("return_timeout", 25.0)    # s on the node clock
+        # Fail a sweep that has stopped advancing this long, instead of waiting
+        # out the whole length/speed budget with the plate stuck on something.
+        self.declare_parameter("no_progress_timeout", 25.0)
 
         # --- Frames and I/O --------------------------------------------------
         self.declare_parameter("map_frame", "map")
@@ -110,9 +138,26 @@ class WholeBodySweepNode(Node):
         # along-wall travel (it can go forever) and the arm spends its motion on
         # the standoff, height and parallelism corrections it is quick at.
         self.declare_parameter("damping_base", [0.01, 0.01, 0.02])
-        self.declare_parameter("damping_arm", 0.1)
-        self.declare_parameter("weight_posture", 0.05)
+        # Keep this a regulariser, not a competing objective. At 0.1 the cost of
+        # a 0.5 rad/s arm motion is the same order as the task cost of missing
+        # the reference by 0.05 m/s, so once the base is (correctly) discouraged
+        # from taking normal corrections, the QP simply declines to close the
+        # standoff error at all. It only looked fine while the base was doing the
+        # arm's job for it.
+        self.declare_parameter("damping_arm", 0.03)
+        # How hard the base is discouraged from moving along the wall normal, so
+        # the arm takes the standoff corrections instead. Costs the sweep nothing
+        # (the sweep is tangential) but is a soft term, not a constraint, so the
+        # base can still follow a wall that is not straight.
+        self.declare_parameter("weight_base_normal", 100.0)
+        self.declare_parameter("weight_posture", 0.02)
         self.declare_parameter("k_posture", 0.5)
+        # Ceiling on how fast the posture task may pull, in rad/s. Without it the
+        # posture pull grows with joint displacement while the standoff reference
+        # is saturated at v_normal_max, so the secondary task eventually
+        # overpowers the primary one and the standoff settles with a large steady
+        # error. A background term must stay in the background.
+        self.declare_parameter("posture_rate_max", 0.05)
         self.declare_parameter("arm_qdot_max", 0.5)     # rad/s
         self.declare_parameter("joint_limit_margin", 0.15)  # rad
 
@@ -126,6 +171,38 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("max_angular_base", 0.2)
         self.declare_parameter("max_turret_motor_speed", 0.5)
         self.declare_parameter("sweep_speed_margin", 0.9)   # of the computed cap
+
+        # --- Obstacle avoidance ----------------------------------------------
+        # The sweep drives the base itself, so nothing else is watching for
+        # obstacles while it runs; these turn the local costmap into barrier rows
+        # in the same QP. See wbc/avoidance.py.
+        self.declare_parameter("avoid_obstacles", True)
+        self.declare_parameter("costmap_topic", "/local_costmap/costmap")
+        self.declare_parameter("avoid_safety_margin", 0.15)
+        self.declare_parameter("avoid_influence", 1.0)
+        self.declare_parameter("avoid_alpha", 1.0)
+        self.declare_parameter("avoid_obstacle_cost", 100)
+        self.declare_parameter("avoid_unknown_is_obstacle", False)
+        self.declare_parameter("avoid_footprint_radius", 0.45)
+        self.declare_parameter("avoid_footprint_offset", [0.0, 0.0])
+        self.declare_parameter("avoid_n_samples", 8)
+        self.declare_parameter("avoid_max_rows", 6)
+        # Must exceed the costmap's inflation radius, or the scanned wall's
+        # inflated ring survives the mask and pushes the base off the wall.
+        self.declare_parameter("avoid_mask_halfwidth", 0.7)
+        self.declare_parameter("avoid_mask_extension", 3.0)
+        self.declare_parameter("avoid_slack_weight", 1e3)
+        # A costmap that never arrives is a warning, not a failure: the sweep is
+        # slow, deliberate motion over ground the FSM already vetted with
+        # reachable_wall_segments, and refusing to scan because Nav2 is not
+        # publishing would be its own kind of unsafe. Flip this to insist.
+        # Floor on the base's own distance to the wall being scanned, measured
+        # from the plate's sensed standoff rather than from any map. Nav2 models
+        # this base as a 0.6 m disc, so a base closer than that to the wall is
+        # "in collision" by its own reckoning and no transit will plan.
+        self.declare_parameter("base_wall_min_gap", 0.75)
+        self.declare_parameter("avoid_require_costmap", False)
+        self.declare_parameter("costmap_max_age", 10.0)
 
         # --- Safety ----------------------------------------------------------
         self.declare_parameter("max_data_age", 1.0)        # s
@@ -169,15 +246,18 @@ class WholeBodySweepNode(Node):
         # costs chassis yaw rate (w = v_lateral / center_distance). Asking for
         # more just makes sim_controller rescale the command, which silently
         # distorts the sweep, so clamp the reference here and say so.
-        cap = self.limits.max_lateral_speed() * float(p("sweep_speed_margin").value)
+        # How fast the base can sweep depends on the direction it sweeps in, and
+        # that is not known until the surface is sensed — so the reference is
+        # capped per cycle (see _control_step), and this only says what to expect.
         self.sweep_speed = float(p("sweep_speed").value)
-        if self.sweep_speed > cap:
+        sideways = self.limits.max_lateral_speed() * float(p("sweep_speed_margin").value)
+        if self.sweep_speed > sideways:
             self.get_logger().warn(
-                f"sweep_speed {self.sweep_speed:.3f} m/s exceeds what the base can hold "
-                f"({cap:.3f} m/s = {p('sweep_speed_margin').value:.2f} x d1 x chassis rate); "
-                f"clamping."
+                f"sweep_speed {self.sweep_speed:.3f} m/s is above the {sideways:.3f} m/s "
+                f"this base holds sweeping SIDEWAYS (d1 x chassis yaw rate), which is the "
+                f"usual geometry with the chassis parked square to the wall. It will be "
+                f"capped per cycle by the actual sweep direction."
             )
-            self.sweep_speed = cap
 
         segment_length = float(np.linalg.norm(self.seg_end[:2] - self.seg_start[:2]))
         self.segment_length = segment_length
@@ -195,9 +275,45 @@ class WholeBodySweepNode(Node):
         self.q_posture = None
         self.holding_since = None
         self.standoff_strikes = 0
+        # "sweep" -> "retreat" (backing the plate off the wall) -> "done". The
+        # terminal status is withheld until "done", because the FSM kills this
+        # process as soon as it sees one.
+        self.phase = "sweep"
+        self.pending_status = None
+        self.retreat_deadline = 0.0
+        self.return_deadline = 0.0
+        # A typed-but-unset parameter RAISES on .value rather than returning
+        # None, so an absent return target has to be caught, not defaulted.
+        try:
+            raw = p("return_joints").value
+        except rclpy.exceptions.ParameterUninitializedException:
+            raw = None
+        self.return_joints = [float(v) for v in (raw or [])]
         self.status = "running"
         self.control_timer = None
         self.progress = 0.0
+        self.best_progress = 0.0
+        self.progress_stamp = None   # set on the first cycle, not at construction
+
+        self.avoid = bool(p("avoid_obstacles").value)
+        self.avoid_config = AvoidanceConfig(
+            safety_margin=float(p("avoid_safety_margin").value),
+            influence=float(p("avoid_influence").value),
+            alpha=float(p("avoid_alpha").value),
+            obstacle_cost=int(p("avoid_obstacle_cost").value),
+            unknown_is_obstacle=bool(p("avoid_unknown_is_obstacle").value),
+            footprint_radius=float(p("avoid_footprint_radius").value),
+            footprint_offset=tuple(p("avoid_footprint_offset").value),
+            n_samples=int(p("avoid_n_samples").value),
+            max_rows=int(p("avoid_max_rows").value),
+            mask_halfwidth=float(p("avoid_mask_halfwidth").value),
+            mask_extension=float(p("avoid_mask_extension").value),
+        )
+        self.costmap_msg = None
+        self.costmap_stamp = None
+        self.obstacle_field = None
+        self._field_from = None      # the message the cached field was built from
+        self.closest_obstacle = float("inf")
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -215,6 +331,9 @@ class WholeBodySweepNode(Node):
             JointState, str(p("joint_states_topic").value), self._on_joint_states, 10)
         self.create_subscription(
             Float32MultiArray, str(p("distance_topic").value), self._on_distances, 10)
+        if self.avoid:
+            self.create_subscription(
+                OccupancyGrid, str(p("costmap_topic").value), self._on_costmap, 1)
         # Republished, not just latched: the FSM may subscribe after we start.
         self.create_timer(0.5, self._publish_status)
 
@@ -273,6 +392,105 @@ class WholeBodySweepNode(Node):
         if len(msg.data) == 6:
             self.distances = np.array(msg.data, dtype=float)
             self.distance_stamp = self._now()
+
+    def _on_costmap(self, msg):
+        self.costmap_msg = msg
+        self.costmap_stamp = self._now()
+
+    def _obstacle_field(self):
+        """The cached distance field, rebuilt when a new costmap arrives.
+
+        The costmap has its own frame (``odom`` for a rolling local costmap), and
+        a grid cannot be rotated into another frame without resampling, so the
+        field stays in that frame and the query points are brought TO it. The
+        scan segment is transformed the same way before being masked out.
+        """
+        msg = self.costmap_msg
+        if msg is None:
+            return None
+        if self._field_from is msg:
+            return self.obstacle_field
+
+        frame = msg.header.frame_id or self.map_frame
+        segment = self._segment_in(frame)
+        try:
+            data = np.asarray(msg.data, dtype=np.int16).reshape(
+                msg.info.height, msg.info.width)
+            self.obstacle_field = ObstacleField.from_grid(
+                data, msg.info.resolution,
+                (msg.info.origin.position.x, msg.info.origin.position.y),
+                self.avoid_config, mask_segment=segment)
+        except Exception as exc:
+            self.get_logger().warn(f"Unusable costmap: {exc}", throttle_duration_sec=10.0)
+            self.obstacle_field = None
+        self._field_from = msg
+        return self.obstacle_field
+
+    def _segment_in(self, frame):
+        """The scan segment's endpoints in ``frame``, or None if TF cannot say.
+
+        Masking the wrong strip is worse than masking none: the wall would keep
+        pushing the base while some innocent patch of floor went unguarded. So a
+        failed transform drops the mask rather than guessing.
+        """
+        if frame == self.map_frame:
+            return (self.seg_start[:2], self.seg_end[:2])
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                frame, self.map_frame, rclpy.time.Time())
+        except Exception:
+            self.get_logger().warn(
+                f"No TF {self.map_frame}->{frame}; sweeping without the wall mask, "
+                f"so the scanned wall itself may push the base away.",
+                throttle_duration_sec=10.0)
+            return None
+        t, q = tf.transform.translation, tf.transform.rotation
+        R = _quat_to_matrix(np.array([q.x, q.y, q.z, q.w]))[:2, :2]
+        shift = np.array([t.x, t.y])
+        return (R @ self.seg_start[:2] + shift, R @ self.seg_end[:2] + shift)
+
+    def _avoidance_rows(self, n_arm):
+        """Barrier rows for this cycle, or empty when there is nothing to avoid."""
+        empty = (np.zeros((0, 3 + n_arm)), np.zeros(0))
+        if not self.avoid:
+            return empty
+        field = self._obstacle_field()
+        if field is None:
+            self.get_logger().warn(
+                "No costmap yet: sweeping with NO obstacle avoidance on the base.",
+                throttle_duration_sec=5.0)
+            return empty
+        age = self._now() - (self.costmap_stamp or 0.0)
+        if age > float(self.get_parameter("costmap_max_age").value):
+            # STOP using it, don't just grumble. The local costmap is a rolling
+            # window anchored to the robot: once it stops updating, the grid
+            # describes where the robot USED to be, and the barrier starts
+            # steering around obstacles that are no longer there while missing
+            # anything that has appeared. Observed in Gazebo — a phantom
+            # obstacle 0.07 m away pushed the base backwards and stalled the
+            # last 6 cm of a sweep. Better to say plainly that there is no
+            # avoidance than to act confidently on a stale picture.
+            self.get_logger().error(
+                f"Costmap is {age:.0f}s old — DROPPING base obstacle avoidance rather "
+                f"than steering by a stale map. The sweep continues unguarded.",
+                throttle_duration_sec=5.0)
+            self.closest_obstacle = float("inf")
+            return empty
+
+        frame = self.costmap_msg.header.frame_id or self.map_frame
+        pose = self._lookup(self.base_frame, source_frame=frame)
+        if pose is None:
+            self.get_logger().warn(
+                f"No TF {frame}->{self.base_frame}; no obstacle rows this cycle.",
+                throttle_duration_sec=5.0)
+            return empty
+        quat, position = pose
+        yaw = math.atan2(2.0 * (quat[3] * quat[2] + quat[0] * quat[1]),
+                         1.0 - 2.0 * (quat[1] ** 2 + quat[2] ** 2))
+        A, lower, _, closest = avoidance_rows(
+            field, yaw, position, self.avoid_config, n_arm=n_arm)
+        self.closest_obstacle = closest
+        return A, lower
 
     # ------------------------------------------------------------------
     # Startup / teardown
@@ -338,6 +556,9 @@ class WholeBodySweepNode(Node):
             missing.append(f"TF {self.map_frame}->{self.arm_root_link}")
         if self._base_pose() is None:
             missing.append(f"TF {self.map_frame}->{self.base_frame}")
+        if (self.avoid and self.costmap_msg is None
+                and bool(self.get_parameter("avoid_require_costmap").value)):
+            missing.append("costmap")
         return missing
 
     def start(self):
@@ -357,11 +578,48 @@ class WholeBodySweepNode(Node):
         self.arm_cmd_pub.publish(Float64MultiArray(data=[0.0] * len(self.arm_joints)))
 
     def finish(self, status, reason=""):
-        """Stop moving and latch a terminal status for the FSM."""
-        self.halt()
-        self.status = status if not reason else f"{status}: {reason}"
+        """End the sweep — but back the plate off the wall before saying so.
+
+        The plate ends a sweep at its scanning standoff, centimetres off the
+        surface, and everything that happens next needs it further out: the FSM
+        retracts it before letting the base transit, and its planner has to solve
+        that as a Cartesian goal through an octomap that contains the wall the
+        plate is nearly touching. From there the search routinely fails ("no path
+        found"), the FSM shrugs and carries on, and the base then transits with
+        the arm still extended.
+
+        This node is in a much better position to do it: it already holds the
+        arm's velocity controller and it knows, from the plate's own sensors,
+        which way "away from the wall" is. So retreat straight back along the
+        sensed normal first, then hand the arm over — by which time the FSM's
+        retraction has nothing left to do and never calls the planner at all.
+
+        The terminal status is deliberately withheld until the retreat finishes:
+        the FSM kills this process the moment it sees one.
+        """
+        self.pending_status = status if not reason else f"{status}: {reason}"
         level = self.get_logger().info if status == "succeeded" else self.get_logger().error
-        level(f"Sweep {self.status} (progress {self.progress:.2f}/{self.segment_length:.2f} m).")
+        level(f"Sweep {self.pending_status} (progress {self.progress:.2f}/"
+              f"{self.segment_length:.2f} m).")
+
+        target = float(self.get_parameter("retreat_standoff").value)
+        if self.phase != "sweep" or target <= 0.0 or self.surface.distance is None:
+            self._terminate()
+            return
+        self.cmd_vel_pub.publish(Twist())        # the base is done moving
+        self.phase = "retreat"
+        self.retreat_deadline = self._now() + float(
+            self.get_parameter("retreat_timeout").value)
+        self.get_logger().info(
+            f"Retreating the plate from {self.surface.distance:.2f} m to {target:.2f} m "
+            f"along the sensed normal before handing the arm back."
+        )
+
+    def _terminate(self):
+        """Publish the withheld status and stop commanding anything."""
+        self.phase = "done"
+        self.halt()
+        self.status = self.pending_status or "failed: ended without a status"
         self._publish_status()
 
     def _publish_status(self):
@@ -385,9 +643,10 @@ class WholeBodySweepNode(Node):
         """
         return self.joint_positions.get(self.turret_joint, 0.0)
 
-    def _lookup(self, target_frame):
+    def _lookup(self, target_frame, source_frame=None):
         try:
-            tf = self.tf_buffer.lookup_transform(self.map_frame, target_frame, rclpy.time.Time())
+            tf = self.tf_buffer.lookup_transform(
+                source_frame or self.map_frame, target_frame, rclpy.time.Time())
         except Exception:
             return None
         t = tf.transform.translation
@@ -437,8 +696,135 @@ class WholeBodySweepNode(Node):
     # ------------------------------------------------------------------
     # The control loop
     # ------------------------------------------------------------------
+    def _retreat_step(self):
+        """Back the plate off along the sensed normal, arm only, base held still.
+
+        Deliberately the same QP as the sweep with the base pinned to zero: the
+        arm's joint limits and the plate's orientation task still apply, so the
+        retreat cannot fling a joint into a stop or twist the plate on the way
+        out. Any input it cannot trust ends the retreat rather than guessing a
+        direction to move the arm in.
+        """
+        now = self._now()
+        target = float(self.get_parameter("retreat_standoff").value)
+
+        if now > self.retreat_deadline:
+            self.get_logger().warn(
+                f"Retreat timed out at {self.surface.distance:.2f} m (wanted "
+                f"{target:.2f} m); returning the arm from here.")
+            self._begin_return()
+            return
+        if self._stale_inputs(now) or not self.surface.update(self.distances):
+            self.get_logger().warn("Lost the plate ranges mid-retreat; stopping here.")
+            self._terminate()
+            return
+
+        T_mount = self._mount_pose()
+        base = self._base_pose()
+        q_arm = self._arm_positions()
+        if T_mount is None or base is None or q_arm is None:
+            self._terminate()
+            return
+        yaw, p_base = base
+        J, T_plate = whole_body_jacobian(self.chain, q_arm, T_mount, yaw, p_base)
+        R_plate = T_plate[:3, :3]
+        m_hat = R_plate @ self.surface.normal_plate
+
+        remaining = target - self.surface.distance
+        if remaining <= 0.01:
+            self.get_logger().info(
+                f"Plate retreated to {self.surface.distance:.2f} m; arm is clear of "
+                f"the wall.")
+            self._begin_return()
+            return
+
+        p = self.get_parameter
+        speed = min(float(p("retreat_speed").value), remaining)
+        n_arm = self.chain.n_joints
+        xdot = np.concatenate((-speed * m_hat, np.zeros(3)))
+        weights = np.concatenate((np.full(3, float(p("weight_linear").value)),
+                                  np.zeros(3)))
+        damping = np.concatenate((np.array(p("damping_base").value, dtype=float),
+                                  np.full(n_arm, float(p("damping_arm").value))))
+        tasks = [Task(J, xdot, weights),
+                 Task(np.diag(damping), np.zeros(3 + n_arm), 1.0)]
+
+        lower_arm, upper_arm = self.chain.position_limits()
+        arm_lo, arm_hi = joint_limit_bounds(
+            q_arm, lower_arm, upper_arm, float(p("arm_qdot_max").value),
+            margin=float(p("joint_limit_margin").value))
+        solution = solve_velocity_qp(
+            tasks,
+            np.concatenate((np.zeros(3), arm_lo)),      # base pinned: arm only
+            np.concatenate((np.zeros(3), arm_hi)))
+        if not solution.ok:
+            self.get_logger().warn("Retreat QP did not solve; stopping here.")
+            self._terminate()
+            return
+
+        self._publish(solution.u, n_arm)
+        self.get_logger().info(
+            f"Retreating: d={self.surface.distance * 100:.1f}cm -> {target * 100:.0f}cm",
+            throttle_duration_sec=1.0)
+
+    def _begin_return(self):
+        """Move to the joint-space return, or stop if there is nothing to return to."""
+        if not self.return_joints or self.chain is None:
+            self._terminate()
+            return
+        self.phase = "return"
+        self.return_deadline = self._now() + float(
+            self.get_parameter("return_timeout").value)
+        self.get_logger().info(
+            "Returning the arm to the configuration the planner left it in.")
+
+    def _return_step(self):
+        """Drive the arm joints back to ``return_joints``; the base stays put.
+
+        Joint space on purpose. The target is a configuration the FSM's planner
+        actually reached, so it is reachable, clear of the mast cylinder and
+        something A* can plan out of — none of which any particular Cartesian
+        standoff can guarantee.
+        """
+        now = self._now()
+        q_arm = self._arm_positions()
+        if q_arm is None or len(self.return_joints) != len(q_arm):
+            self.get_logger().warn("No usable joint state for the return; stopping here.")
+            self._terminate()
+            return
+
+        error = np.asarray(self.return_joints, dtype=float) - q_arm
+        worst = float(np.max(np.abs(error)))
+        if worst <= float(self.get_parameter("return_tolerance").value):
+            self.get_logger().info(
+                f"Arm back at the unfolded configuration (worst joint error "
+                f"{worst:.3f} rad).")
+            self._terminate()
+            return
+        if now > self.return_deadline:
+            self.get_logger().warn(
+                f"Return timed out with {worst:.2f} rad still to go; handing the arm "
+                f"back as it is.")
+            self._terminate()
+            return
+
+        limit = float(self.get_parameter("arm_qdot_max").value)
+        qdot = np.clip(error * float(self.get_parameter("return_gain").value), -limit, limit)
+        self.cmd_vel_pub.publish(Twist())
+        self._publish(np.concatenate((np.zeros(3), qdot)), len(q_arm))
+        self.get_logger().info(
+            f"Returning: worst joint error {worst:.2f} rad", throttle_duration_sec=1.0)
+
     def _control_step(self):
         now = self._now()
+        if self.phase == "done":
+            return
+        if self.phase == "retreat":
+            self._retreat_step()
+            return
+        if self.phase == "return":
+            self._return_step()
+            return
         if self.status != "running":
             return
         if self.deadline is not None and now > self.deadline:
@@ -460,6 +846,10 @@ class WholeBodySweepNode(Node):
             self._strike("lost TF or joint states")
             return
         yaw, p_base = base
+        # The turret joint angle relates the frame the twist is commanded in to
+        # the chassis that has to yaw for it; both the speed cap and the actuator
+        # rows below are built around it.
+        phi = self._turret_angle()
 
         J, T_plate = whole_body_jacobian(self.chain, q_arm, T_mount, yaw, p_base)
         R_plate, p_plate = T_plate[:3, :3], T_plate[:3, 3]
@@ -477,6 +867,23 @@ class WholeBodySweepNode(Node):
         if remaining <= self.arrive_tolerance:
             self.finish("succeeded")
             return
+
+        # Give up on a sweep that has stopped advancing, rather than sitting on
+        # the wall until the full length/speed budget expires. Something is
+        # holding the plate — an obstacle it is pressed against, a barrier it
+        # cannot satisfy — and none of it improves by waiting several more
+        # minutes with the arm loaded against the surface.
+        if self.progress_stamp is None or self.progress > self.best_progress + 0.02:
+            self.best_progress = self.progress
+            self.progress_stamp = now
+        else:
+            stall = float(self.get_parameter("no_progress_timeout").value)
+            if now - self.progress_stamp > stall:
+                self.finish(
+                    "failed",
+                    f"no progress for {stall:.0f}s at {self.progress:.2f}/{length:.2f} m "
+                    f"(something is holding the plate)")
+                return
 
         # --- The sensed surface frame ---------------------------------------
         m_hat = R_plate @ self.surface.normal_plate      # plate -> wall, world axes
@@ -506,9 +913,17 @@ class WholeBodySweepNode(Node):
                           float(p("v_normal_max").value))
         v_height = _clamp(float(p("k_height").value) * (self.row_z - p_plate[2]),
                           float(p("v_normal_max").value))
-        # Ease off over the last few centimetres so the sweep stops ON the
-        # segment end instead of overshooting past it between cycles.
-        speed = min(self.sweep_speed, remaining)
+        # Cap the reference by what the base can actually hold in THIS direction
+        # (sideways is ~6x slower than straight ahead), then ease off over the
+        # last few centimetres so the sweep stops ON the segment end instead of
+        # overshooting past it between cycles. Asking for more than the base can
+        # give does not make it go faster — sim_controller would rescale the
+        # command, and the arm would try to take up the difference until it ran
+        # out of reach.
+        heading = math.atan2(t_hat[1], t_hat[0])
+        reachable = self.limits.max_speed_along(
+            heading - yaw, heading - (yaw - phi)) * float(p("sweep_speed_margin").value)
+        speed = min(self.sweep_speed, remaining, reachable)
         v_ref = speed * t_hat + v_normal * m_hat + v_height * np.array([0.0, 0.0, 1.0])
 
         R_target = plate_orientation_target(m_hat)
@@ -527,14 +942,30 @@ class WholeBodySweepNode(Node):
                                   np.full(3, float(p("weight_angular").value))))
         damping = np.concatenate((np.array(p("damping_base").value, dtype=float),
                                   np.full(n_arm, float(p("damping_arm").value))))
+        # The BASE owns the tangent, the ARM owns the normal — the task-frame
+        # ownership the design calls for. Without this the damping weights decide
+        # it instead, and they say the base is ~100x cheaper than the arm on
+        # EVERY axis, so the base ends up carrying the standoff corrections too:
+        # it creeps toward or away from the wall for the whole sweep while the
+        # arm barely moves. A steady 1 cm of standoff error is then enough to
+        # walk the base out of position over a few minutes, until it sits inside
+        # Nav2's collision radius and cannot transit to the next segment.
+        # Penalising only the base's velocity ALONG the sensed normal costs the
+        # sweep nothing, since the sweep runs along the tangent, which is
+        # perpendicular to it.
+        rotation = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+        base_normal_row = np.zeros((1, 3 + n_arm))
+        base_normal_row[0, :2] = m_hat[:2] @ rotation
         tasks = [
             Task(J, xdot, weights),
             Task(np.diag(damping), np.zeros(3 + n_arm), 1.0),
+            Task(base_normal_row, np.zeros(1), float(p("weight_base_normal").value)),
             # Posture: pull the arm back toward the pose the sweep started from,
             # so the redundancy is spent keeping the arm workable instead of
             # slowly stretching it out over the length of the wall.
             Task(np.hstack((np.zeros((n_arm, 3)), np.eye(n_arm))),
-                 float(p("k_posture").value) * (self.q_posture - q_arm),
+                 _clamp_norm(float(p("k_posture").value) * (self.q_posture - q_arm),
+                             float(p("posture_rate_max").value)),
                  float(p("weight_posture").value)),
         ]
 
@@ -543,17 +974,48 @@ class WholeBodySweepNode(Node):
             q_arm, lower_arm, upper_arm, float(p("arm_qdot_max").value),
             margin=float(p("joint_limit_margin").value))
         base_lo, base_hi = box_bounds(self.limits)
-        phi = self._turret_angle()
         A_ineq, ineq_lo, ineq_hi = constraint_rows(self.limits, phi)
         A_ineq = np.hstack((A_ineq, np.zeros((A_ineq.shape[0], n_arm))))
+
+        # Obstacle barriers go in SOFT: a base pinned inside its margin can be
+        # asked to retreat faster than it is able to strafe, and a hard row there
+        # would make the whole solve infeasible — stopping the robot instead of
+        # backing it off. Actuator limits stay hard.
+        A_avoid, avoid_lo = self._avoidance_rows(n_arm)
+
+        # The scanned wall is masked out of the costmap barrier by design, which
+        # leaves nothing at all watching the one obstacle the base is guaranteed
+        # to be near. Close that with a barrier against the SENSED wall instead:
+        # the plate measures where the surface is, so the base's distance to it
+        # is (plate standoff + how far the base sits behind the plate) along the
+        # normal. Keep that above a floor, or the base ends up closer to the wall
+        # than Nav2's own footprint allows and the next transit cannot plan.
+        base_gap = float(np.dot(p_plate[:2] - p_base[:2], m_hat[:2])) + distance
+        floor = float(p("base_wall_min_gap").value)
+        if floor > 0.0:
+            A_avoid = np.vstack((A_avoid, -base_normal_row))
+            avoid_lo = np.concatenate((
+                avoid_lo, [-float(p("avoid_alpha").value) * (base_gap - floor)]))
+            if base_gap < floor:
+                self.get_logger().warn(
+                    f"Base is {base_gap:.2f} m from the wall, inside the {floor:.2f} m "
+                    f"floor; backing it off before it gets stuck against the surface.",
+                    throttle_duration_sec=5.0)
 
         solution = solve_velocity_qp(
             tasks,
             np.concatenate((base_lo, arm_lo)), np.concatenate((base_hi, arm_hi)),
-            A_ineq=A_ineq, ineq_lo=ineq_lo, ineq_hi=ineq_hi)
+            A_ineq=A_ineq, ineq_lo=ineq_lo, ineq_hi=ineq_hi,
+            soft_ineq=A_avoid if A_avoid.shape[0] else None, soft_lo=avoid_lo,
+            soft_weight=float(p("avoid_slack_weight").value))
         if not solution.ok:
             self._strike(f"QP did not solve ({solution.status})")
             return
+        if solution.slack > 1e-3:
+            self.get_logger().warn(
+                f"Obstacle {self.closest_obstacle:.2f} m away: retreating as fast as "
+                f"the base allows, still {solution.slack:.3f} m/s short of the barrier.",
+                throttle_duration_sec=2.0)
         if solution.solver.endswith("(box-only)"):
             self.get_logger().warn(
                 "OSQP unavailable: solving with a box-only fallback, so the base's "
@@ -604,17 +1066,27 @@ class WholeBodySweepNode(Node):
     def _log_cycle(self, solution, distance, remaining, phi):
         w_left, w_right, phi_dot, w_chassis = wheel_and_turret_rates(
             self.limits, solution.u[:3], phi)
+        clearance = ("--" if not np.isfinite(self.closest_obstacle)
+                     else f"{self.closest_obstacle:.2f}m")
         self.get_logger().info(
             f"d={distance * 100:.1f}cm tilt={math.degrees(self.surface.tilt()):.1f}deg "
             f"left={remaining:.2f}m | base=({solution.u[0]:+.3f}, {solution.u[1]:+.3f}, "
             f"{solution.u[2]:+.3f}) w_chassis={w_chassis:+.2f} phi_dot={phi_dot:+.2f} "
             f"| arm max={np.max(np.abs(solution.u[3:])):.3f} rad/s "
-            f"| residual={solution.task_residual:.4f}",
+            f"| clear={clearance} | residual={solution.task_residual:.4f}",
             throttle_duration_sec=1.0)
 
 
 def _clamp(value, limit):
     return float(max(-limit, min(limit, value)))
+
+
+def _clamp_norm(vector, limit):
+    """Scale ``vector`` down to ``limit`` in norm, preserving its direction."""
+    norm = float(np.linalg.norm(vector))
+    if limit <= 0.0 or norm <= limit or norm < 1e-12:
+        return vector
+    return vector * (limit / norm)
 
 
 def _quat_to_matrix(q):

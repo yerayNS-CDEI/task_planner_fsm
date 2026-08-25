@@ -58,6 +58,27 @@ class ArmUnfolding(State):
                     ctx["error_triggered"] = True
                     return
 
+        # ScanWall owns the unfold for wall scans, so don't do it here.
+        # It folds the arm again immediately: the base still has to slide from
+        # NavigateToTarget's coarse standoff to the first segment's scanning
+        # standoff, and that transit runs folded. Unfolding here therefore buys
+        # unfold -> fold -> unfold with nothing in between — measured at 87 s +
+        # 89 s of wasted arm motion per scan line in simulation. Hand the arm
+        # over folded instead and let ScanWall unfold once, after the base has
+        # arrived. Floor and ceiling scans (phases 2 and 3) have no such transit
+        # and still unfold here.
+        #
+        # The dashboard play command above has already run: it starts the UR
+        # program on the real robot and has nothing to do with arm position.
+        if ctx.get("scan_phase") == 1 and not ctx.get("arm_unfolding_force_unfold", False):
+            node.get_logger().info(
+                f"[{self.name}] Wall scan: leaving the arm folded — ScanWall unfolds "
+                f"it once the base has reached the first segment."
+            )
+            ctx["unfolding_success"] = True
+            self.movement_done = True
+            return
+
         # Send service request if not already sent
         if not self.goal_sent:
             if not self.service_client.service_is_ready():
