@@ -10,6 +10,9 @@
   <exec_depend>ur_msgs</exec_depend>
   <!-- Whole-body sweep controller (task_planner_fsm.wbc). -->
   <exec_depend>controller_manager_msgs</exec_depend>
+  <!-- Robot mode / safety mode, for the sweep's hardware gate. The import is
+       guarded, so the sweep still runs in simulation without the UR driver. -->
+  <exec_depend>ur_dashboard_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
   <exec_depend>std_srvs</exec_depend>

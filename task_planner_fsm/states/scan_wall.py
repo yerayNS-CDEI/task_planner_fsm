@@ -2474,11 +2474,16 @@ class ScanWall(State):
     def _ensure_arm_trajectory_controller(self, ctx):
         """Ask for the arm's trajectory controller back, in case the sweep could not.
 
-        The sweep node claims ``forward_velocity_controller`` and restores the
-        trajectory controller when it shuts down — but a SIGKILLed node cannot,
-        and every later arm goal would then be published into a controller that
-        is not running. Fire-and-forget and BEST_EFFORT, so it is a no-op when
-        the node already put things back.
+        The sweep node claims a streaming controller and restores the trajectory
+        controller when it shuts down — but a SIGKILLed node cannot, and every
+        later arm goal would then be published into a controller that is not
+        running. Fire-and-forget and BEST_EFFORT, so it is a no-op when the node
+        already put things back.
+
+        BOTH forward controllers are deactivated, because which one the sweep
+        claimed depends on its ``arm_stream_interface`` and this path exists
+        precisely for the case where the sweep process is gone and cannot be
+        asked. BEST_EFFORT makes naming an inactive one harmless.
         """
         node = ctx.get("node")
         if node is None or not bool(ctx.get("sweep_use_wbc", False)):
@@ -2494,8 +2499,9 @@ class ScanWall(State):
         req = SwitchController.Request()
         req.activate_controllers = [str(ctx.get("arm_trajectory_controller",
                                                 "joint_trajectory_controller"))]
-        req.deactivate_controllers = [str(ctx.get("arm_velocity_controller",
-                                                  "forward_velocity_controller"))]
+        req.deactivate_controllers = list(ctx.get(
+            "arm_streaming_controllers",
+            ["forward_velocity_controller", "forward_position_controller"]))
         req.strictness = SwitchController.Request.BEST_EFFORT
         req.activate_asap = True
         fut = self._switch_client.call_async(req)

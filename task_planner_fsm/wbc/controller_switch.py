@@ -1,14 +1,23 @@
-"""Swap the arm between trajectory control and streaming velocity control.
+"""Swap the arm between trajectory control and streaming control.
 
 Planned arm moves (the FSM's named poses, the Z approach) go through a
-``FollowJointTrajectory`` controller; the whole-body sweep instead streams joint
-velocities, and ros2_control allows only one controller per command interface.
-So the sweep has to claim ``forward_velocity_controller`` for its duration and
+``FollowJointTrajectory`` controller; the whole-body sweep instead streams a
+command every cycle, and ros2_control allows only one controller per command
+interface. So the sweep has to claim a streaming controller for its duration and
 give it back afterwards.
+
+WHICH streaming controller depends on how the sweep node is configured to talk
+to the arm (see ``wbc/streaming.py``): ``forward_position_controller`` for
+servoj setpoints, which is the default, or ``forward_velocity_controller`` for
+speedj. The name is passed in rather than assumed, and whichever one is claimed
+is automatically excluded from the list of controllers to deactivate — the two
+forward controllers appear in both roles depending on the mode, and asking the
+manager to activate and deactivate the same controller in one switch is how you
+get a sweep that starts with no controller at all.
 
 Ownership sits with the sweep node rather than the FSM on purpose: whoever holds
 the controller should be the process that dies if the sweep dies, so a crash
-cannot leave the arm parked on a velocity controller nobody is feeding. The FSM
+cannot leave the arm parked on a streaming controller nobody is feeding. The FSM
 still checks on the way out (see ``ScanWall._ensure_arm_trajectory_controller``)
 in case this node was killed hard enough to skip its own teardown.
 
@@ -26,26 +35,38 @@ from controller_manager_msgs.srv import (
     SwitchController,
 )
 
+from .streaming import DEFAULT_CONTROLLER, POSITION
+
 # Controllers that own the arm's command interfaces when the sweep is not
 # running. Whichever of these is active gets deactivated for the sweep and
-# reactivated afterwards.
+# reactivated afterwards. Both forward controllers are listed because either can
+# be the incumbent; the one this sweep is claiming is filtered out below.
 TRAJECTORY_CONTROLLERS = [
     "joint_trajectory_controller",
     "scaled_joint_trajectory_controller",
     "passthrough_trajectory_controller",
     "forward_position_controller",
+    "forward_velocity_controller",
 ]
 
 
 class ArmControllerSwitch:
-    """Claim the velocity controller for a sweep, then put things back."""
+    """Claim a streaming controller for a sweep, then put things back."""
 
-    def __init__(self, node):
+    def __init__(self, node, controller=None):
         self.node = node
-        self.velocity_controller = _param(node, "arm_velocity_controller",
-                                          "forward_velocity_controller")
-        self.trajectory_controllers = list(
-            _param(node, "arm_trajectory_controllers", TRAJECTORY_CONTROLLERS))
+        # Normally handed the name the sweep node derived from its
+        # arm_stream_interface. The parameter and the constant behind it are
+        # fallbacks for a switch constructed on its own, and share the default
+        # with ArmStream so the two cannot drift apart.
+        self.stream_controller = (controller
+                                  or _param(node, "arm_stream_controller", "")
+                                  or DEFAULT_CONTROLLER[POSITION])
+        self.trajectory_controllers = [
+            name for name in _param(node, "arm_trajectory_controllers",
+                                    TRAJECTORY_CONTROLLERS)
+            if name != self.stream_controller
+        ]
         self.controller_manager = _param(node, "controller_manager", "/controller_manager")
         self.enabled = bool(_param(node, "manage_controllers", True))
         self.service_timeout = float(_param(node, "controller_service_timeout", 10.0))
@@ -53,10 +74,10 @@ class ArmControllerSwitch:
         self.activated = False
 
     # ------------------------------------------------------------------
-    def to_velocity_control(self):
-        """Activate the velocity controller, deactivating whoever holds the arm.
+    def claim(self):
+        """Activate the streaming controller, deactivating whoever holds the arm.
 
-        Returns True when the arm is ready to take streamed velocities (also when
+        Returns True when the arm is ready to take streamed commands (also when
         management is disabled — then the caller has arranged it themselves).
         """
         if not self.enabled:
@@ -66,9 +87,9 @@ class ArmControllerSwitch:
         states = self._controller_states()
         if states is None:
             return False
-        if states.get(self.velocity_controller) == "active":
+        if states.get(self.stream_controller) == "active":
             self.node.get_logger().info(
-                f"'{self.velocity_controller}' is already active.")
+                f"'{self.stream_controller}' is already active.")
             return True
         if not self._ensure_loaded(states):
             return False
@@ -76,22 +97,22 @@ class ArmControllerSwitch:
         self.deactivated = [name for name in self.trajectory_controllers
                             if states.get(name) == "active"]
         self.node.get_logger().info(
-            f"Switching the arm to '{self.velocity_controller}'"
+            f"Switching the arm to '{self.stream_controller}'"
             + (f" (deactivating {', '.join(self.deactivated)})" if self.deactivated else "")
         )
-        if not self._switch(activate=[self.velocity_controller], deactivate=self.deactivated):
+        if not self._switch(activate=[self.stream_controller], deactivate=self.deactivated):
             self.deactivated = []
             return False
         self.activated = True
         return True
 
     def restore(self):
-        """Undo :meth:`to_velocity_control`. Safe to call when it never ran."""
+        """Undo :meth:`claim`. Safe to call when it never ran."""
         if not self.enabled or not self.activated:
             return
         self.node.get_logger().info(
             f"Restoring the arm to {', '.join(self.deactivated) or 'no trajectory controller'}.")
-        self._switch(activate=self.deactivated, deactivate=[self.velocity_controller])
+        self._switch(activate=self.deactivated, deactivate=[self.stream_controller])
         self.activated = False
         self.deactivated = []
 
@@ -105,37 +126,39 @@ class ArmControllerSwitch:
         return {c.name: c.state for c in response.controller}
 
     def _ensure_loaded(self, states):
-        """Load and configure the velocity controller if it is not there yet.
+        """Load and configure the streaming controller if it is not there yet.
 
         Launch files spawn the controllers a robot normally uses, and a streaming
-        velocity controller is not one of them — in the Gazebo stack the arm's
-        velocity interfaces sit available and unclaimed with no controller for
-        them. Loading it here (its type and joints are already declared in the
-        controller_manager's parameters) means a whole-body sweep needs no launch
-        file change to try.
+        controller is not always one of them — in the Gazebo stack the arm's
+        position and velocity interfaces sit available and unclaimed with no
+        controller for them. Loading it here (its type and joints are already
+        declared in the controller_manager's parameters) means a whole-body sweep
+        needs no launch file change to try. On the real robot both forward
+        controllers are already spawned inactive by ``arm_control``'s
+        ``ur_control.launch.py``, so this path is a no-op there.
         """
-        state = states.get(self.velocity_controller)
+        state = states.get(self.stream_controller)
         if state is None:
-            self.node.get_logger().info(f"Loading '{self.velocity_controller}'...")
+            self.node.get_logger().info(f"Loading '{self.stream_controller}'...")
             request = LoadController.Request()
-            request.name = self.velocity_controller
+            request.name = self.stream_controller
             response = self._call(LoadController,
                                   f"{self.controller_manager}/load_controller", request)
             if response is None or not response.ok:
                 self.node.get_logger().error(
-                    f"Could not load '{self.velocity_controller}'. Is its type declared in "
+                    f"Could not load '{self.stream_controller}'. Is its type declared in "
                     f"the controller_manager's parameters?"
                 )
                 return False
             state = "unconfigured"
         if state == "unconfigured":
             request = ConfigureController.Request()
-            request.name = self.velocity_controller
+            request.name = self.stream_controller
             response = self._call(ConfigureController,
                                   f"{self.controller_manager}/configure_controller", request)
             if response is None or not response.ok:
                 self.node.get_logger().error(
-                    f"Could not configure '{self.velocity_controller}'.")
+                    f"Could not configure '{self.stream_controller}'.")
                 return False
         return True
 

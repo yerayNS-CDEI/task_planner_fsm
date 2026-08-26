@@ -11,7 +11,8 @@ controllers each unaware of the other — with ONE control law over base + arm::
                            hold the row height
                            keep the plate parallel and upright
     resolve it across 9 DOF with a QP that respects the base's actuator limits
-    publish  base Twist (turret frame)  +  arm joint velocities
+    scale by the robot's execution speed, bound the acceleration, and publish
+    base Twist (turret frame)  +  arm command (servoj setpoints by default)
 
 Started per segment by the FSM with the segment endpoints as parameters, it
 reports on ``status_topic`` ("running" / "succeeded" / "failed: <reason>") and
@@ -20,8 +21,11 @@ Termination is by ARC LENGTH along the sensed surface, not by a base pose: the
 sweep is done when the plate has travelled the segment.
 
 The column is not touched — it holds the row height set before the sweep. On the
-real robot ``force_mode`` cannot coexist with the streaming velocity controller
-this node needs, so it is sim-first by design; the FSM gates it accordingly.
+real robot ``force_mode`` cannot coexist with a streaming controller, so the
+press is still sim-only and the FSM gates the sweep accordingly; everything
+between the QP and the actuators, though, is written for the hardware — see
+``wbc/streaming.py`` (why the arm gets positions, not velocities) and
+``wbc/hardware.py`` (why the base is scaled by the UR's speed slider).
 
 Run standalone (outside the FSM) for bench tests::
 
@@ -43,12 +47,14 @@ from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32MultiArray, Float64MultiArray, String
+from std_msgs.msg import Float32MultiArray, String
 
 from .avoidance import AvoidanceConfig, ObstacleField, avoidance_rows
 from .base_model import BaseLimits, box_bounds, constraint_rows, wheel_and_turret_rates
+from .hardware import HardwareMonitor
 from .kinematics import SerialChain, rotation_error, whole_body_jacobian
 from .qp import Task, joint_limit_bounds, solve_velocity_qp
+from .streaming import DEFAULT_CONTROLLER, POSITION, ArmStream, slew_limit
 from .surface import SurfaceEstimator, plate_orientation_target, sweep_tangent
 
 ARM_JOINTS = [
@@ -115,7 +121,20 @@ class WholeBodySweepNode(Node):
         # keeps the same meaning it has everywhere else in the FSM.
         self.declare_parameter("arm_tip_link", "arm_tool0")
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
-        self.declare_parameter("arm_command_topic", "/forward_velocity_controller/commands")
+        # How the arm is commanded: "position" streams servoj setpoints through
+        # forward_position_controller, "velocity" streams speedj through
+        # forward_velocity_controller. Position is the default because losing
+        # this node then freezes the arm instead of running it away — see
+        # wbc/streaming.py. Both topic and controller default to whatever the
+        # chosen interface implies; "" means "derive it".
+        self.declare_parameter("arm_stream_interface", POSITION)
+        self.declare_parameter("arm_command_topic", "")
+        self.declare_parameter("arm_stream_controller", "")
+        # How far the integrated setpoint may lead the measured joint before it
+        # is clamped. Sized off the servo lag at these speeds (~0.5 rad/s into a
+        # ~30 ms lag is ~0.015 rad), so this is an order of magnitude of
+        # headroom and only bites when the arm is genuinely not following.
+        self.declare_parameter("arm_stream_max_lead", 0.2)
         self.declare_parameter("distance_topic", "/distance_sensors")
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("robot_description_topic", "/robot_description")
@@ -205,6 +224,28 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("costmap_max_age", 10.0)
 
         # --- Safety ----------------------------------------------------------
+        # Per-DOF acceleration bound on the published command, in the same order
+        # as u: [vx, vy, wz | arm joints]. The QP has no memory, so its solution
+        # can step when the active set changes (a barrier engages, a joint limit
+        # releases); streamed straight out that step lands on the actuators.
+        # These are loose enough to be invisible in normal operation — the
+        # reference velocities are tenths of a unit — and only bite on steps.
+        self.declare_parameter("base_accel_max", [0.3, 0.3, 0.6])   # m/s^2, m/s^2, rad/s^2
+        self.declare_parameter("arm_accel_max", 2.0)                # rad/s^2
+        # The UR's execution speed (teach-pendant slider, safety reduced mode)
+        # scales the ARM but not the base, which desynchronises a whole-body
+        # command. Reading it lets the whole command be scaled together. Absent
+        # in sim, where it reads 1.0. See wbc/hardware.py.
+        self.declare_parameter("speed_scaling_topic",
+                               "/speed_scaling_state_broadcaster/speed_scaling")
+        self.declare_parameter("robot_mode_topic", "/io_and_status_controller/robot_mode")
+        self.declare_parameter("safety_mode_topic", "/io_and_status_controller/safety_mode")
+        # Below this the robot is effectively paused (slider at zero, or a stop
+        # in progress) and the sweep holds rather than commanding a scaled-down
+        # crawl. A pause longer than max_hold_seconds ends the sweep — which is
+        # the right outcome: the FSM can retry, and sitting with the arm loaded
+        # against a wall indefinitely is not an improvement.
+        self.declare_parameter("min_speed_scaling", 0.05)
         self.declare_parameter("max_data_age", 1.0)        # s
         self.declare_parameter("max_standoff_error", 0.25)  # m before we call it lost
         self.declare_parameter("standoff_error_cycles", 5)  # ... for this many cycles
@@ -275,6 +316,17 @@ class WholeBodySweepNode(Node):
         self.q_posture = None
         self.holding_since = None
         self.standoff_strikes = 0
+        # The last published command, which the acceleration bound limits the
+        # next one against, and when it went out, which is only used to notice a
+        # loop that is not keeping up. None means "no history yet"; a stop sets
+        # the command to ZERO rather than clearing it, so the cycle that resumes
+        # a sweep ramps up instead of jumping (see _strike).
+        self.u_prev = None
+        self.command_stamp = None
+        self.accel_max = np.concatenate((
+            np.array(p("base_accel_max").value, dtype=float),
+            np.full(len(self.arm_joints), float(p("arm_accel_max").value))))
+        self.min_speed_scaling = float(p("min_speed_scaling").value)
         # "sweep" -> "retreat" (backing the plate off the wall) -> "done". The
         # terminal status is withheld until "done", because the FSM kills this
         # process as soon as it sees one.
@@ -323,8 +375,18 @@ class WholeBodySweepNode(Node):
         latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.status_pub = self.create_publisher(String, str(p("status_topic").value), latched)
         self.cmd_vel_pub = self.create_publisher(Twist, str(p("cmd_vel_topic").value), 10)
-        self.arm_cmd_pub = self.create_publisher(
-            Float64MultiArray, str(p("arm_command_topic").value), 10)
+        self.arm_stream = ArmStream(
+            self, self.arm_joints,
+            mode=str(p("arm_stream_interface").value),
+            topic=str(p("arm_command_topic").value) or None,
+            max_lead=float(p("arm_stream_max_lead").value))
+        self.arm_controller = (str(p("arm_stream_controller").value)
+                               or DEFAULT_CONTROLLER[self.arm_stream.mode])
+        self.hardware = HardwareMonitor(
+            self,
+            speed_scaling_topic=str(p("speed_scaling_topic").value),
+            robot_mode_topic=str(p("robot_mode_topic").value),
+            safety_mode_topic=str(p("safety_mode_topic").value))
         self.create_subscription(
             String, str(p("robot_description_topic").value), self._on_robot_description, latched)
         self.create_subscription(
@@ -341,6 +403,10 @@ class WholeBodySweepNode(Node):
             f"Whole-body sweep: ({self.seg_start[0]:.2f}, {self.seg_start[1]:.2f}) -> "
             f"({self.seg_end[0]:.2f}, {self.seg_end[1]:.2f})  [{segment_length:.2f} m] "
             f"at {self.sweep_speed:.3f} m/s, standoff {self.standoff:.2f} m."
+        )
+        self.get_logger().info(
+            f"Arm commanded by {self.arm_stream.mode} on '{self.arm_stream.topic}' "
+            f"via '{self.arm_controller}'."
         )
 
     def _now(self):
@@ -372,7 +438,7 @@ class WholeBodySweepNode(Node):
             f"{self.chain.joint_names}"
         )
         # The QP solves for the CHAIN's joints; the command goes out in the
-        # velocity controller's joint order. If the two sets disagree the
+        # streaming controller's joint order. If the two sets disagree the
         # commands would be silently zeroed, so refuse the sweep instead.
         missing = set(self.chain.joint_names) ^ set(self.arm_joints)
         if missing:
@@ -382,6 +448,27 @@ class WholeBodySweepNode(Node):
                 f"Set arm_joints to the controller's joint list."
             )
             self.chain = None
+            return
+        # Give the integrator the joint limits, in the CONTROLLER's order — the
+        # order the setpoint is published in. The chain's order is not
+        # guaranteed to match, and clamping a setpoint against another joint's
+        # limits would be worse than not clamping at all.
+        lower, upper = self.chain.position_limits()
+        by_name = dict(zip(self.chain.joint_names, zip(lower, upper)))
+        self.arm_stream.set_position_limits(
+            [by_name[name][0] for name in self.arm_joints],
+            [by_name[name][1] for name in self.arm_joints])
+        if list(self.chain.joint_names) != list(self.arm_joints):
+            # Same joints, different order. Every path here reorders explicitly,
+            # so this is handled — but it is worth saying out loud, because a
+            # mis-ordered POSITION setpoint commands the arm to a pose nobody
+            # asked for, where a mis-ordered velocity merely moves it wrongly.
+            self.get_logger().warn(
+                f"The URDF chain order {self.chain.joint_names} differs from the "
+                f"controller's {self.arm_joints}; commands are reordered to match "
+                f"the controller. Align 'arm_joints' with the controller's joint "
+                f"list to remove the ambiguity."
+            )
 
     def _on_joint_states(self, msg):
         for name, position in zip(msg.name, msg.position):
@@ -562,7 +649,16 @@ class WholeBodySweepNode(Node):
         return missing
 
     def start(self):
-        """Begin the control loop."""
+        """Begin the control loop.
+
+        The first thing out of the door is the arm's CURRENT pose, not a
+        motion: ``forward_position_controller`` has just taken over command
+        interfaces the trajectory controller was holding, and until it hears
+        from us it commands whatever value those interfaces already carry.
+        Publishing the measurement first makes the handover a no-op instead of
+        a jump. Harmless in velocity mode, where it is a zero.
+        """
+        self.arm_stream.initial_command(self._arm_positions())
         self.deadline = self._now() + self.timeout
         self.control_timer = self.create_timer(1.0 / self.control_rate, self._control_step)
         self.get_logger().info(
@@ -570,12 +666,20 @@ class WholeBodySweepNode(Node):
         )
 
     def halt(self):
-        """Zero every command this node owns. Safe to call repeatedly."""
+        """Stop everything this node commands. Safe to call repeatedly.
+
+        The arm's stop is NOT a zero — in position mode that would be a
+        full-speed run to the zero configuration. ``ArmStream.hold`` knows what
+        a stop means for the interface in use; nothing here should build one.
+        """
         if self.control_timer is not None:
             self.control_timer.cancel()
             self.control_timer = None
         self.cmd_vel_pub.publish(Twist())
-        self.arm_cmd_pub.publish(Float64MultiArray(data=[0.0] * len(self.arm_joints)))
+        self.arm_stream.hold(self._arm_positions())
+        self.u_prev = None
+        self.command_stamp = None
+        self.holding_since = None
 
     def finish(self, status, reason=""):
         """End the sweep — but back the plate off the wall before saying so.
@@ -810,14 +914,32 @@ class WholeBodySweepNode(Node):
 
         limit = float(self.get_parameter("arm_qdot_max").value)
         qdot = np.clip(error * float(self.get_parameter("return_gain").value), -limit, limit)
+        # ``error`` is in the CONTROLLER's joint order (both operands came from
+        # arm_joints); _publish expects the chain's, so hand it over by name
+        # rather than by position.
+        by_name = dict(zip(self.arm_joints, qdot))
+        qdot_chain = np.array([by_name[name] for name in self.chain.joint_names])
         self.cmd_vel_pub.publish(Twist())
-        self._publish(np.concatenate((np.zeros(3), qdot)), len(q_arm))
+        self._publish(np.concatenate((np.zeros(3), qdot_chain)), len(q_arm))
         self.get_logger().info(
             f"Returning: worst joint error {worst:.2f} rad", throttle_duration_sec=1.0)
 
     def _control_step(self):
         now = self._now()
         if self.phase == "done":
+            return
+        # Before anything else, and in every phase: is the robot in a state
+        # where it will actually execute what it is told? A protective stop
+        # freezes the arm while ros2_control carries on as if nothing happened —
+        # the QP keeps solving, commands keep publishing, and the BASE keeps
+        # driving along the wall with an arm that is no longer following it.
+        # Nothing downstream would notice, so it has to be caught here.
+        blocked = self.hardware.blocked()
+        if blocked:
+            self._strike(blocked)
+            return
+        if self.hardware.scaling() < self.min_speed_scaling:
+            self._strike(f"execution speed scaled to {self.hardware.scaling():.2f}")
             return
         if self.phase == "retreat":
             self._retreat_step()
@@ -1037,14 +1159,26 @@ class WholeBodySweepNode(Node):
     def _strike(self, reason):
         """One unusable cycle: stop the robot, and give up if it keeps happening.
 
-        Commanding zero (rather than the last command) matters — every consumer
-        here is a velocity interface that would happily keep driving.
+        Stopping (rather than letting the last command stand) matters — every
+        consumer here would happily keep driving on it. What "stop" means
+        differs by interface, so the arm's is delegated to ``ArmStream.hold``,
+        which in position mode re-seeds at the measurement: the arm stays where
+        it is and the integrator resumes from the truth rather than from a
+        setpoint that has been sitting ahead of a stationary robot.
         """
         now = self._now()
         if self.holding_since is None:
             self.holding_since = now
         self.cmd_vel_pub.publish(Twist())
-        self.arm_cmd_pub.publish(Float64MultiArray(data=[0.0] * len(self.arm_joints)))
+        self.arm_stream.hold(self._arm_positions())
+        # Zero, not None: the robot has just been commanded to a stop, so that
+        # IS the current command and the cycle that resumes the sweep must ramp
+        # up from it. Clearing the history instead would let the loop jump
+        # straight back to full sweep speed the moment the input recovers —
+        # exactly the step the acceleration bound exists to prevent, at the one
+        # moment the robot's state is least well understood.
+        self.u_prev = np.zeros_like(self.accel_max)
+        self.command_stamp = now
         held = now - self.holding_since
         if held >= self.max_hold_seconds:
             self.finish("failed", f"{reason} (held {held:.1f}s)")
@@ -1052,27 +1186,77 @@ class WholeBodySweepNode(Node):
             self.get_logger().warn(f"Holding: {reason}.", throttle_duration_sec=1.0)
 
     def _publish(self, u, n_arm):
-        """Base Twist (turret frame, as sim_controller's ``cmd_type: relative``
-        expects) plus arm joint velocities, in the controller's joint order."""
+        """The single funnel every command leaves through.
+
+        Three things happen here that the QP knows nothing about, in this order:
+
+        1. **Speed scaling.** The UR executes the arm at a fraction set by the
+           teach pendant and the safety configuration; the base has never heard
+           of it. Scaling the WHOLE vector keeps base and arm on the same clock
+           — the alternative is a base sweeping at full speed alongside an arm
+           that cannot keep up with the standoff corrections meant to accompany
+           it. Reads 1.0 wherever nothing publishes it, so this is inert in sim.
+        2. **Acceleration bound.** The QP is memoryless and its solution steps
+           when the active set changes; ``speedj`` is given 40 rad/s^2 to make
+           that step with.
+        3. **Split and stream.** Base Twist in the turret frame (as
+           sim_controller's ``cmd_type: relative`` expects), arm through
+           ``ArmStream``, which decides whether the wire carries velocities or
+           integrated setpoints.
+        """
+        u = np.asarray(u, dtype=float) * self.hardware.scaling()
+
+        # The NOMINAL control period, not the measured one. Integrating the
+        # elapsed time looks more faithful and is worse in both directions that
+        # matter: a burst of early cycles under-integrates the setpoint (the arm
+        # silently runs slow), and a cycle that arrives late after a stall
+        # advances the setpoint by the whole gap at once — a jump, at the one
+        # moment the robot is least understood. With a fixed period a late loop
+        # simply moves the arm slower, which is the safe direction, and the
+        # divergence is reported below rather than absorbed.
+        dt = 1.0 / self.control_rate
+        u = slew_limit(u, self.u_prev, self.accel_max, dt)
+        self.u_prev = u
+
+        now = self._now()
+        if self.command_stamp is not None:
+            measured = now - self.command_stamp
+            if measured > 2.0 * dt:
+                # The setpoint stream is thinner than the arm was promised, so
+                # it will track slower than commanded. Usually CPU starvation.
+                self.get_logger().warn(
+                    f"Control loop is running at {1.0 / max(measured, 1e-6):.0f} Hz, "
+                    f"not the {self.control_rate:.0f} Hz it commands for; the arm "
+                    f"will move slower than the base.",
+                    throttle_duration_sec=5.0)
+        self.command_stamp = now
+
         twist = Twist()
         twist.linear.x, twist.linear.y = float(u[0]), float(u[1])
         twist.angular.z = float(u[2])
         self.cmd_vel_pub.publish(twist)
 
+        # Reorder from the CHAIN's joints to the CONTROLLER's, which is what
+        # goes on the wire.
         by_name = dict(zip(self.chain.joint_names, u[3:3 + n_arm]))
-        self.arm_cmd_pub.publish(Float64MultiArray(
-            data=[float(by_name.get(name, 0.0)) for name in self.arm_joints]))
+        qdot = np.array([float(by_name.get(name, 0.0)) for name in self.arm_joints])
+        self.arm_stream.send(qdot, dt, self._arm_positions())
 
     def _log_cycle(self, solution, distance, remaining, phi):
         w_left, w_right, phi_dot, w_chassis = wheel_and_turret_rates(
             self.limits, solution.u[:3], phi)
         clearance = ("--" if not np.isfinite(self.closest_obstacle)
                      else f"{self.closest_obstacle:.2f}m")
+        # The setpoint's lead over the measured joints is the tell for an arm
+        # that is not keeping up: it sits near zero when all is well and pins at
+        # arm_stream_max_lead under speed scaling or a stop.
+        lead = self.arm_stream.lead(self._arm_positions())
         self.get_logger().info(
             f"d={distance * 100:.1f}cm tilt={math.degrees(self.surface.tilt()):.1f}deg "
             f"left={remaining:.2f}m | base=({solution.u[0]:+.3f}, {solution.u[1]:+.3f}, "
             f"{solution.u[2]:+.3f}) w_chassis={w_chassis:+.2f} phi_dot={phi_dot:+.2f} "
-            f"| arm max={np.max(np.abs(solution.u[3:])):.3f} rad/s "
+            f"| arm max={np.max(np.abs(solution.u[3:])):.3f} rad/s lead={lead:.3f}rad "
+            f"| {self.hardware.describe()} "
             f"| clear={clearance} | residual={solution.task_residual:.4f}",
             throttle_duration_sec=1.0)
 
@@ -1106,15 +1290,20 @@ def main(args=None):
 
     # Handle the stop signal ourselves. rclpy's default handler invalidates the
     # context the moment SIGINT lands, and this node has real work to do on the
-    # way out: zero the base and arm commands, and hand the arm's command
-    # interfaces back to the trajectory controller. With the default handler
-    # both of those throw ("publisher's context is invalid") and the arm is left
-    # parked on a velocity controller nobody is feeding — every later FSM arm
-    # goal would then silently do nothing. SIGTERM is treated the same way, so a
-    # supervisor that stops the node also gets a clean handover.
+    # way out: stop the base and arm, and hand the arm's command interfaces back
+    # to the trajectory controller. With the default handler both of those throw
+    # ("publisher's context is invalid") and the arm is left parked on a
+    # streaming controller nobody is feeding — every later FSM arm goal would
+    # then silently do nothing. SIGTERM is treated the same way, so a supervisor
+    # that stops the node also gets a clean handover.
+    #
+    # A SIGKILL or a hard crash still skips all of it, which is the case the
+    # position interface is chosen for: the last setpoint the controller holds
+    # is a POSE, so an abandoned arm stops rather than continues. The FSM's
+    # _ensure_arm_trajectory_controller then puts the controller back.
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = WholeBodySweepNode()
-    switch = ArmControllerSwitch(node)
+    switch = ArmControllerSwitch(node, controller=node.arm_controller)
 
     stopping = False
 
@@ -1130,9 +1319,12 @@ def main(args=None):
     try:
         if not node.wait_until_ready():
             node.finish("failed", "inputs never became available")
-        elif not switch.to_velocity_control():
-            node.finish("failed", "could not activate the arm velocity controller")
+        elif not switch.claim():
+            node.finish("failed",
+                        f"could not activate '{node.arm_controller}' for the arm")
         else:
+            # start() publishes the arm's current pose immediately, closing the
+            # window between the switch landing and the first real command.
             node.start()
         while rclpy.ok() and not stopping:
             rclpy.spin_once(node, timeout_sec=0.1)
