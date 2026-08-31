@@ -767,16 +767,44 @@ class ScanWall(State):
         req.task_frame.pose.position.x = -0.08
         req.task_frame.pose.orientation.w = 1.0
         req.selection_vector_z = True          # Z compliant; all others stiff
-        req.wrench.force.z = 5.0
+        # ARM_SWEEP_PLAN §7.D: keep the tested value as the DEFAULT, but make it a
+        # knob so the press force can be retuned deliberately in one campaign
+        # rather than by editing code.
+        req.wrench.force.z = float(ctx.get("scan_wall_press_force_n", 5.0))
+        if bool(ctx.get("scan_wall_gimbal_press", False)):
+            # Experimental passive RX/RY gimbal. Tested once and found unreliable
+            # (§4.2), so it is off unless explicitly asked for: with RX/RY
+            # compliant the PTC trajectory no longer commands plate orientation
+            # and wall_parallel_controller's alignment stops being authoritative.
+            req.selection_vector_rx = True
+            req.selection_vector_ry = True
+            ctx["node"].get_logger().warn(
+                f"[{self.name}] scan_wall_gimbal_press is ON: RX/RY are compliant, "
+                f"so the commanded plate orientation is no longer enforced. This "
+                f"was unreliable when last tested."
+            )
         req.type = 2                           # NO_TRANSFORM (task frame as given)
         req.speed_limits.linear.z = 0.1
         # The Z deviation limit is what the press is allowed to travel, so it must
-        # cover the gap the arm's approach deliberately leaves (scan_wall_plate_offset)
-        # plus a margin. Sized from that knob rather than fixed: raising the offset
-        # without raising this would leave force_mode short of the wall, and
-        # _wall_contact_ready would burn its timeout and sweep without contact.
+        # cover the gap the arm's approach deliberately leaves plus a margin.
+        # Sized from the knob rather than fixed: raising the offset without raising
+        # this would leave force_mode short of the wall, and _wall_contact_ready
+        # would burn its timeout and sweep without contact.
         press_reach = float(ctx.get("scan_wall_plate_offset", 0.20)) + 0.05
         req.deviation_limits = [0.1, 0.1, max(0.15, press_reach), 0.1, 0.1, 0.1]
+        # ...and in arm-sweep mode the approach standoff is a DIFFERENT knob, so
+        # check rather than assume. ARM_SWEEP_PLAN §7.C says not to raise the
+        # deviation limits automatically -- log it and let the press force /
+        # standoff be retuned deliberately in one campaign.
+        approach = self._approach_standoff(ctx) if self._use_arm_sweep(ctx) else press_reach
+        if approach > req.deviation_limits[2]:
+            ctx["node"].get_logger().warn(
+                f"[{self.name}] Force mode may not reach the wall: the arm approaches "
+                f"at {approach:.2f} m but the Z deviation limit is only "
+                f"{req.deviation_limits[2]:.2f} m. Lower sweep_scan_standoff_m / "
+                f"sweep_approach_retract_m, or raise the limit deliberately — do not "
+                f"expect contact on hardware as configured."
+            )
         req.damping_factor = 0.025
         req.gain_scaling = 0.5
         return req
@@ -860,7 +888,11 @@ class ScanWall(State):
         if bool(ctx.get("sim", False)) or not self.force_mode_active:
             return True
 
-        threshold = float(ctx.get("scan_wall_touch_force_n", -5.0))
+        # Default paired with scan_wall_press_force_n: contact is declared when the
+        # sensor reads the commanded press back. §7.C is explicit that retuning one
+        # without the other is how a scan ends up sweeping without contact.
+        press = float(ctx.get("scan_wall_press_force_n", 5.0))
+        threshold = float(ctx.get("scan_wall_touch_force_n", -press))
         timeout_s = float(ctx.get("scan_wall_touch_force_timeout_s", 120.0))
 
         now = time.time()
