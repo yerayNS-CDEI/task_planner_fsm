@@ -183,6 +183,9 @@ class ScanWall(State):
         self.force_mode_start_client = None
         self.force_mode_stop_client = None
         self.force_mode_active = False
+        # _wbc_enabled is consulted several times per segment; the "no press on
+        # hardware" warning is worth saying once per run, not once per call.
+        self._wbc_real_warned = False
 
         # Wall-contact gate (real robot only): before starting the GPR and moving
         # the base, wait until force_mode has driven the GPR wheel against the wall,
@@ -821,8 +824,16 @@ class ScanWall(State):
             node.get_logger().error(f"[{self.name}] force_mode {label} call failed: {e}")
 
     def _start_force_mode(self, ctx):
-        """Real robot only. Start the GPR press for this line sweep."""
-        if bool(ctx.get("sim", False)):
+        """Real robot only, and only when the sweep is NOT whole-body.
+
+        The UR driver refuses to run ``force_mode`` alongside a streaming
+        controller, and the whole-body sweep claims one for its duration. Asking
+        anyway achieved nothing useful and cost real time: the service call is
+        accepted (it stays advertised while the controller is inactive), so
+        ``force_mode_active`` was set, and ``_wall_contact_ready`` then waited
+        out its full timeout for a contact that could never arrive.
+        """
+        if bool(ctx.get("sim", False)) or self._wbc_enabled(ctx):
             return
         node = ctx["node"]
         if self.force_mode_start_client is None:
@@ -2314,23 +2325,34 @@ class ScanWall(State):
     def _wbc_enabled(self, ctx):
         """True when this sweep should be whole-body rather than a base goal.
 
-        Opt-in through ``ctx["sweep_use_wbc"]`` and, by default, SIM ONLY. On the
-        real robot the UR ``force_mode_controller`` only runs alongside the
-        passthrough trajectory controller, never alongside the streaming velocity
-        controller the whole-body loop needs — so enabling it there means giving
-        up the hardware press in exchange for a software one, which is a separate
-        decision. ``ctx["wbc_allow_real"]`` makes it explicit.
+        One flag: ``ctx["sweep_use_wbc"]``. It used to take a second one
+        (``wbc_allow_real``) to run on hardware, on the grounds that giving up
+        the ``force_mode`` press was a separate decision. That was the wrong
+        shape for two reasons.
+
+        It is not a separate decision: the UR driver carries a hard-coded
+        compatibility table (``mode_compatibility_[HW_IF_POSITION][FORCE_MODE_GPIO]
+        = false``, likewise for velocity) and refuses the switch outright, so
+        choosing the whole-body sweep on hardware IS choosing to go without the
+        press. Confirmed on the robot: activating a forward controller while
+        force mode runs drops force mode, and the reverse is rejected.
+
+        And the failure mode was bad. Forgetting the second flag fell back to the
+        Nav2 sweep with only a warning, so a run could look like a whole-body
+        test and not be one. Asking for the sweep now gets the sweep; the loss of
+        the press is announced rather than silently avoided.
         """
         if not bool(ctx.get("sweep_use_wbc", False)):
             return False
-        if bool(ctx.get("sim", False)) or bool(ctx.get("wbc_allow_real", False)):
-            return True
-        ctx["node"].get_logger().warn(
-            f"[{self.name}] sweep_use_wbc is set but this is the real robot: force_mode "
-            f"cannot run with the streaming velocity controller. Falling back to the Nav2 "
-            f"sweep (set wbc_allow_real to override)."
-        )
-        return False
+        if not bool(ctx.get("sim", False)) and not self._wbc_real_warned:
+            self._wbc_real_warned = True
+            ctx["node"].get_logger().warn(
+                f"[{self.name}] Whole-body sweep on the REAL robot: the force_mode "
+                f"press is unavailable (the driver refuses force mode alongside a "
+                f"streaming controller), so this sweep holds the standoff on measured "
+                f"distance and makes NO contact with the wall."
+            )
+        return True
 
     def _start_wbc_sweep(self, ctx, seg_start, seg_end):
         """Launch the whole-body sweep for one segment and watch its status.
