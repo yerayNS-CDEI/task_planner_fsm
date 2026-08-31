@@ -11,10 +11,12 @@ from ..utils.costmap_utils import (
 )
 from ..utils.wall_partitioning import sweep_line_order
 from ..utils.wall_approach import unfolded_pose_name
+from arm_control.action import SweepLine
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import SpeedLimit
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import Point, PoseStamped, Twist
 from rclpy.qos import QoSProfile, DurabilityPolicy
+from std_msgs.msg import Bool
 from rclpy.action import ActionClient
 from rclpy.action import GoalResponse, CancelResponse
 from action_msgs.msg import GoalStatus
@@ -354,6 +356,72 @@ class ScanWall(State):
              "wall_parallel_controller"),
         ])
 
+    def _start_sweep_executor(self, ctx):
+        """Bring up the arm-sweep executor for the whole line.
+
+        Unlike wall_parallel_controller, this node does not stream anything: it
+        sits idle until a SweepLine goal arrives. So it is safe to leave running
+        across transits and arm approaches, and starting it once per line rather
+        than once per partition keeps its TF/joint-state warm-up off the critical
+        path of all 19 of them.
+
+        The controller it drives differs by platform: Gazebo runs
+        joint_trajectory_controller, the real robot passthrough_trajectory_controller
+        (the only one the UR driver will run alongside force mode, ARM_SWEEP_PLAN
+        §3.1). Goal tolerance follows the same split — meaningful in sim, empty on
+        the robot, where the endpoint legitimately differs along the compliant Z
+        axis (§3.4).
+        """
+        use_sim = bool(ctx.get("sim", False))
+        controller = str(ctx.get(
+            "sweep_controller_name",
+            "joint_trajectory_controller" if use_sim else "passthrough_trajectory_controller",
+        ))
+        goal_tolerance = float(ctx.get("sweep_goal_tolerance_rad", 0.05 if use_sim else 0.0))
+        cmd = [
+            "ros2", "run", "arm_control", "wall_sweep_executor", "--ros-args",
+            # The trajectory controller advances trajectories on the sim clock, and
+            # the executor's watchdog compares against a trajectory's planned
+            # duration -- so the two must share a clock, or the watchdog fires
+            # early on motion that is running fine.
+            "-p", f"use_sim_time:={'true' if use_sim else 'false'}",
+            "-p", f"controller_name:={controller}",
+            "-p", f"erase_path_tolerance:={'true' if use_sim else 'false'}",
+            "-p", f"goal_tolerance_rad:={goal_tolerance}",
+            "-p", f"sweep_speed_mps:={float(ctx.get('sweep_speed_mps', 0.05))}",
+            "-p", f"waypoint_spacing_m:={float(ctx.get('waypoint_spacing_m', 0.03))}",
+            "-p", f"max_joint_step_rad:={float(ctx.get('max_joint_step_rad', 0.35))}",
+            "-p", f"sweep_contact_loss_timeout_s:="
+                  f"{float(ctx.get('sweep_contact_loss_timeout_s', 0.20))}",
+            # How far off the wall the plate sweeps when NOTHING is pressing it
+            # (Gazebo, and the no-press first run on hardware per §11.2).
+            # Deliberately its own knob rather than scan_wall_plate_offset: that
+            # one sizes the gap force mode is expected to press through, whereas
+            # this one is the gap that has to survive the whole sweep untouched.
+            # Under Force Mode the executor ignores it entirely and sweeps in the
+            # plane the press established.
+            "-p", f"scan_standoff_m:={float(ctx.get('sweep_scan_standoff_m', 0.30))}",
+            "-p", f"approach_retract_m:={float(ctx.get('sweep_approach_retract_m', 0.20))}",
+            "-p", f"max_traverse_m:={float(ctx.get('sweep_max_traverse_m', 1.10))}",
+            "-p", f"trajectory_timeout_factor:="
+                  f"{float(ctx.get('sweep_timeout_factor', 4.0))}",
+            "-p", f"trajectory_timeout_pad_s:="
+                  f"{float(ctx.get('sweep_timeout_pad_s', 30.0))}",
+            # Bench diagnostics (ARM_SWEEP_PLAN §7.B). The topic is always on.
+            "-p", f"diagnostics_rate_hz:={float(ctx.get('sweep_diagnostics_rate_hz', 20.0))}",
+        ]
+        # The per-sweep CSV only when a directory is configured. Appended
+        # conditionally because `-p name:=` with an EMPTY value is not parseable:
+        # rcl rejects the whole argument list and the node dies before it can
+        # advertise its action, which the FSM then sees only as
+        # "'sweep_line' action never came up".
+        csv_dir = str(ctx.get("sweep_diagnostics_csv_dir", "")).strip()
+        if csv_dir:
+            cmd += ["-p", f"diagnostics_csv_dir:={csv_dir}"]
+        return self._start_arm_procs(
+            ctx, [("sweep_executor_proc", cmd, "wall_sweep_executor")]
+        )
+
     def _start_arm_procs(self, ctx, arm_procs):
         node = ctx["node"]
         for proc_key, cmd_args, proc_name in arm_procs:
@@ -384,11 +452,17 @@ class ScanWall(State):
 
         Between segments the reader stays up: the plate distance is still needed to
         retract the arm before the base slides along the wall.
+
+        The sweep executor is tied to the reader rather than to the alignment
+        controller. It is stopped mid-line only by the calls that also take the
+        sensors down (line/wall teardown) — between partitions it must survive,
+        because that is the whole reason it is started once per line.
         """
         node = ctx["node"]
         procs = [("wall_parallel_proc", "wall_parallel_controller")]
         if not keep_sensors:
             procs.append(("arduino_sensors_proc", "distance sensors"))
+            procs.append(("sweep_executor_proc", "wall_sweep_executor"))
         for proc_key, proc_name in procs:
             proc = ctx.get(proc_key)
             if proc and proc.poll() is None:
@@ -1268,6 +1342,11 @@ class ScanWall(State):
         # reader up now and leave it up for the whole line; the alignment controller
         # still waits until the sweep (see _start_wall_alignment).
         self._start_distance_sensors(ctx)
+        # Arm-driven sweep: bring the executor up now, not per segment. It needs
+        # joint_states and a TF calibration before it can plan, and doing that
+        # once per partition would add its startup to all 19 of them.
+        if self._use_arm_sweep(ctx):
+            self._start_sweep_executor(ctx)
 
         self.preapproach_done = True
         node.get_logger().info(f"[{self.name}] Pre-approach complete. Arm in scanning position.")
@@ -1916,23 +1995,55 @@ class ScanWall(State):
 
             # Wheel is pressed against the wall. GPR: connect, create the LINE_SCAN
             # measurement and start the line now (real robot only).
-            self._gpr_start_measurement_and_line(ctx)
-            if ctx.get("error_triggered"):
-                return
+            #
+            # NOT in arm-sweep mode. There the arm first travels from the partition
+            # centre (where the base parked) to the partition start, and a line
+            # started here would record that lead-in travel as scan data. It starts
+            # instead on the executor's "sweep" feedback phase, in sweep_wait.
+            if not self._use_arm_sweep(ctx):
+                self._gpr_start_measurement_and_line(ctx)
+                if ctx.get("error_triggered"):
+                    return
 
-            goal_xy = base_standoff_goal(ctx, self.name, seg_end)
-            node.get_logger().info(
-                f"[{self.name}] Sweeping segment {self._seg_idx + 1} to "
-                f"({goal_xy[0]:.2f}, {goal_xy[1]:.2f})."
-            )
             self.set_activity(
                 ctx,
                 f"Sweeping wall segment {seg_no}/{seg_total}",
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            # Nav2 route (default): slow Nav2 sweep, speed already capped in
-            # sweep_setup. Alternative (ctx["sweep_use_crawl"]): a /cmd_vel drag.
+
+            if self._use_arm_sweep(ctx):
+                # The ARM sweeps; the base does not move at all. Stop the alignment
+                # controller's trajectory output first: it publishes to
+                # planned_trajectory, and two publishers driving one arm controller
+                # is not survivable (ARM_SWEEP_PLAN §3.3). The distance sensors stay
+                # up — the executor's contact watchdog reads them.
+                self._stop_arm_processes(ctx, keep_sensors=True)
+                # Stop the trajectory BRIDGE from dispatching too. Killing the
+                # alignment controller leaves its last trajectory queued in the
+                # bridge, which re-sends it the moment the executor's preempt frees
+                # a slot — and that goal then preempts the executor's own, which is
+                # how the traverse leg came back CANCELED.
+                self._set_trajectory_bridge_hold(ctx, True)
+                # No sleep here. Killing a node does not stop the trajectory it
+                # already handed to the controller — one was measured still
+                # executing 67 s later — so a fixed wait is guesswork either way.
+                # The executor preempts whatever is in flight and waits for the
+                # joints to go quiet before it reads them.
+                if not self._send_sweep_goal(ctx, seg_start, seg_end):
+                    self._set_trajectory_bridge_hold(ctx, False)
+                    return
+                self._seg_phase = "sweep_wait"
+                return
+
+            # Legacy base-driven sweep. Nav2 route (default): slow Nav2 sweep,
+            # speed already capped in sweep_setup. Alternative
+            # (ctx["sweep_use_crawl"]): a /cmd_vel drag.
+            goal_xy = base_standoff_goal(ctx, self.name, seg_end)
+            node.get_logger().info(
+                f"[{self.name}] Sweeping segment {self._seg_idx + 1} to "
+                f"({goal_xy[0]:.2f}, {goal_xy[1]:.2f})."
+            )
             if bool(ctx.get("sweep_use_crawl", False)):
                 self._start_sweep_crawl(ctx, goal_xy)
             elif not self._send_base_goal(ctx, goal_xy):
@@ -1947,17 +2058,51 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            # The crawl timer sets self._nav_status on arrival/timeout.
-            if self._nav_status is None:
-                return
-            status = self._nav_status
-            self._stop_sweep_crawl(ctx, publish_stop=True)   # ensure base is stopped
-            self._restore_sweep_speed(ctx)   # clear the slow-sweep cap for the next transit
+            arm_sweep = self._use_arm_sweep(ctx)
+            reason = ""      # only set on the arm-sweep path; read by the backoff
+            if arm_sweep:
+                # The lead-in is done and the plate is now crossing the wall: this
+                # is the moment the GPR line has to start (see press_settle).
+                if self._sweep_scanning and not self.gpr_line_active:
+                    self._gpr_start_measurement_and_line(ctx)
+                    if ctx.get("error_triggered"):
+                        return
+                # The executor owns the sweep's own watchdogs and reports one
+                # outcome; everything after it here is unchanged.
+                if self._sweep_result is None:
+                    return
+                succeeded, reason, detail = self._sweep_result
+                self._sweep_result = None
+                status = GoalStatus.STATUS_SUCCEEDED if succeeded else GoalStatus.STATUS_ABORTED
+                if succeeded and reason:
+                    # Success with a reason: the scan is good but a cleanup step
+                    # failed (currently only the post-sweep retract, which
+                    # transit_clear will redo from a measured distance).
+                    node.get_logger().warn(
+                        f"[{self.name}] Arm sweep of segment {self._seg_idx + 1} "
+                        f"completed with a warning [{reason}]: {detail}"
+                    )
+                if not succeeded:
+                    node.get_logger().error(
+                        f"[{self.name}] Arm sweep of segment {self._seg_idx + 1} "
+                        f"failed [{reason}]: {detail}"
+                    )
+            else:
+                # The crawl timer sets self._nav_status on arrival/timeout.
+                if self._nav_status is None:
+                    return
+                status = self._nav_status
+                self._stop_sweep_crawl(ctx, publish_stop=True)   # ensure base is stopped
+                self._restore_sweep_speed(ctx)   # clear the slow-sweep cap for the next transit
             # Release hardware/process state first (safety), regardless of outcome.
             node.get_logger().info(
                 f"[{self.name}] Segment sweep finished (status={status}). Stopping GPR, "
                 f"force mode + arm processes..."
             )
+            if arm_sweep:
+                # The executor is done with the arm; the bridge owns it again for
+                # the retract and the next transit's arm Z moves.
+                self._set_trajectory_bridge_hold(ctx, False)
             self._gpr_stop_line_and_measurement(ctx)   # stop line + measurement before releasing the press
             self._stop_force_mode(ctx)      # release the press before the arm retracts
             # Keep the reader running: the next segment's transit_clear needs the
@@ -2572,6 +2717,8 @@ class ScanWall(State):
         ## alignment nodes.
         self._stop_sweep_crawl(ctx, publish_stop=True)
         self._restore_sweep_speed(ctx)
+        self._cancel_sweep_goal(ctx)
+        self._set_trajectory_bridge_hold(ctx, False)   # never leave the arm stack muted
         self._gpr_stop_line_and_measurement(ctx)
         self._stop_force_mode(ctx)
         self._stop_arm_processes(ctx)
