@@ -1395,6 +1395,27 @@ class ScanWall(State):
         """
         return unfolded_pose_name(ctx)
 
+    def _nest_lines(self, ctx):
+        """True when every scan-line height is swept at one base stop (§8).
+
+        Step 2 of ARM_SWEEP_PLAN. Without it the base re-traverses every partition
+        for every height: the worked example in §6 is 4 x 8 = 32 base stops for a
+        6 m wall at 4 heights, against 8 with nesting. The column is faster and far
+        more repeatable than repositioning the base, so trading base transits for
+        column moves is a straight win.
+
+        Requires the arm sweep: in the base-driven path the base IS the sweep, so
+        there is nothing to nest.
+        """
+        return bool(ctx.get("nest_lines_in_partition", True)) and self._use_arm_sweep(ctx)
+
+    def _line_heights(self, ctx):
+        """Scan-line heights for the current wall, bottom-first."""
+        lines = ctx.get("current_wall_scan_lines")
+        if not lines:
+            lines = [self._resolve_current_line_z(ctx)]
+        return list(lines)
+
     def _use_arm_sweep(self, ctx):
         """True when the arm performs the lateral sweep and the base stays parked.
 
@@ -1558,6 +1579,20 @@ class ScanWall(State):
             return
 
         seg_start, seg_end = self._segments[self._seg_idx]
+        # Every height sweeps the SAME way by default: one direction per partition,
+        # so consecutive GPR lines are acquired identically and nothing downstream
+        # has to know which way a line was recorded.
+        #
+        # §8.2 proposes alternating per height instead ("free and strictly better"),
+        # because the arm would finish each height where the next one begins and
+        # save a return traverse. It is available behind sweep_serpentine_heights,
+        # but it is off until the scan data from a single-direction run is known
+        # good -- a reversed line is the kind of thing that only shows up much
+        # later, in stitching.
+        if (self._nest_lines(ctx)
+                and bool(ctx.get("sweep_serpentine_heights", False))
+                and self._line_idx % 2 == 1):
+            seg_start, seg_end = seg_end, seg_start
         seg_no, seg_total = self._seg_idx + 1, len(self._segments)
 
         if self._seg_phase == "transit_clear":
@@ -1873,6 +1908,82 @@ class ScanWall(State):
                 self._seg_phase = "sweep_setup"
             return
 
+        if self._seg_phase == "line_change":
+            # Between heights at ONE base stop the base does not move, so the plate
+            # only has to clear the wall enough for the COLUMN to travel -- much
+            # less than the transit case, which exists to stop the plate being
+            # dragged sideways while the whole robot slides (§8.2). Its own knob so
+            # it can be tried at the scan standoff, where this retract and the
+            # following arm_approach both collapse to no-ops.
+            heights = self._line_heights(ctx)
+            self.current_line_z = heights[self._line_idx]
+            self.set_activity(
+                ctx,
+                f"Raising the column to height {self._line_idx + 1}/{len(heights)} "
+                f"at wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            outcome = self._send_arm_to_clearance(
+                ctx,
+                float(ctx.get("scan_wall_line_change_plate_offset", 0.40)),
+                retract_only=True,
+            )
+            if outcome == "wait":
+                return
+            if outcome == "sent":
+                self._arm_goal_start = None
+                self._seg_phase = "line_change_wait"
+                return
+            self._seg_phase = "line_column"
+            return
+
+        if self._seg_phase == "line_change_wait":
+            if not self._arm_goal_settled(ctx):
+                return
+            self._arm_goal_start = None
+            self._seg_phase = "line_column"
+            return
+
+        if self._seg_phase == "line_column":
+            if self._nest_lines(ctx):
+                self.current_line_z = self._line_heights(ctx)[self._line_idx]
+            elif self.current_line_z is None:
+                self.current_line_z = self._resolve_current_line_z(ctx)
+            # The only motion between heights. The arm keeps its pose; §8.2
+            # confirmed on hardware that the plate standoff is enough clearance for
+            # the column to travel, so no unfolded_fsm re-pose is needed here.
+            if not self.column_commanded:
+                target_h = self._column_target_for_line(ctx, self.current_line_z)
+                node.get_logger().info(
+                    f"[{self.name}] Column to {target_h:.3f}m for line "
+                    f"z={self.current_line_z:.3f}m; base stays at partition {seg_no}."
+                )
+                if not self.column.command(node, ctx, target_h):
+                    ctx["error_triggered"] = True
+                    return
+                self.column_commanded = True
+                return
+            if not self.column.reached_target(node, ctx):
+                if self.column.timed_out(node):
+                    node.get_logger().error(
+                        f"[{self.name}] Column did not reach the height for line "
+                        f"{self._line_idx + 1}; skipping this height rather than "
+                        f"scanning it at the wrong elevation."
+                    )
+                    self.column.reset()
+                    self.column_commanded = False
+                    self._sweep_result = (
+                        False, "column_failed", "column did not reach the line height"
+                    )
+                    self._nav_status = -1
+                    self._seg_phase = "sweep_wait"
+                return
+            self.column.reset()
+            self.column_commanded = False
+            self._seg_phase = "sweep_setup"
+            return
+
         if self._seg_phase == "sweep_setup":
             self.set_activity(
                 ctx,
@@ -2120,6 +2231,26 @@ class ScanWall(State):
                     f"[{self.name}] Segment {self._seg_idx + 1} sweep did not succeed "
                     f"(status={status}); skipping to the next segment."
                 )
+
+            # Nesting (§8): sweep every height at this base stop before moving the
+            # base. A height that fails moves to the NEXT HEIGHT, not away from the
+            # partition -- §8.2's failure isolation: losing one line must not cost
+            # the whole stretch of wall.
+            if self._nest_lines(ctx):
+                heights = self._line_heights(ctx)
+                if self._line_idx + 1 < len(heights):
+                    self._line_idx += 1
+                    ctx["current_line_idx"] = self._line_idx
+                    node.get_logger().info(
+                        f"[{self.name}] Partition {self._seg_idx + 1}: on to height "
+                        f"{self._line_idx + 1}/{len(heights)} "
+                        f"(z={heights[self._line_idx]:.3f}m). Base stays parked."
+                    )
+                    self._seg_phase = "line_change"
+                    return
+                self._line_idx = 0
+                ctx["current_line_idx"] = 0
+
             self._seg_idx += 1
             self._seg_phase = "transit_clear"
             return
@@ -2144,12 +2275,23 @@ class ScanWall(State):
 
         # Advance to the next horizontal line on this wall. more_lines drives
         # both the self-loop and whether this was the last line of the wall.
-        ctx["current_line_idx"] = ctx.get("current_line_idx", 0) + 1
         lines = ctx.get("current_wall_scan_lines", [])
-        self.more_lines = ctx["current_line_idx"] < len(lines)
+        if self._nest_lines(ctx):
+            # Every height was already swept at every partition, inside the phase
+            # machine. There is no next line to re-enter for: the state exits once
+            # (§8.1), and the column retract + walls_left in _run_post_scan run at
+            # the end of the WALL rather than at the end of a line.
+            ctx["current_line_idx"] = len(lines)
+            self.more_lines = False
+        else:
+            ctx["current_line_idx"] = ctx.get("current_line_idx", 0) + 1
+            self.more_lines = ctx["current_line_idx"] < len(lines)
         node.get_logger().info(
-            f"[{self.name}] Line done ({self._segments_ok}/{len(self._segments)} segment(s) "
-            f"swept)."
+            f"[{self.name}] "
+            + (f"Wall done: {len(lines)} height(s) x {len(self._segments)} partition(s), "
+               f"{self._segments_ok} sweep(s) succeeded."
+               if self._nest_lines(ctx) else
+               f"Line done ({self._segments_ok}/{len(self._segments)} segment(s) swept).")
             + (
                 f" {len(lines) - ctx['current_line_idx']} more line(s) on this wall; "
                 f"will retract arm then re-enter for next height."
