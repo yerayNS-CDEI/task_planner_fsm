@@ -4,10 +4,12 @@ from ..utils.costmap_utils import (
     COSTMAP_WAIT_TIMEOUT_S,
     base_standoff_goal,
     nav_bt_xml,
+    plan_wall_partitions,
     reachable_wall_segments,
     publish_wall_segment_markers,
     wall_parallel_goal,
 )
+from ..utils.wall_partitioning import sweep_line_order
 from ..utils.wall_approach import unfolded_pose_name
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import SpeedLimit
@@ -119,10 +121,34 @@ class ScanWall(State):
         #   press_settle     wait for the FT sensor to confirm wall contact
         #   sweep_wait       the actual scan
         self._segments = None        # [((sx,sy,z),(ex,ey,z)), ...] robot-end first
+        # Arm-sweep mode only: one (x, y, yaw) Nav2 scan pose per entry of
+        # self._segments (which then holds partitions, not raw segments).
+        # Resolved up front so an unplaceable partition is visible in RViz before
+        # the robot moves. None in the legacy base-driven path.
+        self._scan_poses = None
+        # Per reachable segment, the max partition length currently in force. Only
+        # differs from partition_max_length_m after a backoff retry (§7.B).
+        self._segment_max_len = {}
+        # Which scan-line height is being swept at the CURRENT partition. Always 0
+        # unless nest_lines_in_partition is on (§8).
+        self._line_idx = 0
+        # Base goal held between deciding to transit and actually sending it, so
+        # the column can be retracted in between.
+        self._pending_transit = None
         self._seg_idx = 0
         self._seg_phase = "transit_clear"
+        # Arm-driven sweep: the SweepLine action client and the latest result,
+        # (succeeded, reason, detail), or None while a sweep is in flight.
+        self._sweep_client = None
+        self._sweep_result = None
+        self._sweep_goal_handle = None
+        # Set from the executor's feedback once the plate reaches the wall. A flag
+        # rather than the GPR call itself: that call blocks on HTTP round trips to
+        # the Proceq and must not run inside an executor callback.
+        self._sweep_scanning = False
         self._arm_goal_pub = None        # /arm/goal_pose publisher (created once)
         self._arm_goal_start = None      # planner wait deadline for the Z move
+        self._recenter_future = None     # /send_position call for the pre-transit re-pose
         self._plate_wait_start = None    # bounded wait for the first plate reading
         self._segments_ok = 0        # segments actually swept on this line
         self._last_swept_point = None
@@ -137,6 +163,11 @@ class ScanWall(State):
         # SimpleProgressChecker (needs 0.1 m/s) and sits below trans_stopped_velocity.)
         # Transit between segments still uses the Nav2 goal at normal speed.
         self._sweep_crawl_target = None    # (x, y) base-standoff goal in map frame
+        self._crawl_yaw = None             # heading held during a crawl (None = sweep heading)
+        self._crawl_speed = None
+        self._crawl_tol = None             # arrival tolerance (None = sweep_arrive_tol)
+        self._crawl_started = 0.0
+        self._crawl_distance = 0.0
         self._sweep_crawl_deadline = None
         self._sweep_crawl_timer = None
 
@@ -205,18 +236,34 @@ class ScanWall(State):
         self.column_retract_commanded = False
         self._costmap_wait_start = None
         self._segments = None
+        self._scan_poses = None
+        # Per reachable segment, the max partition length currently in force. Only
+        # differs from partition_max_length_m after a backoff retry (§7.B).
+        self._segment_max_len = {}
+        # Which scan-line height is being swept at the CURRENT partition. Always 0
+        # unless nest_lines_in_partition is on (§8).
+        self._line_idx = 0
+        # Base goal held between deciding to transit and actually sending it, so
+        # the column can be retracted in between.
+        self._pending_transit = None
         self._seg_idx = 0
         self._seg_phase = "transit_clear"
         self._arm_goal_start = None
+        self._recenter_future = None
         self._plate_wait_start = None
         self._segments_ok = 0
         self._last_swept_point = None
         self._nav_status = None
+        self._sweep_result = None
+        self._sweep_goal_handle = None
+        self._sweep_scanning = False
         self._sweep_from = None
         self._sweep_to = None
         self._stop_sweep_crawl(ctx)   # clear any stale timer from a re-entry
         self._sweep_crawl_target = None
         self._sweep_crawl_deadline = None
+        self._crawl_yaw = None       # heading held during a crawl (None = sweep heading)
+        self._crawl_speed = None
         self._restore_sweep_speed(ctx)   # clear any stale slow-sweep limit from a re-entry
         self.force_mode_active = False
         self._press_settle_start = None
@@ -464,11 +511,35 @@ class ScanWall(State):
         )
         return True
 
-    def _send_arm_to_clearance(self, ctx, target, contact_default=False):
+    def _approach_standoff(self, ctx):
+        """Plate-to-wall distance the arm approaches a partition at.
+
+        The sweep standoff plus a retraction margin. The plate travels sideways to
+        the partition start at THIS distance, not at the sweep distance, so a long
+        lateral move never drags the sensor plate along the wall face -- which in
+        Gazebo means real contact forces, and on the robot means scrubbing the GPR
+        wheel across a surface it is not measuring.
+
+        Keyed off ``sweep_scan_standoff_m`` in arm-sweep mode so raising the sweep
+        standoff carries the approach out with it; the legacy base-driven path
+        keeps using the press offset it was tuned against.
+        """
+        base = (float(ctx.get("sweep_scan_standoff_m", 0.30))
+                if self._use_arm_sweep(ctx)
+                else float(ctx.get("scan_wall_plate_offset", 0.20)))
+        return base + float(ctx.get("sweep_approach_retract_m", 0.20))
+
+    def _send_arm_to_clearance(self, ctx, target, contact_default=False,
+                               retract_only=False):
         """Move the plate so it ends up ``target`` metres off the wall.
 
         Returns "sent" once a goal is out, "skip" when the move is unnecessary or
         cannot be sized, or "wait" while still waiting for a first sensor frame.
+
+        ``retract_only`` refuses to move the plate TOWARD the wall. A move whose
+        whole purpose is to clear the wall should never close on it, whatever the
+        arithmetic says -- and the arithmetic can say so, because the standoff
+        knobs are independent and drift apart when one is retuned.
 
         With ``contact_default`` the plate is assumed to be ON the wall when no
         reading is usable — true after a force-mode press, where the ranges sit
@@ -506,6 +577,13 @@ class ScanWall(State):
 
         self._plate_wait_start = None
         advance = d - float(target)
+        if retract_only and advance > 0.0:
+            node.get_logger().info(
+                f"[{self.name}] Plate already {d:.3f} m off the wall, further out "
+                f"than the {target:.2f} m clearance target; leaving it there rather "
+                f"than moving {advance:+.3f} m back toward the wall."
+            )
+            return "skip"
         max_step = float(ctx.get("scan_wall_arm_z_max_step", 0.6))
         if abs(advance) > max_step:
             node.get_logger().warn(
@@ -525,6 +603,53 @@ class ScanWall(State):
             f"{advance:+.3f} m to sit at {target:.2f} m."
         )
         return "sent" if self._send_arm_z_goal(ctx, advance) else "skip"
+
+    def _send_named_pose(self, ctx, pose_name):
+        """Ask the arm to go to a named pose. Returns "sent" / "wait" / "skip".
+
+        Same /send_position + execution_status handshake the pre-approach uses,
+        so :meth:`_arm_goal_settled` waits on it unchanged. "skip" means the
+        request could not be placed at all -- the caller carries on rather than
+        stranding the wall over a re-pose that is an optimisation, not a
+        requirement.
+        """
+        node = ctx["node"]
+        if self._recenter_future is not None:
+            if not self._recenter_future.done():
+                return "wait"
+            try:
+                response = self._recenter_future.result()
+                if not response.success:
+                    node.get_logger().warn(
+                        f"[{self.name}] Arm rejected the '{pose_name}' pose "
+                        f"({response.message}); moving the base from the current "
+                        f"arm configuration instead."
+                    )
+                    self._recenter_future = None
+                    return "skip"
+                node.get_logger().info(
+                    f"[{self.name}] '{pose_name}' accepted: {response.message}"
+                )
+            except Exception as e:
+                node.get_logger().warn(f"[{self.name}] '{pose_name}' service exception: {e}")
+                self._recenter_future = None
+                return "skip"
+            self._recenter_future = None
+            return "sent"
+
+        if not self.position_client.service_is_ready():
+            node.get_logger().warn(
+                f"[{self.name}] Waiting for /send_position to send '{pose_name}'..."
+            )
+            return "wait"
+
+        node.get_logger().info(f"[{self.name}] Sending the arm to '{pose_name}'.")
+        request = SendPosition.Request()
+        request.position_name = pose_name
+        ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
+        self._recenter_future = self.position_client.call_async(request)
+        return "wait"
 
     def _arm_goal_settled(self, ctx):
         """True once the planner reports the Z move finished, failed, or ran out of
@@ -1191,6 +1316,97 @@ class ScanWall(State):
         """
         return unfolded_pose_name(ctx)
 
+    def _use_arm_sweep(self, ctx):
+        """True when the arm performs the lateral sweep and the base stays parked.
+
+        The master A/B switch against the legacy base-driven sweep. Everything
+        the base-crawl path owns (speed caps, progress-checker relaxation, the
+        /cmd_vel drag, chassis parking) is gated off this.
+
+        Defaults to True: wall_sweep_executor has landed, so the arm sweeps and
+        the base only repositions between partitions. Set sweep_use_arm False to
+        fall back to the base-driven crawl — but set nav_face_wall False with it,
+        or the base parks facing the wall and is then dragged sideways at a
+        heading meant for driving along it, which is worse than either path
+        alone.
+        """
+        return bool(ctx.get("sweep_use_arm", True))
+
+    def _plan_line(self, ctx):
+        """Segments to sweep for this scan line, with a base scan pose each.
+
+        Returns ``(segments, scan_poses)`` -- ``scan_poses`` is ``None`` in the
+        legacy base-driven mode -- or ``None`` while still polling for the global
+        costmap. ``([], None)`` means the state has already been failed.
+
+        In arm-sweep mode this is normally a **cache lookup, not a computation**:
+        NavigateToTarget built the same plan to choose its approach pose, so
+        partition 1 here is the partition the base is already parked on and its
+        transit below collapses to a no-op. Sharing the plan is also what keeps
+        partition boundaries identical at every line height (ARM_SWEEP_PLAN §3.6),
+        which is what lets the GPR lines stitch.
+        """
+        node = ctx["node"]
+        arm_sweep = self._use_arm_sweep(ctx)
+
+        if arm_sweep:
+            plan = plan_wall_partitions(
+                ctx, self.name, self._sweep_from, self._sweep_to
+            )
+            segments, poses = (None, None) if plan is None else plan
+        else:
+            segments = reachable_wall_segments(ctx, self._sweep_from, self._sweep_to)
+            poses = None
+
+        if segments is None:      # costmap not received yet — bounded poll
+            now = time.time()
+            if self._costmap_wait_start is None:
+                node.get_logger().info(
+                    f"[{self.name}] Waiting for the global costmap to segment the "
+                    f"scan line (up to {COSTMAP_WAIT_TIMEOUT_S:.0f}s)..."
+                )
+                self._costmap_wait_start = now
+                return None
+            if now - self._costmap_wait_start < COSTMAP_WAIT_TIMEOUT_S:
+                return None
+            node.get_logger().warn(
+                f"[{self.name}] No costmap after {COSTMAP_WAIT_TIMEOUT_S:.0f}s; "
+                f"sweeping the whole line unsegmented."
+            )
+            whole = [(tuple(self._sweep_from), tuple(self._sweep_to))]
+            if arm_sweep:
+                # Only the reachability split needs the costmap; the partition
+                # geometry and its scan poses need the wall normal alone. So the
+                # arm sweep degrades to partitioning the raw line rather than
+                # abandoning the wall — obstacles along it are simply not skipped.
+                segments, poses = plan_wall_partitions(
+                    ctx, self.name, self._sweep_from, self._sweep_to, segments=whole
+                )
+            else:
+                segments = whole
+
+        if not segments:
+            # plan_wall_partitions / the arm-reach check logged the specific reason.
+            self.fail(
+                ctx,
+                "no partition of this scan line has a usable base scan pose"
+                if arm_sweep
+                else "no reachable portion of the scan line within arm reach",
+            )
+            return [], None
+
+        if not arm_sweep:
+            publish_wall_segment_markers(ctx, segments)
+            node.get_logger().info(
+                f"[{self.name}] Scan line split into {len(segments)} reachable "
+                f"segment(s): "
+                + "; ".join(
+                    f"({s[0]:.2f}, {s[1]:.2f})->({e[0]:.2f}, {e[1]:.2f})"
+                    for s, e in segments
+                )
+            )
+        return segments, poses
+
     def _run_scan(self, ctx):
         node = ctx["node"]
 
@@ -1205,15 +1421,10 @@ class ScanWall(State):
                 return
 
             # Serpentine: sweep from the wall end the robot is at toward the
-            # other end. Nearest-endpoint match — the current point may be a
-            # clamped reachable-segment endpoint, not the raw wall end.
-            d0 = math.hypot(prev_target_point[0] - wall_data[0][0],
-                            prev_target_point[1] - wall_data[0][1])
-            d1 = math.hypot(prev_target_point[0] - wall_data[1][0],
-                            prev_target_point[1] - wall_data[1][1])
-            near_end, far_end = (
-                (wall_data[0], wall_data[1]) if d0 <= d1 else (wall_data[1], wall_data[0])
-            )
+            # other end. Shared with NavigateToTarget — it orders the line the
+            # same way to pick which partition to approach, and the two must not
+            # disagree or its approach pose belongs to a different partition.
+            near_end, far_end = sweep_line_order(wall_data, prev_target_point)
             self._sweep_from, self._sweep_to = near_end, far_end
 
             # Keep a FIXED base heading for the whole wall (computed on the first
@@ -1248,41 +1459,18 @@ class ScanWall(State):
 
         # --- Split the line into reachable segments; gaps get skipped. ---
         if self._segments is None:
-            segments = reachable_wall_segments(ctx, self._sweep_from, self._sweep_to)
-            if segments is None:  # costmap not received yet — bounded poll
-                now = time.time()
-                if self._costmap_wait_start is None:
-                    node.get_logger().info(
-                        f"[{self.name}] Waiting for the global costmap to segment the "
-                        f"scan line (up to {COSTMAP_WAIT_TIMEOUT_S:.0f}s)..."
-                    )
-                    self._costmap_wait_start = now
-                    return
-                if now - self._costmap_wait_start < COSTMAP_WAIT_TIMEOUT_S:
-                    return
-                node.get_logger().warn(
-                    f"[{self.name}] No costmap after {COSTMAP_WAIT_TIMEOUT_S:.0f}s; "
-                    f"sweeping the whole line unsegmented."
-                )
-                segments = [(tuple(self._sweep_from), tuple(self._sweep_to))]
+            plan = self._plan_line(ctx)
+            if plan is None:
+                return                    # still polling for the global costmap
+            segments, poses = plan
             if not segments:
-                node.get_logger().error(
-                    f"[{self.name}] No reachable portion of this scan line (no base cell "
-                    f"within arm reach anywhere along it); cannot scan this wall."
-                )
-                self.fail(ctx, "no reachable portion of the scan line within arm reach")
-                return
+                return                    # _plan_line already failed the state
+
             self._segments = segments
+            self._scan_poses = poses
             self._seg_idx = 0
             self._seg_phase = "transit_clear"
             self._segments_ok = 0
-            publish_wall_segment_markers(ctx, segments)
-            node.get_logger().info(
-                f"[{self.name}] Scan line split into {len(segments)} reachable segment(s): "
-                + "; ".join(
-                    f"({s[0]:.2f}, {s[1]:.2f})->({e[0]:.2f}, {e[1]:.2f})" for s, e in segments
-                )
-            )
             return
 
         # --- All segments processed: finalize the line. ---
@@ -1306,13 +1494,20 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            target = float(ctx.get("scan_wall_transit_plate_offset", 0.40))
+            # In arm-sweep mode the executor's own retract leg has already left the
+            # plate at the approach standoff, so use that same number here. Using a
+            # separate knob made the two drift apart the moment the sweep standoff
+            # was retuned, and this move then pushed the plate 10 cm back TOWARD the
+            # wall before transit_recenter folded the arm away anyway.
+            target = (self._approach_standoff(ctx) if self._use_arm_sweep(ctx)
+                      else float(ctx.get("scan_wall_transit_plate_offset", 0.40)))
             # After a sweep the plate sits against the wall with its ranges below
             # their valid floor, so a missing reading there means "in contact", not
             # "unknown" — but only from the second segment on. Before the first
             # transit nothing has touched the wall yet and no such assumption holds.
             outcome = self._send_arm_to_clearance(
-                ctx, target, contact_default=self._segments_ok > 0
+                ctx, target, contact_default=self._segments_ok > 0,
+                retract_only=True,
             )
             if outcome == "wait":
                 return
@@ -1320,13 +1515,58 @@ class ScanWall(State):
                 self._arm_goal_start = None
                 self._seg_phase = "transit_clear_wait"
                 return
-            self._seg_phase = "transit"
+            # "skip" still has to re-centre. The Z retract is usually a no-op now
+            # (the executor's own retract leg already left the plate at the
+            # approach standoff), and routing that case straight to the transit is
+            # what stopped the arm folding back between partitions.
+            self._seg_phase = "transit_recenter"
             return
 
         if self._seg_phase == "transit_clear_wait":
             if not self._arm_goal_settled(ctx):
                 return
             self._arm_goal_start = None
+            self._seg_phase = "transit_recenter"
+            return
+
+        if self._seg_phase == "transit_recenter":
+            # Fold the arm back to its named pose before the base moves.
+            #
+            # The Z retract above only pulls the plate off the wall along the plate
+            # normal; it leaves the arm wherever the sweep ended, which is up to
+            # half a partition off to one side. Strafing the base with the arm
+            # extended sideways swings the plate through a much larger arc than the
+            # base itself covers, and the dynamic footprint has to grow to match.
+            # Re-posing first puts the plate back on the robot's centreline, so the
+            # transit is the base's own footprint moving and nothing more.
+            #
+            # This is also the pose the next partition's approach starts from, so
+            # every partition begins from the same arm configuration rather than
+            # from wherever the last sweep happened to finish.
+            if not self._use_arm_sweep(ctx):
+                self._seg_phase = "transit"
+                return
+            self.set_activity(
+                ctx,
+                f"Centring the arm before moving to segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            outcome = self._send_named_pose(ctx, self._unfolded_pose_name(ctx))
+            if outcome == "wait":
+                return
+            if outcome == "sent":
+                self._arm_goal_start = None
+                self._seg_phase = "transit_recenter_wait"
+                return
+            self._seg_phase = "transit"
+            return
+
+        if self._seg_phase == "transit_recenter_wait":
+            if not self._arm_goal_settled(ctx):
+                return
+            self._arm_goal_start = None
+            self._recenter_future = None
             self._seg_phase = "transit"
             return
 
@@ -1345,11 +1585,61 @@ class ScanWall(State):
             # NavigateToTarget, or contiguous serpentine turnarounds.
             pos = ctx.get("base_position")
             skip_tol = float(ctx.get("segment_transit_skip_tol", 0.4))
-            goal_xy = base_standoff_goal(ctx, self.name, seg_start)
-            goal_xy = wall_parallel_goal(
-                ctx, self.name, goal_xy, (pos.x, pos.y) if pos is not None else None
-            )
-            if pos is not None and math.hypot(pos.x - goal_xy[0], pos.y - goal_xy[1]) <= skip_tol:
+
+            # Arm-driven sweep: the Nav2 goal IS the final scan pose — centred on
+            # the partition, backed off along the wall normal, facing the wall.
+            # No wall_parallel_goal (that strips the wall-ward component to keep
+            # the base at its arrived standoff; here the standoff is the point of
+            # the goal) and no separate park correction afterwards.
+            arm_sweep = self._use_arm_sweep(ctx)
+            if arm_sweep:
+                pose = (self._scan_poses or [None] * len(self._segments))[self._seg_idx]
+                if pose is None:
+                    node.get_logger().warn(
+                        f"[{self.name}] Partition {seg_no} has no scan pose; skipping."
+                    )
+                    self._seg_idx += 1
+                    self._seg_phase = "transit_clear"
+                    return
+                goal_xy, goal_yaw = (pose[0], pose[1]), pose[2]
+            else:
+                goal_yaw = None
+                goal_xy = base_standoff_goal(ctx, self.name, seg_start)
+                goal_xy = wall_parallel_goal(
+                    ctx, self.name, goal_xy, (pos.x, pos.y) if pos is not None else None
+                )
+
+            if arm_sweep:
+                # Skipping needs BOTH position and heading here. The base-driven
+                # sweep only cared about position (it re-parked afterwards), but a
+                # parked arm sweep depends on facing the wall square-on, and the
+                # base could be at the right spot left over from a previous
+                # partition at a completely different heading. Compared in the map
+                # frame — ctx["base_position"] is odom and would be off by map->odom.
+                here = self._base_xy_yaw_map(ctx)
+                # Defaults to NavigateToTarget's own convergence tolerance rather
+                # than something tighter: the skip test cannot demand a heading
+                # more accurate than navigation is able to deliver, or partition 1
+                # re-transits every time despite the base already standing on its
+                # scan pose — the exact trip this approach exists to avoid.
+                yaw_tol = float(
+                    ctx.get("partition_scan_yaw_tol", ctx.get("nav_yaw_tolerance", 0.25))
+                )
+                if here is not None:
+                    yaw_err = abs(atan2(sin(here[2] - goal_yaw), cos(here[2] - goal_yaw)))
+                    if math.hypot(here[0] - goal_xy[0], here[1] - goal_xy[1]) <= skip_tol \
+                            and yaw_err <= yaw_tol:
+                        node.get_logger().info(
+                            f"[{self.name}] Base already at partition {seg_no} scan pose "
+                            f"(yaw err {yaw_err:.3f} rad); skipping transit."
+                        )
+                        # No transit happened, so the column was never lowered;
+                        # line_column is a no-op unless nesting has moved on to a
+                        # different height.
+                        self.column_commanded = False
+                        self._seg_phase = "line_column"
+                        return
+            elif pos is not None and math.hypot(pos.x - goal_xy[0], pos.y - goal_xy[1]) <= skip_tol:
                 node.get_logger().info(
                     f"[{self.name}] Base already at segment {self._seg_idx + 1} start; "
                     f"skipping transit."
@@ -1358,10 +1648,100 @@ class ScanWall(State):
                 self._seg_phase = "park"
                 return
             node.get_logger().info(
-                f"[{self.name}] Transit to segment {self._seg_idx + 1}/{len(self._segments)} "
-                f"start ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) (no press)."
+                f"[{self.name}] Transit to "
+                f"{'partition' if arm_sweep else 'segment'} {self._seg_idx + 1}/"
+                f"{len(self._segments)} "
+                f"{'scan pose' if arm_sweep else 'start'} "
+                f"({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) (no press)."
             )
-            if not self._send_base_goal(ctx, goal_xy):
+            # Retract the column BEFORE the base moves, never after. A raised
+            # column with the arm on top is a tall, top-heavy load; driving the
+            # base like that is unsafe whatever the terrain. Deferred to here
+            # rather than done in transit_clear so a SKIPPED transit costs no
+            # column travel at all -- above, the skip paths return without ever
+            # reaching this point.
+            self._pending_transit = (goal_xy, goal_yaw)
+            self.column_commanded = False
+            self._seg_phase = "transit_column"
+            return
+
+        if self._seg_phase == "transit_column":
+            self.set_activity(
+                ctx,
+                f"Retracting the column before moving to segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            if not self.column_commanded:
+                node.get_logger().info(
+                    f"[{self.name}] Lowering the column to "
+                    f"{self.column.column_min_height_m:.3f}m before the base moves. "
+                    f"(A no-op when it was never raised.)"
+                )
+                if not self.column.command(node, ctx, self.column.column_min_height_m):
+                    ctx["error_triggered"] = True
+                    return
+                self.column_commanded = True
+                return
+            if not self.column.reached_target(node, ctx):
+                if self.column.timed_out(node):
+                    # Do NOT transit anyway: moving the base with the column up is
+                    # the thing this phase exists to prevent.
+                    node.get_logger().error(
+                        f"[{self.name}] Column did not retract before the transit; "
+                        f"refusing to move the base with it raised."
+                    )
+                    self.fail(ctx, "column did not retract before a base transit")
+                return
+            self.column.reset()
+            self.column_commanded = False
+            self._seg_phase = "transit_send"
+            return
+
+        if self._seg_phase == "transit_send":
+            # Rebind: every phase is a separate tick, so nothing bound in
+            # `transit` survives to here.
+            arm_sweep = self._use_arm_sweep(ctx)
+            if self._pending_transit is None:
+                node.get_logger().error(
+                    f"[{self.name}] transit_send with no pending goal; restarting "
+                    f"the transit for partition {seg_no}."
+                )
+                self._seg_phase = "transit"
+                return
+            goal_xy, goal_yaw = self._pending_transit
+            self._pending_transit = None
+            if arm_sweep and bool(ctx.get("partition_transit_use_crawl", True)):
+                # Nav2 cannot make this move. Both scan poses sit inside the
+                # costmap inflation band (ARM_SWEEP_PLAN §9: DWB needs footprint +
+                # inscribed = 1.3 m of clearance and the scan standoff is
+                # necessarily less), so the global planner cannot even reach the
+                # goal cell:
+                #     GridBased: failed to create plan with tolerance 0.50
+                #     No valid trajectories out of 6656! BaseObstacle/...
+                # and the recovery behaviours drive the base backwards away from
+                # the wall, undoing the scan pose.
+                #
+                # Between partitions the move is a pure strafe ALONG the wall at
+                # constant standoff and constant heading, which the omnidirectional
+                # base does directly. Same argument §9 already made for the
+                # in-place rotation: DWB is being conservative rather than right.
+                # It does mean the move is not obstacle-checked -- acceptable only
+                # because reachable_wall_segments already established that a base
+                # cell exists within arm reach along this stretch of wall.
+                self._start_sweep_crawl(
+                    ctx, goal_xy, yaw=goal_yaw,
+                    speed=float(ctx.get("partition_transit_speed", 0.15)),
+                    # Far looser than the sweep's own 0.05 m. The scan pose is
+                    # accepted by NavigateToTarget at nav_pos_tolerance (0.30 m),
+                    # so demanding 0.05 m here is stricter than the pose the FSM
+                    # was happy with for partition 1 — and the arm re-measures its
+                    # own standoff afterwards anyway.
+                    tol=float(ctx.get("partition_transit_arrive_tol", 0.15)),
+                    timeout_pad=float(ctx.get("partition_transit_timeout_pad_s", 60.0)),
+                    what=f"Partition {seg_no} transit",
+                )
+            elif not self._send_base_goal(ctx, goal_xy, yaw=goal_yaw):
                 return
             self._seg_phase = "transit_wait"
             return
@@ -1369,7 +1749,22 @@ class ScanWall(State):
         if self._seg_phase == "transit_wait":
             if self._nav_status is None:
                 return
+            # No-op for a Nav2 transit; stops the timer and zeroes /cmd_vel after a
+            # crawl, including the timeout path.
+            self._stop_sweep_crawl(ctx, publish_stop=True)
             if self._nav_status == GoalStatus.STATUS_SUCCEEDED:
+                # Arm-sweep mode: the Nav2 goal WAS the final scan pose (position
+                # and wall-facing heading), so there is nothing left to correct —
+                # _run_parking exists only to square the chassis after a transit
+                # that ignored heading. Skipping it also avoids rotating the base
+                # away from the pose the partition geometry just established.
+                if self._use_arm_sweep(ctx):
+                    # The column was lowered for the transit, so it always has to
+                    # be raised to this partition's scan height before sweeping --
+                    # in both modes, not only when nesting.
+                    self.column_commanded = False
+                    self._seg_phase = "line_column"
+                    return
                 self._reset_park_state()
                 self._seg_phase = "park"
             else:
@@ -1409,8 +1804,11 @@ class ScanWall(State):
             # Nav2 route: cap the base to a crawl speed + relax the progress checker
             # NOW, so the async param change has propagated by the time the base
             # sweeps (the arm approach + stabilise wait below cover it). Skipped when
-            # the /cmd_vel crawl is selected (it sets its own speed).
-            if not bool(ctx.get("sweep_use_crawl", False)):
+            # the /cmd_vel crawl is selected (it sets its own speed), and entirely
+            # when the ARM sweeps — the base does not move at all then, so capping
+            # its speed and relaxing Nav2's progress checker only leave the next
+            # transit crawling for no reason (ARM_SWEEP_PLAN §7.C).
+            if not self._use_arm_sweep(ctx) and not bool(ctx.get("sweep_use_crawl", False)):
                 self._apply_sweep_speed(ctx)
             self._seg_phase = "arm_approach"
             return
@@ -1428,7 +1826,24 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            target = float(ctx.get("scan_wall_plate_offset", 0.20))
+            # Normal distance only -- no lateral move here, in either mode.
+            #
+            # An earlier attempt sent the plate to a Cartesian pose in front of the
+            # partition to save the executor the traverse. It cannot work: the
+            # partition centre lies on the base's own centreline, and the arm
+            # planner carries the robot's column as a 0.3 m static cylinder at the
+            # arm_base origin. Commanding the plate there put wrist_3 0.222 m from
+            # that axis and the planner refused the endpoint outright
+            # ("Global request goal wrist_3 position is INSIDE ENVIRONMENT
+            # OBSTACLE"). Retracting further from the wall makes it worse, not
+            # better: at this base standoff, back is toward the column.
+            #
+            # So the arm only ever moves along the plate normal here -- the move
+            # that has always worked -- and the executor makes the lateral traverse
+            # to the partition start, where the plate is already extended and well
+            # clear of the column.
+            target = (self._approach_standoff(ctx) if self._use_arm_sweep(ctx)
+                      else float(ctx.get("scan_wall_plate_offset", 0.20)))
             outcome = self._send_arm_to_clearance(ctx, target)
             if outcome == "wait":
                 return
@@ -1604,10 +2019,170 @@ class ScanWall(State):
     # ------------------------------------------------------------------
     # Base goal plumbing (segment transit + sweep goals)
     # ------------------------------------------------------------------
-    def _send_base_goal(self, ctx, goal_xy):
-        """Send a NavigateToPose goal at the fixed sweep heading. The result
-        lands in ``self._nav_status`` (a GoalStatus value, or -1 on
-        rejection/exception); ``None`` while in flight."""
+    # ------------------------------------------------------------------
+    # Arm-driven sweep: the SweepLine action (ARM_SWEEP_PLAN §7.B)
+    # ------------------------------------------------------------------
+    def _set_trajectory_bridge_hold(self, ctx, held):
+        """Tell publisher_joint_trajectory_planned to stand down, or resume.
+
+        The bridge forwards ``planned_trajectory`` to the same controller the
+        executor drives, so while a sweep is running the two preempt each other's
+        goals and the sweep comes back CANCELED. Killing wall_parallel_controller
+        does not prevent it: its last trajectory is still queued in the bridge, and
+        the bridge re-dispatches it as soon as a slot opens -- which is exactly
+        what happened to the traverse leg (JTC status 5).
+
+        Latched (transient_local) so the bridge picks the hold up even if it
+        restarts mid-sweep.
+        """
+        node = ctx["node"]
+        pub = ctx.get("_traj_hold_pub")
+        if pub is None:
+            qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            pub = node.create_publisher(Bool, "trajectory_bridge/hold", qos)
+            ctx["_traj_hold_pub"] = pub
+        pub.publish(Bool(data=bool(held)))
+        node.get_logger().info(
+            f"[{self.name}] Trajectory bridge {'held for the arm sweep' if held else 'released'}."
+        )
+
+    def _send_sweep_goal(self, ctx, seg_start, seg_end):
+        """Hand one partition to wall_sweep_executor. The base does not move.
+
+        The result lands in ``self._sweep_result`` as
+        ``(succeeded, reason, detail)``; ``None`` while the sweep is in flight,
+        which is what ``sweep_wait`` polls.
+
+        The endpoints go over in the MAP frame exactly as the partitioning
+        produced them: ``normalize(end - start)`` is the authoritative sweep
+        direction (§4.2), and re-deriving it from the arm's current pose would
+        substitute where the plate happens to point for where the wall actually
+        is. The executor transforms them into ``arm_base`` once — safe because
+        the base is parked for the whole sweep.
+        """
+        node = ctx["node"]
+        if self._sweep_client is None:
+            self._sweep_client = ActionClient(node, SweepLine, "sweep_line")
+
+        # Restart a dead executor rather than failing every remaining partition
+        # of the line. It is started once per line in the pre-approach, so without
+        # this a single crash silently costs the whole wall.
+        proc = ctx.get("sweep_executor_proc")
+        if proc is not None and proc.poll() is not None:
+            node.get_logger().warn(
+                f"[{self.name}] wall_sweep_executor exited (code {proc.returncode}); "
+                f"restarting it before this sweep."
+            )
+            ctx["sweep_executor_proc"] = None
+            self._start_sweep_executor(ctx)
+
+        if not self._sweep_client.wait_for_server(timeout_sec=10.0):
+            # Say WHY. A dead executor and a slow one look identical from the
+            # action client, and the difference is the whole diagnosis: an
+            # unparseable --ros-args (a `-p name:=` with an empty value, say)
+            # kills the node before it can advertise, and the only symptom
+            # upstream was this timeout.
+            proc = ctx.get("sweep_executor_proc")
+            if proc is None:
+                why = "the executor was never started"
+            elif proc.poll() is not None:
+                why = (f"the executor process exited with code {proc.returncode} — "
+                       f"check its stderr, most likely a bad --ros-args parameter")
+            else:
+                why = f"the executor (pid {proc.pid}) is running but has not advertised"
+            node.get_logger().error(
+                f"[{self.name}] wall_sweep_executor's 'sweep_line' action never came "
+                f"up: {why}. Cannot sweep this partition with the arm."
+            )
+            self._sweep_result = (False, "executor_unavailable", why)
+            return False
+
+        # The partitions carry the wall's BASE scan-line height, which is only the
+        # first line's. Stamp the height being scanned now, or every line after the
+        # first sweeps at the wrong elevation.
+        line_z = self.current_line_z
+        if line_z is None:
+            line_z = self._resolve_current_line_z(ctx)
+        line_z = float(line_z)
+
+        goal = SweepLine.Goal()
+        goal.start = Point(x=float(seg_start[0]), y=float(seg_start[1]), z=line_z)
+        goal.end = Point(x=float(seg_end[0]), y=float(seg_end[1]), z=line_z)
+        goal.partition_index = int(self._seg_idx)
+        goal.partition_count = int(len(self._segments))
+        goal.frame_id = "map"
+        goal.speed = float(ctx.get("sweep_speed_mps", 0.05))
+        # Sim has no force_mode controller, so the sweep runs contact-free at the
+        # plate offset (§11.2) and the contact watchdog must not fire.
+        goal.press = not bool(ctx.get("sim", False))
+
+        node.get_logger().info(
+            f"[{self.name}] Arm sweep of partition {self._seg_idx + 1}/"
+            f"{len(self._segments)}: ({seg_start[0]:.2f}, {seg_start[1]:.2f}) -> "
+            f"({seg_end[0]:.2f}, {seg_end[1]:.2f}) at {goal.speed:.3f} m/s "
+            f"({'press' if goal.press else 'no press'}). Base stays parked."
+        )
+        self._sweep_result = None
+        self._sweep_goal_handle = None
+        self._sweep_scanning = False
+        future = self._sweep_client.send_goal_async(
+            goal, feedback_callback=self._on_sweep_feedback
+        )
+        future.add_done_callback(self._on_sweep_response)
+        return True
+
+    def _on_sweep_feedback(self, message):
+        if message.feedback.phase == "sweep":
+            self._sweep_scanning = True
+
+    def _on_sweep_response(self, future):
+        try:
+            handle = future.result()
+        except Exception as e:
+            self._sweep_result = (False, "executor_exception", str(e))
+            return
+        if not handle.accepted:
+            self._sweep_result = (False, "goal_rejected", "executor rejected the sweep goal")
+            return
+        self._sweep_goal_handle = handle
+        handle.get_result_async().add_done_callback(self._on_sweep_result)
+
+    def _on_sweep_result(self, future):
+        try:
+            result = future.result().result
+        except Exception as e:
+            self._sweep_result = (False, "executor_exception", str(e))
+            return
+        self._sweep_result = (bool(result.success), result.reason, result.detail)
+
+    def _cancel_sweep_goal(self, ctx):
+        """Cancel an in-flight arm sweep on the way out of the state.
+
+        Killing the executor process alone is not enough: SIGINT during a
+        FollowJointTrajectory goal leaves the controller running the rest of the
+        trajectory, so the arm would keep sweeping after the FSM has moved on.
+        Cancelling first lets the executor preempt the controller goal properly.
+        """
+        handle = self._sweep_goal_handle
+        self._sweep_goal_handle = None
+        if handle is None:
+            return
+        try:
+            handle.cancel_goal_async()
+            ctx["node"].get_logger().info(f"[{self.name}] Cancelled the in-flight arm sweep.")
+        except Exception as e:
+            ctx["node"].get_logger().warn(f"[{self.name}] Sweep cancel failed: {e}")
+
+    def _send_base_goal(self, ctx, goal_xy, yaw=None):
+        """Send a NavigateToPose goal. The result lands in ``self._nav_status``
+        (a GoalStatus value, or -1 on rejection/exception); ``None`` while in
+        flight.
+
+        Defaults to the fixed along-wall sweep heading used by the base-driven
+        sweep. ``yaw`` overrides it with a per-goal heading — the arm-driven
+        sweep parks facing INTO the wall instead (ARM_SWEEP_PLAN §7.A), so it
+        passes the yaw from ``partition_scan_pose``.
+        """
         node = ctx["node"]
         nav_client = ctx.get("nav_client", None)
         if nav_client is None:
@@ -1620,8 +2195,12 @@ class ScanWall(State):
         goal_msg.pose.pose.position.x = float(goal_xy[0])
         goal_msg.pose.pose.position.y = float(goal_xy[1])
         goal_msg.pose.pose.position.z = 0.0
-        goal_msg.pose.pose.orientation.z = self._sweep_qz
-        goal_msg.pose.pose.orientation.w = self._sweep_qw
+        if yaw is None:
+            goal_msg.pose.pose.orientation.z = self._sweep_qz
+            goal_msg.pose.pose.orientation.w = self._sweep_qw
+        else:
+            goal_msg.pose.pose.orientation.z = math.sin(float(yaw) / 2.0)
+            goal_msg.pose.pose.orientation.w = math.cos(float(yaw) / 2.0)
         # No base-reversing recoveries (BackOutFromObstacle/BackUp): backing the
         # base out mid-sweep ruins the scan geometry — fail fast to the FSM.
         goal_msg.behavior_tree = nav_bt_xml(ctx, self.name)
@@ -1692,30 +2271,46 @@ class ScanWall(State):
             return float(t.x), float(t.y), yaw
         return None
 
-    def _start_sweep_crawl(self, ctx, target_xy):
-        """Begin dragging the base to ``target_xy`` (map-frame base standoff) at a
-        slow constant velocity. Drives ``self._nav_status`` like a Nav2 goal:
-        None while in flight, STATUS_SUCCEEDED on arrival, -1 on timeout/lost pose,
-        so the existing sweep_wait completion logic is reused unchanged."""
+    def _start_sweep_crawl(self, ctx, target_xy, yaw=None, speed=None, tol=None,
+                           timeout_pad=None, what="Sweep crawl"):
+        """Begin driving the base to ``target_xy`` (map frame) over /cmd_vel.
+
+        Drives ``self._nav_status`` like a Nav2 goal: None while in flight,
+        STATUS_SUCCEEDED on arrival, -1 on timeout/lost pose, so both the
+        ``sweep_wait`` and ``transit_wait`` completion logic are reused unchanged.
+
+        ``yaw`` overrides the heading held during the move; it defaults to the
+        fixed along-wall sweep heading the legacy base sweep uses. The partition
+        transit passes the scan-pose yaw instead, so the base arrives already
+        square to the wall.
+        """
         node = ctx["node"]
         if ctx.get("_cmd_vel_pub") is None:
             ctx["_cmd_vel_pub"] = node.create_publisher(Twist, "/cmd_vel", 10)
         self._stop_sweep_crawl(ctx)   # no duplicate timers
         self._sweep_crawl_target = (float(target_xy[0]), float(target_xy[1]))
+        self._crawl_yaw = None if yaw is None else float(yaw)
         self._nav_status = None
 
-        speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
+        if speed is None:
+            speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
+        self._crawl_speed = float(speed)
+        self._crawl_tol = tol
+        self._crawl_started = time.time()
         pose = self._base_xy_yaw_map(ctx)
         dist = (
             math.hypot(self._sweep_crawl_target[0] - pose[0],
                        self._sweep_crawl_target[1] - pose[1])
             if pose else 0.0
         )
-        self._sweep_crawl_deadline = (
-            time.time() + dist / max(speed, 1e-3) + self.SWEEP_CRAWL_TIMEOUT_PAD_S
-        )
+        self._crawl_distance = dist
+        # The base tracks a /cmd_vel command far more slowly than it is asked to
+        # (measured at roughly a seventh of the commanded speed on the omni base in
+        # Gazebo), so the nominal dist/speed is not a usable estimate on its own.
+        pad = self.SWEEP_CRAWL_TIMEOUT_PAD_S if timeout_pad is None else float(timeout_pad)
+        self._sweep_crawl_deadline = time.time() + dist / max(speed, 1e-3) + pad
         node.get_logger().info(
-            f"[{self.name}] Sweep crawl to ({self._sweep_crawl_target[0]:.2f}, "
+            f"[{self.name}] {what} to ({self._sweep_crawl_target[0]:.2f}, "
             f"{self._sweep_crawl_target[1]:.2f}) at {speed:.3f} m/s ({dist:.2f} m)."
         )
         self._sweep_crawl_timer = node.create_timer(
@@ -1737,8 +2332,13 @@ class ScanWall(State):
         if self._nav_status is not None:
             return
         node = ctx["node"]
-        speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
-        tol = float(ctx.get("sweep_arrive_tol", self.SWEEP_ARRIVE_TOL_M))
+        speed = getattr(self, "_crawl_speed", None) or float(
+            ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS)
+        )
+        tol = getattr(self, "_crawl_tol", None)
+        if tol is None:
+            tol = float(ctx.get("sweep_arrive_tol", self.SWEEP_ARRIVE_TOL_M))
+        tol = float(tol)
 
         pose = self._base_xy_yaw_map(ctx)
         if pose is None:
@@ -1753,14 +2353,20 @@ class ScanWall(State):
         if dist <= tol:
             self._stop_sweep_crawl(ctx, publish_stop=True)
             node.get_logger().info(
-                f"[{self.name}] Sweep crawl reached the segment end ({dist:.3f} m)."
+                f"[{self.name}] Base crawl reached its target ({dist:.3f} m)."
             )
             self._nav_status = GoalStatus.STATUS_SUCCEEDED
             return
         if time.time() > self._sweep_crawl_deadline:
             self._stop_sweep_crawl(ctx, publish_stop=True)
+            elapsed = max(time.time() - getattr(self, "_crawl_started", time.time()), 1e-3)
+            covered = max(getattr(self, "_crawl_distance", 0.0) - dist, 0.0)
             node.get_logger().warn(
-                f"[{self.name}] Sweep crawl timed out ({dist:.3f} m from the end)."
+                f"[{self.name}] Base crawl timed out {dist:.3f} m from the target "
+                f"(tolerance {tol:.3f} m). Covered {covered:.3f} m in {elapsed:.1f}s "
+                f"= {covered / elapsed:.3f} m/s against {speed:.3f} m/s commanded — "
+                f"if those differ a lot, /cmd_vel is being throttled or arbitrated "
+                f"away before it reaches the base."
             )
             self._nav_status = -1
             return
@@ -1772,7 +2378,9 @@ class ScanWall(State):
         cmd = Twist()
         cmd.linear.x = cos(yaw) * vx_w + sin(yaw) * vy_w
         cmd.linear.y = -sin(yaw) * vx_w + cos(yaw) * vy_w
-        target_yaw = 2.0 * atan2(self._sweep_qz, self._sweep_qw)
+        crawl_yaw = getattr(self, "_crawl_yaw", None)
+        target_yaw = (crawl_yaw if crawl_yaw is not None
+                      else 2.0 * atan2(self._sweep_qz, self._sweep_qw))
         dyaw = atan2(sin(target_yaw - yaw), cos(target_yaw - yaw))
         cmd.angular.z = max(-self.SWEEP_MAX_YAW_RATE,
                             min(self.SWEEP_MAX_YAW_RATE, self.SWEEP_KP_YAW * dyaw))
