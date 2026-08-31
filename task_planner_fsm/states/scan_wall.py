@@ -8,6 +8,7 @@ from ..utils.costmap_utils import (
     publish_wall_segment_markers,
     wall_parallel_goal,
 )
+from ..utils.wall_approach import unfolded_pose_name
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import SpeedLimit
 from geometry_msgs.msg import PoseStamped, Twist
@@ -1070,14 +1071,15 @@ class ScanWall(State):
                     node.get_logger().warn(f"[{self.name}] Waiting for /send_position service...")
                     return
                 self.current_line_z = self._resolve_current_line_z(ctx)
+                pose_name = self._unfolded_pose_name(ctx)
                 node.get_logger().info(
                     f"[{self.name}] Pre-approach for line z={self.current_line_z:.3f}m "
                     f"(line {ctx.get('current_line_idx', 0) + 1}/"
                     f"{len(ctx.get('current_wall_scan_lines', [self.current_line_z]))}): "
-                    f"sending unfolded_fsm pose."
+                    f"sending {pose_name} pose."
                 )
                 request = SendPosition.Request()
-                request.position_name = "unfolded_fsm"
+                request.position_name = pose_name
                 ctx["execution_status"] = False
                 ctx["planner_goal_failed"] = False
                 self.pose_future = self.position_client.call_async(request)
@@ -1176,6 +1178,18 @@ class ScanWall(State):
             self.set_activity(ctx, "Retracting the arm after the wall sweep")
             self._run_post_scan(ctx)
             return
+
+    # ------------------------------------------------------------------
+    # Arm-driven sweep: partitioning + fixed scan pose (ARM_SWEEP_PLAN §7.A)
+    # ------------------------------------------------------------------
+    def _unfolded_pose_name(self, ctx):
+        """Named arm pose the scan approaches and retracts to.
+
+        Shared with ArmUnfolding and keyed on the same approach decision as
+        NavigateToTarget's heading, so the plate is always aimed at the wall
+        rather than along it.
+        """
+        return unfolded_pose_name(ctx)
 
     def _run_scan(self, ctx):
         node = ctx["node"]
@@ -1876,13 +1890,16 @@ class ScanWall(State):
             if not self.position_client.service_is_ready():
                 node.get_logger().warn(f"[{self.name}] Waiting for /send_position service (retract)...")
                 return
+            pose_name = self._unfolded_pose_name(ctx)
             request = SendPosition.Request()
-            request.position_name = "unfolded_fsm"
+            request.position_name = pose_name
             ctx["execution_status"] = False
             ctx["planner_goal_failed"] = False
             self.retract_future = self.position_client.call_async(request)
             self.retract_pose_sent = True
-            node.get_logger().info(f"[{self.name}] Re-sending pose to retract arm from wall.")
+            node.get_logger().info(
+                f"[{self.name}] Re-sending {pose_name} pose to retract arm from wall."
+            )
             return
 
         if self.retract_future is not None:

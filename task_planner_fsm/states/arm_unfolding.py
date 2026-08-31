@@ -1,4 +1,5 @@
 from ..state import State
+from ..utils.wall_approach import unfolded_pose_name
 from arm_control.srv import SendPosition
 from control.remote_DASHBOARD import send_dashboard_play_command
 
@@ -79,16 +80,20 @@ class ArmUnfolding(State):
                 return  # retry next tick
             self.service_wait_deadline = None
             
-            # Create service request
+            # Create service request. The pose must match how NavigateToTarget
+            # parked the base: along the wall -> plate on the left flank; facing
+            # the wall -> plate to the front. Picking the wrong one aims the
+            # sensor plate along the wall instead of at it.
+            pose_name = unfolded_pose_name(ctx)
             request = SendPosition.Request()
-            request.position_name = 'unfolded_fsm'
+            request.position_name = pose_name
             
             # Reset execution status before sending
             ctx["execution_status"] = False
             
             # Send async service call
             self.future = self.service_client.call_async(request)
-            node.get_logger().info(f"[{self.name}] Sending service request for position: unfolded_fsm")
+            node.get_logger().info(f"[{self.name}] Sending service request for position: {pose_name}")
             self.goal_sent = True
             return
         
@@ -120,7 +125,7 @@ class ArmUnfolding(State):
         if ctx.get("planner_goal_failed"):
             ctx["planner_goal_failed"] = False
             node.get_logger().error(
-                f"[{self.name}] Planner reported failure while moving to unfolded_fsm."
+                f"[{self.name}] Planner reported failure while moving to {unfolded_pose_name(ctx)}."
             )
             ctx["error_triggered"] = True
             return
@@ -130,11 +135,11 @@ class ArmUnfolding(State):
             # Movement completed successfully
             self.movement_done = True
             ctx["execution_status"] = False  # Reset for next state
-            node.get_logger().info(f"[{self.name}] Position unfolded_fsm reached. Movement complete.")
+            node.get_logger().info(f"[{self.name}] Position {unfolded_pose_name(ctx)} reached. Movement complete.")
         elif exec_status is False or exec_status is None:
             # Still waiting for arrival
             if not self.verbose:
-                node.get_logger().info(f"[{self.name}] Waiting for arm to reach unfolded_fsm...")
+                node.get_logger().info(f"[{self.name}] Waiting for arm to reach {unfolded_pose_name(ctx)}...")
                 self.verbose = True
 
     def check_transition(self, ctx):
