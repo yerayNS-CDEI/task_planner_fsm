@@ -35,9 +35,13 @@ class NavigateToTarget(State):
         self._pose_retries = 0
         self._goal_xy = None
         self._goal_yaw = None
+        self._nav_goal_handle = None    # in-flight NavigateToPose handle, for early cancel
+        self._nav_cancel_sent = False
         self._target_clamped = False
         self._servo_timer = None
         self._servo_start = 0.0
+        # True while the fine-correction servo is commanding yaw only.
+        self._servo_rotate_only = False
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -58,6 +62,8 @@ class NavigateToTarget(State):
         self._pose_retries = 0
         self._goal_xy = None
         self._goal_yaw = None
+        self._nav_goal_handle = None    # in-flight NavigateToPose handle, for early cancel
+        self._nav_cancel_sent = False
         self._target_clamped = False
         self._stop_fine_correction(ctx)  # clear any stale servo from a re-entry
 
@@ -228,10 +234,35 @@ class NavigateToTarget(State):
                 self.fail(ctx, "Nav2 rejected the navigation goal")
                 return
             node.get_logger().info(f"[{self.name}] Goal accepted. Waiting for result...")
+            self._nav_goal_handle = goal_handle
             self._get_result_future = goal_handle.get_result_async()
             self._get_result_future.add_done_callback(lambda fut: self.result_callback(fut, ctx))
 
             self.waiting = False
+
+        elif not self._nav_result_pending and self._arrived_but_still_navigating(ctx):
+            # Nav2 is at the goal POSITION and can only be trying to rotate now --
+            # and at the scan standoff it provably cannot (ARM_SWEEP_PLAN §9: DWB
+            # needs footprint + inscribed = 1.3 m of clearance, the standoff is
+            # necessarily less, so BaseObstacle rejects the pure rotations and
+            # RotateToGoal rejects anything with translation; the sample set
+            # empties). Left alone it burns six recovery cycles of costmap clears
+            # and 5 s waits against an obstacle that is the wall and is not going
+            # anywhere.
+            #
+            # Cancel now and let the in-place /cmd_vel rotation below do the part
+            # that works. result_callback fires on CANCELED like any other status,
+            # so verification is unchanged.
+            node.get_logger().info(
+                f"[{self.name}] Base is at the goal position; cancelling Nav2 rather "
+                f"than letting it retry a rotation it cannot plan this close to the "
+                f"wall. Finishing the heading over /cmd_vel."
+            )
+            self._nav_cancel_sent = True
+            try:
+                self._nav_goal_handle.cancel_goal_async()
+            except Exception as e:
+                node.get_logger().warn(f"[{self.name}] Nav2 cancel failed: {e}")
 
         elif self._nav_result_pending:
             # Nav2 finished (any status). Success is judged by the ACTUAL base
@@ -275,14 +306,42 @@ class NavigateToTarget(State):
             # (fine_correction_enabled) because the open-loop /cmd_vel servo was
             # seen oscillating (overshoot past the goal and back); when off,
             # sub-tolerance misses fall through to the Nav2 goal retry below.
+            # Position already good, only the heading is off. Rotate in place over
+            # /cmd_vel rather than re-sending a Nav2 goal, because DWB CANNOT do
+            # this near a wall: with footprint radius 0.7 m and an inscribed
+            # radius of 0.6 m, any pose closer than ~1.3 m to the wall puts the
+            # footprint over inscribed cells, so BaseObstacle rejects every
+            # sample while RotateToGoal rejects anything with translation --
+            # "No valid trajectories out of 6656". The scan standoff is
+            # necessarily inside that band (the arm has to reach the wall), so
+            # this is the normal case, not an edge case.
+            #
+            # Safe despite DWB's refusal: the base-only footprint is a CIRCLE, so
+            # rotating about its centre sweeps no new area. DWB's check is static
+            # (footprint vs inscribed cells), not a swept-volume test, so it is
+            # merely conservative here. Translation is NOT safe on the same
+            # argument, which is why this is rotation-only and the full x/y servo
+            # stays behind fine_correction_enabled (it was seen oscillating).
+            rotate_only = (
+                pos_err <= pos_tol
+                and bool(ctx.get("fine_correction_rotate_only", True))
+            )
             servo_enabled = bool(ctx.get("fine_correction_enabled", False))
             max_servo_err = float(ctx.get("fine_correction_max_err", 0.7))
+            if rotate_only:
+                node.get_logger().info(
+                    f"[{self.name}] Position within tolerance but heading is off "
+                    f"(yaw err {yaw_err:.2f} rad > {yaw_tol:.2f}); rotating in place "
+                    f"over /cmd_vel (Nav2 cannot rotate this close to the wall)."
+                )
+                self._start_fine_correction(ctx, rotate_only=True)
+                return
             if servo_enabled and pos_err <= max_servo_err:
                 node.get_logger().info(
                     f"[{self.name}] Fine-correcting base pose over /cmd_vel "
                     f"(pos err {pos_err:.2f} m, yaw err {yaw_err:.2f} rad)."
                 )
-                self._start_fine_correction(ctx)
+                self._start_fine_correction(ctx, rotate_only=False)
                 return
             max_retries = int(ctx.get("nav_pose_max_retries", self.MAX_POSE_RETRIES))
             if self._pose_retries < max_retries:
@@ -293,6 +352,11 @@ class NavigateToTarget(State):
                     f"retry {self._pose_retries}/{max_retries}."
                 )
                 self.goal_sent = False  # resend the goal (standoff recomputed)
+                # A retry is a fresh goal: re-arm the arrival cancel, or the new
+                # goal would run its full recovery budget after the first one used
+                # the cancel up.
+                self._nav_goal_handle = None
+                self._nav_cancel_sent = False
                 return
             node.get_logger().error(
                 f"[{self.name}] Base pose still off goal after {max_retries} "
@@ -402,14 +466,20 @@ class NavigateToTarget(State):
     SERVO_MAX_ANG = 0.35   # rad/s
     SERVO_TIMEOUT_S = 30.0
 
-    def _start_fine_correction(self, ctx):
+    def _start_fine_correction(self, ctx, rotate_only=False):
         """Servo the omni base onto the standoff pose over /cmd_vel (through the
         twist_mux navigation channel; no Nav2 goal is active meanwhile). Ends by
-        setting navigation_done (verified) or error_triggered (timeout)."""
+        setting navigation_done (verified) or error_triggered (timeout).
+
+        ``rotate_only`` commands yaw alone and holds translation at zero — the
+        safe case near a wall (a circular footprint rotating about its centre
+        sweeps no new area) and the one that cannot oscillate in position.
+        """
         node = ctx["node"]
         if ctx.get("_cmd_vel_pub") is None:
             ctx["_cmd_vel_pub"] = node.create_publisher(Twist, "/cmd_vel", 10)
         self._stop_fine_correction(ctx)  # no duplicate timers
+        self._servo_rotate_only = bool(rotate_only)
         self._servo_start = time.time()
         self._servo_timer = node.create_timer(
             1.0 / self.SERVO_RATE_HZ, lambda: self._fine_correction_tick(ctx)
@@ -434,8 +504,24 @@ class NavigateToTarget(State):
             node.get_logger().error(f"[{self.name}] Lost base pose during fine correction.")
             ctx["error_triggered"] = True
             return
-        if pos_err <= pos_tol and yaw_err <= yaw_tol:
+        # Rotation-only converges on yaw alone. turret_footprint (the frame Nav2
+        # and _pose_error use) sits ~0.23 m off the chassis rotation centre, so a
+        # pure chassis rotation traces it around a small circle -- demanding the
+        # position tolerance too could leave this spinning until it times out.
+        rotate_only = self._servo_rotate_only
+        converged = yaw_err <= yaw_tol and (rotate_only or pos_err <= pos_tol)
+        if converged:
             self._stop_fine_correction(ctx, publish_stop=True)
+            if rotate_only and pos_err > pos_tol:
+                # The rotation walked the base off the standoff point. Hand back
+                # to the retry path rather than accepting a bad scan pose.
+                node.get_logger().warn(
+                    f"[{self.name}] Heading corrected (yaw err {yaw_err:.2f} rad) but "
+                    f"the rotation moved the base off the standoff point "
+                    f"(pos err {pos_err:.2f} m > {pos_tol:.2f}); re-verifying."
+                )
+                self._nav_result_pending = True
+                return
             node.get_logger().info(
                 f"[{self.name}] Base pose verified after fine correction "
                 f"(pos err {pos_err:.2f} m, yaw err {yaw_err:.2f} rad). Navigation done."
@@ -469,8 +555,9 @@ class NavigateToTarget(State):
             return max(-lim, min(lim, v))
 
         cmd = Twist()
-        cmd.linear.x = clamp(self.SERVO_KP_LIN * ex_b, self.SERVO_MAX_LIN)
-        cmd.linear.y = clamp(self.SERVO_KP_LIN * ey_b, self.SERVO_MAX_LIN)
+        if not self._servo_rotate_only:
+            cmd.linear.x = clamp(self.SERVO_KP_LIN * ex_b, self.SERVO_MAX_LIN)
+            cmd.linear.y = clamp(self.SERVO_KP_LIN * ey_b, self.SERVO_MAX_LIN)
         cmd.angular.z = clamp(self.SERVO_KP_ANG * dyaw, self.SERVO_MAX_ANG)
         ctx["_cmd_vel_pub"].publish(cmd)
 
@@ -520,6 +607,24 @@ class NavigateToTarget(State):
             )
             return float(t.x), float(t.y), yaw
         return None
+
+    def _arrived_but_still_navigating(self, ctx):
+        """True when a Nav2 goal is in flight and the base has already reached its
+        POSITION, so nothing Nav2 does next can help.
+
+        Deliberately position-only: the heading is the part Nav2 cannot finish
+        here, and it is exactly the part the in-place servo handles. Guarded by
+        ``nav_cancel_on_arrival`` in case a deployment wants Nav2 to run its full
+        course.
+        """
+        if not bool(ctx.get("nav_cancel_on_arrival", True)):
+            return False
+        if self._nav_cancel_sent or self._nav_goal_handle is None or self.waiting:
+            return False
+        pos_err, _ = self._pose_error(ctx)
+        if pos_err is None:
+            return False
+        return pos_err <= float(ctx.get("nav_pos_tolerance", self.POS_TOL_M))
 
     def _pose_error(self, ctx):
         """(position error m, |yaw error| rad) between the current base pose and
