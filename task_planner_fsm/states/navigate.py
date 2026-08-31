@@ -3,10 +3,14 @@ from ..utils.costmap_utils import (
     base_standoff_goal,
     await_costmap,
     nav_bt_xml,
+    plan_wall_partitions,
     reachable_wall_segments,
     publish_wall_segment_markers,
     set_arm_footprint_enabled,
+    wall_facing_yaw,
 )
+from ..utils.wall_approach import should_approach_partition, should_face_wall
+from ..utils.wall_partitioning import sweep_line_order
 import rclpy
 import rclpy.time
 from rclpy.action import ActionClient
@@ -129,6 +133,16 @@ class NavigateToTarget(State):
                         return  # wall entirely unreachable -> error set
                     self._target_clamped = True
 
+            # Arm-driven sweep: approach the scan pose of the FIRST partition
+            # ScanWall will sweep, not the start of the wall. The base then
+            # arrives already parked for that partition and ScanWall skips its
+            # transit -- which matters because by then the arm is unfolded and
+            # Nav2 can barely manoeuvre at the scan standoff (ARM_SWEEP_PLAN §9).
+            # None falls back to the wall-start goal below.
+            partition_goal = None
+            if ctx.get("scan_phase") != 2 and should_approach_partition(ctx):
+                partition_goal = self._first_partition_pose(ctx, wall_data, target_point)
+
             if math.dist(target_point[:2], wall_data[0][:2]) <= math.dist(
                 target_point[:2], wall_data[1][:2]
             ):
@@ -136,10 +150,35 @@ class NavigateToTarget(State):
             else:
                 other_point = wall_data[0]
             
-            # Orientation
-            dx = other_point[0] - target_point[0]
-            dy = other_point[1] - target_point[1]
-            yaw = atan2(dy, dx)
+            # Orientation. Two conventions, one per sweep architecture:
+            #  - base-driven sweep: head ALONG the wall (start -> far end), so the
+            #    base can drive down it with the sensor plate on its left flank.
+            #  - arm-driven sweep (see should_face_wall): face INTO the wall, so
+            #    the parked base is square to it and the arm sweeps symmetrically
+            #    about its centreline. ScanWall then parks each partition at this
+            #    same heading, so approaching at it here means the turret is
+            #    already right when the first partition transit is skipped as a
+            #    no-op. See ARM_SWEEP_PLAN §7.A.
+            #
+            # The arm pose must match: ArmUnfolding picks it via the same
+            # helper, so the plate always ends up aimed at the wall.
+            yaw = None
+            if partition_goal is not None:
+                # The partition pose already carries the wall-facing yaw, turret
+                # offset included -- taking it wholesale keeps position and
+                # heading from being derived by two different code paths.
+                yaw = partition_goal[2]
+            elif should_face_wall(ctx):
+                yaw = wall_facing_yaw(ctx, self.name)
+                if yaw is None:
+                    node.get_logger().warn(
+                        f"[{self.name}] Arm-sweep mode but no wall normal; falling "
+                        f"back to the along-wall heading."
+                    )
+            if yaw is None:
+                dx = other_point[0] - target_point[0]
+                dy = other_point[1] - target_point[1]
+                yaw = atan2(dy, dx)
             qz = sin(yaw / 2.0)
             qw = cos(yaw / 2.0)
 
@@ -150,6 +189,8 @@ class NavigateToTarget(State):
             # along the exterior normal (-inward_normal) to a safe standoff.
             if ctx.get("scan_phase") == 2:
                 goal_xy = ctx.get("selected_base")
+            elif partition_goal is not None:
+                goal_xy = (partition_goal[0], partition_goal[1])
             else:
                 goal_xy = self._base_standoff_goal(ctx, target_point)
 
@@ -319,6 +360,39 @@ class NavigateToTarget(State):
             )
             ctx["target_scan_point"] = best
         return best
+
+    def _first_partition_pose(self, ctx, wall_data, target_point):
+        """Base scan pose of the first partition ScanWall will sweep, or ``None``.
+
+        ``None`` means "no partition plan available, use the legacy wall-start
+        goal" -- either the costmap has not arrived (clamping was skipped too, so
+        the raw target is all anyone has) or no partition could be placed, which
+        :func:`plan_wall_partitions` has already explained in the log. Falling
+        back costs an extra ScanWall transit; it never scans the wrong place.
+
+        The near/far ordering comes from :func:`sweep_line_order`, the same
+        helper ScanWall uses, so partition 1 here IS partition 1 there.
+        """
+        node = ctx["node"]
+        near_end, far_end = sweep_line_order(wall_data, target_point)
+        plan = plan_wall_partitions(ctx, self.name, near_end, far_end)
+        if plan is None:
+            node.get_logger().warn(
+                f"[{self.name}] No costmap yet to partition the wall; approaching "
+                f"its reachable start instead (ScanWall will transit to partition 1)."
+            )
+            return None
+        partitions, poses = plan
+        if not poses:
+            return None      # plan_wall_partitions logged the reason
+
+        (px, py, _), (qx, qy, _) = partitions[0]
+        node.get_logger().info(
+            f"[{self.name}] Approaching partition 1/{len(poses)} directly: sweep "
+            f"({px:.2f}, {py:.2f})->({qx:.2f}, {qy:.2f}), base scan pose "
+            f"({poses[0][0]:.2f}, {poses[0][1]:.2f}) at yaw {poses[0][2]:.2f} rad."
+        )
+        return poses[0]
 
     # Fine-correction servo (last few decimeters, below Nav2's goal tolerance).
     SERVO_RATE_HZ = 10.0
