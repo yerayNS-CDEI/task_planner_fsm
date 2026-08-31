@@ -27,6 +27,11 @@ class GeometryReconstruction(State):
         self.latest_map = None
         self.map_wait_start = None
 
+        # Bounded wait for a walls YAML produced by THIS run (see
+        # _wall_file_is_fresh); _logged keeps the poll from spamming the log.
+        self._walls_wait_start = None
+        self._walls_wait_logged = False
+
         # Wall-marker publisher.
         self.marker_pub = None
 
@@ -161,6 +166,8 @@ class GeometryReconstruction(State):
         self._declare_params(node)
         self.latest_map = None
         self.map_wait_start = node.get_clock().now()
+        self._walls_wait_start = None
+        self._walls_wait_logged = False
         self.future = None
 
         # Latched-map QoS so we receive the last published OccupancyGrid. Only
@@ -300,18 +307,23 @@ class GeometryReconstruction(State):
         ``z_min`` is used for the endpoint z (falling back to the default wall z),
         while the operator still supplies real scan heights in ComputeWallPoints.
 
-        Returns ``(walls, columns)`` (columns always empty), or ``None`` when no
-        walls are available so the caller flags an error.
+        Returns ``(walls, columns)`` (columns always empty), or ``None`` when the
+        file is not ready yet (keep waiting) or an error was flagged.
         """
         node = ctx["node"]
 
-        detections_dir = self._resolve_detections_dir(ctx)
-        yaml_path = (
-            os.path.join(detections_dir, "detected_walls.yaml")
-            if detections_dir is not None
-            else None
-        )
-        raw_walls = self._load_walls_from_yaml(node, yaml_path) if yaml_path else []
+        yaml_path = self._resolve_wall_file_path(ctx)
+        if yaml_path is None:
+            node.get_logger().error(
+                f"[{self.name}] Could not resolve a detected_walls.yaml path."
+            )
+            ctx["error_triggered"] = True
+            return None
+
+        if not self._wall_file_is_fresh(ctx, yaml_path):
+            return None      # still waiting, or the wait already errored out
+
+        raw_walls = self._load_walls_from_yaml(node, yaml_path)
         if not raw_walls:
             node.get_logger().error(
                 f"[{self.name}] No walls available from detected_walls.yaml "
@@ -560,9 +572,12 @@ class GeometryReconstruction(State):
         """
         node = ctx["node"]
 
-        detections_dir = self._resolve_detections_dir(ctx)
-        if detections_dir is not None:
-            yaml_path = os.path.join(detections_dir, "detected_walls.yaml")
+        # Same file the scan walls come from. Resolving this independently used to
+        # land on <install>/share/navi_wall/rgb_detections/detected_walls.yaml —
+        # whatever an earlier run left in the install tree — so objects were
+        # associated against stale walls rather than the ones being scanned.
+        yaml_path = self._resolve_wall_file_path(ctx)
+        if yaml_path is not None:
             walls = self._load_walls_from_yaml(node, yaml_path)
             if walls:
                 node.get_logger().info(
@@ -578,6 +593,102 @@ class GeometryReconstruction(State):
                 f"{len(walls)} wall(s) from ctx['verified_walls'] for object association."
             )
         return walls
+
+    def _resolve_wall_file_path(self, ctx):
+        """Absolute path of the walls YAML to read.
+
+        Prefers ``geometry_reconstruction_wall_file_path`` — set by StateMachine
+        to the very path it hands wall_detection_node, so writer and reader
+        cannot drift. Falls back to ``<detections_dir>/detected_walls.yaml`` for
+        setups that bootstrap this state without going through StateMachine.
+        """
+        override = ctx.get("geometry_reconstruction_wall_file_path")
+        if override:
+            return os.path.expanduser(str(override))
+        detections_dir = self._resolve_detections_dir(ctx)
+        if detections_dir is None:
+            return None
+        return os.path.join(detections_dir, "detected_walls.yaml")
+
+    def _wall_file_is_fresh(self, ctx, yaml_path):
+        """True once a walls file written by THIS run is on disk.
+
+        Guards against reading a stale detected_walls.yaml — a previous session's
+        file, a different Gazebo world's, or one an earlier run left behind in the
+        install tree. Those loads were silent: plausible-looking walls, just from
+        somewhere else.
+
+        Returns False while waiting (the caller returns None and run() retries)
+        and flags an error once ``geometry_reconstruction_wall_file_timeout_s``
+        elapses. Set ``geometry_reconstruction_require_fresh_walls`` False to
+        accept whatever is on disk (e.g. replaying a saved capture on purpose).
+        """
+        node = ctx["node"]
+        if not bool(ctx.get("geometry_reconstruction_require_fresh_walls", True)):
+            return True
+
+        timeout = float(ctx.get("geometry_reconstruction_wall_file_timeout_s", 120.0))
+        # Detection starts in ObjectID, before this state runs, so the reference
+        # has to be FSM start rather than this state's entry — otherwise a file
+        # written during ObjectID would be rejected as stale.
+        started = float(ctx.get("fsm_start_wall_time", 0.0))
+        now = time.time()
+        if self._walls_wait_start is None:
+            self._walls_wait_start = now
+
+        try:
+            mtime = os.path.getmtime(yaml_path)
+        except OSError:
+            mtime = None
+
+        if mtime is not None and mtime >= started:
+            return True
+
+        if now - self._walls_wait_start < timeout:
+            if not self._walls_wait_logged:
+                self._walls_wait_logged = True
+                if mtime is None:
+                    detail = "not written yet"
+                else:
+                    detail = (
+                        f"last written {started - mtime:.0f}s before this run started, "
+                        f"so it is from an earlier session/environment"
+                    )
+                node.get_logger().info(
+                    f"[{self.name}] Waiting up to {timeout:.0f}s for wall_detection_node "
+                    f"to save '{yaml_path}' ({detail})."
+                )
+            return False
+
+        # The detector reaches us two ways: ObjectID launches it directly
+        # (_procs["wall_detection"]), and move_robot.launch.py starts one of its
+        # own as part of the nav stack (_procs["nav_sim"]). Either counts.
+        procs = ctx.get("_procs") or {}
+        alive = {
+            name: p
+            for name, p in ((n, procs.get(n)) for n in ("wall_detection", "nav_sim"))
+            if p is not None and p.poll() is None
+        }
+        if not alive:
+            hint = (
+                "no process that would run wall_detection_node is alive (neither "
+                "ObjectID's launch nor the nav stack). Check that the FSM actually "
+                "started one."
+            )
+        else:
+            owners = ", ".join(f"{n} pid={p.pid}" for n, p in alive.items())
+            hint = (
+                f"wall_detection_node should be running under [{owners}] but nothing "
+                f"has been saved to this path. It detects from RTAB-Map's latched "
+                f"/rtabmap/cloud_map, so check that a mapped environment is loaded "
+                f"and that wall_file_path was forwarded to the detector."
+            )
+        node.get_logger().error(
+            f"[{self.name}] No walls file produced by this run at '{yaml_path}' after "
+            f"{timeout:.0f}s. Refusing to load a stale one — {hint}"
+        )
+        ctx["error_triggered"] = True
+        return False
 
     def _load_walls_from_yaml(self, node, yaml_path):
         if not os.path.isfile(yaml_path):
