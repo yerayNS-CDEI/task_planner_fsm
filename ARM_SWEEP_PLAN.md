@@ -1686,8 +1686,7 @@ Verifying the workflow visually is most of the value of the Gazebo phase:
 > | leg | who | why |
 > |---|---|---|
 > | approach: plate out to `scan_wall_plate_offset + sweep_approach_retract_m`, **normal only, no lateral move** | the FSM, via `_send_arm_to_clearance` | the move that has always worked |
-> | traverse: sideways to the partition start, still backed off | executor | carries the WHOLE lateral move, held clear of the wall so it never scrubs |
-> | plunge: close onto the sweep plane | executor | short, pure wall-normal |
+> | traverse: to the partition start AND onto the sweep plane, one diagonal line | executor | carries the WHOLE lateral move; safe as a diagonal because the approach plane is the further of the two, so wall distance decreases monotonically and never drops below `sweep_scan_standoff_m`. Was two legs (lateral, then a pure-normal `plunge`); merged to drop a stop-settle-accelerate cycle between two collision-free legs |
 > | sweep: cross the partition | executor | the scan; must be a straight constant-speed Cartesian line |
 > | retract: back off by the same margin | executor | symmetric with the approach; clears the plate before the base moves |
 >
