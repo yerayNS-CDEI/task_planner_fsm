@@ -9,7 +9,7 @@ from ..utils.costmap_utils import (
     publish_wall_segment_markers,
     wall_parallel_goal,
 )
-from ..utils.wall_partitioning import sweep_line_order
+from ..utils.wall_partitioning import next_backoff_length, sweep_line_order
 from ..utils.wall_approach import unfolded_pose_name
 from arm_control.action import SweepLine
 from nav2_msgs.action import NavigateToPose
@@ -1432,6 +1432,91 @@ class ScanWall(State):
         """
         return bool(ctx.get("sweep_use_arm", True))
 
+    # Failures that mean "this partition is too long for the arm", as opposed to
+    # a transient or a setup problem. Only these are worth re-cutting for: the
+    # arm could not reach along the partition, so a shorter one might.
+    LENGTH_FAILURE_REASONS = frozenset({
+        "ik_unreachable", "near_singular", "joint_velocity", "branch_discontinuity",
+    })
+
+    def _shorten_failed_partition(self, ctx, reason):
+        """Re-cut the reachable segment a rejected partition came from, shorter.
+
+        ARM_SWEEP_PLAN §7.B: a partition the validator refuses is NOT halved and
+        NOT skipped. The affected reachable segment is re-partitioned as a whole at
+        a maximum length reduced by ``partition_length_backoff_m``, so equal
+        lengths, full coverage and the configured overlap all survive. Skipping
+        instead — which is what happened before this existed — silently drops that
+        stretch of wall from the scan.
+
+        Returns True when the segment was re-cut and the sweep should be retried,
+        False when it cannot be (floor reached, or the failure is not a
+        length problem) and the caller should fall back to skipping.
+        """
+        node = ctx["node"]
+        if reason not in self.LENGTH_FAILURE_REASONS:
+            return False
+        sources = ctx.get("current_wall_partition_sources") or []
+        if self._seg_idx >= len(sources):
+            return False
+        source = sources[self._seg_idx]
+
+        segments = ctx.get("current_wall_segments") or []
+        if source >= len(segments):
+            return False
+
+        current = self._segment_max_len.get(
+            source, float(ctx.get("partition_max_length_m", 0.8))
+        )
+        shorter = next_backoff_length(
+            current,
+            float(ctx.get("partition_length_backoff_m", 0.20)),
+            float(ctx.get("partition_min_length_m", 0.20)),
+        )
+        if shorter is None:
+            node.get_logger().error(
+                f"[{self.name}] Partition {self._seg_idx + 1} failed [{reason}] and "
+                f"its segment is already cut to {current:.2f} m "
+                f"(partition_min_length_m); reporting this stretch of wall as "
+                f"unreachable rather than shortening further."
+            )
+            return False
+
+        plan = plan_wall_partitions(
+            ctx, self.name, self._sweep_from, self._sweep_to,
+            segments=[segments[source]], max_len=shorter,
+        )
+        if plan is None or not plan[0]:
+            node.get_logger().error(
+                f"[{self.name}] Re-cutting segment {source} at {shorter:.2f} m "
+                f"produced nothing; skipping it."
+            )
+            return False
+        new_partitions, new_poses = plan
+
+        # Splice the replacements in where the old ones were, so the partitions
+        # stay in sweep order and every other segment is untouched.
+        old_sources = list(sources)
+        first = old_sources.index(source)
+        last = len(old_sources) - 1 - old_sources[::-1].index(source)
+        self._segments = (self._segments[:first] + list(new_partitions)
+                          + self._segments[last + 1:])
+        self._scan_poses = ((self._scan_poses or [])[:first] + list(new_poses)
+                            + (self._scan_poses or [])[last + 1:])
+        ctx["current_wall_partition_sources"] = (
+            old_sources[:first] + [source] * len(new_partitions) + old_sources[last + 1:]
+        )
+        self._segment_max_len[source] = shorter
+        self._seg_idx = first
+
+        node.get_logger().warn(
+            f"[{self.name}] Partition failed [{reason}]; re-cut its segment at "
+            f"{shorter:.2f} m into {len(new_partitions)} partition(s) "
+            f"(was {last - first + 1}) and retrying from partition {first + 1}. "
+            f"Coverage of this stretch is preserved."
+        )
+        return True
+
     def _plan_line(self, ctx):
         """Segments to sweep for this scan line, with a base scan pose each.
 
@@ -2227,6 +2312,14 @@ class ScanWall(State):
                 self._segments_ok += 1
                 self._last_swept_point = seg_end
             else:
+                # "Too long for the arm" is recoverable: re-cut this partition's
+                # SEGMENT shorter and sweep it again, rather than dropping that
+                # stretch of wall (ARM_SWEEP_PLAN §7.B). _shorten_failed_partition
+                # rewinds _seg_idx itself when it succeeds.
+                if arm_sweep and self._shorten_failed_partition(ctx, reason):
+                    self._line_idx = 0
+                    self._seg_phase = "transit_clear"
+                    return
                 node.get_logger().warn(
                     f"[{self.name}] Segment {self._seg_idx + 1} sweep did not succeed "
                     f"(status={status}); skipping to the next segment."
