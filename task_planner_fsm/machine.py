@@ -1,6 +1,55 @@
+import os
 import time
 import traceback
 from task_planner_fsm.states.proc_utils import install_global_cleanup
+
+# Where wall_detection_node writes detected_walls.yaml, and where
+# GeometryReconstruction reads it back.
+#
+# This deliberately lives OUTSIDE the install space. navi_wall's CMakeLists
+# installs rgb_detections/ from source, so the detector's runtime output used to
+# land in the install tree: a directory that is not cleared between runs and is
+# shared by every environment the robot is driven in. A read before the detector
+# had saved picked up whatever the last run left there — a different building, a
+# different Gazebo world, or a capture from weeks earlier. Intermittent, and
+# silent: the markers just showed the wrong walls.
+#
+# Split by sim/real as well, so a simulation run can never read walls left over
+# from the robot (or vice versa).
+WALL_RUN_DIR = "/tmp/navi_wall_run"
+
+
+def wall_file_path(sim: bool) -> str:
+    """Absolute path to this run's detected_walls.yaml (see WALL_RUN_DIR)."""
+    return os.path.join(WALL_RUN_DIR, "sim" if sim else "real", "detected_walls.yaml")
+
+
+def seed_wall_detection_ctx(ctx) -> None:
+    """Install the wall-detection defaults: launch command, walls path, run clock.
+
+    Called from BOTH FSMNode.__init__ (before the initial-state bootstrap, which
+    needs ``wall_detection_cmd`` to launch the detector when it stands in for
+    ObjectID) and StateMachine.__init__ (for callers that build a machine
+    directly). All setdefault, so whichever runs first wins and the second is a
+    no-op.
+
+    One source of truth for the walls file: the same absolute path is handed to
+    the detector to write and stored in ctx for GeometryReconstruction to read,
+    so the two cannot drift apart.
+    """
+    sim = bool(ctx.get('sim', False))
+    sim_value = 'true' if sim else 'false'
+    walls_yaml = wall_file_path(sim)
+    ctx.setdefault('geometry_reconstruction_wall_file_path', walls_yaml)
+    ctx.setdefault('wall_detection_cmd', [
+        'ros2', 'launch', 'navi_wall', 'wall_detection.launch.py',
+        f'use_sim_time:={sim_value}',
+        f'wall_file_path:={walls_yaml}',
+    ])
+    # Wall-clock reference for the staleness guard: a detected_walls.yaml older
+    # than this was not produced by this run and must not be trusted.
+    ctx.setdefault('fsm_start_wall_time', time.time())
+
 
 class StateMachine:
     def __init__(self, states, initial_state, ctx):
@@ -33,10 +82,9 @@ class StateMachine:
         # verifies/refines the walls against the STATIC localization-mode map (no
         # flicker); torn down when ObjectID exits. (aggregate defaults to true in
         # the launch file.)
-        self.ctx.setdefault('wall_detection_cmd', [
-            'ros2', 'launch', 'navi_wall', 'wall_detection.launch.py',
-            f'use_sim_time:={sim_value}',
-        ])
+        # Usually already seeded by FSMNode.__init__ before the initial-state
+        # bootstrap; this covers callers that construct a machine directly.
+        seed_wall_detection_ctx(self.ctx)
         install_global_cleanup(self.ctx)
         self.current_state.on_enter(self.ctx)
         self.ctx["is_initial_entry"] = False

@@ -19,7 +19,7 @@ import tf2_ros
 from rclpy.duration import Duration
 from std_msgs.msg import Bool, Float32MultiArray, String
 
-from task_planner_fsm.machine import StateMachine
+from task_planner_fsm.machine import StateMachine, seed_wall_detection_ctx
 from task_planner_fsm.states import (
     ArmFolding,
     ArmUnfolding,
@@ -157,6 +157,7 @@ NAV_SIM_REQUIRED_START_STATES = {
     if s not in {"Finished", "Error"}
 }
 
+
 # Fallback walls, only used when navi_wall's detected_walls.yaml cannot be
 # loaded during bootstrap. The default wall source is the YAML (see
 # _load_bootstrap_walls / GeometryReconstruction._load_detected_walls_from_yaml).
@@ -252,6 +253,13 @@ class RobotFSMNode(Node):
                 continue
             self.ctx.setdefault(pname, param.value)
             self.get_logger().info(f"[FSM] ctx param override: {pname}={param.value!r}")
+
+        # Wall-detection defaults MUST be seeded before the bootstrap: when the
+        # FSM starts at a state past ObjectID, the bootstrap stands in for it and
+        # launches the detector itself, which needs wall_detection_cmd to already
+        # be in ctx. StateMachine seeds these too, but it is constructed after
+        # the bootstrap runs.
+        seed_wall_detection_ctx(self.ctx)
 
         # Build test context for non-default initial state.
         self._bootstrap_context_for_initial_state(initial_state, scan_phase)
@@ -822,6 +830,9 @@ class RobotFSMNode(Node):
                     f"use_sim_time:={sim_value}",
                     "hybrid_sim:=false",
                     f"planner_backend:={planner_backend}",
+                    # This launch starts wall_detection_node itself, so it must
+                    # write the very file GeometryReconstruction reads back.
+                    f"wall_file_path:={self.ctx['geometry_reconstruction_wall_file_path']}",
                     # Push out launch's own SIGKILL deadline so ros2_control survives
                     # long enough to retract the column on shutdown.
                     *ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
