@@ -640,3 +640,384 @@ def wall_parallel_goal(ctx, state_name: str, goal_xy, current_xy) -> Tuple[float
     )
     publish_base_goal_markers(ctx, (gx, gy), (px, py), "wall-parallel transit")
     return (px, py)
+
+
+# ----------------------------------------------------------------------------
+# Arm-driven sweep: fixed scan pose per partition (ARM_SWEEP_PLAN §7.A)
+# ----------------------------------------------------------------------------
+# The base-driven sweep drives ALONG the wall, so its Nav2 goal yaw is the
+# along-wall heading and the plate rides on the robot's left flank. The
+# arm-driven sweep is different in kind: the base parks once, centred on the
+# partition, and the arm sweeps sideways across it. That only works if the robot
+# faces the wall square-on, so the partition is symmetric about the arm's
+# centreline -- hence `turret_link +X || n_wall` rather than the along-wall yaw
+# used by NavigateToTarget.
+
+# Nav2's base frame differs by platform: the omni config drives `turret_footprint`
+# (the turret projected to the ground, so its yaw IS turret_link's), the diff
+# config drives `base_footprint` (the chassis, with turret_joint free on top).
+# The goal yaw has to be expressed in whichever frame Nav2 is steering.
+DEFAULT_NAV_BASE_FRAME = "turret_footprint"
+TURRET_FRAME = "turret_link"
+
+
+def _nav_base_frame(ctx) -> str:
+    """Frame Nav2 steers (its ``robot_base_frame``), ctx-overridable."""
+    return str(ctx.get("nav_base_frame", DEFAULT_NAV_BASE_FRAME))
+
+
+def turret_yaw_offset(ctx, state_name: str) -> float:
+    """Yaw of ``turret_link`` expressed in Nav2's base frame, in radians.
+
+    Zero when Nav2 already steers the turret (omni: ``turret_footprint`` is
+    ``turret_link`` projected to the ground, same yaw). Non-zero on the diff
+    config, where Nav2 steers the chassis and ``turret_joint`` sits between the
+    two -- there the commanded chassis yaw must be reduced by this offset for
+    the turret to end up pointing at the wall.
+
+    Looked up from TF rather than assumed, per ARM_SWEEP_PLAN §7.A: the two +X
+    axes coincide only when the turret happens to be at zero.
+    """
+    base_frame = _nav_base_frame(ctx)
+    if base_frame == "turret_footprint":
+        return 0.0
+
+    tf_buffer = ctx.get("tf_buffer")
+    if tf_buffer is None:
+        ctx["node"].get_logger().warn(
+            f"[{state_name}] No TF buffer; assuming {TURRET_FRAME} and {base_frame} "
+            f"share a heading. Verify the turret is at zero before trusting the "
+            f"scan-pose orientation."
+        )
+        return 0.0
+    try:
+        import rclpy.time  # local: keeps this module importable without a node
+        tf = tf_buffer.lookup_transform(
+            base_frame, TURRET_FRAME, rclpy.time.Time(), Duration(seconds=0.5)
+        )
+    except Exception as e:
+        ctx["node"].get_logger().warn(
+            f"[{state_name}] {base_frame}->{TURRET_FRAME} lookup failed ({e}); "
+            f"assuming a zero turret offset."
+        )
+        return 0.0
+    q = tf.transform.rotation
+    return math.atan2(
+        2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    )
+
+
+def wall_facing_yaw(ctx, state_name: str) -> Optional[float]:
+    """Nav2 goal yaw that leaves ``turret_link +X`` pointing INTO the wall.
+
+    The heading the arm-driven sweep parks at, shared by NavigateToTarget and
+    ScanWall so both approach a wall the same way. Returns ``None`` when the
+    wall normal is unknown.
+
+    Contrast with the base-driven sweep, whose goal yaw is the ALONG-wall
+    heading (see NavigateToTarget): there the base drives down the wall with the
+    sensor plate on its left flank. Facing the wall square-on instead is what
+    makes a parked arm sweep symmetric about the robot's centreline.
+    """
+    outward = _outward_dir(ctx)
+    if outward is None:
+        ctx["node"].get_logger().error(
+            f"[{state_name}] No inward normal for wall index "
+            f"{ctx.get('current_wall_index')}; cannot face the wall."
+        )
+        return None
+    ox, oy = outward
+    yaw = math.atan2(-oy, -ox) - turret_yaw_offset(ctx, state_name)
+    return math.atan2(math.sin(yaw), math.cos(yaw))   # wrap to [-pi, pi]
+
+
+def partition_scan_pose(ctx, state_name: str, p_start, p_end):
+    """Nav2 goal ``(x, y, yaw)`` for the arm-driven sweep of one partition.
+
+    Geometry, per ARM_SWEEP_PLAN §7.A::
+
+        p_center = 0.5 * (p_start + p_end)
+        n_wall   = -_outward_dir(ctx)              # from free space INTO the wall
+        position = p_center + standoff * outward   # back off along the normal
+        yaw      = heading of n_wall, minus the turret offset
+
+    The standoff is ``partition_base_standoff_m``, a dedicated knob: it is a
+    property of arm reach and turret/column geometry, not of costmap inflation,
+    so it is deliberately NOT derived from ``base_goal_max_offset`` or the plate
+    retraction parameters.
+
+    Returns ``None`` when the wall normal is unknown -- unlike the base-driven
+    path there is no sane fallback, because a partition swept from a guessed
+    side is worse than one not swept at all.
+    """
+    node = ctx["node"]
+    from .wall_partitioning import partition_centre_and_tangent
+
+    outward = _outward_dir(ctx)
+    if outward is None:
+        node.get_logger().error(
+            f"[{state_name}] No inward normal for wall index "
+            f"{ctx.get('current_wall_index')}; cannot place an arm-sweep scan pose."
+        )
+        return None
+    ox, oy = outward
+
+    try:
+        centre, tangent = partition_centre_and_tangent(p_start, p_end)
+    except ValueError as e:
+        node.get_logger().error(f"[{state_name}] Degenerate partition: {e}")
+        return None
+
+    # The partition tangent and the wall normal both come from wall geometry, so
+    # they must be perpendicular. A large residual means the partition and the
+    # normal describe different walls (stale current_wall_index, or endpoints
+    # from another segment) -- worth shouting about, since every downstream
+    # sweep direction depends on it.
+    skew = abs(tangent[0] * ox + tangent[1] * oy)
+    tol = float(ctx.get("partition_normal_skew_tol", 0.15))
+    if skew > tol:
+        node.get_logger().warn(
+            f"[{state_name}] Partition tangent is not perpendicular to the wall "
+            f"normal (|cos| = {skew:.3f} > {tol:.2f}); the partition and the "
+            f"normal may belong to different walls."
+        )
+
+    standoff = float(ctx.get("partition_base_standoff_m", _min_standoff(ctx)))
+    gx = centre[0] + ox * standoff
+    gy = centre[1] + oy * standoff
+
+    # Validate the cell, but only ever search FURTHER OUT along the same normal.
+    # A 2D search (as base_standoff_goal does for corners) would slide the base
+    # along the wall, decentring it from the partition -- the arm would then be
+    # asked to reach past its half-length at one end. Better to fail loudly.
+    costmap = ctx.get("global_costmap")
+    cost_threshold, max_offset = _search_knobs(ctx)
+    if costmap is not None:
+        cost = _cost_at(costmap, gx, gy)
+        if cost is None or not (0 <= cost < cost_threshold):
+            hit = nearest_free_along(
+                costmap, centre[0], centre[1], ox, oy,
+                max_dist=max_offset, cost_threshold=cost_threshold,
+                min_dist=standoff,
+            )
+            if hit is None:
+                node.get_logger().warn(
+                    f"[{state_name}] Scan pose ({gx:.2f}, {gy:.2f}) is not standable "
+                    f"and nothing free lies further out within {max_offset:.2f} m; "
+                    f"sending it anyway so Nav2 rejects it rather than silently "
+                    f"scanning from the wrong place."
+                )
+            else:
+                gx, gy, pushed = hit
+                node.get_logger().info(
+                    f"[{state_name}] Scan pose was blocked; pushed {pushed:.2f} m out "
+                    f"along the normal to ({gx:.2f}, {gy:.2f}) (still centred on the "
+                    f"partition)."
+                )
+
+    yaw = wall_facing_yaw(ctx, state_name)
+    if yaw is None:      # unreachable: _outward_dir already succeeded above
+        return None
+
+    node.get_logger().info(
+        f"[{state_name}] Partition scan pose: centre ({centre[0]:.2f}, "
+        f"{centre[1]:.2f}) + {standoff:.2f} m standoff -> ({gx:.2f}, {gy:.2f}), "
+        f"yaw {yaw:.2f} rad ({_nav_base_frame(ctx)} facing the wall)."
+    )
+    return (gx, gy, yaw)
+
+
+def publish_partition_markers(ctx, partitions, scan_poses=None):
+    """RViz markers for the arm-sweep partitions and their base scan poses.
+
+    Published latched on ``/fsm/partition_markers`` in a separate namespace from
+    ``publish_wall_segment_markers`` so both can be shown at once: the reachable
+    segments (that helper) and the partitions they were cut into (this one).
+
+    ``scan_poses`` is an optional list of ``(x, y, yaw)`` aligned with
+    ``partitions``; each becomes a base-position sphere plus an arrow along the
+    commanded heading. The arrow should come out ANTIPARALLEL to the wall
+    detector's own normal arrow -- that is the visual check for ARM_SWEEP_PLAN
+    §7.A's orientation requirement.
+    """
+    node = ctx["node"]
+    pub = ctx.get("_partition_marker_pub")
+    if pub is None:
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        pub = node.create_publisher(MarkerArray, "/fsm/partition_markers", qos)
+        ctx["_partition_marker_pub"] = pub
+
+    stamp = node.get_clock().now().to_msg()
+    markers = []
+
+    def _base(mid, ns, mtype):
+        m = Marker()
+        m.header.frame_id = "map"
+        m.header.stamp = stamp
+        m.ns = ns
+        m.id = mid
+        m.type = mtype
+        m.action = Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.color.a = 0.9
+        m.lifetime = Duration(seconds=0).to_msg()
+        return m
+
+    # Alternating shades so adjacent partitions (which overlap by design) stay
+    # visually separable where they meet.
+    from geometry_msgs.msg import Point
+    for i, (p_start, p_end) in enumerate(partitions):
+        bar = _base(i, "partitions", Marker.LINE_LIST)
+        bar.scale.x = 0.06
+        shade = 1.0 if i % 2 == 0 else 0.45
+        bar.color.r, bar.color.g, bar.color.b = 0.1, shade, 1.0 - shade
+        # Drawn just above the reachable-segment bars so the two are readable
+        # together rather than z-fighting.
+        for p in (p_start, p_end):
+            bar.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.20))
+        markers.append(bar)
+
+    for i, pose in enumerate(scan_poses or []):
+        x, y, yaw = pose
+        dot = _base(i, "scan_pose", Marker.SPHERE)
+        dot.pose.position.x, dot.pose.position.y, dot.pose.position.z = x, y, 0.1
+        dot.scale.x = dot.scale.y = dot.scale.z = 0.18
+        dot.color.r, dot.color.g, dot.color.b = 1.0, 0.55, 0.0
+        markers.append(dot)
+
+        arrow = _base(i, "scan_heading", Marker.ARROW)
+        arrow.pose.position.x, arrow.pose.position.y, arrow.pose.position.z = x, y, 0.1
+        arrow.pose.orientation.z = math.sin(yaw / 2.0)
+        arrow.pose.orientation.w = math.cos(yaw / 2.0)
+        arrow.scale.x, arrow.scale.y, arrow.scale.z = 0.6, 0.06, 0.06
+        arrow.color.r, arrow.color.g, arrow.color.b = 1.0, 0.55, 0.0
+        markers.append(arrow)
+
+    pub.publish(MarkerArray(markers=markers))
+
+
+def plan_wall_partitions(ctx, state_name: str, p_start, p_end, segments=None,
+                         max_len=None):
+    """Cut a scan line into arm-sweepable partitions and place a base scan pose
+    on each, memoised in ``ctx``.
+
+    The whole two-stage split of ARM_SWEEP_PLAN §7.A in one call:
+    :func:`reachable_wall_segments` (obstacle-driven) ->
+    ``wall_partitioning.partition_segments`` (geometric) ->
+    :func:`partition_scan_pose` per partition, publishing both marker sets.
+
+    Returns two aligned lists ``(partitions, scan_poses)``. ``None`` means the
+    global costmap has not arrived yet and the caller should poll; ``([], [])``
+    means the line is reachable nowhere, or that no partition of it has a usable
+    scan pose.
+
+    **Memoised on purpose.** NavigateToTarget drives straight to
+    ``scan_poses[0]`` and ScanWall then skips that transit as a no-op, which only
+    works if the two agree on what partition 1 is. Recomputing per state (and
+    per line height) invites them to disagree by one costmap update. Caching also
+    honours §3.6: the split is height-independent, so pinning it once guarantees
+    identical partition boundaries at every height -- which is what makes the GPR
+    lines stitch.
+
+    The key pins the line, the wall (its normal decides which side the standoff
+    is on) and every knob that changes the split, so a new wall or a retuned
+    parameter recomputes rather than silently reusing a stale plan.
+
+    Pass ``segments`` to supply the reachable split yourself and skip the costmap
+    stage -- how a caller degrades to partitioning the raw line when the costmap
+    never arrives. Such a plan is deliberately **not** cached: it is worse than
+    the one a costmap would give, and caching it would poison every later line.
+    """
+    node = ctx["node"]
+    from .wall_partitioning import partition_segment
+
+    if max_len is None:
+        max_len = float(ctx.get("partition_max_length_m", 0.8))
+    max_len = float(max_len)
+    overlap = float(ctx.get("partition_overlap_m", 0.05))
+    standoff = float(ctx.get("partition_base_standoff_m", _min_standoff(ctx)))
+
+    key = (
+        round(float(p_start[0]), 3), round(float(p_start[1]), 3),
+        round(float(p_end[0]), 3), round(float(p_end[1]), 3),
+        ctx.get("current_wall_index"),
+        max_len, overlap, standoff,
+    )
+    degraded = segments is not None
+    cached = ctx.get("_partition_plan")
+    if not degraded and cached is not None and cached[0] == key:
+        ctx["current_wall_partition_sources"] = cached[3]
+        return cached[1], cached[2]
+
+    if not degraded:
+        segments = reachable_wall_segments(ctx, p_start, p_end)
+        if segments is None:
+            return None                  # no costmap yet -- the caller polls
+        if not segments:
+            node.get_logger().error(
+                f"[{state_name}] No portion of the wall is reachable within arm "
+                f"reach (base_goal_max_offset); cannot scan this wall."
+            )
+            return [], []
+
+    ctx["current_wall_segments"] = segments
+    publish_wall_segment_markers(ctx, segments)
+    node.get_logger().info(
+        f"[{state_name}] Wall split into {len(segments)} reachable segment(s): "
+        + "; ".join(
+            f"({s[0]:.2f}, {s[1]:.2f})->({e[0]:.2f}, {e[1]:.2f})" for s, e in segments
+        )
+    )
+
+    partitions, sources = [], []
+    for index, (seg_start, seg_end) in enumerate(segments):
+        cut = partition_segment(seg_start, seg_end, max_len, overlap)
+        partitions.extend(cut)
+        sources.extend([index] * len(cut))
+    if not partitions:
+        node.get_logger().error(
+            f"[{state_name}] Partitioning produced nothing from {len(segments)} "
+            f"reachable segment(s)."
+        )
+        return [], []
+
+    # A partition whose pose cannot be placed at all is dropped rather than
+    # guessed at: sweeping from the wrong side of the wall is worse than leaving
+    # a gap a later pass can pick up.
+    kept, poses, kept_sources = [], [], []
+    for (pa, pb), source in zip(partitions, sources):
+        pose = partition_scan_pose(ctx, state_name, pa, pb)
+        if pose is None:
+            node.get_logger().warn(
+                f"[{state_name}] Dropping partition ({pa[0]:.2f}, {pa[1]:.2f})->"
+                f"({pb[0]:.2f}, {pb[1]:.2f}): no scan pose."
+            )
+            continue
+        kept.append((pa, pb))
+        poses.append(pose)
+        kept_sources.append(source)
+
+    if not kept:
+        node.get_logger().error(
+            f"[{state_name}] No partition of this wall has a usable base scan pose."
+        )
+        return [], []
+
+    publish_partition_markers(ctx, kept, poses)
+    node.get_logger().info(
+        f"[{state_name}] Arm-sweep mode: {len(segments)} reachable segment(s) cut into "
+        f"{len(kept)} partition(s) of <= {max_len:.2f} m (overlap {overlap:.2f} m, "
+        f"standoff {standoff:.2f} m)."
+    )
+    if not degraded:
+        ctx["_partition_plan"] = (key, kept, poses, kept_sources)
+    ctx["current_wall_partitions"] = kept
+    # Which reachable segment each partition was cut from. The backoff retry
+    # (§7.B) needs it: a rejected partition means its whole SEGMENT has to be
+    # re-cut shorter, not just that one piece halved.
+    ctx["current_wall_partition_sources"] = kept_sources
+    return kept, poses
