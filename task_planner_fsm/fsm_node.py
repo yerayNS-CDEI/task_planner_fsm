@@ -14,6 +14,7 @@ from nav_msgs.msg import Odometry, OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import JointState
 import tf2_ros
 from rclpy.duration import Duration
@@ -173,6 +174,25 @@ BOOTSTRAP_WALL_DEFAULT_Z = 0.0
 
 
 class RobotFSMNode(Node):
+    # Knobs that are declared up front so they can be retuned live with
+    # `ros2 param set /robot_fsm_node <name> <value>`. Defaults MUST match the
+    # fallbacks the states pass to ctx.get(...), so declaring them changes
+    # nothing until someone actually sets one. (name, default)
+    SWEEP_TUNING_PARAMS = (
+        # Which sweep route ScanWall uses: True = /cmd_vel crawl, False = Nav2.
+        ("sweep_use_crawl", True),
+        # /cmd_vel crawl (ScanWall._sweep_crawl_tick).
+        ("sweep_crawl_speed", 0.05),       # m/s along the wall
+        ("sweep_arrive_tol", 0.05),        # m, along-heading stop band
+        ("sweep_crawl_kp_yaw", 0.9),       # turret heading P-hold (0 disables)
+        ("sweep_crawl_timeout_pad", 20.0), # s of grace beyond the nominal time
+        ("sweep_crawl_slack", 10.0),       # x nominal before the hard cap trips
+        ("sweep_crawl_stall_dist", 0.02),  # m of progress required per stall window
+        ("sweep_crawl_stall_s", 20.0),     # s, the stall window
+        # Nav2 slow-sweep route (used when sweep_use_crawl is False).
+        ("sweep_speed_limit", 0.05),       # m/s cap published to /speed_limit
+    )
+
     def __init__(
         self,
         sim: bool = False,
@@ -246,12 +266,35 @@ class RobotFSMNode(Node):
         # at launch. setdefault keeps the explicit ctx values above authoritative
         # (a param cannot clobber e.g. "node"/"sim"); any other override lands in
         # ctx under its flat name and is picked up by the matching ctx.get(...).
+        #
+        # Tuning knobs that must be adjustable WITHOUT relaunching (the wall-sweep
+        # ones, tuned against the robot with the arm already in contact) are
+        # declared explicitly here rather than left to the override bridge:
+        # automatically_declare_parameters_from_overrides only declares what was
+        # passed on the command line, and `ros2 param set` refuses an undeclared
+        # name. Declaring them makes the whole set show up in `ros2 param list`
+        # and settable live -- see _on_set_parameters, which mirrors a runtime
+        # change back into ctx so the next crawl tick picks it up.
+        for pname, default in self.SWEEP_TUNING_PARAMS:
+            if not self.has_parameter(pname):
+                self.declare_parameter(pname, default)
+
+        # Snapshot of the keys the FSM owns, taken BEFORE the bridge below: these
+        # are off-limits to both the bridge (via setdefault) and to live updates.
+        self._ctx_reserved = set(self.ctx.keys())
+
         param_overrides = self.get_parameters_by_prefix("")
         for pname, param in param_overrides.items():
             if pname == "use_sim_time":
                 continue
             self.ctx.setdefault(pname, param.value)
             self.get_logger().info(f"[FSM] ctx param override: {pname}={param.value!r}")
+
+        # Live re-tuning: `ros2 param set /robot_fsm_node <name> <value>` updates
+        # ctx immediately, so a knob can be changed mid-run without restarting the
+        # FSM. States read their knobs through ctx.get(...) on every tick, so the
+        # new value takes effect on the next tick.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         # Build test context for non-default initial state.
         self._bootstrap_context_for_initial_state(initial_state, scan_phase)
@@ -1110,6 +1153,26 @@ class RobotFSMNode(Node):
 
     def mapping_callback(self, msg):
         self.ctx["map_ready"] = msg.data
+
+    def _on_set_parameters(self, params):
+        """Mirror runtime `ros2 param set` changes into ctx.
+
+        Lets the sweep knobs be retuned while a scan is running -- the states read
+        them through ctx.get(...) every tick. Keys the FSM owns (node, sim, tf
+        buffer, live state) are never overwritten; the set still succeeds as a ROS
+        parameter, it just does not reach ctx.
+        """
+        for p in params:
+            if p.name == "use_sim_time":
+                continue
+            if p.name in self._ctx_reserved:
+                self.get_logger().warn(
+                    f"[FSM] '{p.name}' is FSM-owned context; parameter set, ctx untouched."
+                )
+                continue
+            self.ctx[p.name] = p.value
+            self.get_logger().info(f"[FSM] ctx param retuned live: {p.name}={p.value!r}")
+        return SetParametersResult(successful=True)
 
     def parking_active_callback(self, msg: Bool):
         # Latched chassis-parking flag from sim_controller. ScanWall waits for the
