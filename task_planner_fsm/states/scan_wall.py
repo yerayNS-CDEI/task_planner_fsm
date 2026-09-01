@@ -134,16 +134,35 @@ class ScanWall(State):
         # controllers can keep the plate on the wall without being "left behind".
         # (Nav2's DWB sweep can't hold a stable ~0.05 m/s: it trips
         # SimpleProgressChecker (needs 0.1 m/s) and sits below trans_stopped_velocity.)
-        # Transit between segments still uses the Nav2 goal at normal speed.
+        # Transit between segments still uses the Nav2 goal at normal speed, so the
+        # long moves keep their costmap collision checking; only the short, already
+        # costmap-validated sweep segment is driven open-loop.
+        #
+        # The command is published on /cmd_vel, the same input Nav2 uses: twist_mux
+        # forwards it to /diffbot_base_controller/cmd_vel_unstamped (priority 10,
+        # 0.5 s staleness timeout — hence the 10 Hz tick), and the joystick keeps a
+        # higher priority, so a human can always override the drag.
+        # Enable with ctx["sweep_use_crawl"]=True; knobs (all ctx / ROS params):
+        #   sweep_crawl_speed       m/s along the wall            (0.05)
+        #   sweep_arrive_tol        m, along-heading stop band     (0.05)
+        #   sweep_crawl_kp_yaw      turret heading P-hold gain     (0.9, 0 disables)
+        #   sweep_crawl_timeout_pad s of grace beyond dist/speed   (20.0)
         self._sweep_crawl_target = None    # (x, y) base-standoff goal in map frame
         self._sweep_crawl_deadline = None
         self._sweep_crawl_timer = None
+        self._crawl_axis = (1.0, 0.0)      # unit vector of the fixed sweep heading
+        self._crawl_distance = 0.0         # along-heading distance at crawl start
+        self._crawl_started = None
+        self._crawl_missed_ticks = 0       # consecutive ticks with no TF pose
+        self._crawl_stall_mark = None      # start of the current stall window
+        self._crawl_stall_remaining = None # along-heading distance left at that mark
 
-        # Nav2 slow-sweep route (default): cap DWB to a crawl speed via a Nav2
-        # SpeedLimit and relax the progress checker so the sub-0.1 m/s sweep is
-        # not aborted as "no progress". Both are scoped to the sweep and restored
-        # afterwards. Set ctx["sweep_use_crawl"]=True to use the /cmd_vel crawl
-        # instead (exact speed, but no DWB collision checking during the drag).
+        # Nav2 slow-sweep route (still the default, since it is the one tested on
+        # the robot): cap DWB to a crawl speed via a Nav2 SpeedLimit and relax the
+        # progress checker so the sub-0.1 m/s sweep is not aborted as "no
+        # progress". Both are scoped to the sweep and restored afterwards. Set
+        # ctx["sweep_use_crawl"]=True to use the /cmd_vel crawl instead (exact
+        # speed, but no DWB collision checking during the drag).
         self._speed_limit_pub = None
         self._controller_param_client = None
         self._sweep_speed_applied = False
@@ -216,6 +235,8 @@ class ScanWall(State):
         self._stop_sweep_crawl(ctx)   # clear any stale timer from a re-entry
         self._sweep_crawl_target = None
         self._sweep_crawl_deadline = None
+        self._crawl_started = None
+        self._crawl_missed_ticks = 0
         self._restore_sweep_speed(ctx)   # clear any stale slow-sweep limit from a re-entry
         self.force_mode_active = False
         self._press_settle_start = None
@@ -1645,30 +1666,49 @@ class ScanWall(State):
     SWEEP_KP_YAW = 0.9                # P-hold on the fixed sweep heading
     SWEEP_MAX_YAW_RATE = 0.3          # rad/s cap on the heading hold
     SWEEP_CRAWL_TIMEOUT_PAD_S = 20.0  # grace beyond nominal (dist / speed) before aborting
+    # The base does NOT track /cmd_vel one-for-one: measured in Gazebo at ~0.018 m/s
+    # achieved for 0.050 m/s commanded (wheels turning at exactly the commanded
+    # 0.4 rad/s, so the loss is traction, not the controller). A deadline built on
+    # the nominal dist/speed would abort a perfectly healthy sweep, so progress --
+    # not elapsed time -- is what decides: the base must cover STALL_DIST along the
+    # heading within each STALL_S window. The nominal deadline survives only as a
+    # generous SLACK-multiplied backstop that guarantees termination.
+    SWEEP_CRAWL_SLACK = 10.0          # x nominal (dist / speed) before the hard cap
+    SWEEP_CRAWL_STALL_DIST_M = 0.02   # along-heading progress required per window
+    SWEEP_CRAWL_STALL_S = 20.0        # length of that window
 
     # Base frames tried when reading the map-frame base pose (turret_footprint
     # first: it is the frame the omni Nav2 config drives). Mirrors NavigateToTarget.
     BASE_FRAMES = ("turret_footprint", "base_footprint", "base_link", "base", "chassis")
 
-    def _base_xy_yaw_map(self, ctx):
+    def _base_xy_yaw_map(self, ctx, wait=True):
         """Current base pose (x, y, yaw) in the map frame from TF, or None.
 
         The sweep segments are map-frame, so progress must be measured in map too
         (ctx["base_position"] is the odom frame and would be off by map->odom).
+
+        ``wait=False`` makes the lookup strictly non-blocking. The FSM runs on a
+        single-threaded executor, so a blocking TF wait inside the 10 Hz crawl
+        timer would stall the very callbacks that fill the buffer, stop /cmd_vel
+        from being published, and let twist_mux time the command out mid-contact.
+        The crawl always passes wait=False and simply skips a tick when TF is not
+        ready yet.
         """
         tf_buffer = ctx.get("tf_buffer")
         if tf_buffer is None:
             return None
+        can_timeout = Duration(seconds=0.2) if wait else Duration(seconds=0.0)
+        lookup_timeout = Duration(seconds=0.5) if wait else Duration(seconds=0.0)
         primary = str(ctx.get("nav_base_frame", "turret_footprint"))
         frames = (primary,) + tuple(f for f in self.BASE_FRAMES if f != primary)
         for frame in frames:
             try:
                 if not tf_buffer.can_transform(
-                    "map", frame, rclpy.time.Time(), Duration(seconds=0.2)
+                    "map", frame, rclpy.time.Time(), can_timeout
                 ):
                     continue
                 tf = tf_buffer.lookup_transform(
-                    "map", frame, rclpy.time.Time(), Duration(seconds=0.5)
+                    "map", frame, rclpy.time.Time(), lookup_timeout
                 )
             except Exception:
                 continue
@@ -1682,86 +1722,239 @@ class ScanWall(State):
         """Begin dragging the base to ``target_xy`` (map-frame base standoff) at a
         slow constant velocity. Drives ``self._nav_status`` like a Nav2 goal:
         None while in flight, STATUS_SUCCEEDED on arrival, -1 on timeout/lost pose,
-        so the existing sweep_wait completion logic is reused unchanged."""
+        so the existing sweep_wait completion logic is reused unchanged.
+
+        The drag is strictly ALONG the fixed sweep heading (ctx["scan_heading_yaw"],
+        computed on the wall's first line), not "towards the target point". Two
+        reasons, both specific to this base:
+
+        * The wall-normal axis belongs to the arm, not the base — the same rule
+          wall_parallel_goal enforces for Nav2 transits. Chasing the goal point
+          would let TF/AMCL noise inject a wall-ward component into the command
+          while the plate is pressed against the wall.
+        * The chassis is a differential drive carrying a turret, and /cmd_vel is
+          interpreted in the TURRET frame (sim_odometry InverseKine_relative_speed).
+          A pure linear.x is the one command it executes as a clean straight line:
+          both wheels equal, no chassis rotation, turret joint stationary. Any
+          lateral component is realised by rotating the whole chassis about the
+          turret axis, and is hard-capped at max_angular_base * center_distance
+          (0.2 rad/s * 0.167 m = 0.033 m/s) — below the crawl speed, so it would
+          also scale the whole command down.
+
+        Which is why parking matters here: with the chassis squared to the turret,
+        the along-heading command IS pure linear.x.
+        """
         node = ctx["node"]
         if ctx.get("_cmd_vel_pub") is None:
-            ctx["_cmd_vel_pub"] = node.create_publisher(Twist, "/cmd_vel", 10)
+            ctx["_cmd_vel_pub"] = node.create_publisher(
+                Twist, ctx.get("cmd_vel_topic", "/cmd_vel"), 10)
         self._stop_sweep_crawl(ctx)   # no duplicate timers
         self._sweep_crawl_target = (float(target_xy[0]), float(target_xy[1]))
         self._nav_status = None
 
         speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
+        # Unit vector of the fixed sweep heading; all progress is measured on it.
+        heading = 2.0 * atan2(self._sweep_qz, self._sweep_qw)
+        self._crawl_axis = (cos(heading), sin(heading))
         pose = self._base_xy_yaw_map(ctx)
-        dist = (
-            math.hypot(self._sweep_crawl_target[0] - pose[0],
-                       self._sweep_crawl_target[1] - pose[1])
-            if pose else 0.0
-        )
+        remaining = self._crawl_remaining(pose) if pose else 0.0
+        self._crawl_distance = abs(remaining)
+        self._crawl_started = time.time()
+        nominal_s = self._crawl_distance / max(speed, 1e-3)
         self._sweep_crawl_deadline = (
-            time.time() + dist / max(speed, 1e-3) + self.SWEEP_CRAWL_TIMEOUT_PAD_S
+            time.time()
+            + nominal_s * float(ctx.get("sweep_crawl_slack", self.SWEEP_CRAWL_SLACK))
+            + float(ctx.get("sweep_crawl_timeout_pad", self.SWEEP_CRAWL_TIMEOUT_PAD_S))
         )
+        # Stall watchdog: checkpoint the along-heading progress every window.
+        self._crawl_stall_mark = time.time()
+        self._crawl_stall_remaining = abs(remaining)
         node.get_logger().info(
             f"[{self.name}] Sweep crawl to ({self._sweep_crawl_target[0]:.2f}, "
-            f"{self._sweep_crawl_target[1]:.2f}) at {speed:.3f} m/s ({dist:.2f} m)."
+            f"{self._sweep_crawl_target[1]:.2f}) at {speed:.3f} m/s "
+            f"({self._crawl_distance:.2f} m along heading {math.degrees(heading):.1f} deg)."
         )
+        # Frame preflight: makes "the base drove the wrong way" diagnosable from the
+        # log alone — it states which frame the command is in and how far the
+        # chassis is from it. See _turret_chassis_offset.
+        turret_frame = str(ctx.get("nav_base_frame", "turret_footprint"))
+        offset = self._turret_chassis_offset(ctx)
+        if offset is None:
+            node.get_logger().info(
+                f"[{self.name}] Sweep crawl commands are in '{turret_frame}' (the turret "
+                f"frame sim_controller expects); chassis offset unknown (no TF)."
+            )
+        else:
+            node.get_logger().info(
+                f"[{self.name}] Sweep crawl commands are in '{turret_frame}' (the turret "
+                f"frame sim_controller expects); the chassis sits "
+                f"{math.degrees(offset):+.1f} deg from it."
+            )
+            pull_min = float(ctx.get("pull_compensation_min_speed", 0.05))
+            if abs(offset) > math.radians(90.0) and speed > pull_min:
+                node.get_logger().warn(
+                    f"[{self.name}] Chassis is {math.degrees(offset):+.1f} deg from the "
+                    f"turret, so it drives BACKWARDS to carry the turret forward, and "
+                    f"{speed:.3f} m/s is above pull_compensation_min_speed "
+                    f"({pull_min:.3f} m/s) — the controller will reflect the velocity and "
+                    f"steer the base off the wall line. Park the chassis first, or keep "
+                    f"sweep_crawl_speed at or below {pull_min:.3f} m/s."
+                )
         self._sweep_crawl_timer = node.create_timer(
             1.0 / self.SWEEP_CRAWL_RATE_HZ, lambda: self._sweep_crawl_tick(ctx)
         )
 
-    def _stop_sweep_crawl(self, ctx, publish_stop=False):
+    def _turret_chassis_offset(self, ctx):
+        """Angle from the chassis to the turret (rad), or None if TF is missing.
+
+        /cmd_vel is interpreted in the TURRET frame: sim_controller runs with
+        cmd_type 'relative', and InverseKine_relative_speed rotates the incoming
+        Twist by the turret_joint angle before solving for wheel speeds. The crawl
+        matches that by expressing its Twist in nav_base_frame (turret_footprint,
+        which the broadcaster keeps aligned with turret_link), so a forward
+        command moves the turret forward whatever this offset is.
+
+        It is still worth logging, because at 180 deg the CHASSIS drives backwards
+        to carry the turret forward. That is correct, but it puts the command in
+        applyPullCompensation's x_chassis < 0 region, which reflects the velocity
+        vector once the speed exceeds pull_compensation_min_speed (0.05 m/s) — so
+        raising sweep_crawl_speed with an unparked chassis would steer the base off
+        the wall line. Parking is what keeps this near zero.
+        """
+        tf_buffer = ctx.get("tf_buffer")
+        if tf_buffer is None:
+            return None
+        chassis = str(ctx.get("chassis_frame", "base_footprint"))
+        turret = str(ctx.get("nav_base_frame", "turret_footprint"))
+        try:
+            tf = tf_buffer.lookup_transform(
+                chassis, turret, rclpy.time.Time(), Duration(seconds=0.5)
+            )
+        except Exception:
+            return None
+        q = tf.transform.rotation
+        return atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+    def _crawl_remaining(self, pose):
+        """Signed distance still to travel, projected on the sweep heading.
+
+        Positive means the target is ahead along +heading, negative behind it
+        (the serpentine sweeps alternate lines in opposite directions). The
+        wall-normal component of the error is deliberately dropped: the arm owns
+        that axis.
+        """
+        ex = self._sweep_crawl_target[0] - pose[0]
+        ey = self._sweep_crawl_target[1] - pose[1]
+        return ex * self._crawl_axis[0] + ey * self._crawl_axis[1]
+
+    def _stop_sweep_crawl(self, ctx, publish_stop=False, destroy=True):
+        """Stop the crawl and (optionally) zero the base.
+
+        ``destroy=False`` only cancels the timer: destroying an rclpy timer from
+        inside its own callback invalidates a handle the executor is still
+        holding. The tick uses it, and the FSM tick (sweep_wait / on_enter /
+        on_exit) calls this again with destroy=True to release the timer.
+        """
         timer = getattr(self, "_sweep_crawl_timer", None)
         if timer is not None:
             timer.cancel()
-            ctx["node"].destroy_timer(timer)
-            self._sweep_crawl_timer = None
+            if destroy:
+                ctx["node"].destroy_timer(timer)
+                self._sweep_crawl_timer = None
         if publish_stop and ctx.get("_cmd_vel_pub") is not None:
             ctx["_cmd_vel_pub"].publish(Twist())   # zero twist
 
     def _sweep_crawl_tick(self, ctx):
-        """Timer callback: publish a constant-speed Twist toward the target and
-        stop (set _nav_status) on arrival / timeout / lost pose."""
+        """Timer callback: publish a constant-speed Twist along the sweep heading
+        and stop (set _nav_status) on arrival / timeout / lost pose."""
         if self._nav_status is not None:
             return
         node = ctx["node"]
         speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
         tol = float(ctx.get("sweep_arrive_tol", self.SWEEP_ARRIVE_TOL_M))
 
-        pose = self._base_xy_yaw_map(ctx)
+        # Non-blocking: the FSM executor is single-threaded, so a TF wait here
+        # would stall the publisher and let the command go stale (twist_mux and
+        # the base controller both time out at 0.5 s). A missed tick is harmless.
+        pose = self._base_xy_yaw_map(ctx, wait=False)
         if pose is None:
-            node.get_logger().error(f"[{self.name}] Lost base pose during sweep crawl.")
-            self._stop_sweep_crawl(ctx, publish_stop=True)
-            self._nav_status = -1
+            self._crawl_missed_ticks = getattr(self, "_crawl_missed_ticks", 0) + 1
+            # ~2 s of no pose at all: give up rather than keep the base rolling
+            # blind on the last command until the driver's timeout catches it.
+            if self._crawl_missed_ticks > 2 * self.SWEEP_CRAWL_RATE_HZ:
+                node.get_logger().error(f"[{self.name}] Lost base pose during sweep crawl.")
+                self._stop_sweep_crawl(ctx, publish_stop=True, destroy=False)
+                self._nav_status = -1
             return
+        self._crawl_missed_ticks = 0
         px, py, yaw = pose
-        ex, ey = self._sweep_crawl_target[0] - px, self._sweep_crawl_target[1] - py
-        dist = math.hypot(ex, ey)
+        remaining = self._crawl_remaining(pose)
 
-        if dist <= tol:
-            self._stop_sweep_crawl(ctx, publish_stop=True)
+        if abs(remaining) <= tol:
+            self._stop_sweep_crawl(ctx, publish_stop=True, destroy=False)
             node.get_logger().info(
-                f"[{self.name}] Sweep crawl reached the segment end ({dist:.3f} m)."
+                f"[{self.name}] Sweep crawl reached the segment end "
+                f"({abs(remaining):.3f} m along the heading)."
             )
             self._nav_status = GoalStatus.STATUS_SUCCEEDED
             return
-        if time.time() > self._sweep_crawl_deadline:
-            self._stop_sweep_crawl(ctx, publish_stop=True)
+        # Stall watchdog: abort when the base stops making progress, rather than
+        # when a nominal-speed clock runs out (the base tracks /cmd_vel well below
+        # the commanded speed even when perfectly healthy).
+        stall_s = float(ctx.get("sweep_crawl_stall_s", self.SWEEP_CRAWL_STALL_S))
+        stall_dist = float(ctx.get("sweep_crawl_stall_dist", self.SWEEP_CRAWL_STALL_DIST_M))
+        now = time.time()
+        if self._crawl_stall_mark is None:   # crawl started without a checkpoint
+            self._crawl_stall_mark = now
+            self._crawl_stall_remaining = abs(remaining)
+        if now - self._crawl_stall_mark >= stall_s:
+            progressed = self._crawl_stall_remaining - abs(remaining)
+            if progressed < stall_dist:
+                self._stop_sweep_crawl(ctx, publish_stop=True, destroy=False)
+                node.get_logger().warn(
+                    f"[{self.name}] Sweep crawl stalled: {progressed:.3f} m of progress in "
+                    f"the last {stall_s:.0f}s (needs {stall_dist:.3f} m) while commanding "
+                    f"{speed:.3f} m/s, {abs(remaining):.3f} m from the end. Either the base "
+                    f"is blocked or /cmd_vel is being throttled or arbitrated away before it "
+                    f"reaches the base."
+                )
+                self._nav_status = -1
+                return
+            self._crawl_stall_mark = now
+            self._crawl_stall_remaining = abs(remaining)
+
+        if now > self._sweep_crawl_deadline:
+            self._stop_sweep_crawl(ctx, publish_stop=True, destroy=False)
+            elapsed = max(now - self._crawl_started, 1e-3)
+            covered = max(self._crawl_distance - abs(remaining), 0.0)
             node.get_logger().warn(
-                f"[{self.name}] Sweep crawl timed out ({dist:.3f} m from the end)."
+                f"[{self.name}] Sweep crawl hit its hard time cap {abs(remaining):.3f} m from "
+                f"the end. Covered {covered:.3f} m in {elapsed:.1f}s = {covered / elapsed:.3f} "
+                f"m/s against {speed:.3f} m/s commanded (tracking "
+                f"{covered / elapsed / max(speed, 1e-9):.2f}x). Raise sweep_crawl_slack if the "
+                f"base is simply slower than commanded."
             )
             self._nav_status = -1
             return
 
-        # Constant-magnitude velocity toward the target, rotated into the base
-        # frame (Twist is body-frame), plus a P-hold on the fixed sweep heading so
-        # the omni base strafes along the wall without turning.
-        vx_w, vy_w = speed * ex / dist, speed * ey / dist
+        # Constant-magnitude velocity along the sweep heading (sign = which way the
+        # target lies), rotated into the base frame because Twist is body-frame.
+        # With the chassis parked to the turret this comes out as pure linear.x.
+        direction = 1.0 if remaining > 0.0 else -1.0
+        vx_w = direction * speed * self._crawl_axis[0]
+        vy_w = direction * speed * self._crawl_axis[1]
         cmd = Twist()
         cmd.linear.x = cos(yaw) * vx_w + sin(yaw) * vy_w
         cmd.linear.y = -sin(yaw) * vx_w + cos(yaw) * vy_w
+        # P-hold on the sweep heading. On this base angular.z is the TURRET rate,
+        # so the correction rotates the turret joint (keeping the arm square to the
+        # wall) rather than the chassis. Set ctx["sweep_crawl_kp_yaw"]=0.0 to leave
+        # the heading entirely to wall_parallel_controller.
+        kp = float(ctx.get("sweep_crawl_kp_yaw", self.SWEEP_KP_YAW))
         target_yaw = 2.0 * atan2(self._sweep_qz, self._sweep_qw)
         dyaw = atan2(sin(target_yaw - yaw), cos(target_yaw - yaw))
         cmd.angular.z = max(-self.SWEEP_MAX_YAW_RATE,
-                            min(self.SWEEP_MAX_YAW_RATE, self.SWEEP_KP_YAW * dyaw))
+                            min(self.SWEEP_MAX_YAW_RATE, kp * dyaw))
         ctx["_cmd_vel_pub"].publish(cmd)
 
     # ------------------------------------------------------------------
