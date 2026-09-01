@@ -19,7 +19,12 @@ from rclpy.task import Future
 from rclpy.duration import Duration
 import rclpy.time
 from arm_control.srv import SendPosition
-from controller_manager_msgs.srv import SwitchController
+from controller_manager_msgs.srv import ListControllers, SwitchController
+
+# The sweep node owns the arm's controller switching; this state only runs the
+# safety net for a sweep that died before it could restore. Share the one list
+# so the net cannot name a controller the sweep would never have displaced.
+from ..wbc.controller_switch import TRAJECTORY_CONTROLLERS as WBC_TRAJECTORY_CONTROLLERS
 from std_msgs.msg import String
 from ur_msgs.srv import SetForceMode
 from std_srvs.srv import Trigger
@@ -177,6 +182,7 @@ class ScanWall(State):
         self._wbc_ever_started = False
         self._wbc_failure = None      # the node's own failure text, for the log
         self._switch_client = None
+        self._list_client = None
 
         # Force mode (real robot only): press the GPR wheel against the wall (Z)
         # while the distance-sensor alignment holds the plate orientation.
@@ -1848,9 +1854,19 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
+            # Say what will actually run. The whole-body sweep owns parallelism
+            # itself and never presses (see _start_force_mode), so announcing
+            # "alignment + press" there described a press that cannot happen and
+            # read, in the log of a failed sweep, like force mode was involved.
+            if whole_body:
+                detail = (f"holding a {target:.2f} m standoff, no press "
+                          f"(whole-body sweep)")
+            elif bool(ctx.get("sim", False)):
+                detail = "activating alignment for the sweep"
+            else:
+                detail = "activating alignment + press for the sweep"
             node.get_logger().info(
-                f"[{self.name}] Segment {self._seg_idx + 1}/{len(self._segments)}: "
-                f"activating alignment + press for the sweep."
+                f"[{self.name}] Segment {self._seg_idx + 1}/{len(self._segments)}: {detail}."
             )
             # The reader has been up since the pre-approach; this is a no-op unless it
             # died. The alignment controller starts only now, with the arm already at
@@ -1888,7 +1904,7 @@ class ScanWall(State):
             self.set_activity(
                 ctx,
                 "Aligning the sensor plate to the wall"
-                if bool(ctx.get("sim", False))
+                if bool(ctx.get("sim", False)) or self._wbc_enabled(ctx)
                 else "Stretching the arm against the wall with force-mode control",
                 progress_current=seg_no,
                 progress_total=seg_total,
@@ -2499,33 +2515,85 @@ class ScanWall(State):
         The sweep node claims a streaming controller and restores the trajectory
         controller when it shuts down — but a SIGKILLed node cannot, and every
         later arm goal would then be published into a controller that is not
-        running. Fire-and-forget and BEST_EFFORT, so it is a no-op when the node
-        already put things back.
+        running.
 
-        BOTH forward controllers are deactivated, because which one the sweep
-        claimed depends on its ``arm_stream_interface`` and this path exists
-        precisely for the case where the sweep process is gone and cannot be
-        asked. BEST_EFFORT makes naming an inactive one harmless.
+        Which controller to put back cannot be hardcoded: the incumbent is
+        ``scaled_joint_trajectory_controller`` or ``passthrough_trajectory_controller``
+        on the real UR and ``joint_trajectory_controller`` in Gazebo, and naming
+        the wrong one is not a harmless no-op — asking for a position-interface
+        controller while the driver holds ``trajectory_passthrough`` is rejected
+        by the hardware interface, which fails the whole switch. So ask the
+        controller manager what is actually loaded and act on that.
         """
         node = ctx.get("node")
         if node is None or not bool(ctx.get("sweep_use_wbc", False)):
             return
-        service = str(ctx.get("controller_manager", "/controller_manager")) + "/switch_controller"
-        if self._switch_client is None:
-            self._switch_client = node.create_client(SwitchController, service)
-        if not self._switch_client.wait_for_service(timeout_sec=2.0):
+        manager = str(ctx.get("controller_manager", "/controller_manager"))
+        if self._list_client is None:
+            self._list_client = node.create_client(ListControllers,
+                                                   f"{manager}/list_controllers")
+        if not self._list_client.wait_for_service(timeout_sec=2.0):
             node.get_logger().warn(
-                f"[{self.name}] '{service}' unavailable; cannot verify the arm controller."
+                f"[{self.name}] '{manager}/list_controllers' unavailable; "
+                f"cannot verify the arm controller."
             )
             return
+        fut = self._list_client.call_async(ListControllers.Request())
+        fut.add_done_callback(lambda f: self._restore_arm_controller(ctx, f))
+
+    def _restore_arm_controller(self, ctx, future):
+        """Switch the arm back, given the controller manager's actual state."""
+        node = ctx["node"]
+        try:
+            states = {c.name: c.state for c in future.result().controller}
+        except Exception as e:
+            node.get_logger().warn(f"[{self.name}] list_controllers call failed ({e}).")
+            return
+
+        streaming = list(ctx.get("arm_streaming_controllers",
+                                 ["forward_velocity_controller", "forward_position_controller"]))
+        stuck = [name for name in streaming if states.get(name) == "active"]
+        if not stuck:
+            # The sweep never took the arm (it died before claiming anything) or
+            # already handed it back. Nothing to undo — and issuing a switch here
+            # is what produced the "can not be deactivated" warnings and the
+            # rejected position/trajectory_passthrough combination.
+            node.get_logger().info(
+                f"[{self.name}] Arm is not on a streaming controller; nothing to restore.")
+            return
+
+        # Reactivate the trajectory controller the sweep displaced: the first
+        # candidate that is loaded and merely inactive. Only one, because they
+        # all claim the same joints.
+        candidates = [name for name in ctx.get("arm_trajectory_controllers",
+                                               WBC_TRAJECTORY_CONTROLLERS)
+                      if name not in streaming]
+        restore = next((name for name in candidates if states.get(name) == "inactive"), None)
+        if restore is None:
+            node.get_logger().warn(
+                f"[{self.name}] Deactivating {', '.join(stuck)}, but no inactive trajectory "
+                f"controller of {candidates} is loaded to put back; arm goals may not execute."
+            )
+
         req = SwitchController.Request()
-        req.activate_controllers = [str(ctx.get("arm_trajectory_controller",
-                                                "joint_trajectory_controller"))]
-        req.deactivate_controllers = list(ctx.get(
-            "arm_streaming_controllers",
-            ["forward_velocity_controller", "forward_position_controller"]))
+        req.activate_controllers = [restore] if restore else []
+        req.deactivate_controllers = stuck
         req.strictness = SwitchController.Request.BEST_EFFORT
         req.activate_asap = True
+        manager = str(ctx.get("controller_manager", "/controller_manager"))
+        if self._switch_client is None:
+            self._switch_client = node.create_client(SwitchController,
+                                                     f"{manager}/switch_controller")
+        if not self._switch_client.wait_for_service(timeout_sec=2.0):
+            node.get_logger().warn(
+                f"[{self.name}] '{manager}/switch_controller' unavailable; "
+                f"cannot restore the arm controller."
+            )
+            return
+        node.get_logger().info(
+            f"[{self.name}] Restoring the arm to '{restore or 'no trajectory controller'}' "
+            f"(deactivating {', '.join(stuck)})."
+        )
         fut = self._switch_client.call_async(req)
         fut.add_done_callback(lambda f: self._log_switch_result(ctx, f))
 
