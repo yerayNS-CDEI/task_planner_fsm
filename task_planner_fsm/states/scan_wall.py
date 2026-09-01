@@ -142,7 +142,8 @@ class ScanWall(State):
         # forwards it to /diffbot_base_controller/cmd_vel_unstamped (priority 10,
         # 0.5 s staleness timeout — hence the 10 Hz tick), and the joystick keeps a
         # higher priority, so a human can always override the drag.
-        # Enable with ctx["sweep_use_crawl"]=True; knobs (all ctx / ROS params):
+        # This is the DEFAULT route for the sweep. Set ctx["sweep_use_crawl"]=False
+        # to fall back to the Nav2 slow sweep below. Knobs (all ctx / ROS params):
         #   sweep_crawl_speed       m/s along the wall            (0.05)
         #   sweep_arrive_tol        m, along-heading stop band     (0.05)
         #   sweep_crawl_kp_yaw      turret heading P-hold gain     (0.9, 0 disables)
@@ -157,12 +158,12 @@ class ScanWall(State):
         self._crawl_stall_mark = None      # start of the current stall window
         self._crawl_stall_remaining = None # along-heading distance left at that mark
 
-        # Nav2 slow-sweep route (still the default, since it is the one tested on
-        # the robot): cap DWB to a crawl speed via a Nav2 SpeedLimit and relax the
-        # progress checker so the sub-0.1 m/s sweep is not aborted as "no
-        # progress". Both are scoped to the sweep and restored afterwards. Set
-        # ctx["sweep_use_crawl"]=True to use the /cmd_vel crawl instead (exact
-        # speed, but no DWB collision checking during the drag).
+        # Nav2 slow-sweep route (fallback, ctx["sweep_use_crawl"]=False): cap DWB to
+        # a crawl speed via a Nav2 SpeedLimit and relax the progress checker so the
+        # sub-0.1 m/s sweep is not aborted as "no progress". Both are scoped to the
+        # sweep and restored afterwards. This is the route that was tested on the
+        # robot; the /cmd_vel crawl holds an exact speed instead, at the cost of no
+        # DWB collision checking during the drag.
         self._speed_limit_pub = None
         self._controller_param_client = None
         self._sweep_speed_applied = False
@@ -1417,7 +1418,7 @@ class ScanWall(State):
             # NOW, so the async param change has propagated by the time the base
             # sweeps (the arm approach + stabilise wait below cover it). Skipped when
             # the /cmd_vel crawl is selected (it sets its own speed).
-            if not bool(ctx.get("sweep_use_crawl", False)):
+            if not bool(ctx.get("sweep_use_crawl", True)):
                 self._apply_sweep_speed(ctx)
             self._seg_phase = "arm_approach"
             return
@@ -1525,7 +1526,7 @@ class ScanWall(State):
             )
             # Nav2 route (default): slow Nav2 sweep, speed already capped in
             # sweep_setup. Alternative (ctx["sweep_use_crawl"]): a /cmd_vel drag.
-            if bool(ctx.get("sweep_use_crawl", False)):
+            if bool(ctx.get("sweep_use_crawl", True)):
                 self._start_sweep_crawl(ctx, goal_xy)
             elif not self._send_base_goal(ctx, goal_xy):
                 return
