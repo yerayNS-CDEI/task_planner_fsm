@@ -2362,13 +2362,43 @@ class ScanWall(State):
             return False
         if not bool(ctx.get("sim", False)) and not self._wbc_real_warned:
             self._wbc_real_warned = True
-            ctx["node"].get_logger().warn(
-                f"[{self.name}] Whole-body sweep on the REAL robot: the force_mode "
-                f"press is unavailable (the driver refuses force mode alongside a "
-                f"streaming controller), so this sweep holds the standoff on measured "
-                f"distance and makes NO contact with the wall."
-            )
+            if self._wbc_press_enabled(ctx):
+                ctx["node"].get_logger().warn(
+                    f"[{self.name}] Whole-body sweep on the REAL robot, pressing the "
+                    f"GPR wheel with the sweep's OWN admittance loop (force mode cannot "
+                    f"run alongside a streaming controller). This regulates contact "
+                    f"force against concrete with no mechanical compliance in the "
+                    f"mount: keep a hand on the e-stop, and set ctx['wbc_press']=False "
+                    f"to sweep at a standoff instead."
+                )
+            else:
+                ctx["node"].get_logger().warn(
+                    f"[{self.name}] Whole-body sweep on the REAL robot with the press "
+                    f"DISABLED: this sweep holds the standoff on measured distance and "
+                    f"makes NO contact with the wall, so the GPR will scan through air."
+                )
         return True
+
+    def _wbc_press_enabled(self, ctx):
+        """Whether the whole-body sweep should press, rather than hold a standoff.
+
+        Defaults to "yes on the real robot, no in simulation", because that is
+        what each one can actually do. Gazebo has no force/torque sensor at all —
+        the ``<sensor>`` block in ``arm_control/urdf/ur.ros2_control.xacro`` sits
+        inside an ``unless sim_gazebo or sim_ignition`` — so a press there would
+        wait forever for a contact force that cannot arrive.
+
+        Defaulting ON for hardware rather than behind another opt-in flag is the
+        same lesson ``_wbc_enabled`` records above: a run that quietly does less
+        than it looks like it is doing is worse than one that announces what it
+        is about to do. A sweep with no press is a GPR scanning air, and that is
+        not a thing anyone asks for on purpose. ``ctx["wbc_press"]`` overrides
+        either way.
+        """
+        override = ctx.get("wbc_press")
+        if override is not None:
+            return bool(override)
+        return not bool(ctx.get("sim", False))
 
     def _start_wbc_sweep(self, ctx, seg_start, seg_end):
         """Launch the whole-body sweep for one segment and watch its status.
@@ -2425,10 +2455,23 @@ class ScanWall(State):
         # holding that height instead of whatever it happens to start at.
         if self.current_line_z is not None:
             cmd += ["-p", f"row_z:={float(self.current_line_z)}"]
+        # The press. Without this the node runs at its default (off) and the
+        # sweep holds a standoff, which on the real robot means the GPR wheel
+        # never touches the wall — the thing the whole sweep exists to do.
+        cmd += ["-p", f"press_enabled:={'true' if self._wbc_press_enabled(ctx) else 'false'}"]
         for key, param in (("wbc_control_rate", "control_rate"),
                            ("wbc_k_standoff", "k_standoff"),
                            ("wbc_k_align", "k_align"),
-                           ("wbc_arm_qdot_max", "arm_qdot_max")):
+                           ("wbc_arm_qdot_max", "arm_qdot_max"),
+                           # Press tunables, so the gain can be walked up from a
+                           # run rather than by editing the node. Only the ones
+                           # worth touching on a bench: the rest are safety
+                           # limits and belong in the node's own defaults.
+                           ("wbc_press_force", "press_force"),
+                           ("wbc_press_gain", "press_gain"),
+                           ("wbc_press_v_max", "press_v_max"),
+                           ("wbc_press_seek_speed", "press_seek_speed"),
+                           ("wbc_press_force_limit", "press_force_limit")):
             if ctx.get(key) is not None:
                 cmd += ["-p", f"{param}:={float(ctx[key])}"]
 

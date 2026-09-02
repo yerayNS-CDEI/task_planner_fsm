@@ -41,7 +41,7 @@ import time
 import numpy as np
 import rclpy
 import tf2_ros
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, WrenchStamped
 from nav_msgs.msg import OccupancyGrid
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from rclpy.node import Node
@@ -49,6 +49,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray, String
 
+from .admittance import SEEK, AdmittancePress
 from .avoidance import AvoidanceConfig, ObstacleField, avoidance_rows
 from .base_model import BaseLimits, box_bounds, constraint_rows, wheel_and_turret_rates
 from .hardware import HardwareMonitor
@@ -135,6 +136,47 @@ class WholeBodySweepNode(Node):
         # ~30 ms lag is ~0.015 rad), so this is an order of magnitude of
         # headroom and only bites when the arm is genuinely not following.
         self.declare_parameter("arm_stream_max_lead", 0.2)
+        # --- The GPR press (real robot only) ----------------------------------
+        # Regulate CONTACT FORCE on the wall-normal axis instead of a standoff
+        # distance, so the GPR wheel actually touches. This is our own admittance
+        # loop because UR's force_mode cannot run alongside a streaming
+        # controller — confirmed on hardware, see wbc/admittance.py. Off by
+        # default: there is no force/torque sensor in Gazebo (the <sensor> block
+        # in arm_control's ur.ros2_control.xacro is inside an
+        # `unless sim_gazebo or sim_ignition`), and a sweep that waits for a
+        # contact force that can never arrive would just stall.
+        self.declare_parameter("press_enabled", False)
+        self.declare_parameter("wrench_topic", "/force_torque_sensor_broadcaster/wrench")
+        self.declare_parameter("press_force", 5.0)          # N, matches the old force_mode
+        # m/s per N. Small on purpose: the loop is a velocity source against a
+        # stiff environment, so k * K_e sets the closed-loop bandwidth and must
+        # stay well under the servo lag. See the module docstring for the sizing.
+        self.declare_parameter("press_gain", 5.0e-5)
+        self.declare_parameter("press_v_max", 0.005)        # m/s
+        self.declare_parameter("press_seek_speed", 0.01)    # m/s, closing on the wall
+        self.declare_parameter("press_contact_force", 1.0)  # N, SEEK -> PRESS
+        self.declare_parameter("press_release_force", 0.5)  # N, PRESS -> SEEK
+        self.declare_parameter("press_force_limit", 25.0)   # N, abort above this
+        # The distance sensors stop being the setpoint and become the envelope:
+        # no approach closer than this to the sensed plane, whatever the force
+        # says. A wrong force reading then cannot walk the arm into the wall,
+        # because a different sensor is what stops it.
+        self.declare_parameter("press_min_distance", 0.005)  # m
+        self.declare_parameter("press_filter_alpha", 0.2)
+        self.declare_parameter("press_stall_cycles", 100)
+        # Tare: hold the normal axis still for this many cycles at the start and
+        # average what the sensor reads in free space, then subtract it. 25 is
+        # half a second at 50 Hz. Set to 0 to trust the sensor as it comes, which
+        # is only sane if something else has just tared it. The plate must be at
+        # least press_tare_min_distance off the surface, or the tare would fold
+        # the contact force into the zero — see wbc/admittance.py.
+        self.declare_parameter("press_tare_cycles", 25)
+        self.declare_parameter("press_tare_min_distance", 0.05)   # m
+        # How hard the normal axis is held to what the force loop asks for. Large
+        # because a press command is orders of magnitude smaller than the sweep
+        # travel, and anything less lets it disappear into the pooled task's
+        # residual. See where it is used for the measurement behind that.
+        self.declare_parameter("weight_press_normal", 1.0e4)
         self.declare_parameter("distance_topic", "/distance_sensors")
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("robot_description_topic", "/robot_description")
@@ -345,6 +387,11 @@ class WholeBodySweepNode(Node):
         self.joint_stamp = None
         self.distances = None
         self.distance_stamp = None
+        # Press force along the plate's own +Z, positive = pressing INTO the
+        # wall. The UR reports the opposite sign on tool0 Z, and the flip happens
+        # in _on_wrench so nothing downstream has to think about it.
+        self.press_force = 0.0
+        self.wrench_stamp = None
         self.surface = SurfaceEstimator(ema_alpha=float(p("ema_alpha").value))
         self.q_posture = None
         self.holding_since = None
@@ -420,6 +467,23 @@ class WholeBodySweepNode(Node):
             speed_scaling_topic=str(p("speed_scaling_topic").value),
             robot_mode_topic=str(p("robot_mode_topic").value),
             safety_mode_topic=str(p("safety_mode_topic").value))
+        self.press = None
+        if bool(p("press_enabled").value):
+            self.press = AdmittancePress(
+                target_force=float(p("press_force").value),
+                gain=float(p("press_gain").value),
+                v_max=float(p("press_v_max").value),
+                seek_speed=float(p("press_seek_speed").value),
+                contact_force=float(p("press_contact_force").value),
+                release_force=float(p("press_release_force").value),
+                force_limit=float(p("press_force_limit").value),
+                min_distance=float(p("press_min_distance").value),
+                filter_alpha=float(p("press_filter_alpha").value),
+                stall_cycles=int(p("press_stall_cycles").value),
+                tare_cycles=int(p("press_tare_cycles").value),
+                tare_min_distance=float(p("press_tare_min_distance").value))
+            self.create_subscription(
+                WrenchStamped, str(p("wrench_topic").value), self._on_wrench, 10)
         self.create_subscription(
             String, str(p("robot_description_topic").value), self._on_robot_description, latched)
         self.create_subscription(
@@ -512,6 +576,56 @@ class WholeBodySweepNode(Node):
         if len(msg.data) == 6:
             self.distances = np.array(msg.data, dtype=float)
             self.distance_stamp = self._now()
+
+    # The press tunables that may be changed WHILE the wheel is loaded, as
+    # (parameter, AdmittancePress attribute). Deliberately not the whole set:
+    # min_distance is the safety envelope and filter_alpha is part of what keeps
+    # the loop stable, so neither should move mid-press. These five are the ones
+    # worth reaching for on a bench, and the important one is the gain.
+    PRESS_TUNABLES = (
+        ("press_force", "target_force"),
+        ("press_gain", "gain"),
+        ("press_v_max", "v_max"),
+        ("press_seek_speed", "seek_speed"),
+        ("press_force_limit", "force_limit"),
+    )
+
+    def _refresh_press_tuning(self):
+        """Pick up ``ros2 param set`` on the press, once per cycle.
+
+        Tuning a force loop against concrete by restarting the FSM means every
+        attempt begins by driving the wheel back into the wall at the gain that
+        just misbehaved. Reading these live instead means a press that starts to
+        ring can be backed off from another terminal while it runs::
+
+            ros2 param set /wbc_sweep_controller press_gain 2.5e-5
+
+        Changes are logged at WARN rather than silently applied: a force loop
+        that was retuned mid-run is the first thing anyone reading the log
+        afterwards needs to know.
+        """
+        for name, attr in self.PRESS_TUNABLES:
+            value = float(self.get_parameter(name).value)
+            current = getattr(self.press, attr)
+            if value != current:
+                self.get_logger().warn(
+                    f"Press retuned live: {attr} {current:g} -> {value:g}.")
+                setattr(self.press, attr, value)
+
+    def _on_wrench(self, msg):
+        """TCP wrench -> press force, positive = pressing into the wall.
+
+        ``force_torque_sensor_broadcaster`` reports in the tool frame, whose +Z
+        is the axis the plate's sensors look along and the axis the wheel presses
+        along. Pushing the wheel into the wall loads the sensor in -Z, so the
+        sign flips here and the rest of the code only sees "how hard".
+
+        Only the Z component is taken. The lateral components are real — the
+        wheel drags along the wall as the sweep travels — but they are friction,
+        not press, and folding them in would read a fast sweep as a hard press.
+        """
+        self.press_force = -float(msg.wrench.force.z)
+        self.wrench_stamp = self._now()
 
     def _on_costmap(self, msg):
         self.costmap_msg = msg
@@ -1047,7 +1161,13 @@ class WholeBodySweepNode(Node):
             self._strike("scan direction is normal to the sensed surface")
             return
         distance = self.surface.distance
-        if abs(distance - self.standoff) > self.max_standoff_error:
+        if self.press is not None:
+            # Pressing: the plate sits where the wall puts it, so a standoff
+            # target is not a thing to hold and not a thing to police. The
+            # protections here are the force limit and the min_distance
+            # envelope, both inside AdmittancePress.
+            self.standoff_strikes = 0
+        elif abs(distance - self.standoff) > self.max_standoff_error:
             # A gap this far off is the plate meeting something the wall plane
             # does not explain (a pilaster, a fixture) or losing the wall
             # entirely — the case the old sweep could not see. Require several
@@ -1064,8 +1184,25 @@ class WholeBodySweepNode(Node):
 
         # --- Task twist ------------------------------------------------------
         p = self.get_parameter
-        v_normal = _clamp(float(p("k_standoff").value) * (distance - self.standoff),
-                          float(p("v_normal_max").value))
+        if self.press is not None:
+            # Force replaces distance on this axis, and only on this axis. The
+            # press has its own clamp (press_v_max), sized for contact rather
+            # than for closing a 20 cm gap, so v_normal_max does not apply.
+            self._refresh_press_tuning()
+            v_normal = self.press.update(self.press_force, distance)
+            if self.press.fault:
+                self.finish("failed", self.press.fault)
+                return
+            if self.press.stalled:
+                self.finish(
+                    "failed",
+                    f"plate is at the {self.press.min_distance * 100:.1f} cm envelope "
+                    f"with only {self.press.force:.1f} N on the wheel — the press is "
+                    f"not reaching the wall (check the F/T tare and the plate offset)")
+                return
+        else:
+            v_normal = _clamp(float(p("k_standoff").value) * (distance - self.standoff),
+                              float(p("v_normal_max").value))
         v_height = _clamp(float(p("k_height").value) * (self.row_z - p_plate[2]),
                           float(p("v_normal_max").value))
         # Cap the reference by what the base can actually hold in THIS direction
@@ -1111,8 +1248,39 @@ class WholeBodySweepNode(Node):
         rotation = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
         base_normal_row = np.zeros((1, 3 + n_arm))
         base_normal_row[0, :2] = m_hat[:2] @ rotation
-        tasks = [
-            Task(J, xdot, weights),
+
+        J_task, xdot_task = J, xdot
+        press_task = []
+        if self.press is not None:
+            # A press reference is TINY — tens of microns per second, three or
+            # four orders below the sweep travel. Left inside the pooled linear
+            # task it is simply lost: measured here, a 2.5e-4 m/s press command
+            # sat 26x below the solve's own residual, and the plate drifted off
+            # the wall while the loop politely asked it not to. Weighting the
+            # whole linear task harder does not help either, since that scales
+            # the tangent and the height with it.
+            #
+            # So separate the axes. The pooled task is projected onto the tangent
+            # plane and keeps the travel, the height and the orientation; the
+            # normal gets one row of its own at a weight that makes it effectively
+            # authoritative. This is the same move as pinning the base travel: the
+            # quantity that has to be exact stops being one voice in a sum.
+            #
+            # A weight rather than a hard constraint, deliberately. An equality
+            # row here could conflict with a joint limit and make the whole solve
+            # infeasible, which would stop the robot dead mid-press; a large
+            # weight degrades instead, and the force loop's own clamps bound what
+            # it can ask for anyway.
+            projector = np.eye(3) - np.outer(m_hat, m_hat)
+            J_task = J.copy()
+            J_task[:3, :] = projector @ J[:3, :]
+            xdot_task = np.concatenate((projector @ v_ref, w_ref))
+            press_task = [Task(np.atleast_2d(m_hat @ J[:3, :]),
+                               np.array([v_normal]),
+                               float(p("weight_press_normal").value))]
+
+        tasks = press_task + [
+            Task(J_task, xdot_task, weights),
             Task(np.diag(damping), np.zeros(3 + n_arm), 1.0),
             Task(base_normal_row, np.zeros(1), float(p("weight_base_normal").value)),
             # Posture: pull the arm back toward the pose the sweep started from,
@@ -1243,6 +1411,11 @@ class WholeBodySweepNode(Node):
             stale.append("joint_states")
         if self.distance_stamp is None or now - self.distance_stamp > self.max_data_age:
             stale.append("distance_sensors")
+        if self.press is not None and (
+                self.wrench_stamp is None or now - self.wrench_stamp > self.max_data_age):
+            # A press with no force feedback is an arm driving at a wall on a
+            # timer. Hold, exactly as for a lost surface.
+            stale.append("wrench")
         return ", ".join(stale)
 
     def _strike(self, reason):
@@ -1340,8 +1513,12 @@ class WholeBodySweepNode(Node):
         # that is not keeping up: it sits near zero when all is well and pins at
         # arm_stream_max_lead under speed scaling or a stop.
         lead = self.arm_stream.lead(self._arm_positions())
+        press = ("" if self.press is None else
+                 f"press={self.press.force:+.1f}N/{self.press.target_force:.0f} "
+                 f"[{self.press.state.upper() if self.press.state != SEEK else 'seek'}] "
+                 f"bias={self.press.bias:+.1f}N | ")
         self.get_logger().info(
-            f"d={distance * 100:.1f}cm tilt={math.degrees(self.surface.tilt()):.1f}deg "
+            f"{press}d={distance * 100:.1f}cm tilt={math.degrees(self.surface.tilt()):.1f}deg "
             f"left={remaining:.2f}m | base{'*' if self.base_travel_pinned else ''}"
             f"{'~' if self.base_travel_capped else ''}="
             f"({solution.u[0]:+.3f}, {solution.u[1]:+.3f}, "

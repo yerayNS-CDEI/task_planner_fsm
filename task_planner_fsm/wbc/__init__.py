@@ -16,6 +16,9 @@ Module map:
   ``kinematics``  URDF chain -> FK and the whole-body Jacobian (base | arm).
   ``base_model``  sim_controller's diff-drive + turret actuator limits as QP rows.
   ``surface``     the six plate ranges -> the sensed surface frame.
+  ``admittance``  the normal axis during a GPR press: contact state + force loop,
+                  standing in for UR force_mode, which cannot run alongside a
+                  streaming controller.
   ``avoidance``   local costmap -> distance field -> barrier rows for the QP.
   ``qp``          the velocity QP that turns a task twist into joint commands.
   ``streaming``   how the arm is commanded (servoj setpoints or speedj), and
