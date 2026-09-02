@@ -190,6 +190,31 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("max_angular_base", 0.2)
         self.declare_parameter("max_turret_motor_speed", 0.5)
         self.declare_parameter("sweep_speed_margin", 0.9)   # of the computed cap
+        # Pin the base's FORWARD velocity to the along-wall reference instead of
+        # letting the QP apportion the travel between base and arm. Two reasons,
+        # and they are both about the base being the wrong actuator for detail:
+        #
+        #   * The GPR line scan assumes a steady travel speed — it counts
+        #     distance off its own wheel. A base velocity that dips whenever the
+        #     solver's active set changes is exactly the input that smears a
+        #     scan, and nothing downstream can undo it.
+        #   * The base is the imprecise one: casters that must break away before
+        #     they swivel, stiction at a few cm/s, odometry drift. Asking it for
+        #     the fine corrections gives the delicate work to the worst actuator.
+        #     The arm has six joints and millimetre resolution — let it absorb
+        #     the error while the base does one steady thing per segment.
+        #
+        # Only the turret's forward axis is pinned; vy and wz stay free so the
+        # solver can still correct heading drift over a long segment, held near
+        # zero by weight_base_normal and damping_base rather than by a hard row.
+        self.declare_parameter("base_constant_travel", True)
+        # How closely the turret must point along the sweep before the pin is
+        # applied, as |cos(angle)|. During a wall scan the turret faces ALONG the
+        # wall with the wall on its left, so this is ~1.0 and the pin holds. If
+        # the turret is turned well off the sweep direction the forward axis is
+        # no longer the travel axis, and pinning it would command the wrong thing
+        # — so hand the apportioning back to the solver instead. 0.5 is 60 deg.
+        self.declare_parameter("base_travel_min_alignment", 0.5)
 
         # --- Obstacle avoidance ----------------------------------------------
         # The sweep drives the base itself, so nothing else is watching for
@@ -272,6 +297,14 @@ class WholeBodySweepNode(Node):
         self.max_standoff_error = float(p("max_standoff_error").value)
         self.standoff_error_cycles = int(p("standoff_error_cycles").value)
         self.max_hold_seconds = float(p("max_hold_seconds").value)
+        self.base_constant_travel = bool(p("base_constant_travel").value)
+        self.base_travel_min_alignment = float(p("base_travel_min_alignment").value)
+        # What the forward bound did THIS cycle, for the log: pinned to the
+        # reference, capped at it while a barrier works, or neither. It is the
+        # thing to look at when a sweep is jerky — a bound that keeps coming off
+        # says the geometry or the obstacle field is fighting it, not the solver.
+        self.base_travel_pinned = False
+        self.base_travel_capped = False
 
         self.limits = BaseLimits(
             center_distance=float(p("center_distance").value),
@@ -1124,6 +1157,62 @@ class WholeBodySweepNode(Node):
                     f"floor; backing it off before it gets stuck against the surface.",
                     throttle_duration_sec=5.0)
 
+        # --- Pin the base's travel, so the wheels do one steady thing ---------
+        # Collapsing the forward bound to a point makes the base's along-wall
+        # speed an input to the solve rather than an output of it. The remaining
+        # 8 DOF then resolve everything else around a base that is no longer
+        # free to hesitate. ``speed`` already carries the ease-off over the last
+        # few centimetres, so this tracks the reference rather than being a
+        # literal constant that would overshoot the segment end.
+        #
+        # Only ONE case hands the travel back to the solver outright, because
+        # only one makes pinning actively wrong rather than merely inconvenient.
+        # An obstacle narrows the bound instead of removing it — see below.
+        self.base_travel_pinned = False
+        self.base_travel_capped = False
+        if self.base_constant_travel:
+            # Sweep direction expressed in the turret frame, where the twist is
+            # commanded. During a wall scan this is ~[±1, 0]: the turret faces
+            # along the wall, so its forward axis IS the travel axis.
+            t_base = rotation.T @ t_hat[:2]
+            if abs(float(t_base[0])) < self.base_travel_min_alignment:
+                # The forward axis is not the travel axis. Pinning it would hold
+                # the base at some fraction of the sweep speed along the wrong
+                # direction and leave the arm to make up an ever-growing rest.
+                self.get_logger().warn(
+                    f"Turret is {math.degrees(math.acos(min(1.0, abs(float(t_base[0]))))):.0f} deg "
+                    f"off the sweep direction: letting the solver apportion the base "
+                    f"travel rather than pinning an axis that is not the travel axis.",
+                    throttle_duration_sec=5.0)
+            else:
+                pin = float(np.clip(speed * float(t_base[0]), base_lo[0], base_hi[0]))
+                engaged = (self.closest_obstacle < float(p("avoid_influence").value)
+                           or base_gap < floor)
+                if engaged:
+                    # The obstacle rows go in SOFT so they can never make the
+                    # solve infeasible, and a two-sided pin is HARD, so the pin
+                    # would win against them and carry the base on into whatever
+                    # they were avoiding. The barrier has to be able to act.
+                    #
+                    # But it only ever needs to act in ONE direction. Slowing the
+                    # base, or stopping it, is the whole of what a barrier is
+                    # for; nothing about avoiding an obstacle is served by
+                    # running the base FASTER than the scan speed or reversing
+                    # it. Releasing the bound entirely granted both, and that is
+                    # what the base actually did — measured over one Gazebo
+                    # segment, 0.002 to 0.063 m/s against a 0.030 reference,
+                    # while a real corner sat inside the influence radius for the
+                    # first quarter of the sweep.
+                    #
+                    # So keep the half of the bound that costs the barrier
+                    # nothing. Zero stays reachable, full authority to slow is
+                    # preserved, and the scan speed remains a ceiling.
+                    base_lo[0], base_hi[0] = min(0.0, pin), max(0.0, pin)
+                    self.base_travel_capped = True
+                else:
+                    base_lo[0] = base_hi[0] = pin
+                    self.base_travel_pinned = True
+
         solution = solve_velocity_qp(
             tasks,
             np.concatenate((base_lo, arm_lo)), np.concatenate((base_hi, arm_hi)),
@@ -1253,7 +1342,9 @@ class WholeBodySweepNode(Node):
         lead = self.arm_stream.lead(self._arm_positions())
         self.get_logger().info(
             f"d={distance * 100:.1f}cm tilt={math.degrees(self.surface.tilt()):.1f}deg "
-            f"left={remaining:.2f}m | base=({solution.u[0]:+.3f}, {solution.u[1]:+.3f}, "
+            f"left={remaining:.2f}m | base{'*' if self.base_travel_pinned else ''}"
+            f"{'~' if self.base_travel_capped else ''}="
+            f"({solution.u[0]:+.3f}, {solution.u[1]:+.3f}, "
             f"{solution.u[2]:+.3f}) w_chassis={w_chassis:+.2f} phi_dot={phi_dot:+.2f} "
             f"| arm max={np.max(np.abs(solution.u[3:])):.3f} rad/s lead={lead:.3f}rad "
             f"| {self.hardware.describe()} "
