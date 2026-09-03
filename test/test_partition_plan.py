@@ -21,7 +21,10 @@ import math
 
 import pytest
 
-from task_planner_fsm.utils.costmap_utils import plan_wall_partitions
+from task_planner_fsm.utils.costmap_utils import (
+    DEFAULT_SCAN_LINE_OFFSET,
+    plan_wall_partitions,
+)
 from task_planner_fsm.utils.wall_approach import (
     should_approach_partition,
     should_face_wall,
@@ -82,7 +85,10 @@ class _FakePublisher:
 # space INTO the wall face, i.e. +Y here.
 WALL = [(0.0, 0.0, 1.0), (4.0, 0.0, 1.0)]
 INWARD_NORMAL = (0.0, 1.0)
-STANDOFF = 1.0
+# From the WALL FACE: the scan line the partitions lie on is
+# DEFAULT_SCAN_LINE_OFFSET closer to the wall, so the pose sits PUSH off it.
+STANDOFF = 1.6
+PUSH = STANDOFF - DEFAULT_SCAN_LINE_OFFSET
 
 
 def make_ctx(**extra):
@@ -166,7 +172,7 @@ def test_scan_pose_sits_a_standoff_out_from_the_partition_centre():
         cx, cy = 0.5 * (pa[0] + pb[0]), 0.5 * (pa[1] + pb[1])
         # Free space is -Y, so the base backs off to negative y.
         assert gx == pytest.approx(cx)
-        assert gy == pytest.approx(cy - STANDOFF)
+        assert gy == pytest.approx(cy - PUSH)
 
 
 def test_scan_pose_yaw_points_into_the_wall():

@@ -53,7 +53,51 @@ DEFAULT_MAX_OFFSET = 1.3
 # Override per launch with the ``min_base_standoff`` ctx/ROS param; 0 disables
 # the clamp (pure nearest-free). Always capped by arm reach: the enforced
 # distance can never exceed scan_offset + base_goal_max_offset.
-DEFAULT_MIN_STANDOFF = 0.95
+DEFAULT_MIN_STANDOFF = 0.75
+
+# How far off the wall FACE a wall's scan line is drawn (m). Every scan point,
+# reachable segment and partition endpoint the states pass around lies on that
+# line, not on the wall itself, so any base standoff measured from the wall face
+# has to subtract it. Must match ``build_wall_data``'s ``offset`` (fsm_node passes
+# its own 0.6 default); override both together with ``wall_scan_line_offset_m``.
+DEFAULT_SCAN_LINE_OFFSET = 0.6
+
+# Base-center distance from the wall FACE (m) for an arm-sweep partition scan
+# pose. Not derived from min_base_standoff: that one is the floor for a base-driven
+# approach, this one is where the arm sweeps from, and it is bounded below by arm
+# reach rather than by the costmap. Tuned on hardware (2026-09-02): the base has a
+# 0.6 m footprint radius, and at 1.15 m the arm holds the same extension it was
+# validated at when the plate approached at 0.40 m -- it now approaches at 0.20 m
+# from 0.20 m closer in. Before that campaign the scan-line offset was added on
+# top of this knob rather than subtracted from it, which parked the base 0.60 m
+# further out than the number said.
+DEFAULT_PARTITION_BASE_STANDOFF = 1.15
+
+
+def _scan_line_offset(ctx) -> float:
+    """Distance (m) from the wall face to the scan line the partitions lie on."""
+    return max(0.0, float(ctx.get("wall_scan_line_offset_m", DEFAULT_SCAN_LINE_OFFSET)))
+
+
+def _partition_standoff(ctx, state_name: str) -> Tuple[float, float]:
+    """``(standoff_from_wall_face, push_from_the_scan_line)`` for a scan pose.
+
+    The knob is quoted from the wall FACE because that is the number anyone
+    measures with a tape; the geometry needs the push from the partition centre,
+    which sits ``scan_offset`` closer to the wall than the base ever goes.
+    """
+    standoff = float(ctx.get("partition_base_standoff_m", DEFAULT_PARTITION_BASE_STANDOFF))
+    scan_offset = _scan_line_offset(ctx)
+    push = standoff - scan_offset
+    if push < 0.0:
+        ctx["node"].get_logger().warn(
+            f"[{state_name}] partition_base_standoff_m {standoff:.2f} m is inside the "
+            f"{scan_offset:.2f} m scan-line offset; parking ON the scan line instead. "
+            f"The base cannot stand closer to the wall than the scan line without "
+            f"the scan geometry being wrong."
+        )
+        push = 0.0
+    return standoff, push
 
 
 def _search_knobs(ctx) -> Tuple[int, float]:
@@ -462,7 +506,7 @@ def base_standoff_goal(
     state_name: str,
     target_point,
     default_standoff: float = 1.6,
-    scan_offset: float = 0.6,
+    scan_offset: float = DEFAULT_SCAN_LINE_OFFSET,
 ) -> Tuple[float, float]:
     """Turn a wall scan point into a base Nav2 goal the planner can reach.
 
@@ -738,13 +782,18 @@ def partition_scan_pose(ctx, state_name: str, p_start, p_end):
 
         p_center = 0.5 * (p_start + p_end)
         n_wall   = -_outward_dir(ctx)              # from free space INTO the wall
-        position = p_center + standoff * outward   # back off along the normal
+        position = p_center + push * outward       # back off along the normal
         yaw      = heading of n_wall, minus the turret offset
 
     The standoff is ``partition_base_standoff_m``, a dedicated knob: it is a
     property of arm reach and turret/column geometry, not of costmap inflation,
     so it is deliberately NOT derived from ``base_goal_max_offset`` or the plate
     retraction parameters.
+
+    It is measured from the **wall face**, so ``push`` is that standoff minus the
+    scan-line offset the partition endpoints already carry. Quoting it any other
+    way costs 0.6 m of unintended reach: the base parked 1.35 m out while the knob
+    read 0.75, and the arm had to span the difference on every partition.
 
     Returns ``None`` when the wall normal is unknown -- unlike the base-driven
     path there is no sane fallback, because a partition swept from a guessed
@@ -782,9 +831,9 @@ def partition_scan_pose(ctx, state_name: str, p_start, p_end):
             f"normal may belong to different walls."
         )
 
-    standoff = float(ctx.get("partition_base_standoff_m", _min_standoff(ctx)))
-    gx = centre[0] + ox * standoff
-    gy = centre[1] + oy * standoff
+    standoff, push = _partition_standoff(ctx, state_name)
+    gx = centre[0] + ox * push
+    gy = centre[1] + oy * push
 
     # Validate the cell, but only ever search FURTHER OUT along the same normal.
     # A 2D search (as base_standoff_goal does for corners) would slide the base
@@ -798,7 +847,7 @@ def partition_scan_pose(ctx, state_name: str, p_start, p_end):
             hit = nearest_free_along(
                 costmap, centre[0], centre[1], ox, oy,
                 max_dist=max_offset, cost_threshold=cost_threshold,
-                min_dist=standoff,
+                min_dist=push,
             )
             if hit is None:
                 node.get_logger().warn(
@@ -821,8 +870,9 @@ def partition_scan_pose(ctx, state_name: str, p_start, p_end):
 
     node.get_logger().info(
         f"[{state_name}] Partition scan pose: centre ({centre[0]:.2f}, "
-        f"{centre[1]:.2f}) + {standoff:.2f} m standoff -> ({gx:.2f}, {gy:.2f}), "
-        f"yaw {yaw:.2f} rad ({_nav_base_frame(ctx)} facing the wall)."
+        f"{centre[1]:.2f}) + {push:.2f} m -> ({gx:.2f}, {gy:.2f}), "
+        f"{standoff:.2f} m from the wall face, yaw {yaw:.2f} rad "
+        f"({_nav_base_frame(ctx)} facing the wall)."
     )
     return (gx, gy, yaw)
 
@@ -939,7 +989,7 @@ def plan_wall_partitions(ctx, state_name: str, p_start, p_end, segments=None,
         max_len = float(ctx.get("partition_max_length_m", 0.8))
     max_len = float(max_len)
     overlap = float(ctx.get("partition_overlap_m", 0.05))
-    standoff = float(ctx.get("partition_base_standoff_m", _min_standoff(ctx)))
+    standoff, _push = _partition_standoff(ctx, state_name)
 
     key = (
         round(float(p_start[0]), 3), round(float(p_start[1]), 3),
@@ -1011,7 +1061,7 @@ def plan_wall_partitions(ctx, state_name: str, p_start, p_end, segments=None,
     node.get_logger().info(
         f"[{state_name}] Arm-sweep mode: {len(segments)} reachable segment(s) cut into "
         f"{len(kept)} partition(s) of <= {max_len:.2f} m (overlap {overlap:.2f} m, "
-        f"standoff {standoff:.2f} m)."
+        f"standoff {standoff:.2f} m from the wall face)."
     )
     if not degraded:
         ctx["_partition_plan"] = (key, kept, poses, kept_sources)

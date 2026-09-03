@@ -16,9 +16,16 @@ import math
 
 import pytest
 
-from task_planner_fsm.utils.costmap_utils import partition_scan_pose
+from task_planner_fsm.utils.costmap_utils import (
+    DEFAULT_SCAN_LINE_OFFSET,
+    partition_scan_pose,
+)
 
-STANDOFF = 1.0
+# partition_base_standoff_m is measured from the WALL FACE, while the partition
+# endpoints these tests pass in lie on the scan line -- DEFAULT_SCAN_LINE_OFFSET
+# closer to the wall. PUSH is therefore what separates the pose from the points.
+STANDOFF = 1.6
+PUSH = STANDOFF - DEFAULT_SCAN_LINE_OFFSET
 
 
 class _FakeLogger:
@@ -76,7 +83,7 @@ def test_pose_is_centred_on_the_partition():
     x, y, _ = partition_scan_pose(ctx, "T", (2.0, 0.0, 1.0), (3.0, 0.0, 1.0))
     # Centred laterally: the arm reaches +/- half the partition from here.
     assert x == pytest.approx(2.5)
-    assert y == pytest.approx(STANDOFF)
+    assert y == pytest.approx(PUSH)
 
 
 def test_pose_backs_off_on_the_free_space_side_not_through_the_wall():
@@ -86,10 +93,20 @@ def test_pose_backs_off_on_the_free_space_side_not_through_the_wall():
 
 
 def test_standoff_distance_is_honoured():
-    for standoff in (0.6, 1.0, 1.4):
+    """The knob is quoted from the wall face, which sits at -scan_offset here."""
+    for standoff in (1.0, 1.4, 1.8):
         ctx = make_ctx((0.0, -1.0, 0.0), standoff=standoff)
         _, y, _ = partition_scan_pose(ctx, "T", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
-        assert y == pytest.approx(standoff)
+        wall_face_y = -DEFAULT_SCAN_LINE_OFFSET
+        assert y - wall_face_y == pytest.approx(standoff)
+
+
+def test_standoff_below_the_scan_line_offset_parks_on_the_line():
+    """Asking for less than the scan-line offset cannot be honoured; warn, clamp."""
+    ctx = make_ctx((0.0, -1.0, 0.0), standoff=0.4)
+    _, y, _ = partition_scan_pose(ctx, "T", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+    assert y == pytest.approx(0.0)
+    assert any("inside the" in w for w in ctx["node"].get_logger().warnings)
 
 
 def test_standoff_is_measured_along_the_normal_for_a_diagonal_wall():
@@ -98,7 +115,7 @@ def test_standoff_is_measured_along_the_normal_for_a_diagonal_wall():
     p_start, p_end = (0.0, 0.0, 0.0), (2.0, 2.0, 0.0)        # wall along the diagonal
     x, y, _ = partition_scan_pose(ctx, "T", p_start, p_end)
     centre = (1.0, 1.0)
-    assert math.hypot(x - centre[0], y - centre[1]) == pytest.approx(STANDOFF)
+    assert math.hypot(x - centre[0], y - centre[1]) == pytest.approx(PUSH)
 
 
 # ---------------------------------------------------------------------------
