@@ -118,10 +118,14 @@ class ScanWall(State):
         #   transit(_wait)   slide along the wall to the segment start
         #   park             square the chassis against the wall
         #   sweep_setup      cap the base speed for the sweep
-        #   arm_approach(_wait)  extend the arm to scan_wall_plate_offset from the wall
+        #   arm_approach(_wait)  extend the arm to the approach standoff
+        #   lead_in(_wait)   arm crosses to the partition START, still off the wall
         #   press_prepare    alignment controller + force-mode press
         #   press_settle     wait for the FT sensor to confirm wall contact
         #   sweep_wait       the actual scan
+        # The lead-in comes BEFORE the press on purpose: the base parks at the
+        # partition centre, so pressing first would drag the GPR wheel half a
+        # partition sideways across the wall under load.
         self._segments = None        # [((sx,sy,z),(ex,ey,z)), ...] robot-end first
         # Arm-sweep mode only: one (x, y, yaw) Nav2 scan pose per entry of
         # self._segments (which then holds partitions, not raw segments).
@@ -400,8 +404,8 @@ class ScanWall(State):
             # this one is the gap that has to survive the whole sweep untouched.
             # Under Force Mode the executor ignores it entirely and sweeps in the
             # plane the press established.
-            "-p", f"scan_standoff_m:={float(ctx.get('sweep_scan_standoff_m', 0.30))}",
-            "-p", f"approach_retract_m:={float(ctx.get('sweep_approach_retract_m', 0.20))}",
+            "-p", f"scan_standoff_m:={float(ctx.get('sweep_scan_standoff_m', 0.20))}",
+            "-p", f"approach_retract_m:={float(ctx.get('sweep_approach_retract_m', 0.0))}",
             "-p", f"max_traverse_m:={float(ctx.get('sweep_max_traverse_m', 1.10))}",
             "-p", f"trajectory_timeout_factor:="
                   f"{float(ctx.get('sweep_timeout_factor', 4.0))}",
@@ -588,20 +592,28 @@ class ScanWall(State):
     def _approach_standoff(self, ctx):
         """Plate-to-wall distance the arm approaches a partition at.
 
-        The sweep standoff plus a retraction margin. The plate travels sideways to
-        the partition start at THIS distance, not at the sweep distance, so a long
-        lateral move never drags the sensor plate along the wall face -- which in
-        Gazebo means real contact forces, and on the robot means scrubbing the GPR
-        wheel across a surface it is not measuring.
+        The sweep standoff plus an optional retraction margin. The plate travels
+        sideways to the partition start at THIS distance, so the lateral move never
+        drags the sensor plate along the wall face -- which in Gazebo means real
+        contact forces, and on the robot means scrubbing the GPR wheel across a
+        surface it is not measuring.
+
+        ``sweep_approach_retract_m`` is 0 by default: on the robot the margin only
+        widened the gap force mode then had to press through (0.40 m against a
+        0.25 m Z deviation limit), and the lateral move is now made BEFORE the
+        press, so it needs no extra clearance of its own. Raise it to put the
+        approach plane back outside the sweep plane -- for the no-press path, where
+        nothing holds the plate off the wall, that margin is also the executor's
+        post-sweep retract.
 
         Keyed off ``sweep_scan_standoff_m`` in arm-sweep mode so raising the sweep
         standoff carries the approach out with it; the legacy base-driven path
         keeps using the press offset it was tuned against.
         """
-        base = (float(ctx.get("sweep_scan_standoff_m", 0.30))
+        base = (float(ctx.get("sweep_scan_standoff_m", 0.20))
                 if self._use_arm_sweep(ctx)
                 else float(ctx.get("scan_wall_plate_offset", 0.20)))
-        return base + float(ctx.get("sweep_approach_retract_m", 0.20))
+        return base + float(ctx.get("sweep_approach_retract_m", 0.0))
 
     def _send_arm_to_clearance(self, ctx, target, contact_default=False,
                                retract_only=False):
@@ -1731,7 +1743,7 @@ class ScanWall(State):
             # was retuned, and this move then pushed the plate 10 cm back TOWARD the
             # wall before transit_recenter folded the arm away anyway.
             target = (self._approach_standoff(ctx) if self._use_arm_sweep(ctx)
-                      else float(ctx.get("scan_wall_transit_plate_offset", 0.40)))
+                      else float(ctx.get("scan_wall_transit_plate_offset", 0.20)))
             # After a sweep the plate sits against the wall with its ranges below
             # their valid floor, so a missing reading there means "in contact", not
             # "unknown" — but only from the second segment on. Before the first
@@ -2043,7 +2055,7 @@ class ScanWall(State):
             )
             outcome = self._send_arm_to_clearance(
                 ctx,
-                float(ctx.get("scan_wall_line_change_plate_offset", 0.40)),
+                float(ctx.get("scan_wall_line_change_plate_offset", 0.20)),
                 retract_only=True,
             )
             if outcome == "wait":
@@ -2123,9 +2135,9 @@ class ScanWall(State):
         if self._seg_phase == "arm_approach":
             # The base is parked and will not move again until the sweep, so the arm
             # closes the remaining distance itself: measure the plate standoff and
-            # travel along the plate's Z axis until only scan_wall_plate_offset is
-            # left for force_mode to press through. Runs BEFORE the alignment
-            # controller comes up — that node streams IK setpoints continuously, so
+            # travel along the plate's Z axis until only the approach standoff is
+            # left for force_mode to press through. Runs BEFORE the lead-in and the
+            # alignment controller — that node streams IK setpoints continuously, so
             # nothing else may command the arm while it runs.
             self.set_activity(
                 ctx,
@@ -2146,9 +2158,9 @@ class ScanWall(State):
             # better: at this base standoff, back is toward the column.
             #
             # So the arm only ever moves along the plate normal here -- the move
-            # that has always worked -- and the executor makes the lateral traverse
-            # to the partition start, where the plate is already extended and well
-            # clear of the column.
+            # that has always worked -- and the lateral traverse to the partition
+            # start is the executor's, in the lead_in phase below, where the plate
+            # is already extended and well clear of the column.
             target = (self._approach_standoff(ctx) if self._use_arm_sweep(ctx)
                       else float(ctx.get("scan_wall_plate_offset", 0.20)))
             outcome = self._send_arm_to_clearance(ctx, target)
@@ -2158,13 +2170,73 @@ class ScanWall(State):
                 self._arm_goal_start = None
                 self._seg_phase = "arm_approach_wait"
                 return
-            self._seg_phase = "press_prepare"
+            # "skip": the plate is already at the approach standoff (or no reading
+            # could size the move). The lateral lead-in still has to run.
+            self._seg_phase = "lead_in" if self._use_arm_sweep(ctx) else "press_prepare"
             return
 
         if self._seg_phase == "arm_approach_wait":
             if not self._arm_goal_settled(ctx):
                 return
             self._arm_goal_start = None
+            self._seg_phase = "lead_in" if self._use_arm_sweep(ctx) else "press_prepare"
+            return
+
+        if self._seg_phase == "lead_in":
+            # Cross to the partition START before anything presses. The base parks
+            # at the partition CENTRE and the FSM's approach can only move along
+            # the plate normal, so this lateral move has to happen somewhere; doing
+            # it here rather than inside the sweep goal is what stops the GPR wheel
+            # being dragged half a partition sideways while pressed against the
+            # wall.
+            #
+            # Same mechanism as before -- the executor's own traverse leg, planned
+            # and validated by plan_sweep -- just issued as its own goal. It is NOT
+            # sent through /arm/goal_pose: that route goes to the arm planner,
+            # which models the column as a 0.3 m obstacle at the arm base and
+            # refuses any lateral endpoint near the base centreline.
+            self.set_activity(
+                ctx,
+                f"Moving the arm to the start of wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            # The bridge still holds whatever the arm approach queued; let it
+            # dispatch during the lead-in and it preempts the executor's goal.
+            # Released again below, because press_prepare's alignment controller
+            # reaches the arm THROUGH the bridge.
+            self._set_trajectory_bridge_hold(ctx, True)
+            if not self._send_sweep_goal(ctx, seg_start, seg_end, lead_in_only=True):
+                self._set_trajectory_bridge_hold(ctx, False)
+                # _send_sweep_goal already filled in _sweep_result; hand the
+                # failure to sweep_wait, which owns the backoff and the skip.
+                self._seg_phase = "sweep_wait"
+                return
+            self._seg_phase = "lead_in_wait"
+            return
+
+        if self._seg_phase == "lead_in_wait":
+            if self._sweep_result is None:
+                return
+            succeeded, reason, detail = self._sweep_result
+            self._sweep_result = None
+            self._set_trajectory_bridge_hold(ctx, False)
+            if not succeeded:
+                node.get_logger().error(
+                    f"[{self.name}] Lead-in to segment {self._seg_idx + 1} failed "
+                    f"[{reason}]: {detail}; not pressing against the wall."
+                )
+                # Re-raised for sweep_wait: a partition whose lead-in cannot be
+                # planned is exactly the "too long for the arm" case its backoff
+                # (§7.B) exists for, and the teardown there is a no-op when
+                # nothing was started.
+                self._sweep_result = (succeeded, reason, detail)
+                self._seg_phase = "sweep_wait"
+                return
+            node.get_logger().info(
+                f"[{self.name}] Plate at the start of segment {self._seg_idx + 1}; "
+                f"starting the alignment controller and the press."
+            )
             self._seg_phase = "press_prepare"
             return
 
@@ -2224,10 +2296,12 @@ class ScanWall(State):
             # Wheel is pressed against the wall. GPR: connect, create the LINE_SCAN
             # measurement and start the line now (real robot only).
             #
-            # NOT in arm-sweep mode. There the arm first travels from the partition
-            # centre (where the base parked) to the partition start, and a line
-            # started here would record that lead-in travel as scan data. It starts
-            # instead on the executor's "sweep" feedback phase, in sweep_wait.
+            # NOT in arm-sweep mode. The plate is at the partition start by now
+            # (the lead_in phase put it there), but the executor still has to
+            # preempt whatever holds the arm and settle it before the sweep leg
+            # begins, and a line started here would record that dead time as scan
+            # data. It starts instead on the executor's "sweep" feedback phase, in
+            # sweep_wait.
             if not self._use_arm_sweep(ctx):
                 self._gpr_start_measurement_and_line(ctx)
                 if ctx.get("error_triggered"):
@@ -2458,8 +2532,13 @@ class ScanWall(State):
             f"[{self.name}] Trajectory bridge {'held for the arm sweep' if held else 'released'}."
         )
 
-    def _send_sweep_goal(self, ctx, seg_start, seg_end):
+    def _send_sweep_goal(self, ctx, seg_start, seg_end, lead_in_only=False):
         """Hand one partition to wall_sweep_executor. The base does not move.
+
+        With ``lead_in_only`` the executor runs the lateral lead-in and stops,
+        leaving the plate at the partition start for force mode to press from
+        (see the ``lead_in`` phase). The result comes back the same way, so the
+        caller polls ``self._sweep_result`` either way.
 
         The result lands in ``self._sweep_result`` as
         ``(succeeded, reason, detail)``; ``None`` while the sweep is in flight,
@@ -2527,10 +2606,16 @@ class ScanWall(State):
         # Sim has no force_mode controller, so the sweep runs contact-free at the
         # plate offset (§11.2) and the contact watchdog must not fire.
         goal.press = not bool(ctx.get("sim", False))
+        # A lead-in goal runs BEFORE force mode, so nothing is pressing yet. It
+        # still carries press=True on the robot: that is what tells the executor
+        # to traverse in the plate's current plane instead of sizing a plunge from
+        # the range sensors, and the plane it is in is the approach standoff.
+        goal.lead_in_only = bool(lead_in_only)
 
         node.get_logger().info(
-            f"[{self.name}] Arm sweep of partition {self._seg_idx + 1}/"
-            f"{len(self._segments)}: ({seg_start[0]:.2f}, {seg_start[1]:.2f}) -> "
+            f"[{self.name}] Arm {'lead-in to' if lead_in_only else 'sweep of'} partition "
+            f"{self._seg_idx + 1}/{len(self._segments)}: "
+            f"({seg_start[0]:.2f}, {seg_start[1]:.2f}) -> "
             f"({seg_end[0]:.2f}, {seg_end[1]:.2f}) at {goal.speed:.3f} m/s "
             f"({'press' if goal.press else 'no press'}). Base stays parked."
         )
