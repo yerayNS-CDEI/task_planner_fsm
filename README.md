@@ -1035,6 +1035,7 @@ task_planner_fsm/
 **Published by FSM:**
 - `/fsm/current_state` - String (current state name, 1 Hz)
 - `/fsm/transition` - String (JSON transition log, on transitions)
+- `/gpr/trigger` - UInt32 (GPR distance trigger, during a ScanWall sweep — see below)
 
 **Subscribed by FSM:**
 - `/start_flag` - Bool (FSM start trigger)
@@ -1044,6 +1045,56 @@ task_planner_fsm/
 - `/arm/execution_status` - Bool (alternative arm status)
 - `/planner/goal_failed` - Bool (planner failure signal)
 - `/map_done` - Bool (map creation complete)
+
+### GPR Distance Triggers (ScanWall)
+
+The GPR's own encoder wheel has to stay in contact with the wall to clock the
+probe, which is hard to guarantee even at the right standoff, so a fake encoder
+takes its place and the FSM decides when it pulses. During each segment sweep
+`ScanWall` samples the sensor-plate (end-effector) pose in the `map` frame and
+fires one trigger per fixed distance of plate travel along the wall. The start
+of the sweep is itself a trigger position (d = 0), so a segment of length L
+yields `floor(L / spacing) + 1` triggers.
+
+The plate pose is read in the `map` frame, so the same sampler serves both sweep
+routes: in arm-sweep mode (`sweep_use_arm`, the default) the arm carries the
+plate with the base parked, and in the legacy base-driven sweep the base carries
+it. What differs is when the triggers start. On the arm path they are armed by
+`wall_sweep_executor`'s `sweep` feedback — the same signal that opens the GPR
+line — so the lead-in traverse to the partition start, which slides the plate
+along the wall without scanning it, produces none. On the base path they start
+with the base motion.
+
+The trigger is currently a stand-in for the hardware: a `std_msgs/UInt32` on
+`/gpr/trigger` carrying the trigger index within the segment, plus a log line
+(every 20th at info, the rest at debug). Watch it live with:
+
+```bash
+ros2 topic echo /gpr/trigger
+ros2 topic hz /gpr/trigger      # ~10 Hz at 0.5 cm spacing and 0.05 m/s
+```
+
+Tuning knobs (ROS parameters on `robot_fsm_node`, e.g.
+`--ros-args -p gpr_trigger_distance_m:=0.01`):
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `gpr_trigger_distance_m` | `0.005` | Plate travel between triggers (0.5 cm) |
+| `gpr_trigger_enabled` | `true` | Emit triggers at all (independent of `gpr_enabled`) |
+| `gpr_trigger_topic` | `/gpr/trigger` | Topic the triggers are published on |
+| `gpr_trigger_rate_hz` | `50.0` | Plate-pose sampling rate; keep well above `sweep_speed / spacing` |
+| `gpr_trigger_min_step_m` | `0.0005` | Per-sample deadband rejecting TF jitter |
+| `gpr_trigger_max_jump_m` | `0.05` | Per-sample cap; a bigger jump re-anchors instead of firing a burst |
+| `gpr_trigger_log_every` | `20` | Log every Nth trigger at info (`0` = none) |
+
+Counters restart at each sweep, which is also each GPR line scan (with
+`nest_lines_in_partition` on, once per height at a partition). Travel is
+measured as the signed projection onto the segment direction, so plate motion
+perpendicular to the wall (the arm's approach, force-mode press) does not clock
+the probe. `gpr_trigger_rate_hz` is checked against whichever speed knob governs
+the active route — `sweep_speed_mps` for the arm sweep, `sweep_crawl_speed` or
+`sweep_speed_limit` for the base one — and warns when sampling is too coarse for
+the spacing.
 
 ### Integration Packages
 

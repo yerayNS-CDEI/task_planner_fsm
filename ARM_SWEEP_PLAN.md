@@ -673,6 +673,18 @@ force-mode stop, arm process teardown, `_segments_ok += 1`,
 `_last_swept_point`) stays unchanged. Watchdog or validation failures flow into
 the existing retract/failure handling.
 
+**GPR distance triggers** — the probe's encoder wheel has to roll on the wall to
+clock a trace, which contact alone cannot guarantee, so a fake encoder is pulsed
+by the FSM instead: one trigger per `gpr_trigger_distance_m` of plate travel,
+sampled off `map -> arm_tool0` on its own timer (the FSM ticks at 1 Hz, far too
+coarse for a 5 mm grid at `sweep_speed_mps`). Arm the sampler on the executor's
+`sweep` feedback, alongside `_gpr_start_measurement_and_line`, and for the same
+reason: the `traverse` leg carries the plate to the partition start without
+scanning it, and triggers armed any earlier would clock that motion as traces.
+Stop it when the executor's result arrives. Travel is the signed projection onto
+`seg_start -> seg_end`, so the approach and the press do not clock the probe,
+and TF jitter cancels instead of accumulating.
+
 **Gate off, do not delete** the base-crawl machinery — it exists solely to make
 the *base* crawl slowly, and you want it for A/B testing on real hardware:
 `_apply_sweep_speed`, `_restore_sweep_speed`, `_start_sweep_crawl`,
@@ -743,6 +755,13 @@ later, update the contact threshold deliberately in the same test campaign.
 | `scan_wall_press_force_n` | `5.0` | force-mode press; the contact gate defaults to `-this`, so the pair cannot drift apart |
 | `scan_wall_gimbal_press` | `false` | RX/RY compliance; warns loudly when on, since the commanded plate orientation stops being enforced |
 | `contact_min_force_n` | `-2.0` | press relaxed past this = contact lost (dwell applies) |
+| `gpr_trigger_distance_m` | `0.005` | plate travel between GPR triggers; the trace spacing along the line |
+| `gpr_trigger_enabled` | `true` | emit triggers at all. Independent of `gpr_enabled`, so the spacing can be validated with the probe still off |
+| `gpr_trigger_topic` | `/gpr/trigger` | `std_msgs/UInt32`, the trigger index within the sweep. Debug stand-in until the fake encoder is wired in |
+| `gpr_trigger_rate_hz` | `50.0` | plate sampling rate; warns when below `2 * sweep_speed_mps / spacing`, where the triggers would come in bursts |
+| `gpr_trigger_min_step_m` | `0.0005` | per-sample deadband; below it the sample is TF jitter, not travel |
+| `gpr_trigger_max_jump_m` | `0.05` | per-sample cap; a bigger jump is a localisation discontinuity and re-anchors instead of firing a burst |
+| `gpr_trigger_log_every` | `20` | log every Nth trigger at info (200/m at the default spacing would drown the console) |
 | `contact_max_force_n` | `-25.0` | past this = abort immediately, no dwell |
 | `orientation_replan_enabled` | `false` | S6 mid-sweep preempt + regenerate. Off until validated |
 | `orientation_replan_threshold_deg` | `4.0` | **not the plan's 2.0** — that is the measured noise median |

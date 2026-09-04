@@ -26,6 +26,7 @@ import rclpy.time
 from arm_control.srv import SendPosition
 from ur_msgs.srv import SetForceMode
 from std_srvs.srv import Trigger
+from std_msgs.msg import UInt32
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter as ParameterMsg, ParameterValue, ParameterType
 import subprocess, os, signal
@@ -122,10 +123,12 @@ class ScanWall(State):
         #   lead_in(_wait)   arm crosses to the partition START, still off the wall
         #   press_prepare    alignment controller + force-mode press
         #   press_settle     wait for the FT sensor to confirm wall contact
-        #   sweep_wait       the actual scan
+        #   sweep_wait       the actual scan (GPR triggers fire every X cm here)
         # The lead-in comes BEFORE the press on purpose: the base parks at the
         # partition centre, so pressing first would drag the GPR wheel half a
-        # partition sideways across the wall under load.
+        # partition sideways across the wall under load. It is also why the
+        # triggers are armed off the executor's "sweep" feedback and not here:
+        # the lead-in slides the plate along the wall without scanning it.
         self._segments = None        # [((sx,sy,z),(ex,ey,z)), ...] robot-end first
         # Arm-sweep mode only: one (x, y, yaw) Nav2 scan pose per entry of
         # self._segments (which then holds partitions, not raw segments).
@@ -212,6 +215,24 @@ class ScanWall(State):
         self.gpr_measurement_active = False
         self.gpr_line_active = False
 
+        # GPR encoder trigger: the probe normally clocks its traces off an encoder
+        # wheel that has to roll on the wall, which is hard to keep in contact even
+        # when the plate is at the right standoff. A fake encoder replaces it, and
+        # the computer decides when to pulse it: one trigger per
+        # ``gpr_trigger_distance_m`` of SENSOR-PLATE travel (measured in the map
+        # frame, so base sweep + arm motion both count). Sampled by its own timer
+        # during the sweep, because the FSM itself only ticks at 1 Hz — far too
+        # coarse for a 5 mm spacing at the sweep speed. See _gpr_trigger_tick.
+        self._gpr_trigger_pub = None
+        self._gpr_trigger_timer = None
+        self._gpr_trigger_last_xyz = None   # previous plate sample (map frame)
+        self._gpr_trigger_axis = None       # unit sweep direction (map frame, XY)
+        self._gpr_trigger_residual = 0.0    # travel not yet converted to a trigger
+        self._gpr_trigger_travel = 0.0      # total plate travel this segment
+        self._gpr_trigger_count = 0         # triggers fired this segment
+        self._gpr_trigger_tf_warned = False
+        self._ee_frame = None               # cached map->EE frame name
+
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering scanning state.")
@@ -275,6 +296,8 @@ class ScanWall(State):
         self._press_settle_start = None
         self.gpr_measurement_active = False
         self.gpr_line_active = False
+        self._stop_gpr_triggers(ctx, log_summary=False)   # clear any stale timer
+        self._ee_frame = None
         ctx["error_triggered"] = False
 
         self.column.reset()
@@ -1042,25 +1065,289 @@ class ScanWall(State):
             node.get_logger().info(f"[{self.name}] GPR line + measurement stopped.")
 
     # ------------------------------------------------------------------
+    # GPR fake-encoder trigger — one pulse per X cm of sensor-plate travel
+    # ------------------------------------------------------------------
+    # Distance the plate must travel between two triggers. 0.5 cm by default;
+    # override with ctx/ROS param ``gpr_trigger_distance_m``.
+    GPR_TRIGGER_DISTANCE_M = 0.005
+    # Sampling rate of the plate pose. Must be well above
+    # sweep_speed / trigger_distance (0.05 m/s / 0.005 m = 10 Hz) so the trigger
+    # position is quantised to a fraction of the spacing; 50 Hz => ~1 mm.
+    GPR_TRIGGER_RATE_HZ = 50.0
+    # Per-sample deadband: displacement below this is TF jitter, not motion, and
+    # is left on the anchor rather than added to the travel (a 1 mm/s numerical
+    # drift would otherwise fire a spurious trigger every 5 s while parked).
+    GPR_TRIGGER_MIN_STEP_M = 0.0005
+    # Per-sample sanity cap: a jump larger than this is a localisation/TF
+    # discontinuity, not plate travel. Re-anchor instead of firing a burst.
+    GPR_TRIGGER_MAX_JUMP_M = 0.05
+    # Log every Nth trigger at info (0.5 cm spacing means ~200 per metre, so
+    # logging each one would drown the console); the rest go to debug.
+    GPR_TRIGGER_LOG_EVERY = 20
+
+    def _gpr_trigger_enabled(self, ctx):
+        """Whether to emit distance triggers during the sweep.
+
+        Deliberately independent of ``_gpr_enabled``: the probe itself is still
+        off by default (not on the robot network yet), but the triggers are what
+        we want to watch on the topic/log while validating the spacing.
+        """
+        return bool(ctx.get("gpr_trigger_enabled", True))
+
+    def _start_gpr_triggers(self, ctx, seg_start=None, seg_end=None):
+        """Arm the distance-trigger sampler for the segment sweep that is about to
+        start, and fire the d = 0 trigger at the segment start. Counters restart
+        per segment, which is also per GPR line scan, so a segment of length L
+        yields floor(L / spacing) + 1 triggers.
+
+        ``seg_start``/``seg_end`` give the direction the plate is about to travel
+        along the wall; the tick measures progress along it (see _gpr_trigger_tick).
+        Falls back to the fixed sweep heading when they are not given (or when the
+        segment is degenerate) — only a guard: every caller passes the segment it
+        is about to sweep, and on a zero-length segment the plate does not travel
+        anyway (the wall heading is fixed per wall, so on a serpentine line swept
+        the other way it would point backwards).
+        """
+        self._stop_gpr_triggers(ctx, log_summary=False)   # never two timers
+        if not self._gpr_trigger_enabled(ctx):
+            return
+        node = ctx["node"]
+        axis = self._sweep_axis(seg_start, seg_end)
+        if axis is None:
+            sweep_yaw = 2.0 * atan2(self._sweep_qz, self._sweep_qw)
+            axis = (cos(sweep_yaw), sin(sweep_yaw))
+        self._gpr_trigger_axis = axis
+        if self._gpr_trigger_pub is None:
+            self._gpr_trigger_pub = node.create_publisher(
+                UInt32, str(ctx.get("gpr_trigger_topic", "/gpr/trigger")), 50
+            )
+        self._gpr_trigger_residual = 0.0
+        self._gpr_trigger_travel = 0.0
+        self._gpr_trigger_count = 0
+        self._gpr_trigger_tf_warned = False
+        # Anchor on the current plate pose (full timeout: this runs once, off the
+        # FSM tick, and TF has to be there before the sweep is worth starting).
+        self._gpr_trigger_last_xyz = self._lookup_ee_world_xyz(ctx)
+        rate = max(1.0, float(ctx.get("gpr_trigger_rate_hz", self.GPR_TRIGGER_RATE_HZ)))
+        # Sub-Nyquist sampling would quantise the triggers into bursts; warn rather
+        # than silently mis-space them. Each sweep route carries the plate at its
+        # own speed, so read the knob that actually governs this one.
+        if self._use_arm_sweep(ctx):
+            speed = float(ctx.get("sweep_speed_mps", 0.05))
+        elif bool(ctx.get("sweep_use_crawl", False)):
+            speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
+        else:
+            speed = float(ctx.get("sweep_speed_limit", self.SWEEP_SPEED_LIMIT_MS))
+        speed = speed or self.SWEEP_SPEED_LIMIT_MS   # 0.0 means "uncapped"
+        spacing = self._gpr_trigger_spacing(ctx)
+        if rate < 2.0 * speed / spacing:
+            node.get_logger().warn(
+                f"[{self.name}] GPR trigger sampling at {rate:.0f} Hz is coarse for "
+                f"{spacing * 100.0:.2f} cm spacing at {speed:.3f} m/s; triggers will "
+                f"come in bursts. Raise gpr_trigger_rate_hz."
+            )
+        self._gpr_trigger_timer = node.create_timer(
+            1.0 / rate, lambda: self._gpr_trigger_tick(ctx)
+        )
+        node.get_logger().info(
+            f"[{self.name}] GPR triggers armed: one every {spacing * 100.0:.2f} cm of "
+            f"plate travel, sampled at {rate:.0f} Hz on "
+            f"'{ctx.get('gpr_trigger_topic', '/gpr/trigger')}'."
+        )
+        # The start of the sweep is itself a trigger position (d = 0), so trace #1
+        # sits at the segment start and every later one a whole spacing along it.
+        if self._gpr_trigger_last_xyz is not None:
+            self._emit_gpr_trigger(ctx)
+        else:
+            node.get_logger().warn(
+                f"[{self.name}] GPR triggers: no map->EE transform yet; the d=0 "
+                f"trigger fires on the first pose the sampler gets."
+            )
+
+    def _stop_gpr_triggers(self, ctx, log_summary=True):
+        """Disarm the sampler (segment sweep finished, or state left)."""
+        timer = getattr(self, "_gpr_trigger_timer", None)
+        if timer is not None:
+            timer.cancel()
+            ctx["node"].destroy_timer(timer)
+            self._gpr_trigger_timer = None
+            self._gpr_trigger_axis = None
+            if log_summary:
+                ctx["node"].get_logger().info(
+                    f"[{self.name}] GPR triggers: {self._gpr_trigger_count} fired over "
+                    f"{self._gpr_trigger_travel:.3f} m of plate travel."
+                )
+        self._gpr_trigger_last_xyz = None
+
+    def _gpr_trigger_spacing(self, ctx):
+        """Configured trigger spacing in metres (never zero/negative)."""
+        spacing = float(ctx.get("gpr_trigger_distance_m", self.GPR_TRIGGER_DISTANCE_M))
+        if spacing <= 0.0:
+            ctx["node"].get_logger().warn(
+                f"[{self.name}] gpr_trigger_distance_m={spacing} is not positive; "
+                f"falling back to {self.GPR_TRIGGER_DISTANCE_M} m."
+            )
+            return self.GPR_TRIGGER_DISTANCE_M
+        return spacing
+
+    @staticmethod
+    def _sweep_axis(seg_start, seg_end):
+        """Unit XY vector from ``seg_start`` to ``seg_end``, or None."""
+        if seg_start is None or seg_end is None:
+            return None
+        dx, dy = seg_end[0] - seg_start[0], seg_end[1] - seg_start[1]
+        norm = math.hypot(dx, dy)
+        if norm < 1e-6:
+            return None
+        return (dx / norm, dy / norm)
+
+    def _gpr_trigger_tick(self, ctx):
+        """Timer callback: accumulate how far the plate has advanced along the
+        sweep and fire a trigger for every whole ``gpr_trigger_distance_m``.
+
+        Advance is measured as the SIGNED projection of the plate displacement
+        onto the sweep axis — the same thing the encoder wheel would roll off as
+        it tracks along the wall. Using the raw 3-D path length instead would let
+        TF jitter accumulate as phantom travel (a random walk never cancels once
+        you take its magnitude), firing triggers with the robot standing still;
+        projected, perpendicular noise drops out and along-axis noise averages to
+        zero. The axis is always set while the sampler is armed; the path-length
+        branch below is only a guard for a sampler ticking without one.
+
+        The residual carries across samples, so triggers stay on a fixed distance
+        grid however irregular the sampling is; one sample spanning several
+        spacings fires several triggers. Motion backwards along the axis holds the
+        triggers instead of firing them, so re-covered ground is not re-triggered
+        beyond one spacing of hysteresis.
+        """
+        node = ctx["node"]
+        xyz = self._lookup_ee_world_xyz(ctx, timeout_s=0.0)
+        if xyz is None:
+            if not self._gpr_trigger_tf_warned:
+                node.get_logger().warn(
+                    f"[{self.name}] GPR triggers: map->EE transform unavailable; "
+                    f"no triggers until it returns."
+                )
+                self._gpr_trigger_tf_warned = True
+            return
+        self._gpr_trigger_tf_warned = False
+
+        last = self._gpr_trigger_last_xyz
+        if last is None:
+            # Late anchor (TF was not up when the sampler was armed): this pose is
+            # the sweep's d = 0 position, so it carries the first trigger.
+            self._gpr_trigger_last_xyz = xyz
+            if self._gpr_trigger_count == 0:
+                self._emit_gpr_trigger(ctx)
+            return
+
+        axis = self._gpr_trigger_axis
+        if axis is None:
+            step = math.dist(xyz, last)
+        else:
+            step = (xyz[0] - last[0]) * axis[0] + (xyz[1] - last[1]) * axis[1]
+
+        min_step = float(ctx.get("gpr_trigger_min_step_m", self.GPR_TRIGGER_MIN_STEP_M))
+        if abs(step) < min_step:
+            # Below the noise floor: keep the old anchor so real slow motion still
+            # accumulates across ticks instead of being discarded sample by sample.
+            return
+        max_jump = float(ctx.get("gpr_trigger_max_jump_m", self.GPR_TRIGGER_MAX_JUMP_M))
+        if abs(step) > max_jump:
+            node.get_logger().warn(
+                f"[{self.name}] GPR triggers: plate pose jumped {step:.3f} m in one "
+                f"sample (> {max_jump:.3f} m); re-anchoring without firing."
+            )
+            self._gpr_trigger_last_xyz = xyz
+            return
+
+        self._gpr_trigger_last_xyz = xyz
+        self._gpr_trigger_travel += step
+        self._gpr_trigger_residual += step
+        spacing = self._gpr_trigger_spacing(ctx)
+        # A retreat (a Nav2 recovery, say) only ever costs one spacing: without the
+        # clamp, backing up 1 m would leave a 1 m dead zone with no triggers while
+        # the sweep re-covers that ground.
+        if self._gpr_trigger_residual < -spacing:
+            self._gpr_trigger_residual = -spacing
+        # Integer grid rather than a subtract-while loop: at an exact multiple
+        # (0.04 m of travel at 0.005 m spacing) repeated subtraction leaves
+        # 4.9999...e-3 and silently drops the last trigger.
+        pending = int(math.floor(self._gpr_trigger_residual / spacing + 1e-9))
+        if pending <= 0:
+            return
+        self._gpr_trigger_residual -= pending * spacing
+        for _ in range(pending):
+            self._emit_gpr_trigger(ctx)
+
+    def _emit_gpr_trigger(self, ctx):
+        """Fire one trigger.
+
+        For now this is the debug stand-in for the fake encoder: a message on
+        ``gpr_trigger_topic`` carrying the trigger index within this segment, plus
+        a log line. Swap the publish for the fake-encoder hardware call once that
+        interface exists — the distance bookkeeping above does not change.
+        """
+        node = ctx["node"]
+        self._gpr_trigger_count += 1
+        if self._gpr_trigger_pub is not None:
+            msg = UInt32()
+            msg.data = self._gpr_trigger_count
+            self._gpr_trigger_pub.publish(msg)
+        text = (
+            f"[{self.name}] GPR trigger #{self._gpr_trigger_count} "
+            f"(plate travel {self._gpr_trigger_travel:.3f} m, line "
+            f"{ctx.get('current_line_idx', 0) + 1}, segment {self._seg_idx + 1})"
+        )
+        every = int(ctx.get("gpr_trigger_log_every", self.GPR_TRIGGER_LOG_EVERY))
+        if every > 0 and self._gpr_trigger_count % every == 0:
+            node.get_logger().info(text)
+        else:
+            node.get_logger().debug(text)
+
+    # ------------------------------------------------------------------
     # Column height from the map-frame line z
     # ------------------------------------------------------------------
-    def _lookup_ee_world_z(self, ctx):
-        """Return the current end-effector height in the map frame, or None."""
+    def _lookup_ee_world_xyz(self, ctx, timeout_s=1.0):
+        """Return the end-effector (sensor-plate TCP) position in the map frame as
+        ``(x, y, z)``, or None.
+
+        Unlike ``_tool0_pose`` (arm_base -> arm_tool0), this is a WORLD pose: it
+        moves when the base slides along the wall, which is what the GPR trigger
+        has to measure. The first frame of the fallback chain that resolves is
+        cached in ``self._ee_frame``, so the high-rate trigger sampler does not
+        re-probe eight frames per tick; pass ``timeout_s=0.0`` there so a momentary
+        TF gap cannot block the executor.
+        """
         tf_buffer = ctx.get("tf_buffer")
         if tf_buffer is None:
             return None
-        ee_frames = [
-            "arm_tool0", "arm_wrist_3_link", "arm_ee_link", "arm_flange",
-            "tool0", "wrist_3_link", "ee_link", "flange",
-        ]
-        for frame in ee_frames:
+        if self._ee_frame is not None:
+            frames = [self._ee_frame]
+        else:
+            frames = [str(ctx.get("arm_tool_frame", "arm_tool0"))] + [
+                f for f in (
+                    "arm_tool0", "arm_wrist_3_link", "arm_ee_link", "arm_flange",
+                    "tool0", "wrist_3_link", "ee_link", "flange",
+                )
+                if f != str(ctx.get("arm_tool_frame", "arm_tool0"))
+            ]
+        timeout = Duration(seconds=float(timeout_s))
+        for frame in frames:
             try:
-                if tf_buffer.can_transform("map", frame, rclpy.time.Time(), Duration(seconds=1.0)):
-                    tf = tf_buffer.lookup_transform("map", frame, rclpy.time.Time(), Duration(seconds=1.0))
-                    return float(tf.transform.translation.z)
+                if tf_buffer.can_transform("map", frame, rclpy.time.Time(), timeout):
+                    tf = tf_buffer.lookup_transform("map", frame, rclpy.time.Time(), timeout)
+                    self._ee_frame = frame
+                    t = tf.transform.translation
+                    return (float(t.x), float(t.y), float(t.z))
             except Exception:
                 continue
         return None
+
+    def _lookup_ee_world_z(self, ctx):
+        """Return the current end-effector height in the map frame, or None."""
+        xyz = self._lookup_ee_world_xyz(ctx)
+        return None if xyz is None else xyz[2]
 
     def _column_target_for_line(self, ctx, line_z):
         """Column extension that places the EE at the map-frame ``line_z``.
@@ -2350,6 +2637,9 @@ class ScanWall(State):
                 self._start_sweep_crawl(ctx, goal_xy)
             elif not self._send_base_goal(ctx, goal_xy):
                 return
+            # Plate is on the wall and the base is moving: start clocking the GPR
+            # with one trigger per gpr_trigger_distance_m of plate travel.
+            self._start_gpr_triggers(ctx, seg_start, seg_end)
             self._seg_phase = "sweep_wait"
             return
 
@@ -2364,15 +2654,28 @@ class ScanWall(State):
             reason = ""      # only set on the arm-sweep path; read by the backoff
             if arm_sweep:
                 # The lead-in is done and the plate is now crossing the wall: this
-                # is the moment the GPR line has to start (see press_settle).
+                # is the moment the GPR line has to start (see press_settle) and,
+                # for the same reason, the moment to start clocking it. Arming any
+                # earlier would trigger through the lead-in traverse and the
+                # executor's settle, recording plate travel that is not scan data;
+                # this feedback is also why none of the three no-sweep paths into
+                # sweep_wait (column failure, lead-in dispatch, lead-in failure)
+                # can arm the sampler.
                 if self._sweep_scanning and not self.gpr_line_active:
                     self._gpr_start_measurement_and_line(ctx)
                     if ctx.get("error_triggered"):
                         return
+                    # Armed once per sweep, not once per tick: with the probe
+                    # disabled (the default) gpr_line_active never latches, so
+                    # this block is re-entered every tick for the whole sweep and
+                    # a bare arm call would restart the counter each second.
+                    if self._gpr_trigger_timer is None:
+                        self._start_gpr_triggers(ctx, seg_start, seg_end)
                 # The executor owns the sweep's own watchdogs and reports one
                 # outcome; everything after it here is unchanged.
                 if self._sweep_result is None:
                     return
+                self._stop_gpr_triggers(ctx)   # the plate has stopped scanning
                 succeeded, reason, detail = self._sweep_result
                 self._sweep_result = None
                 status = GoalStatus.STATUS_SUCCEEDED if succeeded else GoalStatus.STATUS_ABORTED
@@ -2395,6 +2698,7 @@ class ScanWall(State):
                     return
                 status = self._nav_status
                 self._stop_sweep_crawl(ctx, publish_stop=True)   # ensure base is stopped
+                self._stop_gpr_triggers(ctx)     # no triggers once the plate stops moving
                 self._restore_sweep_speed(ctx)   # clear the slow-sweep cap for the next transit
             # Release hardware/process state first (safety), regardless of outcome.
             node.get_logger().info(
@@ -3068,6 +3372,7 @@ class ScanWall(State):
         ## running GPR measurement, release force mode (real) and stop sensor +
         ## alignment nodes.
         self._stop_sweep_crawl(ctx, publish_stop=True)
+        self._stop_gpr_triggers(ctx, log_summary=False)
         self._restore_sweep_speed(ctx)
         self._cancel_sweep_goal(ctx)
         self._set_trajectory_bridge_hold(ctx, False)   # never leave the arm stack muted
