@@ -166,6 +166,10 @@ class AdmittancePress:
         self._stalled = 0
         self._released = 0
         self._tare_samples = []
+        # Backing away from the surface to find room to tare in. Visible so the
+        # log can say so: an arm moving AWAY at the start of a sweep is alarming
+        # if you do not know why.
+        self._backing_off = False
         # Whether contact has EVER been established. The sweep gates its travel
         # on this: a segment that never touched is a GPR recording of air, and
         # reporting it as swept means nobody knows to come back.
@@ -175,6 +179,11 @@ class AdmittancePress:
     @property
     def in_contact(self):
         return self.state == PRESS
+
+    @property
+    def backing_off(self):
+        """Retreating to find free space to tare in, rather than approaching."""
+        return self._backing_off
 
     @property
     def stalled(self):
@@ -213,11 +222,21 @@ class AdmittancePress:
         # yet trustworthy — so the plate's own ranges decide.
         if self.state == TARE:
             if distance is not None and distance < self.tare_min_distance:
-                self.fault = (
-                    f"cannot tare the force sensor: the plate is {distance * 100:.1f} cm "
-                    f"from the surface, inside the {self.tare_min_distance * 100:.0f} cm "
-                    f"free-space margin the tare needs (is it already touching?)")
-                return 0.0
+                # Too close to trust a zero. BACK OFF and try again rather than
+                # failing: the sweep does not choose where it starts. The FSM's
+                # approach is accepted anywhere within scan_wall_approach_tolerance
+                # of its target — 0.05 m to 0.35 m with the shipped numbers — so a
+                # plate that begins inside this margin is ordinary, not broken,
+                # and the arm is already holding the one actuator that can fix it.
+                #
+                # Making this fatal is what regressed the sweep: a legitimate
+                # low approach ended the segment on cycle one and sent the arm
+                # into a full retreat. The bound on backing off is
+                # press_contact_timeout, which is already counting.
+                self._tare_samples.clear()
+                self._backing_off = True
+                return -self.seek_speed
+            self._backing_off = False
             self._tare_samples.append(float(raw_force))
             if len(self._tare_samples) < self.tare_cycles:
                 return 0.0                      # hold still while measuring

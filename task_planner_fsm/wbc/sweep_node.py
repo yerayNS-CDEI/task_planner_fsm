@@ -1339,11 +1339,21 @@ class WholeBodySweepNode(Node):
             self.best_progress = self.progress
             self.progress_stamp = now
             waited = now - self.press_wait_since
+            if self.press.backing_off:
+                # Moving AWAY at the start of a sweep looks like a fault unless
+                # the log says why: the plate began inside the tare's free-space
+                # margin and is making room to measure the sensor's zero.
+                self.get_logger().warn(
+                    f"Plate started {self.surface.distance * 100:.1f} cm from the wall, "
+                    f"inside the {self.press.tare_min_distance * 100:.0f} cm the tare "
+                    f"needs; backing off to measure the force zero before pressing.",
+                    throttle_duration_sec=5.0)
             if waited > float(p("press_contact_timeout").value):
                 self.finish(
                     "failed",
-                    f"the press never reached the wall: {waited:.0f}s at "
-                    f"{self.surface.distance * 100:.1f} cm with {self.press.force:+.1f} N "
+                    f"the press never reached the wall: {waited:.0f}s "
+                    f"{'still backing off to tare' if self.press.backing_off else 'seeking'} "
+                    f"at {self.surface.distance * 100:.1f} cm with {self.press.force:+.1f} N "
                     f"on the wheel against a {self.press.target_force:.0f} N target. "
                     f"Sweeping without contact would record air.")
                 return
