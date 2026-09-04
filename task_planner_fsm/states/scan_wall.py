@@ -219,14 +219,16 @@ class ScanWall(State):
         # wheel that has to roll on the wall, which is hard to keep in contact even
         # when the plate is at the right standoff. A fake encoder replaces it, and
         # the computer decides when to pulse it: one trigger per
-        # ``gpr_trigger_distance_m`` of SENSOR-PLATE travel (measured in the map
-        # frame, so base sweep + arm motion both count). Sampled by its own timer
+        # ``gpr_trigger_distance_m`` of SENSOR-PLATE travel, measured against
+        # whichever body actually carries the plate (arm_base for an arm sweep,
+        # map for a base-driven one — see _gpr_trigger_frame). Sampled by its own timer
         # during the sweep, because the FSM itself only ticks at 1 Hz — far too
         # coarse for a 5 mm spacing at the sweep speed. See _gpr_trigger_tick.
         self._gpr_trigger_pub = None
         self._gpr_trigger_timer = None
         self._gpr_trigger_last_xyz = None   # previous plate sample (map frame)
-        self._gpr_trigger_axis = None       # unit sweep direction (map frame, XY)
+        self._gpr_trigger_axis = None       # unit sweep direction, in the ref frame
+        self._gpr_trigger_ref = "map"       # frame the plate travel is measured in
         self._gpr_trigger_residual = 0.0    # travel not yet converted to a trigger
         self._gpr_trigger_travel = 0.0      # total plate travel this segment
         self._gpr_trigger_count = 0         # triggers fired this segment
@@ -1112,10 +1114,20 @@ class ScanWall(State):
         if not self._gpr_trigger_enabled(ctx):
             return
         node = ctx["node"]
-        axis = self._sweep_axis(seg_start, seg_end)
-        if axis is None:
+        axis_xy = self._sweep_axis(seg_start, seg_end)
+        if axis_xy is None:
             sweep_yaw = 2.0 * atan2(self._sweep_qz, self._sweep_qw)
-            axis = (cos(sweep_yaw), sin(sweep_yaw))
+            axis_xy = (cos(sweep_yaw), sin(sweep_yaw))
+        ref = self._gpr_trigger_frame(ctx)
+        axis = self._axis_in_frame(ctx, ref, axis_xy)
+        if axis is None:
+            node.get_logger().warn(
+                f"[{self.name}] GPR triggers: cannot express the sweep direction in "
+                f"'{ref}' (no {ref}<-map transform); measuring in map instead."
+            )
+            ref = "map"
+            axis = (axis_xy[0], axis_xy[1], 0.0)
+        self._gpr_trigger_ref = ref
         self._gpr_trigger_axis = axis
         if self._gpr_trigger_pub is None:
             self._gpr_trigger_pub = node.create_publisher(
@@ -1127,7 +1139,7 @@ class ScanWall(State):
         self._gpr_trigger_tf_warned = False
         # Anchor on the current plate pose (full timeout: this runs once, off the
         # FSM tick, and TF has to be there before the sweep is worth starting).
-        self._gpr_trigger_last_xyz = self._lookup_ee_world_xyz(ctx)
+        self._gpr_trigger_last_xyz = self._lookup_plate_xyz(ctx, ref)
         rate = max(1.0, float(ctx.get("gpr_trigger_rate_hz", self.GPR_TRIGGER_RATE_HZ)))
         # Sub-Nyquist sampling would quantise the triggers into bursts; warn rather
         # than silently mis-space them. Each sweep route carries the plate at its
@@ -1151,7 +1163,7 @@ class ScanWall(State):
         )
         node.get_logger().info(
             f"[{self.name}] GPR triggers armed: one every {spacing * 100.0:.2f} cm of "
-            f"plate travel, sampled at {rate:.0f} Hz on "
+            f"plate travel measured in '{ref}', sampled at {rate:.0f} Hz on "
             f"'{ctx.get('gpr_trigger_topic', '/gpr/trigger')}'."
         )
         # The start of the sweep is itself a trigger position (d = 0), so trace #1
@@ -1160,7 +1172,7 @@ class ScanWall(State):
             self._emit_gpr_trigger(ctx)
         else:
             node.get_logger().warn(
-                f"[{self.name}] GPR triggers: no map->EE transform yet; the d=0 "
+                f"[{self.name}] GPR triggers: no {ref}->plate transform yet; the d=0 "
                 f"trigger fires on the first pose the sampler gets."
             )
 
@@ -1172,6 +1184,7 @@ class ScanWall(State):
             ctx["node"].destroy_timer(timer)
             self._gpr_trigger_timer = None
             self._gpr_trigger_axis = None
+            self._gpr_trigger_ref = "map"
             if log_summary:
                 ctx["node"].get_logger().info(
                     f"[{self.name}] GPR triggers: {self._gpr_trigger_count} fired over "
@@ -1190,6 +1203,70 @@ class ScanWall(State):
             return self.GPR_TRIGGER_DISTANCE_M
         return spacing
 
+    def _gpr_trigger_frame(self, ctx):
+        """Frame the plate travel is measured against.
+
+        Explicit ``gpr_trigger_reference_frame`` wins. Otherwise it follows the
+        sweep route, because the two move the plate with different bodies: an arm
+        sweep runs with the base parked, so ``arm_base`` measures the plate off
+        the joint states alone and keeps odometry and localisation drift out of
+        the trigger spacing entirely; a base-driven sweep moves the arm base
+        itself, where only a world frame sees the travel at all.
+
+        Setting it to ``arm_base`` for a base-driven sweep would measure almost no
+        travel; setting it to ``map`` for an arm sweep works but inherits the
+        localisation noise this parameter exists to avoid.
+        """
+        ref = ctx.get("gpr_trigger_reference_frame")
+        if ref:
+            return str(ref)
+        if self._use_arm_sweep(ctx):
+            return str(ctx.get("arm_base_frame", "arm_base"))
+        return "map"
+
+    @staticmethod
+    def _rotate_vec(q, v):
+        """Rotate vector ``v`` by quaternion ``q`` (v + 2q_v x (q_v x v + w v))."""
+        x, y, z, w = float(q.x), float(q.y), float(q.z), float(q.w)
+        tx = 2.0 * (y * v[2] - z * v[1])
+        ty = 2.0 * (z * v[0] - x * v[2])
+        tz = 2.0 * (x * v[1] - y * v[0])
+        return (
+            v[0] + w * tx + (y * tz - z * ty),
+            v[1] + w * ty + (z * tx - x * tz),
+            v[2] + w * tz + (x * ty - y * tx),
+        )
+
+    def _axis_in_frame(self, ctx, ref_frame, axis_xy):
+        """Express the map-frame sweep direction ``axis_xy`` in ``ref_frame`` as a
+        3-D unit vector, or None if the rotation cannot be looked up.
+
+        Only the rotation matters — a direction has no origin — and the base is
+        parked for the whole arm sweep, so this is read once at arming and stays
+        valid for the sweep. Doing it per sample would put the very TF chain this
+        parameter exists to avoid back into every measurement.
+        """
+        if ref_frame == "map":
+            return (axis_xy[0], axis_xy[1], 0.0)
+        tf_buffer = ctx.get("tf_buffer")
+        if tf_buffer is None:
+            return None
+        try:
+            if not tf_buffer.can_transform(
+                ref_frame, "map", rclpy.time.Time(), Duration(seconds=1.0)
+            ):
+                return None
+            tf = tf_buffer.lookup_transform(
+                ref_frame, "map", rclpy.time.Time(), Duration(seconds=1.0))
+        except Exception:
+            return None
+        vx, vy, vz = self._rotate_vec(
+            tf.transform.rotation, (axis_xy[0], axis_xy[1], 0.0))
+        norm = math.sqrt(vx * vx + vy * vy + vz * vz)
+        if norm < 1e-6:
+            return None
+        return (vx / norm, vy / norm, vz / norm)
+
     @staticmethod
     def _sweep_axis(seg_start, seg_end):
         """Unit XY vector from ``seg_start`` to ``seg_end``, or None."""
@@ -1206,8 +1283,8 @@ class ScanWall(State):
         sweep and fire a trigger for every whole ``gpr_trigger_distance_m``.
 
         Advance is measured as the SIGNED projection of the plate displacement
-        onto the sweep axis — the same thing the encoder wheel would roll off as
-        it tracks along the wall. Using the raw 3-D path length instead would let
+        onto the sweep axis, both expressed in ``self._gpr_trigger_ref`` — the same
+        thing the encoder wheel would roll off as it tracks along the wall. Using the raw 3-D path length instead would let
         TF jitter accumulate as phantom travel (a random walk never cancels once
         you take its magnitude), firing triggers with the robot standing still;
         projected, perpendicular noise drops out and along-axis noise averages to
@@ -1221,12 +1298,12 @@ class ScanWall(State):
         beyond one spacing of hysteresis.
         """
         node = ctx["node"]
-        xyz = self._lookup_ee_world_xyz(ctx, timeout_s=0.0)
+        xyz = self._lookup_plate_xyz(ctx, self._gpr_trigger_ref, timeout_s=0.0)
         if xyz is None:
             if not self._gpr_trigger_tf_warned:
                 node.get_logger().warn(
-                    f"[{self.name}] GPR triggers: map->EE transform unavailable; "
-                    f"no triggers until it returns."
+                    f"[{self.name}] GPR triggers: {self._gpr_trigger_ref}->plate "
+                    f"transform unavailable; no triggers until it returns."
                 )
                 self._gpr_trigger_tf_warned = True
             return
@@ -1245,7 +1322,9 @@ class ScanWall(State):
         if axis is None:
             step = math.dist(xyz, last)
         else:
-            step = (xyz[0] - last[0]) * axis[0] + (xyz[1] - last[1]) * axis[1]
+            step = ((xyz[0] - last[0]) * axis[0]
+                    + (xyz[1] - last[1]) * axis[1]
+                    + (xyz[2] - last[2]) * axis[2])
 
         min_step = float(ctx.get("gpr_trigger_min_step_m", self.GPR_TRIGGER_MIN_STEP_M))
         if abs(step) < min_step:
@@ -1308,35 +1387,43 @@ class ScanWall(State):
     # ------------------------------------------------------------------
     # Column height from the map-frame line z
     # ------------------------------------------------------------------
-    def _lookup_ee_world_xyz(self, ctx, timeout_s=1.0):
-        """Return the end-effector (sensor-plate TCP) position in the map frame as
-        ``(x, y, z)``, or None.
+    def _lookup_plate_xyz(self, ctx, ref_frame="map", timeout_s=1.0):
+        """Return the end-effector (sensor-plate TCP) position expressed in
+        ``ref_frame`` as ``(x, y, z)``, or None.
 
-        Unlike ``_tool0_pose`` (arm_base -> arm_tool0), this is a WORLD pose: it
-        moves when the base slides along the wall, which is what the GPR trigger
-        has to measure. The first frame of the fallback chain that resolves is
-        cached in ``self._ee_frame``, so the high-rate trigger sampler does not
-        re-probe eight frames per tick; pass ``timeout_s=0.0`` there so a momentary
-        TF gap cannot block the executor.
+        ``map`` gives a WORLD pose: it moves when the base slides along the wall,
+        which is what the base-driven sweep has to measure. An arm-mounted
+        reference (``arm_base``) instead measures the plate the way ``_tool0_pose``
+        does — pure forward kinematics off the joint states, with no odometry or
+        localisation in the number at all. That is the accurate choice whenever
+        the base is parked, and the wrong one whenever it is not: relative to
+        ``arm_base`` a base-driven sweep barely moves the plate.
+
+        The first frame of the fallback chain that resolves is cached in
+        ``self._ee_frame``, so the high-rate trigger sampler does not re-probe
+        eight frames per tick; pass ``timeout_s=0.0`` there so a momentary TF gap
+        cannot block the executor. A cached frame that stops resolving against a
+        different reference falls back to the full chain.
         """
         tf_buffer = ctx.get("tf_buffer")
         if tf_buffer is None:
             return None
-        if self._ee_frame is not None:
-            frames = [self._ee_frame]
-        else:
-            frames = [str(ctx.get("arm_tool_frame", "arm_tool0"))] + [
-                f for f in (
-                    "arm_tool0", "arm_wrist_3_link", "arm_ee_link", "arm_flange",
-                    "tool0", "wrist_3_link", "ee_link", "flange",
-                )
-                if f != str(ctx.get("arm_tool_frame", "arm_tool0"))
-            ]
+        tool = str(ctx.get("arm_tool_frame", "arm_tool0"))
+        chain = [tool] + [
+            f for f in (
+                "arm_tool0", "arm_wrist_3_link", "arm_ee_link", "arm_flange",
+                "tool0", "wrist_3_link", "ee_link", "flange",
+            )
+            if f != tool
+        ]
+        frames = ([self._ee_frame] + [f for f in chain if f != self._ee_frame]
+                  if self._ee_frame is not None else chain)
         timeout = Duration(seconds=float(timeout_s))
         for frame in frames:
             try:
-                if tf_buffer.can_transform("map", frame, rclpy.time.Time(), timeout):
-                    tf = tf_buffer.lookup_transform("map", frame, rclpy.time.Time(), timeout)
+                if tf_buffer.can_transform(ref_frame, frame, rclpy.time.Time(), timeout):
+                    tf = tf_buffer.lookup_transform(
+                        ref_frame, frame, rclpy.time.Time(), timeout)
                     self._ee_frame = frame
                     t = tf.transform.translation
                     return (float(t.x), float(t.y), float(t.z))
@@ -1346,7 +1433,7 @@ class ScanWall(State):
 
     def _lookup_ee_world_z(self, ctx):
         """Return the current end-effector height in the map frame, or None."""
-        xyz = self._lookup_ee_world_xyz(ctx)
+        xyz = self._lookup_plate_xyz(ctx, "map")
         return None if xyz is None else xyz[2]
 
     def _column_target_for_line(self, ctx, line_z):

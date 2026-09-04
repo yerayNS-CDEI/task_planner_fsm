@@ -685,6 +685,17 @@ Stop it when the executor's result arrives. Travel is the signed projection onto
 `seg_start -> seg_end`, so the approach and the press do not clock the probe,
 and TF jitter cancels instead of accumulating.
 
+Measure it against `arm_base`, not `map`: the base is parked for the whole
+sweep, so the plate pose is forward kinematics off the joint states and the
+trace spacing carries no odometry or localisation error. Over a 1 m sweep a 2 cm
+drift in `map -> arm_base` costs 3 spurious traces and a 3 cm relocalisation
+jump costs 6, while `arm_base` is exact through both. The map-frame segment
+direction is rotated into the frame once at arming — a direction needs only the
+rotation, and the base does not move — so no per-sample lookup reintroduces the
+chain the frame choice exists to avoid. `gpr_trigger_reference_frame` overrides
+it; the base-driven A/B path has to stay on `map`, where the travel actually
+lives.
+
 **Gate off, do not delete** the base-crawl machinery — it exists solely to make
 the *base* crawl slowly, and you want it for A/B testing on real hardware:
 `_apply_sweep_speed`, `_restore_sweep_speed`, `_start_sweep_crawl`,
@@ -758,6 +769,7 @@ later, update the contact threshold deliberately in the same test campaign.
 | `gpr_trigger_distance_m` | `0.005` | plate travel between GPR triggers; the trace spacing along the line |
 | `gpr_trigger_enabled` | `true` | emit triggers at all. Independent of `gpr_enabled`, so the spacing can be validated with the probe still off |
 | `gpr_trigger_topic` | `/gpr/trigger` | `std_msgs/UInt32`, the trigger index within the sweep. Debug stand-in until the fake encoder is wired in |
+| `gpr_trigger_reference_frame` | `arm_base` in arm-sweep mode, `map` for the base sweep | frame the plate travel is measured in; the default follows the route, since each moves the plate with a different body |
 | `gpr_trigger_rate_hz` | `50.0` | plate sampling rate; warns when below `2 * sweep_speed_mps / spacing`, where the triggers would come in bursts |
 | `gpr_trigger_min_step_m` | `0.0005` | per-sample deadband; below it the sample is TF jitter, not travel |
 | `gpr_trigger_max_jump_m` | `0.05` | per-sample cap; a bigger jump is a localisation discontinuity and re-anchors instead of firing a burst |

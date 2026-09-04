@@ -1056,14 +1056,33 @@ fires one trigger per fixed distance of plate travel along the wall. The start
 of the sweep is itself a trigger position (d = 0), so a segment of length L
 yields `floor(L / spacing) + 1` triggers.
 
-The plate pose is read in the `map` frame, so the same sampler serves both sweep
-routes: in arm-sweep mode (`sweep_use_arm`, the default) the arm carries the
-plate with the base parked, and in the legacy base-driven sweep the base carries
-it. What differs is when the triggers start. On the arm path they are armed by
-`wall_sweep_executor`'s `sweep` feedback — the same signal that opens the GPR
-line — so the lead-in traverse to the partition start, which slides the plate
-along the wall without scanning it, produces none. On the base path they start
-with the base motion.
+The same sampler serves both sweep routes, with two differences.
+
+**When they start.** In arm-sweep mode (`sweep_use_arm`, the default) they are
+armed by `wall_sweep_executor`'s `sweep` feedback — the same signal that opens
+the GPR line — so the lead-in traverse to the partition start, which slides the
+plate along the wall without scanning it, produces none. On the base-driven path
+they start with the base motion.
+
+**What they measure against** (`gpr_trigger_reference_frame`). An arm sweep runs
+with the base parked, so the plate is measured against `arm_base`: pure forward
+kinematics off the joint states, with no odometry or localisation in the number
+at all. A base-driven sweep moves the arm base itself, so only a world frame
+sees the travel, and it falls back to `map`. The default follows the route; set
+the parameter to override it. It matters — with a 1 m sweep and a deliberately
+corrupted `map -> arm_base` estimate:
+
+| localisation error | measured in `arm_base` | measured in `map` |
+|---|---|---|
+| none | 201 triggers | 201 triggers |
+| 2 cm drift along the wall | 201 | 204 |
+| 3 cm relocalisation jump | 201 | 207 |
+| 8 cm jump (over `gpr_trigger_max_jump_m`) | 201 | 200, plus a re-anchor warning |
+
+Zero-mean jitter cancels in either frame (the projection is signed), so it is
+drift and jumps that the frame choice protects against. Setting it to `arm_base`
+for a *base-driven* sweep would measure almost no travel at all, since the arm
+base moves with the plate.
 
 The trigger is currently a stand-in for the hardware: a `std_msgs/UInt32` on
 `/gpr/trigger` carrying the trigger index within the segment, plus a log line
@@ -1082,6 +1101,7 @@ Tuning knobs (ROS parameters on `robot_fsm_node`, e.g.
 | `gpr_trigger_distance_m` | `0.005` | Plate travel between triggers (0.5 cm) |
 | `gpr_trigger_enabled` | `true` | Emit triggers at all (independent of `gpr_enabled`) |
 | `gpr_trigger_topic` | `/gpr/trigger` | Topic the triggers are published on |
+| `gpr_trigger_reference_frame` | *(route default)* | Frame the plate travel is measured in: `arm_base` for an arm sweep, `map` for a base-driven one |
 | `gpr_trigger_rate_hz` | `50.0` | Plate-pose sampling rate; keep well above `sweep_speed / spacing` |
 | `gpr_trigger_min_step_m` | `0.0005` | Per-sample deadband rejecting TF jitter |
 | `gpr_trigger_max_jump_m` | `0.05` | Per-sample cap; a bigger jump re-anchors instead of firing a burst |
