@@ -62,6 +62,26 @@ A 5 N error moves the plate about a quarter of a millimetre per second. That is
 not slow for what it does: this regulates CONTACT, while the tangent carries the
 scan.
 
+**What "touching" means on this plate, because it is not zero distance.** The
+six range sensors sit on the plate face, but nothing else does: the GPR body has
+length along the wall normal, and four bars with caster wheels stand off the
+plate's corners so it can slide along the wall without scrubbing. When the GPR
+wheel and all four casters are riding the surface, the PLATE is still about
+0.13 m off it, and that is what the ranges report. Contact is a plate distance
+of ~0.13 m, not ~0.
+
+Three consequences, all of which the defaults now reflect:
+
+* ``min_distance`` is sized just inside that standoff, not near zero. An
+  envelope at 5 mm is unreachable — the bars stop the plate first — so it would
+  never fire and would protect nothing.
+* ``tare_min_distance`` must be ABOVE the standoff, or the tare will happily run
+  with the wheel fully pressed, which is the one case it exists to refuse.
+* The casters make the contact STIFF. Past the standoff the plate is pushing on
+  four rigid bars, not compressing a rubber tyre, so force builds with very
+  little travel and the gain must stay small. Do not reason about this contact
+  as if the wheel were the compliant element.
+
 **The distance sensors do not go away.** They stop being the setpoint and become
 the safety envelope: the press may never drive the plate closer than
 ``min_distance`` to the sensed plane, whatever the force says. A force reading
@@ -110,7 +130,8 @@ class AdmittancePress:
     def __init__(self, target_force=5.0, gain=5.0e-5, v_max=0.005,
                  seek_speed=0.01, contact_force=1.0, release_force=0.5,
                  force_limit=25.0, min_distance=0.005, filter_alpha=0.2,
-                 stall_cycles=100, tare_cycles=25, tare_min_distance=0.05):
+                 stall_cycles=100, tare_cycles=25, tare_min_distance=0.05,
+                 release_cycles=10):
         self.target_force = float(target_force)
         self.gain = float(gain)
         self.v_max = float(v_max)
@@ -120,6 +141,11 @@ class AdmittancePress:
         # real surface is several times a second.
         self.contact_force = float(contact_force)
         self.release_force = float(release_force)
+        # How many consecutive cycles below release_force it takes to call the
+        # contact lost. Hysteresis handles a force sitting near ONE threshold;
+        # this handles a force sitting BETWEEN the two, which is where a press
+        # that has not built up ends up.
+        self.release_cycles = int(release_cycles)
         self.force_limit = float(force_limit)
         self.min_distance = float(min_distance)
         self.filter_alpha = float(filter_alpha)
@@ -138,7 +164,12 @@ class AdmittancePress:
         self.fault = None       # set once; the caller decides what to do
         self._seeded = False
         self._stalled = 0
+        self._released = 0
         self._tare_samples = []
+        # Whether contact has EVER been established. The sweep gates its travel
+        # on this: a segment that never touched is a GPR recording of air, and
+        # reporting it as swept means nobody knows to come back.
+        self.touched = False
 
     # ------------------------------------------------------------------
     @property
@@ -213,12 +244,27 @@ class AdmittancePress:
 
         if self.state == SEEK and self.force >= self.contact_force:
             self.state = PRESS
+            self.touched = True
             self._stalled = 0
+            self._released = 0
         elif self.state == PRESS and self.force < self.release_force:
             # Contact lost: a hollow, a gap, the wheel riding over a lip. Go
             # back to closing the distance rather than commanding the full force
             # error, which out of contact is just "drive at the wall".
-            self.state = SEEK
+            #
+            # But not on ONE sample. Hysteresis stops the state flipping when the
+            # force sits near a single threshold; it does nothing when the force
+            # sits between the two, which is exactly where the first hardware run
+            # put it — a press that reached ~1 N against thresholds of 0.5 and
+            # 1.0, flapping several times a sweep. Each flip is a 50x step in
+            # commanded normal velocity (seek_speed vs a force error worth
+            # microns), felt at the wheel as a knock. So require the loss to
+            # persist: a real hollow lasts, a noise dip does not.
+            self._released += 1
+            if self._released >= self.release_cycles:
+                self.state = SEEK
+        else:
+            self._released = 0
 
         if self.state == PRESS:
             # v_max bounds the FORCE loop only. It is sized for contact — a few

@@ -45,7 +45,8 @@ from geometry_msgs.msg import Twist, WrenchStamped
 from nav_msgs.msg import OccupancyGrid
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray, String
 
@@ -57,6 +58,16 @@ from .kinematics import SerialChain, rotation_error, whole_body_jacobian
 from .qp import Task, joint_limit_bounds, solve_velocity_qp
 from .streaming import DEFAULT_CONTROLLER, POSITION, ArmStream, slew_limit
 from .surface import SurfaceEstimator, plate_orientation_target, sweep_tangent
+
+# Depth 1 for the streams the loop only ever wants the newest sample of. The
+# real UR runs its controller_manager at 100 Hz, so joint states and the TCP
+# wrench arrive twice as fast as this loop consumes them; at depth 10 a moment of
+# lateness leaves ten stale messages queued, and every one of them is processed
+# before the control timer runs again. That backlog is self-sustaining, and it is
+# how a 50 Hz loop ends up at 20 (measured on the first hardware run). Dropping
+# what we would have thrown away anyway is the fix.
+FRESHEST = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
+                      history=HistoryPolicy.KEEP_LAST)
 
 ARM_JOINTS = [
     "arm_shoulder_pan_joint", "arm_shoulder_lift_joint", "arm_elbow_joint",
@@ -161,7 +172,17 @@ class WholeBodySweepNode(Node):
         # no approach closer than this to the sensed plane, whatever the force
         # says. A wrong force reading then cannot walk the arm into the wall,
         # because a different sensor is what stops it.
-        self.declare_parameter("press_min_distance", 0.005)  # m
+        #
+        # Sized from the HARDWARE STANDOFF, not from zero. The distance sensors
+        # sit on the plate, but the GPR body has length along the wall normal and
+        # four bars with caster wheels stand off each corner of the plate, so
+        # when the wheel and the casters are all riding the wall the plate itself
+        # is still ~0.13 m off it and the ranges read that. An envelope near zero
+        # is therefore unreachable — the bars stop the plate long before — and a
+        # bad force reading would have nothing catching it. Set just inside the
+        # standoff instead, so "the arm is trying to push through the bars" is a
+        # thing this can actually see.
+        self.declare_parameter("press_min_distance", 0.11)   # m
         self.declare_parameter("press_filter_alpha", 0.2)
         self.declare_parameter("press_stall_cycles", 100)
         # Tare: hold the normal axis still for this many cycles at the start and
@@ -171,7 +192,20 @@ class WholeBodySweepNode(Node):
         # least press_tare_min_distance off the surface, or the tare would fold
         # the contact force into the zero — see wbc/admittance.py.
         self.declare_parameter("press_tare_cycles", 25)
-        self.declare_parameter("press_tare_min_distance", 0.05)   # m
+        # ABOVE the hardware standoff, not near zero. The caster bars put the
+        # plate ~0.13 m off the wall while everything is touching, so a guard at
+        # 0.05 m would let the tare run with the wheel fully pressed — precisely
+        # the case it exists to refuse. Sits between that standoff and the 0.20 m
+        # the arm approach leaves, so a tare at the approach pose is allowed and
+        # a tare anywhere near contact is not.
+        self.declare_parameter("press_tare_min_distance", 0.16)   # m
+        # How long to wait for the wheel to reach the wall before giving up on
+        # the segment. The base holds still for all of it (see _control_step), so
+        # this is not a stall — but a sweep that records air is worse than one
+        # that fails, because nothing downstream knows to come back.
+        self.declare_parameter("press_contact_timeout", 30.0)     # s
+        # Consecutive cycles below release_force before contact counts as lost.
+        self.declare_parameter("press_release_cycles", 10)
         # How hard the normal axis is held to what the force loop asks for. Large
         # because a press command is orders of magnitude smaller than the sweep
         # travel, and anything less lets it disappear into the pooled task's
@@ -392,6 +426,9 @@ class WholeBodySweepNode(Node):
         # in _on_wrench so nothing downstream has to think about it.
         self.press_force = 0.0
         self.wrench_stamp = None
+        # When the sweep started waiting for the wheel to reach the wall. None
+        # means it is not waiting — either in contact, or not pressing at all.
+        self.press_wait_since = None
         self.surface = SurfaceEstimator(ema_alpha=float(p("ema_alpha").value))
         self.q_posture = None
         self.holding_since = None
@@ -481,13 +518,14 @@ class WholeBodySweepNode(Node):
                 filter_alpha=float(p("press_filter_alpha").value),
                 stall_cycles=int(p("press_stall_cycles").value),
                 tare_cycles=int(p("press_tare_cycles").value),
-                tare_min_distance=float(p("press_tare_min_distance").value))
+                tare_min_distance=float(p("press_tare_min_distance").value),
+                release_cycles=int(p("press_release_cycles").value))
             self.create_subscription(
-                WrenchStamped, str(p("wrench_topic").value), self._on_wrench, 10)
+                WrenchStamped, str(p("wrench_topic").value), self._on_wrench, FRESHEST)
         self.create_subscription(
             String, str(p("robot_description_topic").value), self._on_robot_description, latched)
         self.create_subscription(
-            JointState, str(p("joint_states_topic").value), self._on_joint_states, 10)
+            JointState, str(p("joint_states_topic").value), self._on_joint_states, FRESHEST)
         self.create_subscription(
             Float32MultiArray, str(p("distance_topic").value), self._on_distances, 10)
         if self.avoid:
@@ -568,8 +606,19 @@ class WholeBodySweepNode(Node):
             )
 
     def _on_joint_states(self, msg):
-        for name, position in zip(msg.name, msg.position):
-            self.joint_positions[name] = float(position)
+        # Merged into a NEW dict and swapped in, rather than updated in place.
+        # The control step runs on its own thread now, and an in-place update
+        # would let it read a dict halfway through a merge — some joints from
+        # this message, the rest from the previous one.
+        #
+        # The merge itself cannot go away: two ros2_control processes publish
+        # here, the arm's (ur_ros2_control_node) and the base's, so no single
+        # message carries both the arm joints and turret_joint. Making the swap
+        # atomic to the reader is the part that can.
+        merged = dict(self.joint_positions)
+        merged.update((name, float(position))
+                      for name, position in zip(msg.name, msg.position))
+        self.joint_positions = merged
         self.joint_stamp = self._now()
 
     def _on_distances(self, msg):
@@ -807,7 +856,13 @@ class WholeBodySweepNode(Node):
         """
         self.arm_stream.initial_command(self._arm_positions())
         self.deadline = self._now() + self.timeout
-        self.control_timer = self.create_timer(1.0 / self.control_rate, self._control_step)
+        # Its own callback group, so a MultiThreadedExecutor can dispatch the
+        # control step while a subscription callback is still in flight instead
+        # of queueing it behind them. Mutually exclusive, so the loop can still
+        # never re-enter itself.
+        self.control_timer = self.create_timer(
+            1.0 / self.control_rate, self._control_step,
+            callback_group=MutuallyExclusiveCallbackGroup())
         self.get_logger().info(
             f"Sweeping at {self.control_rate:.0f} Hz (timeout {self.timeout:.0f}s)."
         )
@@ -950,10 +1005,16 @@ class WholeBodySweepNode(Node):
     def _retreat_step(self):
         """Back the plate off along the sensed normal, arm only, base held still.
 
-        Deliberately the same QP as the sweep with the base pinned to zero: the
-        arm's joint limits and the plate's orientation task still apply, so the
-        retreat cannot fling a joint into a stop or twist the plate on the way
-        out. Any input it cannot trust ends the retreat rather than guessing a
+        The same QP as the sweep with the base pinned to zero, and it carries the
+        same three things for the same reasons: the arm's joint limits, the
+        plate's orientation, and a posture pull. The orientation and posture
+        tasks were once missing here — the docstring claimed otherwise, which is
+        how it went unnoticed — and their absence cost a twisted wheel and a
+        forearm in the arm base on the first hardware run. A pull-back is three
+        DOF; the other three are redundancy, and something has to say what to do
+        with them or damping decides by folding the elbow.
+
+        Any input it cannot trust ends the retreat rather than guessing a
         direction to move the arm in.
         """
         now = self._now()
@@ -992,13 +1053,54 @@ class WholeBodySweepNode(Node):
         p = self.get_parameter
         speed = min(float(p("retreat_speed").value), remaining)
         n_arm = self.chain.n_joints
-        xdot = np.concatenate((-speed * m_hat, np.zeros(3)))
+        # Orientation is held on the way out, not left free. It used to be
+        # weighted zero here, which meant the plate could rotate as it came off
+        # the wall — and the retreat STARTS with the GPR wheel still loaded
+        # against the surface, so a free-to-rotate plate twists a pressed wheel
+        # against concrete. That is what the crack on the first hardware run
+        # sounded like.
+        R_target = plate_orientation_target(m_hat)
+        if R_target is None:
+            w_ref = np.zeros(3)
+            angular_weight = 0.0
+        else:
+            w_ref = _clamp_norm(rotation_error(R_plate, R_target) * float(p("k_align").value),
+                                float(p("w_align_max").value))
+            angular_weight = float(p("weight_angular").value)
+        xdot = np.concatenate((-speed * m_hat, w_ref))
         weights = np.concatenate((np.full(3, float(p("weight_linear").value)),
-                                  np.zeros(3)))
+                                  np.full(3, angular_weight)))
         damping = np.concatenate((np.array(p("damping_base").value, dtype=float),
                                   np.full(n_arm, float(p("damping_arm").value))))
         tasks = [Task(J, xdot, weights),
                  Task(np.diag(damping), np.zeros(3 + n_arm), 1.0)]
+        # Posture, for the same reason the sweep has one. With the base pinned, a
+        # 3-DOF pull-back leaves the six arm joints with three DOF of redundancy,
+        # and damping alone resolves it by minimising joint velocity — which
+        # folds the elbow back toward the column and put the forearm into the arm
+        # base on the first hardware run. Aiming at return_joints biases the
+        # retreat toward a configuration the planner has already validated.
+        #
+        # It stays at the SWEEP's background weight, and that ceiling is measured
+        # rather than assumed. Against this fixture, raising it buys a straighter
+        # path (largest joint swing 0.54 rad at weight 0, 0.50 at 0.02, 0.19 at
+        # 0.5) and then stops the retreat finishing at all: at 0.1 and above the
+        # pull toward a configuration near the wall fights the pull away from it,
+        # and the plate never reaches retreat_standoff — it would burn
+        # retreat_timeout and hand the arm back still close to the surface, which
+        # is the failure this whole phase exists to prevent. So: a nudge, not a
+        # goal. The orientation task above is what actually fixed the twisting,
+        # and it is independent of this weight (worst plate tilt 4.6 deg at every
+        # value in that table).
+        posture_target = (np.asarray(self.return_joints, dtype=float)
+                          if self.return_joints and len(self.return_joints) == n_arm
+                          else self.q_posture)
+        if posture_target is not None and len(posture_target) == n_arm:
+            tasks.append(Task(
+                np.hstack((np.zeros((n_arm, 3)), np.eye(n_arm))),
+                _clamp_norm(float(p("k_posture").value) * (posture_target - q_arm),
+                            float(p("posture_rate_max").value)),
+                float(p("weight_posture").value)))
 
         lower_arm, upper_arm = self.chain.position_limits()
         arm_lo, arm_hi = joint_limit_bounds(
@@ -1216,6 +1318,37 @@ class WholeBodySweepNode(Node):
         reachable = self.limits.max_speed_along(
             heading - yaw, heading - (yaw - phi)) * float(p("sweep_speed_margin").value)
         speed = min(self.sweep_speed, remaining, reachable)
+        if self.press is not None and not self.press.in_contact:
+            # No travel until the wheel is actually on the wall. The approach and
+            # the sweep used to run at once, and the arithmetic says they cannot:
+            # the arm closes the standoff at press_seek_speed while the base
+            # crosses a whole segment at sweep_speed, so on the first hardware run
+            # the base was a third of the way down the wall before the plate
+            # arrived. Dragging the base while the plate is still coming in also
+            # skews the approach and scrubs the wheel sideways instead of letting
+            # it roll — and the GPR only records while the wheel ROTATES.
+            #
+            # Zero the tangent only. The normal, the height and the orientation
+            # tasks keep running, which is what closes the gap in the first place.
+            speed = 0.0
+            if self.press_wait_since is None:
+                self.press_wait_since = now
+            # Standing still on purpose is not a stall. Without this the
+            # no_progress_timeout would count the approach against the sweep and
+            # kill it for doing exactly what it was told.
+            self.best_progress = self.progress
+            self.progress_stamp = now
+            waited = now - self.press_wait_since
+            if waited > float(p("press_contact_timeout").value):
+                self.finish(
+                    "failed",
+                    f"the press never reached the wall: {waited:.0f}s at "
+                    f"{self.surface.distance * 100:.1f} cm with {self.press.force:+.1f} N "
+                    f"on the wheel against a {self.press.target_force:.0f} N target. "
+                    f"Sweeping without contact would record air.")
+                return
+        elif self.press is not None:
+            self.press_wait_since = None
         v_ref = speed * t_hat + v_normal * m_hat + v_height * np.array([0.0, 0.0, 1.0])
 
         R_target = plate_orientation_target(m_hat)
@@ -1468,29 +1601,44 @@ class WholeBodySweepNode(Node):
         """
         u = np.asarray(u, dtype=float) * self.hardware.scaling()
 
-        # The NOMINAL control period, not the measured one. Integrating the
-        # elapsed time looks more faithful and is worse in both directions that
-        # matter: a burst of early cycles under-integrates the setpoint (the arm
-        # silently runs slow), and a cycle that arrives late after a stall
-        # advances the setpoint by the whole gap at once — a jump, at the one
-        # moment the robot is least understood. With a fixed period a late loop
-        # simply moves the arm slower, which is the safe direction, and the
-        # divergence is reported below rather than absorbed.
-        dt = 1.0 / self.control_rate
+        # The measured control period, CLAMPED to the nominal one either side.
+        #
+        # This used to be the nominal period outright, on the grounds that a
+        # late cycle would otherwise advance the setpoint by the whole gap at
+        # once. That reasoning is right about one late cycle and wrong about a
+        # persistently slow loop, which is what the first hardware run had: at
+        # 20 Hz against a nominal 50, every cycle integrated 20 ms of motion
+        # while 50 ms of wall-clock passed, so the ARM tracked at 40% of the
+        # commanded velocity while the BASE — commanded in velocity, not
+        # integrated — tracked at 100%. The base outran the arm two to one for
+        # the whole sweep, which is exactly the desynchronisation the speed
+        # scaling in this same method exists to prevent.
+        #
+        # Clamping keeps the original protection: a burst of early cycles cannot
+        # under-integrate below the nominal step, and one late cycle after a
+        # stall cannot advance more than one extra period's worth. Between those
+        # bounds the setpoint now tracks real time, so a slow loop moves the arm
+        # slower AND the base slower, together.
+        nominal = 1.0 / self.control_rate
+        now = self._now()
+        elapsed = (now - self.command_stamp) if self.command_stamp else nominal
+        dt = float(min(max(elapsed, nominal), 2.0 * nominal))
         u = slew_limit(u, self.u_prev, self.accel_max, dt)
         self.u_prev = u
 
-        now = self._now()
-        if self.command_stamp is not None:
-            measured = now - self.command_stamp
-            if measured > 2.0 * dt:
-                # The setpoint stream is thinner than the arm was promised, so
-                # it will track slower than commanded. Usually CPU starvation.
-                self.get_logger().warn(
-                    f"Control loop is running at {1.0 / max(measured, 1e-6):.0f} Hz, "
-                    f"not the {self.control_rate:.0f} Hz it commands for; the arm "
-                    f"will move slower than the base.",
-                    throttle_duration_sec=5.0)
+        if self.command_stamp is not None and elapsed > 2.0 * nominal:
+            # Compared against the NOMINAL period, not dt: dt is now the clamped
+            # measurement, so `elapsed > 2 * dt` could never be true once the
+            # clamp engaged and the warning would fall silent exactly when the
+            # loop was slowest. Past the clamp the setpoint no longer tracks real
+            # time either, so this is the point where the arm really does start
+            # lagging the base and it has to be said.
+            self.get_logger().warn(
+                f"Control loop is running at {1.0 / max(elapsed, 1e-6):.0f} Hz, not the "
+                f"{self.control_rate:.0f} Hz it commands for; below "
+                f"{1.0 / (2.0 * nominal):.0f} Hz the setpoint stops tracking real time "
+                f"and the arm starts lagging the base.",
+                throttle_duration_sec=5.0)
         self.command_stamp = now
 
         twist = Twist()
@@ -1552,6 +1700,7 @@ def _quat_to_matrix(q):
 
 
 def main(args=None):
+    from rclpy.executors import MultiThreadedExecutor
     from rclpy.signals import SignalHandlerOptions
 
     from .controller_switch import ArmControllerSwitch
@@ -1594,8 +1743,18 @@ def main(args=None):
             # start() publishes the arm's current pose immediately, closing the
             # window between the switch landing and the first real command.
             node.start()
+        # Multi-threaded, so the control timer is not queued behind the
+        # subscription callbacks. On the real robot the arm publishes joint
+        # states and the TCP wrench at 100 Hz each and TF carries the whole
+        # chain; single-threaded, those ran the 50 Hz loop down to 20 (measured),
+        # which makes the arm track at 40% of commanded while the base tracks at
+        # 100% — the base outrunning the arm two to one. Three threads is enough
+        # for one control step alongside the sensor traffic; the GIL means more
+        # would not help.
+        executor = MultiThreadedExecutor(num_threads=3)
+        executor.add_node(node)
         while rclpy.ok() and not stopping:
-            rclpy.spin_once(node, timeout_sec=0.1)
+            executor.spin_once(timeout_sec=0.1)
     except KeyboardInterrupt:
         pass
     finally:
