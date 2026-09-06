@@ -444,6 +444,15 @@ class WholeBodySweepNode(Node):
         # a sweep ramps up instead of jumping (see _strike).
         self.u_prev = None
         self.command_stamp = None
+        # The SOLVER's own previous answer, and when it produced it. Distinct
+        # from u_prev, which is the published command and therefore already
+        # multiplied by the robot's speed scaling. The acceleration bound inside
+        # the QP has to be measured against the unscaled quantity the QP itself
+        # works in: bounding this cycle's solution against a HALVED published
+        # command would drag the solution down every cycle and converge on a
+        # speed nobody asked for.
+        self.u_qp_prev = None
+        self.qp_stamp = None
         self.accel_max = np.concatenate((
             np.array(p("base_accel_max").value, dtype=float),
             np.full(len(self.arm_joints), float(p("arm_accel_max").value))))
@@ -867,6 +876,8 @@ class WholeBodySweepNode(Node):
         self.arm_stream.hold(self._arm_positions())
         self.u_prev = None
         self.command_stamp = None
+        self.u_qp_prev = None
+        self.qp_stamp = None
         self.holding_since = None
 
     def finish(self, status, reason=""):
@@ -1045,10 +1056,13 @@ class WholeBodySweepNode(Node):
         arm_lo, arm_hi = joint_limit_bounds(
             q_arm, lower_arm, upper_arm, float(p("arm_qdot_max").value),
             margin=float(p("joint_limit_margin").value))
-        solution = solve_velocity_qp(
-            tasks,
+        # The retreat gets the same acceleration constraint as the sweep. It
+        # starts with the wheel still loaded against the wall, so it is the last
+        # place that should begin with a step.
+        lo_all, hi_all = self._accel_bounds(
             np.concatenate((np.zeros(3), arm_lo)),      # base pinned: arm only
-            np.concatenate((np.zeros(3), arm_hi)))
+            np.concatenate((np.zeros(3), arm_hi)), now)
+        solution = solve_velocity_qp(tasks, lo_all, hi_all)
         if not solution.ok:
             self.get_logger().warn("Retreat QP did not solve; stopping here.")
             self._terminate()
@@ -1372,6 +1386,18 @@ class WholeBodySweepNode(Node):
             q_arm, lower_arm, upper_arm, float(p("arm_qdot_max").value),
             margin=float(p("joint_limit_margin").value))
         base_lo, base_hi = box_bounds(self.limits)
+        # Acceleration as a CONSTRAINT, before the solve. Narrowing the box here
+        # rather than clipping the answer afterwards is what makes the solution
+        # both smooth and feasible, and it lands in exactly the right place for
+        # the base travel pin below: the pin already clips itself into
+        # [base_lo[0], base_hi[0]], so a pin that has just jumped from zero to
+        # sweep_speed now becomes a short ramp instead of a step, at the one
+        # moment the wheel is newly loaded against the wall.
+        lo_all, hi_all = self._accel_bounds(
+            np.concatenate((base_lo, arm_lo)),
+            np.concatenate((base_hi, arm_hi)), now)
+        base_lo, base_hi = lo_all[:3], hi_all[:3]
+        arm_lo, arm_hi = lo_all[3:], hi_all[3:]
         A_ineq, ineq_lo, ineq_hi = constraint_rows(self.limits, phi)
         A_ineq = np.hstack((A_ineq, np.zeros((A_ineq.shape[0], n_arm))))
 
@@ -1477,8 +1503,56 @@ class WholeBodySweepNode(Node):
                 throttle_duration_sec=10.0)
 
         self.holding_since = None
+        self.u_qp_prev = np.asarray(solution.u, dtype=float)
+        self.qp_stamp = now
         self._publish(solution.u, n_arm)
         self._log_cycle(solution, distance, remaining, phi)
+
+    def _accel_bounds(self, lo, hi, now):
+        """Narrow the QP's box bounds to what the acceleration limit allows.
+
+        The bound belongs HERE, in the constraints, and not only in
+        ``slew_limit`` after the solve. Clipping the answer afterwards changes
+        it into one the solver never checked: the base travel pin, the obstacle
+        barriers and the joint limits were all satisfied by the number that came
+        out, and the clipped number satisfies none of them by construction. It
+        is also why the arm steps — the QP is memoryless, its active set moves
+        between cycles, and a post-clip does not make the underlying solution
+        any smoother, it just truncates the jump.
+
+        Given to the solver instead, smoothness and feasibility are traded off
+        against each other in one place, by the thing that knows both.
+
+        ``slew_limit`` stays where it is. It is no longer the primary bound but
+        it is still the only thing watching the PUBLISHED command, which carries
+        the speed scaling: a teach-pendant slider moving under our feet steps
+        that command without the QP ever seeing it.
+        """
+        if self.u_qp_prev is None:
+            return lo, hi
+        # The MEASURED interval since the last solve, clamped. Nominal would be
+        # wrong in the direction that matters here: the loop has been seen at
+        # 20 Hz against a nominal 50, and bounding a 50 ms step by 20 ms of
+        # acceleration would hold the robot to 40% of the acceleration it is
+        # configured for. The upper clamp keeps one late cycle after a stall
+        # from authorising a jump.
+        nominal = 1.0 / self.control_rate
+        elapsed = (now - self.qp_stamp) if self.qp_stamp else nominal
+        dt = float(min(max(elapsed, nominal), 3.0 * nominal))
+        step = np.abs(self.accel_max) * dt
+        lo_new = np.maximum(lo, self.u_qp_prev - step)
+        hi_new = np.minimum(hi, self.u_qp_prev + step)
+        # The two can cross, and an empty box is an infeasible solve — the robot
+        # stopping dead, which is the one outcome worse than a step. It happens
+        # whenever the previous solution is already outside the new box: the
+        # joint-limit bounds move as the arm does, and a caller may pin a DOF
+        # (the retreat pins the base to zero) that was moving last cycle. Where
+        # they cross, hand back the box unnarrowed and let slew_limit take it.
+        crossed = lo_new > hi_new
+        if np.any(crossed):
+            lo_new = np.where(crossed, lo, lo_new)
+            hi_new = np.where(crossed, hi, hi_new)
+        return lo_new, hi_new
 
     def _stale_inputs(self, now):
         stale = []
@@ -1516,6 +1590,10 @@ class WholeBodySweepNode(Node):
         # moment the robot's state is least well understood.
         self.u_prev = np.zeros_like(self.accel_max)
         self.command_stamp = now
+        # Same reasoning for the solver's own reference: the robot has just been
+        # stopped, so zero IS where the next solve has to accelerate from.
+        self.u_qp_prev = np.zeros_like(self.accel_max)
+        self.qp_stamp = now
         held = now - self.holding_since
         if held >= self.max_hold_seconds:
             self.finish("failed", f"{reason} (held {held:.1f}s)")
