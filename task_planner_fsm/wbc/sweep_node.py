@@ -47,9 +47,9 @@ from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32MultiArray, String
+from std_msgs.msg import Float32MultiArray, Float64MultiArray, String
 
-from .admittance import SEEK, AdmittancePress
+from .admittance import SEEK, TARE, AdmittancePress
 from .avoidance import AvoidanceConfig, ObstacleField, avoidance_rows
 from .base_model import BaseLimits, box_bounds, constraint_rows, wheel_and_turret_rates
 from .hardware import HardwareMonitor
@@ -219,6 +219,24 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("robot_description_topic", "/robot_description")
         self.declare_parameter("status_topic", "/wbc_sweep/status")
+        # Per-cycle trace, for telling WHERE a jerky motion comes from instead
+        # of guessing. Off by default: it is a message per control cycle, and
+        # nothing in the loop reads it back. Turn it on for a diagnostic run,
+        # record it, turn it off again.
+        #
+        #     ros2 run task_planner_fsm wbc_sweep_controller --ros-args \
+        #       -p publish_diagnostics:=true
+        #     ros2 bag record /wbc_sweep/diagnostics
+        #
+        # The three traces that matter are the solver's own answer, the command
+        # actually published, and the velocity the arm actually reached. Read in
+        # that order they localise the fault: a solve that is already stepped is
+        # a control-law problem, a smooth solve with a stepped command is the
+        # streaming layer, and smooth on both with a rough arm is the driver,
+        # the servo tuning or the speed scaling. Plot all three before changing
+        # anything, rather than watching the robot and guessing.
+        self.declare_parameter("publish_diagnostics", False)
+        self.declare_parameter("diagnostics_topic", "/wbc_sweep/diagnostics")
         self.declare_parameter("turret_joint", "turret_joint")
         self.declare_parameter("arm_joints", ARM_JOINTS)
 
@@ -438,13 +456,20 @@ class WholeBodySweepNode(Node):
         segment_length = float(np.linalg.norm(self.seg_end[:2] - self.seg_start[:2]))
         self.segment_length = segment_length
         self.deadline = None
+        # When the sweep began commanding, so the diagnostics carry a clock
+        # that starts at the segment rather than at the epoch.
+        self.start_stamp = None
         self.timeout = segment_length / max(self.sweep_speed, 1e-3) + float(p("timeout_pad").value)
 
         # --- State -----------------------------------------------------------
         self.chain = None
         self.urdf = None
         self.joint_positions = {}
+        self.joint_velocities = {}
         self.joint_stamp = None
+        # Filled each cycle when diagnostics are on: how long the solve took,
+        # and the answer it gave before the publish path touched it.
+        self.solve_seconds = 0.0
         self.distances = None
         self.distance_stamp = None
         # Press force along the plate's own +Z, positive = pressing INTO the
@@ -475,6 +500,7 @@ class WholeBodySweepNode(Node):
         # speed nobody asked for.
         self.u_qp_prev = None
         self.qp_stamp = None
+        self.cycle_period = 0.0
         self.accel_max = np.concatenate((
             np.array(p("base_accel_max").value, dtype=float),
             np.full(len(self.arm_joints), float(p("arm_accel_max").value))))
@@ -527,6 +553,10 @@ class WholeBodySweepNode(Node):
         latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.status_pub = self.create_publisher(String, str(p("status_topic").value), latched)
         self.cmd_vel_pub = self.create_publisher(Twist, str(p("cmd_vel_topic").value), 10)
+        self.diag_pub = (
+            self.create_publisher(
+                Float64MultiArray, str(p("diagnostics_topic").value), 10)
+            if bool(p("publish_diagnostics").value) else None)
         self.arm_stream = ArmStream(
             self, self.arm_joints,
             mode=str(p("arm_stream_interface").value),
@@ -642,6 +672,16 @@ class WholeBodySweepNode(Node):
     def _on_joint_states(self, msg):
         for name, position in zip(msg.name, msg.position):
             self.joint_positions[name] = float(position)
+        # Velocities are for the diagnostics only — nothing in the control law
+        # reads them. They are the third of the three traces that say WHERE a
+        # jerky motion is coming from: if the solve is already stepped the cause
+        # is upstream of the streaming layer, and if the solve and the published
+        # command are both smooth while this is not, it is the driver, the servo
+        # tuning or the speed scaling. Guarded because velocity is optional in
+        # the message and some publishers leave it empty.
+        if len(msg.velocity) == len(msg.name):
+            for name, velocity in zip(msg.name, msg.velocity):
+                self.joint_velocities[name] = float(velocity)
         self.joint_stamp = self._now()
 
     def _on_distances(self, msg):
@@ -879,6 +919,7 @@ class WholeBodySweepNode(Node):
         """
         self.arm_stream.initial_command(self._arm_positions())
         self.deadline = self._now() + self.timeout
+        self.start_stamp = self._now()
         self.control_timer = self.create_timer(1.0 / self.control_rate, self._control_step)
         self.get_logger().info(
             f"Sweeping at {self.control_rate:.0f} Hz (timeout {self.timeout:.0f}s)."
@@ -1511,12 +1552,14 @@ class WholeBodySweepNode(Node):
                     base_lo[0] = base_hi[0] = pin
                     self.base_travel_pinned = True
 
+        solve_started = time.monotonic()
         solution = solve_velocity_qp(
             tasks,
             np.concatenate((base_lo, arm_lo)), np.concatenate((base_hi, arm_hi)),
             A_ineq=A_ineq, ineq_lo=ineq_lo, ineq_hi=ineq_hi,
             soft_ineq=A_avoid if A_avoid.shape[0] else None, soft_lo=avoid_lo,
             soft_weight=float(p("avoid_slack_weight").value))
+        self.solve_seconds = time.monotonic() - solve_started
         if not solution.ok:
             self._strike(f"QP did not solve ({solution.status})")
             return
@@ -1532,8 +1575,6 @@ class WholeBodySweepNode(Node):
                 throttle_duration_sec=10.0)
 
         self.holding_since = None
-        self.u_qp_prev = np.asarray(solution.u, dtype=float)
-        self.qp_stamp = now
         self._publish(solution.u, n_arm)
         self._log_cycle(solution, distance, remaining, phi)
 
@@ -1648,7 +1689,14 @@ class WholeBodySweepNode(Node):
            ``ArmStream``, which decides whether the wire carries velocities or
            integrated setpoints.
         """
-        u = np.asarray(u, dtype=float) * self.hardware.scaling()
+        # The solver's own answer, kept before anything is done to it. This is
+        # what the acceleration bound in _accel_bounds measures the NEXT solve
+        # against, and it is recorded here rather than at the one call site that
+        # first needed it: the retreat and the return publish through this
+        # method too, and a reference that only some phases update would leave
+        # the retreat bounded against a stale sweep velocity.
+        u_qp = np.asarray(u, dtype=float)
+        u = u_qp * self.hardware.scaling()
 
         # The NOMINAL control period, not the measured one. Integrating the
         # elapsed time looks more faithful and is worse in both directions that
@@ -1663,6 +1711,10 @@ class WholeBodySweepNode(Node):
         self.u_prev = u
 
         now = self._now()
+        # Captured before command_stamp is overwritten below: the
+        # diagnostics need the gap between cycles, and reading it after the
+        # update would record zero every time.
+        self.cycle_period = (now - self.command_stamp) if self.command_stamp else 0.0
         if self.command_stamp is not None:
             measured = now - self.command_stamp
             if measured > 2.0 * dt:
@@ -1685,6 +1737,63 @@ class WholeBodySweepNode(Node):
         by_name = dict(zip(self.chain.joint_names, u[3:3 + n_arm]))
         qdot = np.array([float(by_name.get(name, 0.0)) for name in self.arm_joints])
         self.arm_stream.send(qdot, dt, self._arm_positions())
+
+        self._publish_diagnostics(now, u_qp, u)
+        self.u_qp_prev = u_qp
+        self.qp_stamp = now
+
+    # Layout of the diagnostics array. Published as one flat Float64MultiArray
+    # so it needs no message package of its own; the cost of that is that the
+    # layout lives here and nowhere else, so keep this in step with
+    # _publish_diagnostics and treat it as the format's documentation.
+    #
+    #   [0]        wall-clock seconds since the sweep's first command
+    #   [1]        measured control period, s      <- jitter shows up here
+    #   [2]        QP solve duration, s
+    #   [3]        robot speed scaling, 0..1
+    #   [4]        press state: -1 none, 0 tare, 1 seek, 2 press
+    #   [5]        plate distance to the sensed wall, m
+    #   [6]        press force, N, filtered and de-biased
+    #   [7]        setpoint lead over the measured arm, rad
+    #   [8:8+n]    what the QP asked for       (base 3, then arm)
+    #   [8+n:8+2n] what was published          (after scaling and slew)
+    #   [8+2n:...] what the arm actually did   (arm joints only, from
+    #                                           /joint_states)
+    DIAG_HEADER = 8
+
+    def _publish_diagnostics(self, now, u_qp, u_published):
+        """One row per control cycle, for the plot that localises a jerky arm.
+
+        Deliberately records all three velocities rather than just the last one.
+        Watching the robot cannot distinguish a control law that is producing
+        steps from a smooth law whose commands are arriving too slowly, and
+        those two faults have opposite fixes.
+        """
+        if self.diag_pub is None:
+            return
+        n = 3 + self.chain.n_joints
+        if self.press is None:
+            state = -1.0
+            force = 0.0
+        else:
+            state = float({TARE: 0, SEEK: 1}.get(self.press.state, 2))
+            force = self.press.force
+        measured = [self.joint_velocities.get(name, float("nan"))
+                    for name in self.arm_joints]
+        row = [
+            now - self.start_stamp if self.start_stamp else 0.0,
+            self.cycle_period,
+            self.solve_seconds,
+            self.hardware.scaling(),
+            state,
+            self.surface.distance if self.surface.distance is not None else float("nan"),
+            force,
+            self.arm_stream.lead(self._arm_positions()),
+        ]
+        row.extend(float(v) for v in np.asarray(u_qp, dtype=float)[:n])
+        row.extend(float(v) for v in np.asarray(u_published, dtype=float)[:n])
+        row.extend(measured)
+        self.diag_pub.publish(Float64MultiArray(data=row))
 
     def _log_cycle(self, solution, distance, remaining, phi):
         w_left, w_right, phi_dot, w_chassis = wheel_and_turret_rates(
