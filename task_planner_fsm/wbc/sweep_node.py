@@ -161,7 +161,37 @@ class WholeBodySweepNode(Node):
         # no approach closer than this to the sensed plane, whatever the force
         # says. A wrong force reading then cannot walk the arm into the wall,
         # because a different sensor is what stops it.
-        self.declare_parameter("press_min_distance", 0.005)  # m
+        #
+        # Sized off the HARDWARE STANDOFF, not off zero. The six range sensors
+        # sit on the plate face, but the GPR body has length along the wall
+        # normal and four bars with caster wheels stand off each corner, so when
+        # the wheel and the casters are all riding the wall the plate is still
+        # ~0.13 m off it and that is what the ranges read. The plate BOTTOMS OUT
+        # there — measured on hardware, it cannot physically get closer.
+        #
+        # So an envelope near zero can never be crossed and protects nothing,
+        # which is exactly what the old 0.005 did. What it must catch is the
+        # plate being driven PAST its own stop, i.e. something deforming because
+        # a bad force reading kept SEEK pushing. That means sitting just below
+        # 0.13, with enough room for sensor noise.
+        #
+        # Mind that room, because the ranges are noisy. The per-sensor sigma is
+        # 0.010 m and the plane fit over six of them measures out at 4.2 mm
+        # sigma on the fitted distance, so with the plate resting quietly at its
+        # stop the envelope still trips on its own:
+        #
+        #     0.125 -> 12.4% of cycles      0.115 -> 0.02%
+        #     0.120 ->  1.0% of cycles      0.110 -> never
+        #
+        # 0.115 is the value that buys a real guard without crying wolf. It sits
+        # 1.5 cm inside the stop, which is far more travel than the bars have in
+        # them, and about 3.5 sigma clear of the noise.
+        #
+        # A trip is cheap either way: it clamps the approach to zero for that
+        # one cycle, and the stall counter resets on any untripped cycle, so
+        # noise alone can never reach the 100 in a row that would fail the
+        # sweep. What a too-tight envelope costs is a press that sits light.
+        self.declare_parameter("press_min_distance", 0.115)  # m
         self.declare_parameter("press_filter_alpha", 0.2)
         self.declare_parameter("press_stall_cycles", 100)
         # Tare: hold the normal axis still for this many cycles at the start and
@@ -172,6 +202,14 @@ class WholeBodySweepNode(Node):
         # the contact force into the zero — see wbc/admittance.py.
         self.declare_parameter("press_tare_cycles", 25)
         self.declare_parameter("press_tare_min_distance", 0.05)   # m
+        # How long to wait for the wheel to reach the wall before giving up on
+        # the segment. The base holds still for all of it (see _control_step),
+        # so this is not a stall — but it has to be bounded, because a press that
+        # never arrives would otherwise hold the base for the whole sweep budget
+        # and then report a segment it never scanned. Generous: the approach is
+        # accepted anywhere within scan_wall_approach_tolerance, so the gap can
+        # be up to ~0.22 m, which is 22 s at press_seek_speed.
+        self.declare_parameter("press_contact_timeout", 45.0)     # s
         # How hard the normal axis is held to what the force loop asks for. Large
         # because a press command is orders of magnitude smaller than the sweep
         # travel, and anything less lets it disappear into the pooled task's
@@ -392,6 +430,9 @@ class WholeBodySweepNode(Node):
         # in _on_wrench so nothing downstream has to think about it.
         self.press_force = 0.0
         self.wrench_stamp = None
+        # When the sweep started waiting for the wheel to reach the wall. None
+        # means it is not waiting — either it has touched, or it is not pressing.
+        self.press_wait_since = None
         self.surface = SurfaceEstimator(ema_alpha=float(p("ema_alpha").value))
         self.q_posture = None
         self.holding_since = None
@@ -1216,6 +1257,40 @@ class WholeBodySweepNode(Node):
         reachable = self.limits.max_speed_along(
             heading - yaw, heading - (yaw - phi)) * float(p("sweep_speed_margin").value)
         speed = min(self.sweep_speed, remaining, reachable)
+        if self.press is not None and not self.press.touched:
+            # No travel until the wheel has reached the wall. Otherwise the base
+            # sets off at sweep_speed while the arm is still closing the standoff
+            # at press_seek_speed, and the first stretch of the segment is
+            # crossed with the GPR scanning air.
+            #
+            # Gated on ``touched``, which LATCHES on the first contact, not on
+            # ``in_contact``, which tracks the live contact state. That
+            # distinction is the whole of this change: the press legitimately
+            # drops back to SEEK over a hollow, a lip or a noisy reading, and
+            # tying the base to it would stop and restart the base several times
+            # a sweep — each restart a step from 0 to sweep_speed against a
+            # loaded wheel, which scrubs it sideways instead of rolling it.
+            # Once the wall has been found, the base sweeps to the end.
+            #
+            # Zero the tangent only. The normal, height and orientation tasks
+            # keep running, which is what closes the gap in the first place.
+            speed = 0.0
+            if self.press_wait_since is None:
+                self.press_wait_since = now
+            # Standing still on purpose is not a stall. Without this the
+            # no_progress_timeout would count the approach against the sweep and
+            # kill it for doing exactly what it was told.
+            self.best_progress = self.progress
+            self.progress_stamp = now
+            waited = now - self.press_wait_since
+            if waited > float(p("press_contact_timeout").value):
+                self.finish(
+                    "failed",
+                    f"the press never reached the wall: {waited:.0f}s seeking at "
+                    f"{distance * 100:.1f} cm with {self.press.force:+.1f} N on the "
+                    f"wheel against a {self.press.target_force:.0f} N target. "
+                    f"Sweeping without contact would record air.")
+                return
         v_ref = speed * t_hat + v_normal * m_hat + v_height * np.array([0.0, 0.0, 1.0])
 
         R_target = plate_orientation_target(m_hat)

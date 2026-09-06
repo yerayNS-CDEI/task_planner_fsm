@@ -139,6 +139,13 @@ class AdmittancePress:
         self._seeded = False
         self._stalled = 0
         self._tare_samples = []
+        # Whether the wheel has EVER reached the wall in this segment. Latching,
+        # and deliberately so: it is what the sweep gates its travel on, and the
+        # thing it must not do is follow the contact state back down. ``state``
+        # legitimately drops back to SEEK over a hollow or a lip, several times
+        # in a sweep, and a base that stopped and restarted on each of those
+        # would scrub the wheel instead of rolling it.
+        self.touched = False
 
     # ------------------------------------------------------------------
     @property
@@ -213,6 +220,7 @@ class AdmittancePress:
 
         if self.state == SEEK and self.force >= self.contact_force:
             self.state = PRESS
+            self.touched = True
             self._stalled = 0
         elif self.state == PRESS and self.force < self.release_force:
             # Contact lost: a hollow, a gap, the wheel riding over a lip. Go
