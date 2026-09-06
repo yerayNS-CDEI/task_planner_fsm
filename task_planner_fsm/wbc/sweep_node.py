@@ -283,11 +283,32 @@ class WholeBodySweepNode(Node):
         # ||u - u_prev||, so it pulls toward CARRYING ON. A sweep wants the
         # second one; only the first was present.
         #
-        # Small on purpose. It competes with the task, so too much of it buys
-        # smoothness by refusing to follow the wall, and the failure is quiet:
-        # the plate lags the surface instead of tracking it. Sized against the
-        # damping term rather than the task, so it is a tiebreaker among
-        # solutions the task is nearly indifferent to.
+        # Small, and the ceiling is MEASURED rather than guessed. Do not raise
+        # it on the strength of how much smoother it makes a clear wall look.
+        #
+        # Sweeping a flat wall, more of this is free all the way up. Worst arm
+        # step falls 0.021 -> 0.018 -> 0.012 -> 0.003 rad/s at weights of 0,
+        # 0.05, 0.5 and 5.0, while the standoff error sits at 0.048 m the whole
+        # way. On that evidence alone the weight belongs an order of magnitude
+        # higher than it is.
+        #
+        # That evidence is a trap, because a flat wall never asks the solve to
+        # change its mind. Put an obstacle across the base's path, where the
+        # barrier's whole job is to bring the base to a STOP, and preferring
+        # last cycle's answer is precisely the wrong instinct:
+        #
+        #     weight   base travel when the barrier demands a stop
+        #     0.0        0.000000   stops
+        #     0.05       0.000000   stops
+        #     0.1        0.006773   KEEPS MOVING
+        #     0.5        0.024890   KEEPS MOVING
+        #
+        # The barrier rows go in soft so they can never make the solve
+        # infeasible, which means they win on weight or not at all, and past
+        # 0.05 this term outvotes them. So this is not a comfort setting to be
+        # turned up until the motion looks nice: it is bounded above by the
+        # obstacle avoidance still working, and 0.05 is the last value that
+        # leaves zero reachable.
         self.declare_parameter("weight_smoothness", 0.05)
         self.declare_parameter("weight_posture", 0.02)
         self.declare_parameter("k_posture", 0.5)
