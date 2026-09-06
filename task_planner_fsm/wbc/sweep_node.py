@@ -249,6 +249,28 @@ class WholeBodySweepNode(Node):
         # (the sweep is tangential) but is a soft term, not a constraint, so the
         # base can still follow a wall that is not straight.
         self.declare_parameter("weight_base_normal", 100.0)
+        # Temporal regularisation: how hard the solve is pulled toward the
+        # answer it gave last cycle. This is the term that makes the SOLUTION
+        # continuous rather than truncating its jumps afterwards.
+        #
+        # The QP is memoryless. Its active set moves between cycles — a barrier
+        # engages, a joint limit releases, the travel cap tightens — and nothing
+        # in the cost function has ever said that two consecutive answers ought
+        # to resemble each other, so they need not. That is a step at the
+        # actuator, and on a setpoint stream it reads as the arm moving and
+        # stopping in short hops.
+        #
+        # Distinct from damping, which is already here and does a different job:
+        # damping penalises ||u||, so it pulls toward STOPPING. This penalises
+        # ||u - u_prev||, so it pulls toward CARRYING ON. A sweep wants the
+        # second one; only the first was present.
+        #
+        # Small on purpose. It competes with the task, so too much of it buys
+        # smoothness by refusing to follow the wall, and the failure is quiet:
+        # the plate lags the surface instead of tracking it. Sized against the
+        # damping term rather than the task, so it is a tiebreaker among
+        # solutions the task is nearly indifferent to.
+        self.declare_parameter("weight_smoothness", 0.05)
         self.declare_parameter("weight_posture", 0.02)
         self.declare_parameter("k_posture", 0.5)
         # Ceiling on how fast the posture task may pull, in rad/s. Without it the
@@ -1380,6 +1402,13 @@ class WholeBodySweepNode(Node):
                              float(p("posture_rate_max").value)),
                  float(p("weight_posture").value)),
         ]
+        # Carry on from last cycle unless the task gives a reason not to. See
+        # weight_smoothness. Only once there IS a last cycle: at the start of a
+        # sweep there is nothing to be continuous with, and seeding it with
+        # zeros would ask the first solve to stay stopped.
+        smoothness = float(p("weight_smoothness").value)
+        if self.u_qp_prev is not None and smoothness > 0.0:
+            tasks.append(Task(np.eye(3 + n_arm), self.u_qp_prev, smoothness))
 
         lower_arm, upper_arm = self.chain.position_limits()
         arm_lo, arm_hi = joint_limit_bounds(
