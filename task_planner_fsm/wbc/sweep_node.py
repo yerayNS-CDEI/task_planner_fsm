@@ -242,6 +242,30 @@ class WholeBodySweepNode(Node):
 
         # --- Control law -----------------------------------------------------
         self.declare_parameter("control_rate", 50.0)
+        # How far past the nominal period the setpoint integration may follow
+        # the measured one. See _publish for what it is protecting against.
+        #
+        # 2.0 is the tightest value that could be right, and it is right only if
+        # the loop never falls below half rate. On hardware it did: 18-25 Hz
+        # against a nominal 50 is 40-56 ms, or 2.0x to 2.8x nominal, so a 2x
+        # clamp saturates across most of that range and the setpoint stops
+        # tracking real time exactly where it most needs to. 4.0 covers the
+        # slowest rate seen with margin left.
+        #
+        # Sized from the HARDWARE numbers only. Simulation cannot inform this:
+        # measured there, the loop holds 50.4 Hz on the sim clock against a
+        # nominal 50, so the clamp never engages at all and this parameter is
+        # inert. Gazebo running at 0.29x real time makes that same loop look
+        # like 14.5 Hz of wall clock, which is a property of the simulator and
+        # not of the control loop. Do not retune this from a wall-clock reading.
+        #
+        # Raising it is bounded by something real rather than by nerve: a late
+        # cycle advances the setpoint by qdot * dt, at most arm_qdot_max times
+        # this times nominal, which at 4.0 is 0.04 rad. ArmStream then clamps
+        # the setpoint to within arm_stream_max_lead (0.2 rad) of the measured
+        # arm regardless, so the lead clamp is the actual backstop and this
+        # number sits an order of magnitude inside it.
+        self.declare_parameter("control_period_max_factor", 4.0)
         self.declare_parameter("k_standoff", 1.0)      # 1/s on the normal error
         self.declare_parameter("k_height", 1.0)        # 1/s on the row-height error
         self.declare_parameter("k_align", 1.5)         # 1/s on the plate orientation error
@@ -522,6 +546,8 @@ class WholeBodySweepNode(Node):
         self.u_qp_prev = None
         self.qp_stamp = None
         self.cycle_period = 0.0
+        self.control_period_max_factor = float(
+            p("control_period_max_factor").value)
         self.accel_max = np.concatenate((
             np.array(p("base_accel_max").value, dtype=float),
             np.full(len(self.arm_joints), float(p("arm_accel_max").value))))
@@ -1719,33 +1745,58 @@ class WholeBodySweepNode(Node):
         u_qp = np.asarray(u, dtype=float)
         u = u_qp * self.hardware.scaling()
 
-        # The NOMINAL control period, not the measured one. Integrating the
-        # elapsed time looks more faithful and is worse in both directions that
-        # matter: a burst of early cycles under-integrates the setpoint (the arm
-        # silently runs slow), and a cycle that arrives late after a stall
-        # advances the setpoint by the whole gap at once — a jump, at the one
-        # moment the robot is least understood. With a fixed period a late loop
-        # simply moves the arm slower, which is the safe direction, and the
-        # divergence is reported below rather than absorbed.
-        dt = 1.0 / self.control_rate
+        # The MEASURED control period, clamped either side of the nominal one.
+        #
+        # This was the nominal period outright, on the grounds that a late cycle
+        # would otherwise advance the setpoint by the whole gap at once. That is
+        # right about ONE late cycle and wrong about a loop that is persistently
+        # slow. On hardware this loop is: measured at 18-25 Hz against a nominal
+        # 50, so every cycle integrated 20 ms of motion while 40-56 ms actually
+        # passed, and the ARM tracked at roughly half to a third of the velocity
+        # it was commanded — while the BASE, commanded as a velocity rather than
+        # integrated, tracked at 100%. That is the desynchronisation the speed
+        # scaling three lines up exists to prevent.
+        #
+        # The slow loop is a HARDWARE fault and does not reproduce in
+        # simulation, where the loop holds 50.4 Hz on the sim clock. An earlier
+        # reading suggesting otherwise was wall clock against a Gazebo running
+        # at 0.29x, which says nothing about the loop. So this code path is
+        # inert in sim and cannot be validated there; only the unit tests and
+        # the robot can exercise it.
+        #
+        # The plate drifting off the wall is the failure that follows, and it is
+        # quiet: the base carries the plate along the wall faster than the arm
+        # corrects the standoff, so the error grows over a segment rather than
+        # announcing itself.
+        #
+        # Clamping keeps the original protection at both ends. A burst of early
+        # cycles cannot integrate less than the nominal step, and a late cycle
+        # after a stall cannot advance more than the factor below allows.
+        now = self._now()
+        nominal = 1.0 / self.control_rate
+        elapsed = (now - self.command_stamp) if self.command_stamp else nominal
+        dt = float(min(max(elapsed, nominal),
+                       self.control_period_max_factor * nominal))
         u = slew_limit(u, self.u_prev, self.accel_max, dt)
         self.u_prev = u
 
-        now = self._now()
-        # Captured before command_stamp is overwritten below: the
-        # diagnostics need the gap between cycles, and reading it after the
-        # update would record zero every time.
+        # Captured before command_stamp is overwritten below: the diagnostics
+        # need the gap between cycles, and reading it after the update would
+        # record zero every time.
         self.cycle_period = (now - self.command_stamp) if self.command_stamp else 0.0
-        if self.command_stamp is not None:
-            measured = now - self.command_stamp
-            if measured > 2.0 * dt:
-                # The setpoint stream is thinner than the arm was promised, so
-                # it will track slower than commanded. Usually CPU starvation.
-                self.get_logger().warn(
-                    f"Control loop is running at {1.0 / max(measured, 1e-6):.0f} Hz, "
-                    f"not the {self.control_rate:.0f} Hz it commands for; the arm "
-                    f"will move slower than the base.",
-                    throttle_duration_sec=5.0)
+        if self.command_stamp is not None and elapsed > 2.0 * nominal:
+            # Compared against the NOMINAL period, not against dt. dt is now the
+            # clamped measurement, so `elapsed > 2 * dt` would stop being true
+            # the moment the clamp engaged, silencing the warning exactly when
+            # the loop is slowest.
+            saturated = elapsed > self.control_period_max_factor * nominal
+            self.get_logger().warn(
+                f"Control loop is running at {1.0 / max(elapsed, 1e-6):.0f} Hz, not "
+                f"the {self.control_rate:.0f} Hz it commands for."
+                + (f" Past the {self.control_period_max_factor:.0f}x clamp, so the "
+                   f"setpoint has stopped tracking real time and the arm is now "
+                   f"lagging the base." if saturated else ""),
+                throttle_duration_sec=5.0)
         self.command_stamp = now
 
         twist = Twist()
