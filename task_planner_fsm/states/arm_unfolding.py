@@ -2,6 +2,7 @@ from ..state import State
 from ..utils.wall_approach import unfolded_pose_name
 from arm_control.srv import SendPosition
 from control.remote_DASHBOARD import send_dashboard_play_command
+from ..utils.controller_ready import TrajectoryControllerGate
 
 class ArmUnfolding(State):
     def __init__(self, name):
@@ -14,6 +15,7 @@ class ArmUnfolding(State):
         self.dashboard_sent = False
         self.service_wait_deadline = None
         self.service_wait_timeout_s = 30.0
+        self.controller_gate = TrajectoryControllerGate()
 
     def on_enter(self, ctx):
         self.goal_sent = False
@@ -21,6 +23,7 @@ class ArmUnfolding(State):
         self.verbose = False
         self.dashboard_sent = False
         self.service_wait_deadline = None
+        self.controller_gate.reset()
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering unfolding state.")
 
@@ -58,6 +61,13 @@ class ArmUnfolding(State):
                     node.get_logger().error(f"[{self.name}] Dashboard command failed: {message}")
                     ctx["error_triggered"] = True
                     return
+
+        # The dashboard play only starts the External Control program; the
+        # driver's controller_stopper re-activates the trajectory controller a
+        # second or so later. A goal sent before that is rejected with
+        # "Can't accept new trajectories. Controller is not running."
+        if not self.controller_gate.ready(node):
+            return
 
         # Send service request if not already sent
         if not self.goal_sent:
