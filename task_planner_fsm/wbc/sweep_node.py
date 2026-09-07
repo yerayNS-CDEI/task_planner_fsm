@@ -165,8 +165,18 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("press_gain", 5.0e-5)
         self.declare_parameter("press_v_max", 0.005)        # m/s
         self.declare_parameter("press_seek_speed", 0.01)    # m/s, closing on the wall
-        self.declare_parameter("press_contact_force", 1.0)  # N, SEEK -> PRESS
-        self.declare_parameter("press_release_force", 0.5)  # N, PRESS -> SEEK
+        # SEEK -> PRESS, and the gate the base's travel is released by. 3.0 N
+        # rather than the 1.0 it was: the de-biased force sensor measures sigma
+        # 0.95 N with nothing touching, so 1.0 N was 1.1 sigma — inside the noise
+        # — and on 2026-09-07 the wheel "found" the wall 0.4 s after the tare and
+        # the base swept 1.1 m scanning air. See wbc/admittance.py for the table.
+        self.declare_parameter("press_contact_force", 3.0)  # N, SEEK -> PRESS
+        self.declare_parameter("press_release_force", 1.5)  # N, PRESS -> SEEK
+        # How long the force must STAY over press_contact_force to count as
+        # contact. The threshold alone is not enough at any level worth using,
+        # because an approach gives the noise several hundred tries at it; with
+        # no dwell every threshold tested latches spuriously within 45 s.
+        self.declare_parameter("press_contact_dwell", 0.15)  # s
         self.declare_parameter("press_force_limit", 30.0)   # N, abort above this
         # The distance sensors stop being the setpoint and become the envelope:
         # no approach closer than this to the sensed plane, whatever the force
@@ -823,6 +833,7 @@ class WholeBodySweepNode(Node):
                 seek_speed=float(p("press_seek_speed").value),
                 contact_force=float(p("press_contact_force").value),
                 release_force=float(p("press_release_force").value),
+                contact_dwell=float(p("press_contact_dwell").value),
                 force_limit=float(p("press_force_limit").value),
                 min_distance=float(p("press_min_distance").value),
                 filter_tau=float(p("press_filter_tau").value),

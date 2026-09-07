@@ -134,6 +134,28 @@ because the dominant latency at low rate is the sample interval itself, not the
 filter — but it makes the reported force honest so the limit fires on time, and
 it stops the tare duration drifting with the machine's load.
 
+**Contact is a sustained load, not a threshold crossing.** The second field run
+(2026-09-07) found the wall on noise about 0.4 s after the tare, with the wheel
+still 10 cm off it. ``touched`` latches by design — the sweep gates its travel on
+it — so the base then swept 1.1 m of wall with the GPR scanning air, and every
+other failure on that run followed from it: the base travelled into the obstacle
+influence radius, the avoidance barrier engaged, and from then on the barrier was
+pushing the base off the wall faster than the arm was closing on it.
+
+The threshold was 1.0 N against a sensor whose de-biased noise measures sigma
+0.95 N. That is 1.1 sigma, and an approach gets several hundred independent
+tries at it. No threshold alone is enough at any level worth using, which is why
+there is also a dwell — over 400 simulated 45 s approaches at 10 Hz:
+
+    contact_force    dwell 0     0.10 s     0.20 s
+        1.0 N         100%        100%        99%
+        2.0 N         100%         36%       0.8%
+        3.0 N         100%          0%         0%
+
+Note the first column: with no dwell, EVERY threshold tested latches on noise
+eventually. Time over the threshold is what separates contact from noise; the
+threshold only sets how long that takes.
+
 **The distance sensors do not go away.** They stop being the setpoint and become
 the safety envelope: the press may never drive the plate closer than
 ``min_distance`` to the sensed plane, whatever the force says. A force reading
@@ -185,7 +207,8 @@ class AdmittancePress:
     """
 
     def __init__(self, target_force=5.0, gain=5.0e-5, v_max=0.005,
-                 seek_speed=0.01, contact_force=1.0, release_force=0.5,
+                 seek_speed=0.01, contact_force=3.0, release_force=1.5,
+                 contact_dwell=0.15,
                  force_limit=30.0, min_distance=0.005, filter_tau=0.1,
                  stall_seconds=2.0, tare_seconds=0.5, tare_min_distance=0.05,
                  contact_distance=0.13, approach_gain=3.0,
@@ -198,8 +221,28 @@ class AdmittancePress:
         # Hysteresis, and it matters: a single threshold at the contact force
         # would flip state every time the filtered force crossed it, which on a
         # real surface is several times a second.
+        #
+        # 3.0 N, not the 1.0 it was. Measured off the 2026-09-07 log, the
+        # de-biased force sensor has sigma 0.95 N and swings -2.6 to +2.4 N with
+        # nothing touching, so a 1.0 N threshold is 1.1 sigma — it is inside the
+        # noise, not above it. That mattered more after the filter was put on a
+        # proper time base: a fixed alpha of 0.2 smoothed the same signal to
+        # sigma 0.32 N whatever the rate, while tau = 0.1 s gives 0.64 N at
+        # 10 Hz, and the threshold that had been ~3 sigma became ~1.5. On the
+        # second field run contact latched about 0.4 s after the tare with the
+        # wheel still 10 cm off the wall, and because ``touched`` latches, the
+        # base then swept 1.1 m of wall scanning air.
         self.contact_force = float(contact_force)
         self.release_force = float(release_force)
+        # Contact must PERSIST for this long before it counts. A threshold alone
+        # cannot separate contact from noise at any level worth using, because
+        # the noise gets several hundred independent tries over an approach:
+        # simulated over 400 approaches of 45 s at 10 Hz, 1.0 N latches
+        # spuriously 100% of the time at every dwell, 2.0 N needs 0.2 s to get
+        # down to 0.8%, and 3.0 N with 0.1 s never latches once. Both halves are
+        # load-bearing — this is the one that survives someone deciding the
+        # threshold is too conservative.
+        self.contact_dwell = float(contact_dwell)
         self.force_limit = float(force_limit)
         self.min_distance = float(min_distance)
         # Time constant of the force EMA, in SECONDS. Converted to a per-cycle
@@ -251,6 +294,7 @@ class AdmittancePress:
         self._seeded = False
         self._stalled = 0.0     # seconds sat at the envelope in SEEK
         self._over_limit = 0.0  # seconds the raw force has been over the limit
+        self._contact_held = 0.0    # seconds the force has been over contact_force
         self._tare_samples = []
         self._tare_elapsed = 0.0
         # Whether the wheel has EVER reached the wall in this segment. Latching,
@@ -364,7 +408,13 @@ class AdmittancePress:
         # is already loaded, and SEEK would drive further into the wall.
         force = float(raw_force) - self.bias
         self.raw = force
-        if not self._seeded:
+        seeding = not self._seeded
+        if seeding:
+            # Seeded at the raw reading, which is right for the force loop and
+            # wrong for contact detection: this one value has had no filtering
+            # at all, so on its own it is just a sample of the noise. The
+            # contact test below skips this cycle for that reason. The dwell
+            # would cover it too, but only while someone leaves the dwell alone.
             self.force = force
             self._seeded = True
         else:
@@ -397,15 +447,24 @@ class AdmittancePress:
         else:
             self._over_limit = 0.0
 
-        if self.state == SEEK and self.force >= self.contact_force:
-            self.state = PRESS
-            self.touched = True
-            self._stalled = 0.0
+        if self.state == SEEK:
+            # Held over the threshold, in TIME, and never on the seeding cycle.
+            # Anything short of the dwell resets it: contact is a sustained load,
+            # and noise that happens to cross once is not one.
+            if self.force >= self.contact_force and not seeding:
+                self._contact_held += dt
+            else:
+                self._contact_held = 0.0
+            if self._contact_held >= self.contact_dwell:
+                self.state = PRESS
+                self.touched = True
+                self._stalled = 0.0
         elif self.state == PRESS and self.force < self.release_force:
             # Contact lost: a hollow, a gap, the wheel riding over a lip. Go
             # back to closing the distance rather than commanding the full force
             # error, which out of contact is just "drive at the wall".
             self.state = SEEK
+            self._contact_held = 0.0
 
         if self.state == PRESS:
             # v_max bounds the FORCE loop only. It is sized for contact — a few
@@ -414,12 +473,28 @@ class AdmittancePress:
             v = float(np.clip(self.gain * self.error(), -self.v_max, self.v_max))
             self.approach_speed = 0.0
         else:
-            # The scheduled approach. seek_speed is now a CEILING rather than the
-            # commanded speed: far from the wall the schedule is slack and the
-            # approach runs at seek_speed, and it takes over only over the last
-            # few centimetres, which is the only stretch where it matters.
-            self.approach_speed = min(self.seek_speed,
-                                      self._approach_cap(self.distance))
+            if self._contact_held > 0.0:
+                # Candidate contact: the force is over the threshold but has not
+                # held for the dwell yet. STOP while confirming, rather than
+                # carrying on into the wall for another dwell's worth of travel.
+                #
+                # This is not a detail. The dwell is detection latency, and
+                # detection latency times approach speed is penetration — the
+                # exact quantity the schedule exists to bound. Confirming while
+                # still moving put 33 N on the wheel with a 10 mm distance bias,
+                # against 25 N before the dwell existed; confirming while stopped
+                # costs nothing, because there is no travel to pay for it with.
+                # A noise spike therefore costs a 0.15 s pause in the approach
+                # and nothing else, which is a price worth paying every time.
+                self.approach_speed = 0.0
+            else:
+                # The scheduled approach. seek_speed is a CEILING rather than the
+                # commanded speed: far from the wall the schedule is slack and
+                # the approach runs at seek_speed, and it takes over only over
+                # the last few centimetres, which is the only stretch where it
+                # matters.
+                self.approach_speed = min(self.seek_speed,
+                                          self._approach_cap(self.distance))
             v = self.approach_speed
 
         # The envelope. Approach is refused inside min_distance whatever the
