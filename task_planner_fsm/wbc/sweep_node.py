@@ -60,7 +60,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray, Float64MultiArray, String
 
-from .admittance import SEEK, TARE, AdmittancePress
+from .admittance import PRESS, SEEK, TARE, AdmittancePress
 from .avoidance import AvoidanceConfig, ObstacleField, avoidance_rows
 from .base_model import BaseLimits, box_bounds, constraint_rows, wheel_and_turret_rates
 from .hardware import HardwareMonitor
@@ -167,7 +167,7 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("press_seek_speed", 0.01)    # m/s, closing on the wall
         self.declare_parameter("press_contact_force", 1.0)  # N, SEEK -> PRESS
         self.declare_parameter("press_release_force", 0.5)  # N, PRESS -> SEEK
-        self.declare_parameter("press_force_limit", 25.0)   # N, abort above this
+        self.declare_parameter("press_force_limit", 30.0)   # N, abort above this
         # The distance sensors stop being the setpoint and become the envelope:
         # no approach closer than this to the sensed plane, whatever the force
         # says. A wrong force reading then cannot walk the arm into the wall,
@@ -203,23 +203,72 @@ class WholeBodySweepNode(Node):
         # noise alone can never reach the 100 in a row that would fail the
         # sweep. What a too-tight envelope costs is a press that sits light.
         self.declare_parameter("press_min_distance", 0.115)  # m
-        self.declare_parameter("press_filter_alpha", 0.2)
-        self.declare_parameter("press_stall_cycles", 100)
-        # Tare: hold the normal axis still for this many cycles at the start and
-        # average what the sensor reads in free space, then subtract it. 25 is
-        # half a second at 50 Hz. Set to 0 to trust the sensor as it comes, which
-        # is only sane if something else has just tared it. The plate must be at
-        # least press_tare_min_distance off the surface, or the tare would fold
-        # the contact force into the zero — see wbc/admittance.py.
-        self.declare_parameter("press_tare_cycles", 25)
+        # --- the approach schedule ---------------------------------------
+        # Closing on the wall at a constant speed makes the peak contact force a
+        # function of the loop rate, because the wheel keeps approaching until
+        # the loop NOTICES contact. That is what failed on 2026-09-07: the loop
+        # was at 8-17 Hz (the machine was at load 36 on 12 cores) and the wheel
+        # reached 32 N against a 30 N limit. Scheduling the approach on the
+        # remaining gap makes the penetration during that detection latency go
+        # to zero as the gap does, so the peak force stops depending on the rate
+        # — measured flat at ~5 N from 50 Hz down to 8. See wbc/admittance.py for
+        # the numbers and for why the gap estimate has to be pessimistic.
+        #
+        # Where the plate STOPS: the range reading with the wheel and all four
+        # caster bars riding the wall. Same measurement press_min_distance is
+        # sized off, and the gap the schedule closes is measured from it.
+        self.declare_parameter("press_contact_distance", 0.13)     # m
+        # 1/s. The safety comes from the margin below, not from this: 1.2 -> 4.0
+        # moves the peak force by 0.1 N and only buys back approach time.
+        self.declare_parameter("press_approach_gain", 3.0)
+        # Subtracted from the filtered distance before the gap is taken: 3x the
+        # 4.2 mm sigma of the plane fit. Deliberately one-sided — under-reading
+        # the gap costs time, over-reading it drives the wheel into the wall.
+        self.declare_parameter("press_approach_margin", 0.0126)    # m
+        # The floor, so a pessimistic estimate cannot stall the approach short
+        # of the wall for ever.
+        self.declare_parameter("press_approach_min_speed", 0.0008)  # m/s
+        self.declare_parameter("press_distance_tau", 0.15)         # s
+        # How long the RAW force may sit above press_force_limit before it is a
+        # fault. The filtered check keeps its immunity to a single spike; this
+        # one closes the hole that spike immunity opens, where a lagging filter
+        # read 3.9 N with 40 N on the wheel. In TIME, so it is three samples at
+        # 50 Hz and fires within one cycle at 10 — which is exactly when the
+        # filtered check is least trustworthy.
+        self.declare_parameter("press_force_limit_dwell", 0.06)    # s
+        # Every time constant below is in SECONDS, not cycles. They used to be
+        # cycle counts sized at 50 Hz, so at the 10 Hz the robot achieved the
+        # force filter's lag became 0.5 s and the tare quietly took 2.5 s.
+        self.declare_parameter("press_filter_tau", 0.1)            # s
+        self.declare_parameter("press_stall_seconds", 2.0)         # s
+        # Tare: hold the normal axis still for this long at the start and average
+        # what the sensor reads in free space, then subtract it. Set to 0 to
+        # trust the sensor as it comes, which is only sane if something else has
+        # just tared it. The plate must be at least press_tare_min_distance off
+        # the surface, or the tare would fold the contact force into the zero —
+        # see wbc/admittance.py.
+        self.declare_parameter("press_tare_seconds", 0.5)          # s
         self.declare_parameter("press_tare_min_distance", 0.05)   # m
+        # How long the base takes to reach sweep_speed once the wheel has found
+        # the wall. Without it the travel gate opens as a STEP: base_accel_max is
+        # 0.3 m/s^2, which at the 0.1 s cycle the robot was achieving authorises
+        # the whole 0.03 m/s in a single cycle, and it lands on the one sample
+        # where the contact force is least well known.
+        self.declare_parameter("press_travel_ramp", 1.0)           # s
         # How long to wait for the wheel to reach the wall before giving up on
         # the segment. The base holds still for all of it (see _control_step),
         # so this is not a stall — but it has to be bounded, because a press that
         # never arrives would otherwise hold the base for the whole sweep budget
         # and then report a segment it never scanned. Generous: the approach is
         # accepted anywhere within scan_wall_approach_tolerance, so the gap can
-        # be up to ~0.22 m, which is 22 s at press_seek_speed.
+        # be up to ~0.22 m. That is ~7 s at press_seek_speed down to where the
+        # schedule takes over, then the scheduled crawl over the last few
+        # centimetres — measured end to end at 21-24 s from 0.22 m (worst of 20
+        # noise seeds, 24.1 s), against the 2.7 s the old constant approach took
+        # to arrive at 40 N. 45 s still clears it, but the margin is now under 2x
+        # rather than ~20x, so raising press_approach_gain is the knob to reach
+        # for before raising this one. A distance sensor reading LONG eats into
+        # it further: -10 mm of bias puts contact at 27 s.
         self.declare_parameter("press_contact_timeout", 45.0)     # s
         # How hard the normal axis is held to what the force loop asks for. Large
         # because a press command is orders of magnitude smaller than the sweep
@@ -614,6 +663,15 @@ class WholeBodySweepNode(Node):
         # When the sweep started waiting for the wheel to reach the wall. None
         # means it is not waiting — either it has touched, or it is not pressing.
         self.press_wait_since = None
+        # The press's own clock. Every time constant inside AdmittancePress is
+        # in seconds and is converted against the MEASURED period, so the press
+        # behaves the same in wall-clock terms whatever rate the loop achieves.
+        # Its own stamp rather than the control loop's: the strike paths return
+        # before the press is updated, and the press must measure the gap since
+        # it last ran, not since the last cycle that got that far.
+        self.press_stamp = None
+        # When the travel gate opened, for the ramp that replaces the step.
+        self.press_touch_stamp = None
         self.surface = SurfaceEstimator(ema_alpha=float(p("ema_alpha").value))
         self.q_posture = None
         self.holding_since = None
@@ -767,10 +825,16 @@ class WholeBodySweepNode(Node):
                 release_force=float(p("press_release_force").value),
                 force_limit=float(p("press_force_limit").value),
                 min_distance=float(p("press_min_distance").value),
-                filter_alpha=float(p("press_filter_alpha").value),
-                stall_cycles=int(p("press_stall_cycles").value),
-                tare_cycles=int(p("press_tare_cycles").value),
-                tare_min_distance=float(p("press_tare_min_distance").value))
+                filter_tau=float(p("press_filter_tau").value),
+                stall_seconds=float(p("press_stall_seconds").value),
+                tare_seconds=float(p("press_tare_seconds").value),
+                tare_min_distance=float(p("press_tare_min_distance").value),
+                contact_distance=float(p("press_contact_distance").value),
+                approach_gain=float(p("press_approach_gain").value),
+                approach_margin=float(p("press_approach_margin").value),
+                approach_min_speed=float(p("press_approach_min_speed").value),
+                distance_tau=float(p("press_distance_tau").value),
+                force_limit_dwell=float(p("press_force_limit_dwell").value))
             self.create_subscription(
                 WrenchStamped, str(p("wrench_topic").value), self._on_wrench, 10,
                 callback_group=self.io_group)
@@ -904,15 +968,21 @@ class WholeBodySweepNode(Node):
 
     # The press tunables that may be changed WHILE the wheel is loaded, as
     # (parameter, AdmittancePress attribute). Deliberately not the whole set:
-    # min_distance is the safety envelope and filter_alpha is part of what keeps
-    # the loop stable, so neither should move mid-press. These five are the ones
-    # worth reaching for on a bench, and the important one is the gain.
+    # min_distance is the safety envelope, approach_margin is what makes the gap
+    # estimate one-sided, and filter_tau is part of what keeps the loop stable,
+    # so none of those should move mid-press. These are the ones worth reaching
+    # for on a bench, and the important one is the gain.
     PRESS_TUNABLES = (
         ("press_force", "target_force"),
         ("press_gain", "gain"),
         ("press_v_max", "v_max"),
         ("press_seek_speed", "seek_speed"),
         ("press_force_limit", "force_limit"),
+        # The approach schedule, for the same reason the gain is here: walking
+        # it on a bench beats restarting the FSM, which begins every attempt by
+        # driving the wheel back into the wall.
+        ("press_approach_gain", "approach_gain"),
+        ("press_contact_distance", "contact_distance"),
     )
 
     def _refresh_press_tuning(self):
@@ -1563,7 +1633,16 @@ class WholeBodySweepNode(Node):
             # press has its own clamp (press_v_max), sized for contact rather
             # than for closing a 20 cm gap, so v_normal_max does not apply.
             self._refresh_press_tuning()
-            v_normal = self.press.update(self.press_force, distance)
+            # The MEASURED period since the press last ran, clamped. The floor
+            # keeps a burst of early cycles from dividing the filters down to
+            # nothing; the ceiling stops the first cycle after a long hold —
+            # a protective stop, a stretch of stale inputs — from advancing the
+            # tare or the stall timer by the whole gap at once.
+            nominal_dt = 1.0 / self.control_rate
+            press_dt = (now - self.press_stamp) if self.press_stamp else nominal_dt
+            press_dt = float(min(max(press_dt, 0.2 * nominal_dt), 1.0))
+            self.press_stamp = now
+            v_normal = self.press.update(self.press_force, distance, press_dt)
             if self.press.fault:
                 self.finish("failed", self.press.fault)
                 return
@@ -1624,6 +1703,19 @@ class WholeBodySweepNode(Node):
                     f"wheel against a {self.press.target_force:.0f} N target. "
                     f"Sweeping without contact would record air.")
                 return
+        elif self.press is not None:
+            # The gate has opened. Ease the travel in rather than releasing it
+            # as a step: base_accel_max (0.3 m/s^2) authorises the whole
+            # sweep_speed in one cycle at the rate the robot actually achieves,
+            # and the cycle it would do that on is the first contact sample —
+            # the one where the force is least well known and the wheel is
+            # already loaded. Ramping over press_travel_ramp costs a centimetre
+            # of scan at the start of the segment.
+            if self.press_touch_stamp is None:
+                self.press_touch_stamp = now
+            ramp = float(p("press_travel_ramp").value)
+            if ramp > 0.0:
+                speed *= min(1.0, (now - self.press_touch_stamp) / ramp)
         v_ref = speed * t_hat + v_normal * m_hat + v_height * np.array([0.0, 0.0, 1.0])
 
         R_target = plate_orientation_target(m_hat)
@@ -2180,10 +2272,19 @@ class WholeBodySweepNode(Node):
         # that is not keeping up: it sits near zero when all is well and pins at
         # arm_stream_max_lead under speed scaling or a stop.
         lead = self.arm_stream.lead(self._arm_positions())
-        press = ("" if self.press is None else
-                 f"press={self.press.force:+.1f}N/{self.press.target_force:.0f} "
-                 f"[{self.press.state.upper() if self.press.state != SEEK else 'seek'}] "
-                 f"bias={self.press.bias:+.1f}N | ")
+        # Both the filtered and the RAW force, because the filtered one is a lag
+        # and on 2026-09-07 it read +2.0 N with the wheel already past 30. And
+        # the approach speed the schedule is allowing, which is the number that
+        # says whether the press is closing fast or crawling the last centimetre.
+        if self.press is None:
+            press = ""
+        else:
+            approach = ("" if self.press.state == PRESS
+                        else f"app={self.press.approach_speed * 1000:.1f}mm/s ")
+            press = (f"press={self.press.force:+.1f}N(raw{self.press.raw:+.1f})"
+                     f"/{self.press.target_force:.0f} "
+                     f"[{self.press.state.upper() if self.press.state != SEEK else 'seek'}] "
+                     f"{approach}bias={self.press.bias:+.1f}N | ")
         self.get_logger().info(
             f"{press}d={distance * 100:.1f}cm tilt={math.degrees(self.surface.tilt()):.1f}deg "
             f"left={remaining:.2f}m | base{'*' if self.base_travel_pinned else ''}"
