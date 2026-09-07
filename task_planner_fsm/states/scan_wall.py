@@ -121,7 +121,8 @@ class ScanWall(State):
         #   sweep_setup      cap the base speed for the sweep
         #   arm_approach(_wait)  extend the arm to the approach standoff
         #   lead_in(_wait)   arm crosses to the partition START, still off the wall
-        #   press_prepare    alignment controller + force-mode press
+        #   press_prepare    alignment controller, then tare the FT sensor
+        #   ft_zero_wait     wait for the tare, then start the force-mode press
         #   press_settle     wait for the FT sensor to confirm wall contact
         #   sweep_wait       the actual scan (GPR triggers fire every X cm here)
         # The lead-in comes BEFORE the press on purpose: the base parks at the
@@ -205,6 +206,13 @@ class ScanWall(State):
         # (~-5 N). See _wall_contact_ready.
         self.ft_topic = "/force_torque_sensor_broadcaster/wrench"
         self._press_settle_start = None
+
+        # Tare for that sensor: the broadcaster reads a non-zero Z with nothing
+        # touching the plate, so it is zeroed once per segment just before the
+        # press starts (see _zero_ft_sensor).
+        self._ft_zero_client = None
+        self._ft_zero_future = None
+        self._ft_zero_start = None
 
         # GPR (GP Proceq8800) HTTP API: connect + run a LINE_SCAN measurement
         # while the wheel is pressed against the wall. Real robot only (mirrors
@@ -296,6 +304,8 @@ class ScanWall(State):
         self._restore_sweep_speed(ctx)   # clear any stale slow-sweep limit from a re-entry
         self.force_mode_active = False
         self._press_settle_start = None
+        self._ft_zero_future = None
+        self._ft_zero_start = None
         self.gpr_measurement_active = False
         self.gpr_line_active = False
         self._stop_gpr_triggers(ctx, log_summary=False)   # clear any stale timer
@@ -887,6 +897,75 @@ class ScanWall(State):
         node.get_logger().info(f"[{self.name}] Stopping force mode.")
         fut = self.force_mode_stop_client.call_async(Trigger.Request())
         fut.add_done_callback(lambda f: self._log_force_mode_result(node, f, "stop"))
+
+    # ------------------------------------------------------------------
+    # FT sensor tare (real robot only): zero the TCP wrench before pressing
+    # ------------------------------------------------------------------
+    def _zero_ft_sensor(self, ctx):
+        """Real robot only. Tare the TCP force/torque sensor before the press.
+
+        The sensor carries a bias: with the arm parked and nothing touching the
+        plate, force_torque_sensor_broadcaster still reports ~-5 N on Z — which
+        is exactly the value _wall_contact_ready reads as contact, so without a
+        tare press_settle falls through immediately and the segment is swept
+        with the plate still in free air. The UR driver exposes the same zeroing
+        the teach pendant does; call it here, with the arm settled at the
+        approach pose and not yet pressing, so the offset it captures is the
+        true no-load bias.
+
+        Only issues the call — _ft_zero_ready polls the future — because the FSM
+        ticks on the same single-threaded executor that has to deliver the
+        response, so blocking on it here would deadlock.
+        """
+        self._ft_zero_future = None
+        self._ft_zero_start = time.time()
+        if bool(ctx.get("sim", False)) or not bool(ctx.get("scan_wall_zero_ftsensor", True)):
+            return
+        node = ctx["node"]
+        if self._ft_zero_client is None:
+            self._ft_zero_client = node.create_client(
+                Trigger, "/io_and_status_controller/zero_ftsensor")
+        if not self._ft_zero_client.wait_for_service(timeout_sec=5.0):
+            node.get_logger().warn(
+                f"[{self.name}] zero_ftsensor service unavailable; pressing with an "
+                f"UNTARED FT sensor. Its idle bias (~-5 N on Z) may be read as wall "
+                f"contact, so the sweep can start before the plate touches the wall."
+            )
+            return
+        node.get_logger().info(f"[{self.name}] Taring the TCP force/torque sensor.")
+        self._ft_zero_future = self._ft_zero_client.call_async(Trigger.Request())
+
+    def _ft_zero_ready(self, ctx):
+        """Return True once the tare has answered (or there is nothing to wait
+        for), False while the call is still in flight, so the caller can hand
+        control back to the tick loop. A bounded timeout proceeds anyway rather
+        than stalling the segment on an unresponsive driver."""
+        if self._ft_zero_future is None:
+            return True
+        node = ctx["node"]
+        timeout_s = float(ctx.get("scan_wall_zero_ftsensor_timeout_s", 10.0))
+        if not self._ft_zero_future.done():
+            if time.time() - self._ft_zero_start < timeout_s:
+                return False
+            self._ft_zero_future = None
+            node.get_logger().warn(
+                f"[{self.name}] zero_ftsensor did not answer in {timeout_s:.0f}s; "
+                f"pressing with a possibly untared FT sensor."
+            )
+            return True
+        future, self._ft_zero_future = self._ft_zero_future, None
+        try:
+            res = future.result()
+            if getattr(res, "success", True):
+                node.get_logger().info(f"[{self.name}] FT sensor tared (Fz reset to 0).")
+            else:
+                node.get_logger().warn(
+                    f"[{self.name}] zero_ftsensor refused the tare: "
+                    f"{getattr(res, 'message', '')}"
+                )
+        except Exception as e:
+            node.get_logger().warn(f"[{self.name}] zero_ftsensor call failed: {e}")
+        return True
 
     # ------------------------------------------------------------------
     # Wall-contact detection from the TCP force/torque sensor
@@ -2638,6 +2717,21 @@ class ScanWall(State):
                 return
             node.get_logger().info(f"[{self.name}] Waiting 10s for arm processes to stabilise...")
             time.sleep(10.0)
+
+            # Tare the FT sensor now: the arm is settled at the approach pose and
+            # nothing is pressing yet, so this is the one moment its reading is a
+            # pure no-load bias. Must happen BEFORE force mode, since the contact
+            # gate compares the raw Z force against the commanded press.
+            self._zero_ft_sensor(ctx)
+            self._seg_phase = "ft_zero_wait"
+            return
+
+        if self._seg_phase == "ft_zero_wait":
+            if not self._ft_zero_ready(ctx):
+                return
+            # Drop the pre-tare reading so the contact gate cannot pass on a
+            # wrench measured against the old bias; it waits for a fresh frame.
+            ctx.pop("ft_wrench", None)
 
             # Real robot: press the GPR against the wall for this segment sweep
             # (sim has no force_mode controller -> no-op).
