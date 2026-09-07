@@ -18,7 +18,14 @@ import pytest
 from task_planner_fsm.wbc.admittance import SEEK, AdmittancePress
 
 K_E = 2.0e4          # N/m, stiffness of the wall as seen through the wheel
-BOTTOM = 0.13        # m, sensed range when the wheel and casters ride the wall
+# MEASURED on 2026-09-07, not assumed. The force first appears at d = 14.0 cm
+# and reads 2.9 N by 13.6, so the wheel meets the wall at about 14.1. The earlier
+# 0.13 in this file came from a code comment rather than a run, and it flattered
+# the schedule badly: it sits 12.6 mm BELOW the schedule's asymptote, so the plate
+# was always already crawling when it arrived and approach_gain looked irrelevant.
+# At the real distance the plate arrives AT the asymptote and the gain is
+# everything. Keep this honest — it is what every peak-force number here rests on.
+BOTTOM = 0.141       # m, sensed range when the wheel and casters ride the wall
 SERVO_LAG = 0.04     # s, the 30-50 ms the module docstring credits the arm with
 SIGMA = 0.0042       # m, sigma of the six-range plane fit
 
@@ -26,7 +33,7 @@ SIGMA = 0.0042       # m, sigma of the six-range plane fit
 SIGMA_F = 0.95       # N, sigma of the de-biased force sensor, measured on hardware
 
 
-def press_against_wall(rate, d0=0.155, bias=0.0, sigma=SIGMA, seed=0,
+def press_against_wall(rate, d0=0.20, bias=0.0, sigma=SIGMA, seed=0,
                        horizon=90.0, force_sigma=SIGMA_F, **kwargs):
     """Run one approach-and-press. Returns (peak true force, time to contact, fault)."""
     rng = np.random.default_rng(seed)
@@ -51,8 +58,9 @@ def press_against_wall(rate, d0=0.155, bias=0.0, sigma=SIGMA, seed=0,
     return peak, touched_at, None
 
 
-# The rates the loop actually ran at in the field, plus the 50 it asks for.
-RATES = (50, 25, 17, 10, 8)
+# The rates the loop actually ran at in the field, plus the 50 it asks for. 7 and
+# 5 are not padding: the 2026-09-07 run hit both while the wheel was closing.
+RATES = (50, 25, 17, 10, 7, 5)
 
 
 @pytest.mark.parametrize("rate", RATES)
@@ -285,3 +293,40 @@ def test_a_noise_spike_only_costs_a_pause():
         v = press.update(0.0, 0.20, 0.02)            # noise passes
     assert v > 0.0, "the approach never resumed after a spike"
     assert not press.touched
+
+
+def test_the_schedule_has_room_to_decelerate():
+    """The mechanism, stated as arithmetic rather than as a measured peak.
+
+    The approach starts slowing at ``contact_distance + margin + seek_speed/gain``
+    and the wall is at ``contact_distance + margin``-ish, so ``seek_speed/gain``
+    IS the braking distance. At gain 3.0 that was 4.9 mm — three cycles at 7 Hz —
+    and the wheel went through it at full speed into 30.5 N.
+
+    Pinned here because a peak-force test alone would not say WHY it regressed,
+    and because raising the gain is the obvious-looking way to make the approach
+    faster.
+    """
+    press = AdmittancePress(tare_seconds=0.0)
+    braking_distance = press.seek_speed / press.approach_gain
+    assert braking_distance >= 0.025, (
+        f"only {braking_distance * 1000:.0f} mm to decelerate in; at 7 Hz that is "
+        f"{braking_distance / press.seek_speed * 7:.1f} cycles")
+    bind_point = press.contact_distance + press.approach_margin + braking_distance
+    assert bind_point > BOTTOM + 0.02, (
+        f"the approach only starts slowing at {bind_point * 100:.1f} cm, which is "
+        f"not clear of the wall at {BOTTOM * 100:.1f} cm")
+
+
+@pytest.mark.parametrize("rate", RATES)
+def test_peak_force_with_contact_at_the_schedule_asymptote(rate):
+    """The worst case, and the one the robot is actually in.
+
+    Contact essentially AT the point the schedule decays toward means the plate
+    has no free crawl before it touches — whatever speed the schedule still
+    allows there is the speed it hits at.
+    """
+    peaks = [press_against_wall(rate, seed=s)[0] for s in range(12)]
+    assert max(peaks) < 15.0, (
+        f"at {rate} Hz the wheel reached {max(peaks):.1f} N with contact at "
+        f"{BOTTOM * 100:.1f} cm")

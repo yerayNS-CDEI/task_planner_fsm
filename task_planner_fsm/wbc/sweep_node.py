@@ -228,9 +228,12 @@ class WholeBodySweepNode(Node):
         # caster bars riding the wall. Same measurement press_min_distance is
         # sized off, and the gap the schedule closes is measured from it.
         self.declare_parameter("press_contact_distance", 0.13)     # m
-        # 1/s. The safety comes from the margin below, not from this: 1.2 -> 4.0
-        # moves the peak force by 0.1 N and only buys back approach time.
-        self.declare_parameter("press_approach_gain", 3.0)
+        # 1/s. This sets how much room the approach has to decelerate in --
+        # contact_distance + margin + seek_speed/gain is where it starts slowing.
+        # At 3.0 that was 4.9 mm against a contact the robot has since measured at
+        # 14.1 cm, and the wheel went through it at full speed into 30.5 N. See
+        # wbc/admittance.py for the table; 0.3 buys 35 mm of braking room.
+        self.declare_parameter("press_approach_gain", 0.3)
         # Subtracted from the filtered distance before the gap is taken: 3x the
         # 4.2 mm sigma of the plane fit. Deliberately one-sided — under-reading
         # the gap costs time, over-reading it drives the wheel into the wall.

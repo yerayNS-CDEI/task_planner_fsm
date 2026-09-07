@@ -211,7 +211,7 @@ class AdmittancePress:
                  contact_dwell=0.15,
                  force_limit=30.0, min_distance=0.005, filter_tau=0.1,
                  stall_seconds=2.0, tare_seconds=0.5, tare_min_distance=0.05,
-                 contact_distance=0.13, approach_gain=3.0,
+                 contact_distance=0.13, approach_gain=0.3,
                  approach_margin=0.0126, approach_min_speed=0.0008,
                  distance_tau=0.15, force_limit_dwell=0.06):
         self.target_force = float(target_force)
@@ -243,6 +243,13 @@ class AdmittancePress:
         # load-bearing — this is the one that survives someone deciding the
         # threshold is too conservative.
         self.contact_dwell = float(contact_dwell)
+        # ...and across at least this many separate readings, whichever is the
+        # stronger demand at the rate the loop is achieving. A time-only dwell
+        # inverts the old cycle-counting bug rather than fixing it: at 5 Hz one
+        # period is 0.2 s, so a 0.15 s dwell is satisfied by a SINGLE sample and
+        # stops being a dwell at all — measured, 5 spurious latches in 200
+        # approaches. Two readings cannot both be noise nearly as easily as one.
+        self.contact_samples = 2
         self.force_limit = float(force_limit)
         self.min_distance = float(min_distance)
         # Time constant of the force EMA, in SECONDS. Converted to a per-cycle
@@ -260,10 +267,33 @@ class AdmittancePress:
         # closer, so this — not zero — is what the approach is closing on and
         # what the gap is measured from.
         self.contact_distance = float(contact_distance)
-        # 1/s. Bounded above by seek_speed, below by approach_min_speed. Raising
-        # it buys back approach time and costs nothing in peak force (measured:
-        # 1.2 -> 4.0 moves the peak by 0.1 N and the time to contact by 3 s); it
-        # is the MARGIN below that buys the safety, not this.
+        # 1/s, and the single most important number in this file. It sets where
+        # the approach STARTS to slow:
+        #
+        #     bind point = contact_distance + approach_margin + seek_speed / gain
+        #
+        # and the distance between that and the wall is all the room the loop has
+        # to decelerate in. At 3.0 that room was 4.9 mm, which at 7 Hz is three
+        # cycles, and the 2026-09-07 run drove through it at the full 10 mm/s and
+        # put 30.5 N on the wheel.
+        #
+        # It was 3.0 because it was tuned against an assumed contact distance of
+        # 0.13 m, which sits 12.6 mm BELOW the schedule's asymptote — so in that
+        # model the plate was always already crawling when it arrived and the gain
+        # made almost no difference ("1.2 -> 4.0 moves the peak by 0.1 N"). The
+        # robot then measured contact at 14.1 cm, essentially AT the asymptote,
+        # where the gain is the only thing that matters. Peak force with contact
+        # in the right place, worst of 12 seeds:
+        #
+        #     gain    15 Hz   10 Hz    7 Hz    5 Hz
+        #      3.0     24.0    31.4    42.0    66.2
+        #      1.0      8.7    15.5    18.3    50.2
+        #      0.5      6.9     8.7    13.0    12.8
+        #      0.3      6.5     9.0    11.2    11.2
+        #
+        # 0.3 gives 35 mm of braking room and holds ~11 N down to 5 Hz, for 17 s
+        # to contact from a 22 cm start against a 45 s timeout. Raising it back
+        # trades that room away, and the room is the whole mechanism.
         self.approach_gain = float(approach_gain)
         # Subtracted from the filtered distance before the gap is taken: 3x the
         # 4.2 mm sigma of the plane fit. This is the one-sided error the module
@@ -295,6 +325,7 @@ class AdmittancePress:
         self._stalled = 0.0     # seconds sat at the envelope in SEEK
         self._over_limit = 0.0  # seconds the raw force has been over the limit
         self._contact_held = 0.0    # seconds the force has been over contact_force
+        self._contact_n = 0         # ...and how many readings in a row
         self._tare_samples = []
         self._tare_elapsed = 0.0
         # Whether the wheel has EVER reached the wall in this segment. Latching,
@@ -453,9 +484,12 @@ class AdmittancePress:
             # and noise that happens to cross once is not one.
             if self.force >= self.contact_force and not seeding:
                 self._contact_held += dt
+                self._contact_n += 1
             else:
                 self._contact_held = 0.0
-            if self._contact_held >= self.contact_dwell:
+                self._contact_n = 0
+            if (self._contact_held >= self.contact_dwell
+                    and self._contact_n >= self.contact_samples):
                 self.state = PRESS
                 self.touched = True
                 self._stalled = 0.0
@@ -465,6 +499,7 @@ class AdmittancePress:
             # error, which out of contact is just "drive at the wall".
             self.state = SEEK
             self._contact_held = 0.0
+            self._contact_n = 0
 
         if self.state == PRESS:
             # v_max bounds the FORCE loop only. It is sized for contact — a few
