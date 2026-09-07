@@ -14,6 +14,15 @@ controllers each unaware of the other — with ONE control law over base + arm::
     scale by the robot's execution speed, bound the acceleration, and publish
     base Twist (turret frame)  +  arm command (servoj setpoints by default)
 
+Two rates, not one. The QP runs at ``control_rate`` (50 Hz) and decides what
+velocity the arm should have; the SETPOINT is put on the wire by a second timer
+at ``stream_rate`` (200 Hz), so the servo is handed a fine ramp instead of one
+step per solve. They used to be the same timer, and the arm walked down the wall
+in visible hops. Each timer now has a callback group to itself and the node is
+spun by a ``MultiThreadedExecutor``, so a sensor callback can no longer delay a
+solve — which is what held the loop at 18-25 Hz on hardware — and a solve can no
+longer delay a setpoint.
+
 Started per segment by the FSM with the segment endpoints as parameters, it
 reports on ``status_topic`` ("running" / "succeeded" / "failed: <reason>") and
 the FSM's ``sweep_wait`` waits on that exactly as it waits on a Nav2 result.
@@ -36,6 +45,7 @@ Run standalone (outside the FSM) for bench tests::
 
 import math
 import signal
+import threading
 import time
 
 import numpy as np
@@ -44,6 +54,7 @@ import tf2_ros
 from geometry_msgs.msg import Twist, WrenchStamped
 from nav_msgs.msg import OccupancyGrid
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
@@ -241,16 +252,41 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("arm_joints", ARM_JOINTS)
 
         # --- Control law -----------------------------------------------------
+        # How often the QP runs, i.e. how often the commanded VELOCITY may
+        # change. Not how often the arm setpoint moves — see stream_rate.
         self.declare_parameter("control_rate", 50.0)
-        # How far past the nominal period the setpoint integration may follow
-        # the measured one. See _publish for what it is protecting against.
+        # How finely the arm setpoint expresses that velocity. Separate from
+        # control_rate, and that separation is the whole of this knob.
+        #
+        # In position mode the wire carries q, not qdot (see wbc/streaming.py
+        # for why). The setpoint is therefore a staircase: one tread per cycle
+        # of whatever timer publishes it, each riser qdot * period tall, with
+        # servoj_gain at 2000 — the UR's maximum — chasing every riser. While
+        # the solve and the publish shared a timer, that tread was one control
+        # period wide: 20 ms at the nominal rate, and 40-56 ms at the 18-25 Hz
+        # the loop actually held on hardware. The arm hopped down the wall.
+        #
+        # Nothing about the control law is wrong there. The QP's answer is
+        # smooth and the acceleration bound keeps it so; the setpoint just was
+        # not sampled finely enough to say it. So the two rates come apart: the
+        # solve says how often the velocity CHANGES, this says how often the
+        # setpoint MOVES, and a stream tick is one multiply and one publish with
+        # no QP behind it — tens of microseconds.
+        #
+        # 200 Hz is four setpoints per nominal solve, and is what the receiving
+        # end is built for: the UR's servoj interpolates at 500 Hz internally,
+        # and moveit_servo streams to it in this range for the same reason.
+        self.declare_parameter("stream_rate", 200.0)
+        # How far past the nominal period the acceleration bound on the
+        # PUBLISHED command may follow the measured one. See _publish.
         #
         # 2.0 is the tightest value that could be right, and it is right only if
         # the loop never falls below half rate. On hardware it did: 18-25 Hz
         # against a nominal 50 is 40-56 ms, or 2.0x to 2.8x nominal, so a 2x
-        # clamp saturates across most of that range and the setpoint stops
-        # tracking real time exactly where it most needs to. 4.0 covers the
-        # slowest rate seen with margin left.
+        # clamp saturates across most of that range and the bound stops tracking
+        # real time exactly where it most needs to — holding the robot to 40% of
+        # the acceleration it is configured for. 4.0 covers the slowest rate seen
+        # with margin left.
         #
         # Sized from the HARDWARE numbers only. Simulation cannot inform this:
         # measured there, the loop holds 50.4 Hz on the sim clock against a
@@ -258,14 +294,54 @@ class WholeBodySweepNode(Node):
         # inert. Gazebo running at 0.29x real time makes that same loop look
         # like 14.5 Hz of wall clock, which is a property of the simulator and
         # not of the control loop. Do not retune this from a wall-clock reading.
-        #
-        # Raising it is bounded by something real rather than by nerve: a late
-        # cycle advances the setpoint by qdot * dt, at most arm_qdot_max times
-        # this times nominal, which at 4.0 is 0.04 rad. ArmStream then clamps
-        # the setpoint to within arm_stream_max_lead (0.2 rad) of the measured
-        # arm regardless, so the lead clamp is the actual backstop and this
-        # number sits an order of magnitude inside it.
         self.declare_parameter("control_period_max_factor", 4.0)
+        # The same clamp, one rate down, on the STREAM tick — which is where the
+        # setpoint integration now happens, so this is what bounds how far one
+        # tick may advance the arm. Both halves of the protection are the same
+        # as they were at the control rate: a burst of early ticks cannot
+        # integrate less than one nominal stream step, and one late tick cannot
+        # advance the whole gap it slept through.
+        #
+        # 4.0 at 200 Hz is 20 ms, so the worst a single tick can do is
+        # arm_qdot_max * 0.02 = 0.01 rad. ArmStream clamps the setpoint to
+        # within arm_stream_max_lead (0.2 rad) of the measured arm regardless,
+        # so the lead clamp remains the real backstop and this sits an order of
+        # magnitude inside it.
+        self.declare_parameter("stream_period_max_factor", 4.0)
+        # When the stream stops believing the velocity it is integrating, as a
+        # multiple of the control period actually being achieved.
+        #
+        # This is the one property the coupled design got for free. While the
+        # solve and the publish shared a timer, a solve that stopped happening
+        # was a setpoint that stopped advancing, and the arm froze — which is
+        # the entire reason position mode is the default. With the stream on its
+        # own timer, a dead solve and a live stream would integrate the last
+        # velocity for as long as anyone let it, and the arm would run on down
+        # the wall at scan speed with nothing computing where it should be.
+        #
+        # So the stream checks the age of what it is integrating, and holds
+        # instead when it is too old. Measured against the ACHIEVED period
+        # (self.cycle_period) rather than the nominal one, because a loop
+        # legitimately running at 20 Hz must be allowed to keep running at
+        # 20 Hz — what this catches is a loop that has STOPPED, not one that is
+        # slow.
+        #
+        # 5x, not the 3x that first looked right, and the difference is what a
+        # FALSE hold costs. A hold re-seeds the integrator at the measurement,
+        # throwing away the lead the setpoint had built up — which is a small
+        # backward step, exactly the thing this work exists to remove. So a
+        # threshold that trips on ordinary jitter makes the motion worse, not
+        # safer. Measured on a loaded dev machine, control gaps ran a 20 ms
+        # median with a 97 ms worst, and 3x held the arm for a hiccup that
+        # needed no holding at all.
+        #
+        # Being late is the cheaper mistake, because it is bounded by something
+        # else: the run-on is arm_qdot_max * the age, so even 250 ms of it is
+        # 0.125 rad, and ArmStream clamps the setpoint to arm_stream_max_lead
+        # (0.2 rad) of the measured arm regardless. What this must catch is a
+        # solve that has stopped for good, and that is seconds, not tens of
+        # milliseconds.
+        self.declare_parameter("arm_command_max_age_factor", 5.0)
         self.declare_parameter("k_standoff", 1.0)      # 1/s on the normal error
         self.declare_parameter("k_height", 1.0)        # 1/s on the row-height error
         self.declare_parameter("k_align", 1.5)         # 1/s on the plate orientation error
@@ -458,6 +534,19 @@ class WholeBodySweepNode(Node):
         self.turret_joint = str(p("turret_joint").value)
         self.arm_joints = list(p("arm_joints").value)
         self.control_rate = float(p("control_rate").value)
+        # A stream slower than the solve would throw velocities away unused and
+        # put the staircase back, which is the one configuration this split
+        # cannot mean anything in. Floor it rather than honour it.
+        self.stream_rate = float(p("stream_rate").value)
+        if self.stream_rate < self.control_rate:
+            self.get_logger().warn(
+                f"stream_rate {self.stream_rate:.0f} Hz is below the {self.control_rate:.0f} Hz "
+                f"solve rate, which would discard solutions and coarsen the setpoint; "
+                f"streaming at the control rate instead."
+            )
+            self.stream_rate = self.control_rate
+        self.stream_period_max_factor = float(p("stream_period_max_factor").value)
+        self.arm_command_max_age_factor = float(p("arm_command_max_age_factor").value)
         self.max_data_age = float(p("max_data_age").value)
         self.max_standoff_error = float(p("max_standoff_error").value)
         self.standoff_error_cycles = int(p("standoff_error_cycles").value)
@@ -546,6 +635,26 @@ class WholeBodySweepNode(Node):
         self.u_qp_prev = None
         self.qp_stamp = None
         self.cycle_period = 0.0
+        # What the solve last asked of the ARM, and when it asked. The stream
+        # timer integrates this; the control timer is its only writer, and they
+        # run on different threads — so both are touched under _arm_lock, which
+        # is what makes a stop indivisible: a tick either happens entirely
+        # before the hold or entirely after it, never straddling one and putting
+        # the arm back into motion the moment it was told to stop.
+        #
+        # Cleared — not zeroed — by every stop path: a zero here would be
+        # integrated as "travel to the zero configuration", where None simply
+        # stops the setpoint advancing.
+        self._arm_lock = threading.RLock()
+        self.arm_qdot = None
+        self.arm_qdot_stamp = None
+        # When the last stream tick integrated, and the interval it measured
+        # doing so (which the diagnostics row carries).
+        self.stream_stamp = None
+        self.stream_cycle_period = 0.0
+        # Latched while the stream is holding because the solve went quiet, so
+        # the hold is published and logged once rather than 200 times a second.
+        self.arm_command_stale = False
         self.control_period_max_factor = float(
             p("control_period_max_factor").value)
         self.accel_max = np.concatenate((
@@ -568,6 +677,7 @@ class WholeBodySweepNode(Node):
         self.return_joints = [float(v) for v in (raw or [])]
         self.status = "running"
         self.control_timer = None
+        self.stream_timer = None
         self.progress = 0.0
         self.best_progress = 0.0
         self.progress_stamp = None   # set on the first cycle, not at construction
@@ -596,6 +706,36 @@ class WholeBodySweepNode(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # --- ROS I/O ---------------------------------------------------------
+        # Two callback groups, run by a MultiThreadedExecutor (see main()).
+        #
+        # Everything used to share one implicit group and one thread, so a
+        # joint_states or wrench callback that landed first PUSHED the control
+        # timer, and the loop measured 18-25 Hz on hardware against a nominal 50
+        # while the solve itself cost about 1 ms of the 20 ms budget. The maths
+        # was never the problem; the queue was.
+        #
+        #   control_group  the solve, alone.
+        #   stream_group   the arm setpoint stream, alone — and it has to be its
+        #                  OWN group rather than sharing the control one. Shared,
+        #                  a tick cannot start while a solve is running, and a
+        #                  solve is not short: measured here it is 3-4 ms on
+        #                  average and 13 ms at worst, which starves the 5 ms
+        #                  tick. Measured over a 4 s run, the stream held 45 Hz
+        #                  sharing the group (median gap 15 ms, worst 460) and
+        #                  199.5 Hz with a group of its own (median 5.0 ms,
+        #                  worst 11.2). The whole point of this split is a
+        #                  setpoint that moves faster than the solve, so the
+        #                  stream cannot be behind the solve in a queue.
+        #   io_group       the five subscriptions and the status republish. All
+        #                  of them are a single store; none can now delay a
+        #                  solve.
+        #
+        # The TF listener brings its own group, so TF lands on another thread.
+        # Concurrency between the solve and the stream is what _arm_lock is for.
+        self.control_group = MutuallyExclusiveCallbackGroup()
+        self.stream_group = MutuallyExclusiveCallbackGroup()
+        self.io_group = MutuallyExclusiveCallbackGroup()
+
         latched = QoSProfile(depth=1)
         latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.status_pub = self.create_publisher(String, str(p("status_topic").value), latched)
@@ -632,18 +772,23 @@ class WholeBodySweepNode(Node):
                 tare_cycles=int(p("press_tare_cycles").value),
                 tare_min_distance=float(p("press_tare_min_distance").value))
             self.create_subscription(
-                WrenchStamped, str(p("wrench_topic").value), self._on_wrench, 10)
+                WrenchStamped, str(p("wrench_topic").value), self._on_wrench, 10,
+                callback_group=self.io_group)
         self.create_subscription(
-            String, str(p("robot_description_topic").value), self._on_robot_description, latched)
+            String, str(p("robot_description_topic").value), self._on_robot_description, latched,
+            callback_group=self.io_group)
         self.create_subscription(
-            JointState, str(p("joint_states_topic").value), self._on_joint_states, 10)
+            JointState, str(p("joint_states_topic").value), self._on_joint_states, 10,
+            callback_group=self.io_group)
         self.create_subscription(
-            Float32MultiArray, str(p("distance_topic").value), self._on_distances, 10)
+            Float32MultiArray, str(p("distance_topic").value), self._on_distances, 10,
+            callback_group=self.io_group)
         if self.avoid:
             self.create_subscription(
-                OccupancyGrid, str(p("costmap_topic").value), self._on_costmap, 1)
+                OccupancyGrid, str(p("costmap_topic").value), self._on_costmap, 1,
+                callback_group=self.io_group)
         # Republished, not just latched: the FSM may subscribe after we start.
-        self.create_timer(0.5, self._publish_status)
+        self.create_timer(0.5, self._publish_status, callback_group=self.io_group)
 
         self.get_logger().info(
             f"Whole-body sweep: ({self.seg_start[0]:.2f}, {self.seg_start[1]:.2f}) -> "
@@ -674,51 +819,65 @@ class WholeBodySweepNode(Node):
         if self.chain is not None:
             return
         self.urdf = msg.data
+        # Built into a local and published to self.chain at the very END, as one
+        # rebind. Everything else here keys off "is there a chain yet", and the
+        # control loop now runs on another thread: a chain that were visible
+        # before its position limits reached the stream would be a window in
+        # which the setpoint integrates against no limits at all.
         try:
-            self.chain = SerialChain.from_urdf(self.urdf, self.arm_root_link, self.arm_tip_link)
+            chain = SerialChain.from_urdf(self.urdf, self.arm_root_link, self.arm_tip_link)
         except Exception as exc:
             self.get_logger().error(f"Cannot build the arm chain from the URDF: {exc}")
             return
         self.get_logger().info(
             f"Arm chain {self.arm_root_link} -> {self.arm_tip_link}: "
-            f"{self.chain.joint_names}"
+            f"{chain.joint_names}"
         )
         # The QP solves for the CHAIN's joints; the command goes out in the
         # streaming controller's joint order. If the two sets disagree the
         # commands would be silently zeroed, so refuse the sweep instead.
-        missing = set(self.chain.joint_names) ^ set(self.arm_joints)
+        missing = set(chain.joint_names) ^ set(self.arm_joints)
         if missing:
             self.get_logger().error(
                 f"The chain's joints and the 'arm_joints' parameter disagree "
                 f"({sorted(missing)}); the arm would receive no command. "
                 f"Set arm_joints to the controller's joint list."
             )
-            self.chain = None
             return
         # Give the integrator the joint limits, in the CONTROLLER's order — the
         # order the setpoint is published in. The chain's order is not
         # guaranteed to match, and clamping a setpoint against another joint's
         # limits would be worse than not clamping at all.
-        lower, upper = self.chain.position_limits()
-        by_name = dict(zip(self.chain.joint_names, zip(lower, upper)))
+        lower, upper = chain.position_limits()
+        by_name = dict(zip(chain.joint_names, zip(lower, upper)))
         self.arm_stream.set_position_limits(
             [by_name[name][0] for name in self.arm_joints],
             [by_name[name][1] for name in self.arm_joints])
-        if list(self.chain.joint_names) != list(self.arm_joints):
+        self.chain = chain
+        if list(chain.joint_names) != list(self.arm_joints):
             # Same joints, different order. Every path here reorders explicitly,
             # so this is handled — but it is worth saying out loud, because a
             # mis-ordered POSITION setpoint commands the arm to a pose nobody
             # asked for, where a mis-ordered velocity merely moves it wrongly.
             self.get_logger().warn(
-                f"The URDF chain order {self.chain.joint_names} differs from the "
+                f"The URDF chain order {chain.joint_names} differs from the "
                 f"controller's {self.arm_joints}; commands are reordered to match "
                 f"the controller. Align 'arm_joints' with the controller's joint "
                 f"list to remove the ambiguity."
             )
 
     def _on_joint_states(self, msg):
-        for name, position in zip(msg.name, msg.position):
-            self.joint_positions[name] = float(position)
+        # Built aside and REBOUND, never mutated in place. This callback now
+        # runs on a different thread from the control loop, and a reader that
+        # caught a dict mid-update would get a pose that is part this frame and
+        # part the last — a state the robot was never in, handed to a Jacobian.
+        # A rebind gives the reader one frame or the other, and costs a dict
+        # copy of a dozen keys. It is a copy rather than a fresh dict because
+        # the joints arrive from more than one broadcaster (the turret is not on
+        # the arm's), so this has always accumulated across messages.
+        positions = dict(self.joint_positions)
+        positions.update((name, float(value))
+                         for name, value in zip(msg.name, msg.position))
         # Velocities are for the diagnostics only — nothing in the control law
         # reads them. They are the third of the three traces that say WHERE a
         # jerky motion is coming from: if the solve is already stepped the cause
@@ -727,8 +886,15 @@ class WholeBodySweepNode(Node):
         # tuning or the speed scaling. Guarded because velocity is optional in
         # the message and some publishers leave it empty.
         if len(msg.velocity) == len(msg.name):
-            for name, velocity in zip(msg.name, msg.velocity):
-                self.joint_velocities[name] = float(velocity)
+            velocities = dict(self.joint_velocities)
+            velocities.update((name, float(value))
+                              for name, value in zip(msg.name, msg.velocity))
+            self.joint_velocities = velocities
+        self.joint_positions = positions
+        # Last, and deliberately: a reader that sees the new stamp beside the
+        # old positions would treat stale data as fresh, where this order can
+        # only make fresh data look one frame old — and that is already what the
+        # staleness window is sized for.
         self.joint_stamp = self._now()
 
     def _on_distances(self, msg):
@@ -967,9 +1133,21 @@ class WholeBodySweepNode(Node):
         self.arm_stream.initial_command(self._arm_positions())
         self.deadline = self._now() + self.timeout
         self.start_stamp = self._now()
-        self.control_timer = self.create_timer(1.0 / self.control_rate, self._control_step)
+        self.stream_stamp = None
+        # Two timers, two groups, two threads: the solve decides what velocity
+        # the arm should have, the stream decides how finely the setpoint says
+        # it, and neither waits for the other. The stream tick does nothing at
+        # all until the first solve has stored a velocity, so the order they are
+        # created in does not matter.
+        self.control_timer = self.create_timer(
+            1.0 / self.control_rate, self._control_step,
+            callback_group=self.control_group)
+        self.stream_timer = self.create_timer(
+            1.0 / self.stream_rate, self._stream_step,
+            callback_group=self.stream_group)
         self.get_logger().info(
-            f"Sweeping at {self.control_rate:.0f} Hz (timeout {self.timeout:.0f}s)."
+            f"Sweeping: solving at {self.control_rate:.0f} Hz, streaming the arm "
+            f"setpoint at {self.stream_rate:.0f} Hz (timeout {self.timeout:.0f}s)."
         )
 
     def halt(self):
@@ -978,17 +1156,48 @@ class WholeBodySweepNode(Node):
         The arm's stop is NOT a zero — in position mode that would be a
         full-speed run to the zero configuration. ``ArmStream.hold`` knows what
         a stop means for the interface in use; nothing here should build one.
+
+        Order matters at the top: both timers go BEFORE the hold. Cancelling
+        them is not sufficient on its own — a tick already running on the stream
+        thread would still land — which is why the hold itself is taken under
+        ``_arm_lock`` in :meth:`_hold_arm`.
         """
-        if self.control_timer is not None:
-            self.control_timer.cancel()
-            self.control_timer = None
+        for name in ("stream_timer", "control_timer"):
+            timer = getattr(self, name)
+            if timer is not None:
+                timer.cancel()
+                setattr(self, name, None)
         self.cmd_vel_pub.publish(Twist())
-        self.arm_stream.hold(self._arm_positions())
+        self._hold_arm()
         self.u_prev = None
         self.command_stamp = None
         self.u_qp_prev = None
         self.qp_stamp = None
         self.holding_since = None
+
+    def _hold_arm(self):
+        """Stop the arm, and stop the stream that would move it on. Indivisible.
+
+        Two things have to happen together. The stored velocity is forgotten,
+        because the stream advances the setpoint from whatever was last put
+        there and the only way to make it stop advancing is to leave it nothing
+        to advance by — a zero would not do, since on the position interface
+        that is not "no motion" but "travel to the zero configuration", which is
+        what the whole of ``wbc/streaming.py`` is about. And the arm is held at
+        the measurement, which re-seeds the integrator where the robot actually
+        is.
+
+        Under the lock because the stream runs on another thread: between those
+        two steps, unprotected, a tick could read the velocity that is about to
+        be forgotten and publish a setpoint past the pose we are stopping in.
+        The lock is uncontended in every normal cycle and costs nothing there.
+        """
+        with self._arm_lock:
+            self.arm_qdot = None
+            self.arm_qdot_stamp = None
+            self.stream_stamp = None
+            self.arm_command_stale = False
+            self.arm_stream.hold(self._arm_positions())
 
     def finish(self, status, reason=""):
         """End the sweep — but back the plate off the wall before saying so.
@@ -1698,7 +1907,10 @@ class WholeBodySweepNode(Node):
         if self.holding_since is None:
             self.holding_since = now
         self.cmd_vel_pub.publish(Twist())
-        self.arm_stream.hold(self._arm_positions())
+        # Not just a hold: the stored velocity goes too, or the stream spends
+        # the next few ticks integrating the cycle we have this moment decided
+        # not to trust, undoing the hold from underneath it.
+        self._hold_arm()
         # Zero, not None: the robot has just been commanded to a stop, so that
         # IS the current command and the cycle that resumes the sweep must ramp
         # up from it. Clearing the history instead would let the loop jump
@@ -1731,10 +1943,12 @@ class WholeBodySweepNode(Node):
         2. **Acceleration bound.** The QP is memoryless and its solution steps
            when the active set changes; ``speedj`` is given 40 rad/s^2 to make
            that step with.
-        3. **Split and stream.** Base Twist in the turret frame (as
-           sim_controller's ``cmd_type: relative`` expects), arm through
-           ``ArmStream``, which decides whether the wire carries velocities or
-           integrated setpoints.
+        3. **Split.** The base leaves here and now, as a Twist in the turret
+           frame (which is what sim_controller's ``cmd_type: relative``
+           expects). The arm's velocity is STORED, and :meth:`_stream_step`
+           puts it on the wire at ``stream_rate`` — four times as often as this
+           runs, because a setpoint that only moves when the QP does is a
+           staircase the servo has to chase.
         """
         # The solver's own answer, kept before anything is done to it. This is
         # what the acceleration bound in _accel_bounds measures the NEXT solve
@@ -1748,14 +1962,12 @@ class WholeBodySweepNode(Node):
         # The MEASURED control period, clamped either side of the nominal one.
         #
         # This was the nominal period outright, on the grounds that a late cycle
-        # would otherwise advance the setpoint by the whole gap at once. That is
-        # right about ONE late cycle and wrong about a loop that is persistently
-        # slow. On hardware this loop is: measured at 18-25 Hz against a nominal
-        # 50, so every cycle integrated 20 ms of motion while 40-56 ms actually
-        # passed, and the ARM tracked at roughly half to a third of the velocity
-        # it was commanded — while the BASE, commanded as a velocity rather than
-        # integrated, tracked at 100%. That is the desynchronisation the speed
-        # scaling three lines up exists to prevent.
+        # would otherwise let the command jump by a whole gap of acceleration at
+        # once. That is right about ONE late cycle and wrong about a loop that is
+        # persistently slow. On hardware this loop is: measured at 18-25 Hz
+        # against a nominal 50, so bounding a 50 ms step by 20 ms of
+        # acceleration held the robot to 40% of the acceleration it is
+        # configured for.
         #
         # The slow loop is a HARDWARE fault and does not reproduce in
         # simulation, where the loop holds 50.4 Hz on the sim clock. An earlier
@@ -1764,14 +1976,9 @@ class WholeBodySweepNode(Node):
         # inert in sim and cannot be validated there; only the unit tests and
         # the robot can exercise it.
         #
-        # The plate drifting off the wall is the failure that follows, and it is
-        # quiet: the base carries the plate along the wall faster than the arm
-        # corrects the standoff, so the error grows over a segment rather than
-        # announcing itself.
-        #
         # Clamping keeps the original protection at both ends. A burst of early
-        # cycles cannot integrate less than the nominal step, and a late cycle
-        # after a stall cannot advance more than the factor below allows.
+        # cycles cannot bound the command below the nominal step, and a late
+        # cycle after a stall cannot authorise the whole gap.
         now = self._now()
         nominal = 1.0 / self.control_rate
         elapsed = (now - self.command_stamp) if self.command_stamp else nominal
@@ -1794,8 +2001,9 @@ class WholeBodySweepNode(Node):
                 f"Control loop is running at {1.0 / max(elapsed, 1e-6):.0f} Hz, not "
                 f"the {self.control_rate:.0f} Hz it commands for."
                 + (f" Past the {self.control_period_max_factor:.0f}x clamp, so the "
-                   f"setpoint has stopped tracking real time and the arm is now "
-                   f"lagging the base." if saturated else ""),
+                   f"acceleration bound is now being applied over less time than "
+                   f"has actually passed and the command will ramp slowly."
+                   if saturated else ""),
                 throttle_duration_sec=5.0)
         self.command_stamp = now
 
@@ -1805,14 +2013,98 @@ class WholeBodySweepNode(Node):
         self.cmd_vel_pub.publish(twist)
 
         # Reorder from the CHAIN's joints to the CONTROLLER's, which is what
-        # goes on the wire.
+        # goes on the wire, and hand it to the stream rather than putting it
+        # there. This is the cut between the two rates: the solve owns WHAT
+        # velocity the arm should have, _stream_step owns how finely the
+        # setpoint expresses it. Storing it here rather than sending is also
+        # what makes the retreat and the return come along for free — they
+        # publish through this same funnel.
         by_name = dict(zip(self.chain.joint_names, u[3:3 + n_arm]))
         qdot = np.array([float(by_name.get(name, 0.0)) for name in self.arm_joints])
-        self.arm_stream.send(qdot, dt, self._arm_positions())
+        with self._arm_lock:
+            self.arm_qdot = qdot
+            self.arm_qdot_stamp = now
 
         self._publish_diagnostics(now, u_qp, u)
         self.u_qp_prev = u_qp
         self.qp_stamp = now
+
+    def _arm_command_max_age(self):
+        """How old the stored arm velocity may be before the stream stops trusting it.
+
+        Against the period the loop is ACHIEVING, not the one it commands for.
+        A loop legitimately running at 20 Hz has to be allowed to go on running
+        at 20 Hz — this is here to catch a solve that has STOPPED, not one that
+        is slow, and a threshold pinned to the nominal rate would spend a slow
+        run holding the arm every other tick.
+        """
+        return (max(1.0 / self.control_rate, self.cycle_period)
+                * self.arm_command_max_age_factor)
+
+    def _stream_step(self):
+        """Advance the arm setpoint by the velocity the last solve asked for.
+
+        Runs at ``stream_rate``, four times per solve at the defaults, on its own
+        thread. All the control decisions were made in ``_control_step``; this
+        only decides how finely they are expressed, and holds when they stop
+        arriving.
+
+        Nothing happens until a solve has stored a velocity, and every stop path
+        clears that velocity under the same lock this holds — so this cannot
+        command anything the control loop has not just asked for, and cannot
+        undo a stop that has just been ordered.
+        """
+        if self.phase == "done":
+            return
+        now = self._now()
+        with self._arm_lock:
+            self._stream_locked(now)
+
+    def _stream_locked(self, now):
+        """One stream tick, with ``_arm_lock`` already held."""
+        qdot, stamp = self.arm_qdot, self.arm_qdot_stamp
+        if qdot is None or stamp is None:
+            return
+        if now - stamp > self._arm_command_max_age():
+            # The hazard the coupled design did not have. While the solve and
+            # the publish shared a timer, a solve that stopped happening was a
+            # setpoint that stopped advancing and an arm that froze — which is
+            # exactly why position mode is the default. On its own timer the
+            # stream would happily go on integrating the last velocity it was
+            # given, and walk the arm down the wall with nothing computing where
+            # it ought to be.
+            #
+            # Hold, once. Not a zero: on this interface that is a full-speed run
+            # to the zero configuration, and ArmStream.hold is the only thing
+            # that knows what a stop means per mode. Publishing it once and then
+            # going quiet leaves the controller on a pose rather than putting
+            # the measurement's own noise on the wire 200 times a second.
+            if not self.arm_command_stale:
+                self.arm_command_stale = True
+                self.arm_stream.hold(self._arm_positions())
+                self.get_logger().error(
+                    f"No control solution for {now - stamp:.2f}s (the loop commands at "
+                    f"{self.control_rate:.0f} Hz): holding the arm where it is rather "
+                    f"than streaming on with the last velocity it was given."
+                )
+            self.stream_stamp = now
+            return
+        if self.arm_command_stale:
+            self.arm_command_stale = False
+            self.get_logger().warn("Control solutions are arriving again; resuming the sweep.")
+
+        # The MEASURED interval, clamped either side of the nominal one — the
+        # same protection _publish applies to the acceleration bound, one rate
+        # down, and for the same reason: the setpoint has to advance in real
+        # time when ticks come late, and must not advance a whole gap when one
+        # tick comes very late. Integrating the nominal period regardless is
+        # what desynchronised the arm from the base on the first hardware run.
+        nominal = 1.0 / self.stream_rate
+        elapsed = (now - self.stream_stamp) if self.stream_stamp else nominal
+        dt = float(min(max(elapsed, nominal), self.stream_period_max_factor * nominal))
+        self.stream_cycle_period = elapsed
+        self.stream_stamp = now
+        self.arm_stream.send(qdot, dt, self._arm_positions())
 
     # Layout of the diagnostics array. Published as one flat Float64MultiArray
     # so it needs no message package of its own; the cost of that is that the
@@ -1820,7 +2112,7 @@ class WholeBodySweepNode(Node):
     # _publish_diagnostics and treat it as the format's documentation.
     #
     #   [0]        wall-clock seconds since the sweep's first command
-    #   [1]        measured control period, s      <- jitter shows up here
+    #   [1]        measured SOLVE period, s        <- jitter shows up here
     #   [2]        QP solve duration, s
     #   [3]        robot speed scaling, 0..1
     #   [4]        press state: -1 none, 0 tare, 1 seek, 2 press
@@ -1829,8 +2121,19 @@ class WholeBodySweepNode(Node):
     #   [7]        setpoint lead over the measured arm, rad
     #   [8:8+n]    what the QP asked for       (base 3, then arm)
     #   [8+n:8+2n] what was published          (after scaling and slew)
-    #   [8+2n:...] what the arm actually did   (arm joints only, from
+    #   [8+2n:8+2n+n_arm]
+    #              what the arm actually did   (arm joints only, from
     #                                           /joint_states)
+    #   [8+2n+n_arm]
+    #              measured STREAM period, s
+    #
+    # The last entry is APPENDED rather than folded into the header, so that
+    # every index a recorded bag or a plotting script already knows keeps the
+    # meaning it had. [1] likewise keeps its own: it was the measured control
+    # period when solving and streaming were the same thing, and it is still the
+    # solve's. The two are now different numbers, and reading them together is
+    # the point — [1] near 0.02 with the last entry near 0.005 is the loop doing
+    # what it was split up to do.
     DIAG_HEADER = 8
 
     def _publish_diagnostics(self, now, u_qp, u_published):
@@ -1865,6 +2168,7 @@ class WholeBodySweepNode(Node):
         row.extend(float(v) for v in np.asarray(u_qp, dtype=float)[:n])
         row.extend(float(v) for v in np.asarray(u_published, dtype=float)[:n])
         row.extend(measured)
+        row.append(self.stream_cycle_period)
         self.diag_pub.publish(Float64MultiArray(data=row))
 
     def _log_cycle(self, solution, distance, remaining, phi):
@@ -1915,6 +2219,7 @@ def _quat_to_matrix(q):
 
 
 def main(args=None):
+    from rclpy.executors import MultiThreadedExecutor
     from rclpy.signals import SignalHandlerOptions
 
     from .controller_switch import ArmControllerSwitch
@@ -1947,6 +2252,22 @@ def main(args=None):
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
 
+    # A MultiThreadedExecutor, because the control loop was not losing its
+    # budget to the QP. Measured on hardware, the solve costs about 1 ms of a
+    # 20 ms budget and the loop still ran at 18-25 Hz: one thread and one
+    # implicit callback group meant every joint_states, wrench, costmap and TF
+    # message was ahead of the control timer in the same queue. With the timers
+    # in their own group (see __init__) they are now waited on by their own
+    # thread and a sensor callback can no longer push a solve.
+    #
+    # It has to be spun on a thread of its own rather than in this loop, because
+    # only Executor.spin() actually uses the pool — spin_once() runs the
+    # callback on whichever thread called it, which would put everything back on
+    # one thread while looking like it had not. The main thread keeps the stop
+    # flag, so a signal still lands somewhere that can act on it.
+    executor = MultiThreadedExecutor(num_threads=4)
+    spin_thread = None
+
     try:
         if not node.wait_until_ready():
             node.finish("failed", "inputs never became available")
@@ -1957,11 +2278,26 @@ def main(args=None):
             # start() publishes the arm's current pose immediately, closing the
             # window between the switch landing and the first real command.
             node.start()
+        # Added only now: wait_until_ready and switch.claim() spin the node
+        # themselves through the global executor, and a node can only belong to
+        # one executor at a time.
+        executor.add_node(node)
+        spin_thread = threading.Thread(
+            target=executor.spin, name="wbc_sweep_executor", daemon=True)
+        spin_thread.start()
         while rclpy.ok() and not stopping:
-            rclpy.spin_once(node, timeout_sec=0.1)
+            time.sleep(0.05)
     except KeyboardInterrupt:
         pass
     finally:
+        # Stop the executor and JOIN it before halting. Cancelling the timers is
+        # not enough on its own now that callbacks run on other threads: a solve
+        # or a stream tick already in flight would otherwise land after the arm
+        # had been told to hold, and take it straight back out of the pose it
+        # was stopped in.
+        executor.shutdown(timeout_sec=2.0)
+        if spin_thread is not None:
+            spin_thread.join(timeout=2.0)
         node.halt()
         switch.restore()
         node.destroy_node()

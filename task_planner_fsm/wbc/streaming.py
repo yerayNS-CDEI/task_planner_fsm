@@ -35,6 +35,17 @@ what most of this module is about:
      arm (it must, or there would be no motion) but never by more than one
      bounded step, and it cannot bank error while the robot is not moving.
 
+One thing about that first hazard has moved, and it is worth saying plainly. The
+setpoint used to advance once per QP solve, so "the control loop stopped" and
+"the setpoint stopped" were the same event and the freeze above was free.
+``sweep_node`` now drives ``send`` from its own timer, faster than the solve —
+the setpoint moves at 200 Hz while the velocity behind it changes at 50, because
+a setpoint that only moves when the solve does is a staircase for the servo to
+chase. The safety property is unchanged but is no longer automatic: the CALLER
+has to stop handing velocities in. ``sweep_node`` does that by clearing the
+stored velocity on every stop path, and by holding when the one it has goes
+stale.
+
 ``send`` integrates the COMMANDED position, never the measured one. Re-seeding
 from measurement every cycle would stack a second position loop on top of the
 robot's own servo and ring; the lead clamp is what keeps that open loop honest.

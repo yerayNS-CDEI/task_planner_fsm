@@ -2460,6 +2460,12 @@ class ScanWall(State):
         # never touches the wall — the thing the whole sweep exists to do.
         cmd += ["-p", f"press_enabled:={'true' if self._wbc_press_enabled(ctx) else 'false'}"]
         for key, param in (("wbc_control_rate", "control_rate"),
+                           # How finely the arm setpoint moves between solves.
+                           # Reachable from here for the same reason the control
+                           # rate is: it is the knob to walk if the arm still
+                           # looks stepped on the robot, and the servo retune
+                           # that follows is tuned against it.
+                           ("wbc_stream_rate", "stream_rate"),
                            ("wbc_k_standoff", "k_standoff"),
                            ("wbc_k_align", "k_align"),
                            ("wbc_arm_qdot_max", "arm_qdot_max"),
