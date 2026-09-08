@@ -20,6 +20,8 @@ Module map:
                   standing in for UR force_mode, which cannot run alongside a
                   streaming controller.
   ``avoidance``   local costmap -> distance field -> barrier rows for the QP.
+  ``stiffness``   how stiff the pressed surface is, measured from commanded
+                  travel, and the force-limit barrier row it sizes.
   ``qp``          the velocity QP that turns a task twist into joint commands.
   ``streaming``   how the arm is commanded (servoj setpoints or speedj), and
                   what "stop" means for each.

@@ -65,7 +65,8 @@ from .avoidance import AvoidanceConfig, ObstacleField, avoidance_rows
 from .base_model import BaseLimits, box_bounds, constraint_rows, wheel_and_turret_rates
 from .hardware import HardwareMonitor
 from .kinematics import SerialChain, rotation_error, whole_body_jacobian
-from .qp import Task, joint_limit_bounds, solve_velocity_qp
+from .qp import SoftRows, Task, joint_limit_bounds, solve_velocity_qp
+from .stiffness import ContactStiffness, force_limit_rows
 from .streaming import DEFAULT_CONTROLLER, POSITION, ArmStream, slew_limit
 from .surface import SurfaceEstimator, plate_orientation_target, sweep_tangent
 
@@ -249,6 +250,53 @@ class WholeBodySweepNode(Node):
         # 50 Hz and fires within one cycle at 10 — which is exactly when the
         # filtered check is least trustworthy.
         self.declare_parameter("press_force_limit_dwell", 0.06)    # s
+        # --- the force limit as a CONSTRAINT rather than a fault ----------
+        # Everything above detects an overload and aborts. This bounds the
+        # approach rate by the force headroom left, inside the solve:
+        #
+        #     n_hat^T J u  <=  alpha * (F_limit - F) / K_e
+        #
+        # the same control-barrier shape joint_limit_bounds already uses to stop
+        # a joint driving into its stop, applied to one more axis.
+        #
+        # Be clear about what this is worth, because the obvious argument for it
+        # is wrong. It is NOT that the QP is blind to the base driving the plate
+        # in: weight_press_normal below is 1e4 on this same whole-body normal
+        # row, so the solver already spends arm motion to hold the plate's
+        # normal velocity while the base moves. Measured in the fixture, an
+        # obstacle walks the base 6 cm into the wall and the force does not
+        # move, with this row switched off. See
+        # test_the_press_normal_task_already_couples_the_base_to_the_arm.
+        #
+        # Two things it does add, and both are about the difference between a
+        # target and a bound. A task that loses is a silent residual, while a
+        # constraint that loses is a reported slack — and past the limit this
+        # row asks for retreat in proportion to the overshoot, where the press
+        # loop can never ask for more than gain * error clipped to press_v_max,
+        # which at the limit is 1.25 mm/s. Drop weight_press_normal until the
+        # task stops winning and the row is what holds the force AT the limit
+        # instead of 44% past it.
+        #
+        # So: a backstop, sized to bind only when the task above has stopped
+        # being authoritative. 1/s; 0 disables the row.
+        self.declare_parameter("press_force_alpha", 1.0)
+        # Soft, not hard, and in a slack group of its OWN. Hard would be
+        # infeasible exactly when it matters — past the limit the row demands a
+        # retreat the actuators may not be able to deliver in one step, and an
+        # infeasible solve stops the robot dead mid-press. Sharing the obstacle
+        # barriers' slack would be worse than either: an engaged barrier would
+        # buy the force row permission to squash the plate, and a barrier
+        # pushing the base at the wall is precisely what drives the force up.
+        self.declare_parameter("press_force_slack_weight", 1.0e3)
+        # K_e is measured while pressing (see wbc/stiffness.py) rather than
+        # guessed, because it is what converts the bound above from a velocity
+        # into a force. These bound that estimate. The FLOOR is what the row
+        # assumes before it has learned anything, and conservative here means
+        # HIGH: overestimating K_e tightens the bound and costs a slow press,
+        # underestimating it loosens the bound and costs the plate.
+        self.declare_parameter("press_stiffness_floor", 2000.0)     # N/m
+        self.declare_parameter("press_stiffness_ceiling", 5.0e4)    # N/m
+        self.declare_parameter("press_stiffness_tau", 3.0)          # s
         # Every time constant below is in SECONDS, not cycles. They used to be
         # cycle counts sized at 50 Hz, so at the 10 Hz the robot achieved the
         # force filter's lag became 0.5 s and the tare quietly took 2.5 s.
@@ -719,6 +767,14 @@ class WholeBodySweepNode(Node):
         # holds contact, and closes again on its own if the wall goes away. See
         # press_travel_tau.
         self.travel_authority = 0.0
+        # How stiff the pressed surface has turned out to be, and the rate the
+        # LAST solve actually asked for along the normal — which is the travel
+        # the estimate regresses the force against. Both None/inert without a
+        # press. See wbc/stiffness.py.
+        self.stiffness = None
+        self.normal_rate_prev = 0.0
+        # What the force row allowed this cycle, m/s, for the log line.
+        self.force_cap = float("inf")
         self.surface = SurfaceEstimator(ema_alpha=float(p("ema_alpha").value))
         self.q_posture = None
         self.holding_since = None
@@ -883,6 +939,10 @@ class WholeBodySweepNode(Node):
                 approach_min_speed=float(p("press_approach_min_speed").value),
                 distance_tau=float(p("press_distance_tau").value),
                 force_limit_dwell=float(p("press_force_limit_dwell").value))
+            self.stiffness = ContactStiffness(
+                floor=float(p("press_stiffness_floor").value),
+                ceiling=float(p("press_stiffness_ceiling").value),
+                tau=float(p("press_stiffness_tau").value))
             self.create_subscription(
                 WrenchStamped, str(p("wrench_topic").value), self._on_wrench, 10,
                 callback_group=self.io_group)
@@ -1706,6 +1766,21 @@ class WholeBodySweepNode(Node):
             press_dt = float(min(max(press_dt, 0.2 * nominal_dt), 1.0))
             self.press_stamp = now
             v_normal = self.press.update(self.press_force, distance, press_dt)
+            # Learn how stiff this surface is, from the travel the LAST solve
+            # asked for and the force that came back. Regressed on the commanded
+            # rate rather than on the sensed distance, which has 4.2 mm of
+            # plane-fit sigma against a penetration of a fraction of a
+            # millimetre — see wbc/stiffness.py. Only while the force means
+            # something: during TARE it is an untared reading, and out of
+            # contact the slope being fitted is of nothing at all.
+            if self.press.state == PRESS:
+                self.stiffness.update(self.normal_rate_prev, self.press.force,
+                                      press_dt)
+            elif self.press.state == SEEK:
+                # Contact lost. The next one may be a different surface — a
+                # reveal, the far side of a lip — and carrying the old slope
+                # into it would size the force row for a wall that is not there.
+                self.stiffness.reset()
             if self.press.fault:
                 self.finish("failed", self.press.fault)
                 return
@@ -1938,6 +2013,35 @@ class WholeBodySweepNode(Node):
                     f"floor; backing it off before it gets stuck against the surface.",
                     throttle_duration_sec=5.0)
 
+        # --- The force limit, as a constraint ---------------------------------
+        # Bound the whole body's approach rate by the force headroom left, so
+        # the solver cannot ask for the overload that press_force_limit would
+        # otherwise only be able to report after the fact. See
+        # press_force_alpha and wbc/stiffness.py.
+        #
+        # A group of its own, never merged into A_avoid: they share a slack, and
+        # an engaged barrier would then buy this row the right to squash the
+        # plate — while a barrier pushing the base at the wall is exactly what
+        # drives the force up.
+        soft_groups = []
+        if A_avoid.shape[0]:
+            soft_groups.append(SoftRows(A_avoid, avoid_lo,
+                                        float(p("avoid_slack_weight").value),
+                                        name="obstacle"))
+        force_alpha = float(p("press_force_alpha").value)
+        self.force_cap = float("inf")
+        if self.press is not None and force_alpha > 0.0 and self.press.state != TARE:
+            # Not during TARE: the bias has not been measured yet, so the force
+            # in the barrier would be a payload offset rather than a contact.
+            normal_row = m_hat @ J[:3, :]
+            rows, lower = force_limit_rows(
+                normal_row, self.press.force, self.press.force_limit,
+                force_alpha, self.stiffness)
+            self.force_cap = -float(lower[0])
+            soft_groups.append(
+                SoftRows(rows, lower, float(p("press_force_slack_weight").value),
+                         name="force"))
+
         # --- Pin the base's travel, so the wheels do one steady thing ---------
         # Collapsing the forward bound to a point makes the base's along-wall
         # speed an input to the solve rather than an output of it. The remaining
@@ -1998,24 +2102,42 @@ class WholeBodySweepNode(Node):
         solution = solve_velocity_qp(
             tasks,
             np.concatenate((base_lo, arm_lo)), np.concatenate((base_hi, arm_hi)),
-            A_ineq=A_ineq, ineq_lo=ineq_lo, ineq_hi=ineq_hi,
-            soft_ineq=A_avoid if A_avoid.shape[0] else None, soft_lo=avoid_lo,
-            soft_weight=float(p("avoid_slack_weight").value))
+            A_ineq=A_ineq, ineq_lo=ineq_lo, ineq_hi=ineq_hi, soft=soft_groups)
         self.solve_seconds = time.monotonic() - solve_started
         if not solution.ok:
             self._strike(f"QP did not solve ({solution.status})")
             return
-        if solution.slack > 1e-3:
+        # Per group, so the two read separately — which is the point of giving
+        # them separate slacks. Index follows the order they were appended.
+        slacks = dict(zip([g.name for g in soft_groups], solution.slacks))
+        if slacks.get("obstacle", 0.0) > 1e-3:
             self.get_logger().warn(
                 f"Obstacle {self.closest_obstacle:.2f} m away: retreating as fast as "
-                f"the base allows, still {solution.slack:.3f} m/s short of the barrier.",
+                f"the base allows, still {slacks['obstacle']:.3f} m/s short of the barrier.",
+                throttle_duration_sec=2.0)
+        if slacks.get("force", 0.0) > 1e-4:
+            # The row could not be met, which means the plate is being driven at
+            # the wall faster than the force headroom allows and the actuators
+            # cannot take that back in one step. Not a fault — the barrier is
+            # still slowing it, and press_force_limit is underneath — but it is
+            # the only warning that comes BEFORE an overload rather than after.
+            self.get_logger().warn(
+                f"Force barrier short by {slacks['force'] * 1000:.1f} mm/s: "
+                f"{self.press.force:+.1f}/{self.press.force_limit:.0f} N with "
+                f"K_e={self.stiffness.value:.0f} N/m allowing only "
+                f"{self.force_cap * 1000:+.1f} mm/s of approach.",
                 throttle_duration_sec=2.0)
         if solution.solver.endswith("(box-only)"):
             self.get_logger().warn(
-                "OSQP unavailable: solving with a box-only fallback, so the base's "
-                "chassis/turret/wheel limits are NOT enforced by the solver.",
+                "OSQP unavailable: solving with a box-only fallback, so neither the "
+                "base's chassis/turret/wheel limits nor the force barrier are "
+                "enforced by the solver.",
                 throttle_duration_sec=10.0)
 
+        # What the solve actually asked for along the normal, which is the
+        # travel the stiffness estimate regresses the next force against.
+        if self.press is not None:
+            self.normal_rate_prev = float((m_hat @ J[:3, :]) @ solution.u)
         self.holding_since = None
         self._publish(solution.u, n_arm)
         self._log_cycle(solution, distance, remaining, phi)
@@ -2314,6 +2436,10 @@ class WholeBodySweepNode(Node):
     #              measured STREAM period, s
     #   [8+2n+n_arm+1]
     #              base travel authority, 0..1 (NaN when not pressing)
+    #   [8+2n+n_arm+2]
+    #              force barrier's approach cap, m/s (NaN when inactive)
+    #   [8+2n+n_arm+3]
+    #              estimated contact stiffness, N/m (NaN when not pressing)
     #
     # The last entries are APPENDED rather than folded into the header, so that
     # every index a recorded bag or a plotting script already knows keeps the
@@ -2363,6 +2489,11 @@ class WholeBodySweepNode(Node):
         # for "not applicable" — a zero here would read as a closed gate on a
         # sweep whose travel nothing was gating.
         row.append(float("nan") if self.press is None else self.travel_authority)
+        # The force barrier, for the plot that says whether it ever bound: the
+        # cap against [6] shows how much headroom the solver thought it had, and
+        # the stiffness is the term that converted the one into the other.
+        row.append(self.force_cap if np.isfinite(self.force_cap) else float("nan"))
+        row.append(float("nan") if self.press is None else self.stiffness.value)
         self.diag_pub.publish(Float64MultiArray(data=row))
 
     def _log_cycle(self, solution, distance, remaining, phi):
@@ -2387,7 +2518,14 @@ class WholeBodySweepNode(Node):
                      f"/{self.press.target_force:.0f} "
                      f"[{self.press.state.upper() if self.press.state != SEEK else 'seek'}] "
                      f"{approach}bias={self.press.bias:+.1f}N "
-                     f"auth={self.travel_authority:.2f} | ")
+                     f"auth={self.travel_authority:.2f} "
+                     # The barrier's own two numbers: how much approach the
+                     # force headroom still allows, and the stiffness that
+                     # converted one into the other ('~' while it is still the
+                     # assumed floor rather than a measurement).
+                     f"cap={self.force_cap * 1000:+.1f}mm/s"
+                     f"@{self.stiffness.value:.0f}"
+                     f"{'' if self.stiffness.fitted else '~'}N/m | ")
         self.get_logger().info(
             f"{press}d={distance * 100:.1f}cm tilt={math.degrees(self.surface.tilt()):.1f}deg "
             f"left={remaining:.2f}m | base{'*' if self.base_travel_pinned else ''}"

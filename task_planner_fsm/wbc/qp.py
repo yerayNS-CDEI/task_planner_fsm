@@ -56,16 +56,53 @@ class Task:
 
 
 @dataclass
+class SoftRows:
+    """A group of inequality rows ``jacobian @ u + s >= lower`` sharing one slack.
+
+    Rows in the SAME group share a slack variable, so whichever of them is worst
+    violated pays for all of them; rows in DIFFERENT groups are independent.
+
+    That distinction is not cosmetic. The obstacle barriers belong together —
+    they describe one thing (how close the base is to something) and a retreat
+    that satisfies the worst of them satisfies the rest. The contact-force limit
+    does not: it is a different quantity measured by a different sensor, and
+    sharing a slack with the barriers would mean an engaged obstacle silently
+    buying the force row permission to squash the plate. Which is exactly the
+    situation the force row exists for, since it is the barrier pushing the base
+    at the wall that drives the force up in the first place.
+    """
+
+    jacobian: np.ndarray
+    lower: np.ndarray
+    weight: float = 1e3
+    # Only for the caller's diagnostics. Slacks come back in the order the
+    # groups went in, and matching them up by index is exactly the sort of thing
+    # that goes quietly wrong when a group becomes conditional.
+    name: str = ""
+
+    def rows(self):
+        A = np.atleast_2d(np.asarray(self.jacobian, dtype=float))
+        return A, np.atleast_1d(np.asarray(self.lower, dtype=float))
+
+
+@dataclass
 class QPSolution:
     u: np.ndarray
     status: str
     solver: str
     task_residual: float
-    slack: float = 0.0
+    slacks: np.ndarray = None
 
     @property
     def ok(self):
         return self.u is not None
+
+    @property
+    def slack(self):
+        """The worst shortfall across every soft group, m/s or rad/s."""
+        if self.slacks is None or not len(self.slacks):
+            return 0.0
+        return float(np.max(self.slacks))
 
 
 def stack_tasks(tasks):
@@ -94,23 +131,23 @@ def joint_limit_bounds(q, lower, upper, qdot_max, margin=0.1, gain=1.0):
 
 
 def solve_velocity_qp(tasks, lb, ub, A_ineq=None, ineq_lo=None, ineq_hi=None,
-                      soft_ineq=None, soft_lo=None, soft_weight=1e3,
-                      ridge=1e-8, osqp_settings=None):
+                      soft=None, ridge=1e-8, osqp_settings=None):
     """Solve the stacked-task QP subject to a box and optional linear rows.
 
-    ``A_ineq`` rows are hard. ``soft_ineq`` rows (``soft_ineq @ u >= soft_lo``)
-    share one non-negative slack variable penalised at ``soft_weight``, so they
-    hold whenever they can and bend when they cannot.
+    ``A_ineq`` rows are hard. ``soft`` is a list of :class:`SoftRows` groups,
+    each getting its OWN non-negative slack variable penalised at that group's
+    weight, so its rows hold whenever they can and bend when they cannot — and a
+    group that has to bend does not excuse any other group.
 
-    That distinction matters for obstacle barriers. A barrier deep inside its
-    margin can demand a retreat faster than the actuators are able to deliver
-    — this base can only strafe at ~0.03 m/s — and as a hard row that is simply
-    infeasible, which costs the whole solve and stops the robot dead. As a soft
-    row the solver retreats as fast as it can and reports the shortfall, which
-    is both safer and more informative. Hard rows stay hard: the actuator limits
-    are physics, not preference.
+    Softness matters for obstacle barriers. A barrier deep inside its margin can
+    demand a retreat faster than the actuators are able to deliver — this base
+    can only strafe at ~0.03 m/s — and as a hard row that is simply infeasible,
+    which costs the whole solve and stops the robot dead. As a soft row the
+    solver retreats as fast as it can and reports the shortfall, which is both
+    safer and more informative. Hard rows stay hard: the actuator limits are
+    physics, not preference.
 
-    Keep ``soft_weight`` within a few orders of the task weights. It is large
+    Keep each ``weight`` within a few orders of the task weights. It is large
     enough at 1e3 that slack is a last resort — the solution is identical from
     1e1 to 1e3 on the cases tested, because the slack is forced by the actuator
     box rather than traded against the task — while 1e4 conditions the Hessian
@@ -123,24 +160,35 @@ def solve_velocity_qp(tasks, lb, ub, A_ineq=None, ineq_lo=None, ineq_hi=None,
     lb = np.asarray(lb, dtype=float)
     ub = np.asarray(ub, dtype=float)
 
-    soft = soft_ineq is not None and len(np.atleast_2d(soft_ineq)) > 0
-    if soft:
-        # One extra variable, appended: every task gains a zero column, the
-        # slack gains a cost, and the soft rows gain a +1.
-        soft_ineq = np.atleast_2d(np.asarray(soft_ineq, dtype=float))
-        soft_lo = np.atleast_1d(np.asarray(soft_lo, dtype=float))
+    groups = [g for g in (soft or []) if len(np.atleast_2d(g.jacobian)) > 0]
+    n_soft = len(groups)
+    if n_soft:
+        # One extra variable PER GROUP, appended: every task gains that many
+        # zero columns, each slack gains a cost row of its own, and each group's
+        # rows gain a +1 in their own slack's column and nothing elsewhere.
         n = A.shape[1]
-        A = np.hstack((A, np.zeros((A.shape[0], 1))))
-        penalty = np.zeros((1, n + 1))
-        penalty[0, n] = np.sqrt(soft_weight)
+        A = np.hstack((A, np.zeros((A.shape[0], n_soft))))
+        penalty = np.zeros((n_soft, n + n_soft))
+        for i, group in enumerate(groups):
+            penalty[i, n + i] = np.sqrt(group.weight)
         A = np.vstack((A, penalty))
-        b = np.concatenate((b, [0.0]))
-        lb = np.concatenate((lb, [0.0]))
-        ub = np.concatenate((ub, [np.inf]))
-        soft_block = np.hstack((soft_ineq, np.ones((soft_ineq.shape[0], 1))))
+        b = np.concatenate((b, np.zeros(n_soft)))
+        lb = np.concatenate((lb, np.zeros(n_soft)))
+        ub = np.concatenate((ub, np.full(n_soft, np.inf)))
+
+        blocks, lows = [], []
+        for i, group in enumerate(groups):
+            rows, low = group.rows()
+            selector = np.zeros((rows.shape[0], n_soft))
+            selector[:, i] = 1.0
+            blocks.append(np.hstack((rows, selector)))
+            lows.append(low)
+        soft_block = np.vstack(blocks)
+        soft_lo = np.concatenate(lows)
+
         if A_ineq is not None and len(np.atleast_2d(A_ineq)) > 0:
-            A_ineq = np.hstack((np.atleast_2d(np.asarray(A_ineq, dtype=float)),
-                                np.zeros((np.atleast_2d(A_ineq).shape[0], 1))))
+            A_ineq = np.atleast_2d(np.asarray(A_ineq, dtype=float))
+            A_ineq = np.hstack((A_ineq, np.zeros((A_ineq.shape[0], n_soft))))
             A_ineq = np.vstack((A_ineq, soft_block))
             ineq_lo = np.concatenate((np.atleast_1d(ineq_lo), soft_lo))
             ineq_hi = np.concatenate((np.atleast_1d(ineq_hi),
@@ -150,9 +198,10 @@ def solve_velocity_qp(tasks, lb, ub, A_ineq=None, ineq_lo=None, ineq_hi=None,
             ineq_hi = np.full(soft_block.shape[0], np.inf)
 
     def _unpack(u, status, solver):
-        slack = float(u[-1]) if soft else 0.0
+        slacks = np.asarray(u[-n_soft:], dtype=float) if n_soft else np.zeros(0)
         residual = float(np.linalg.norm(A @ u - b))
-        return QPSolution(u[:-1] if soft else u, status, solver, residual, slack)
+        return QPSolution(u[:-n_soft] if n_soft else u, status, solver,
+                          residual, slacks)
 
     has_rows = A_ineq is not None and len(np.atleast_2d(A_ineq)) > 0
     if _HAVE_OSQP:
