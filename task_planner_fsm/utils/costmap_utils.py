@@ -326,6 +326,24 @@ def _outward_dir(ctx):
     return (-nx / norm, -ny / norm)
 
 
+def wall_axes(ctx):
+    """``((nx, ny), (tx, ty))`` for the current wall, or ``None``.
+
+    The exterior normal (pointing from the wall out into free space) and the
+    along-wall tangent, both unit and in the map frame. The pair is what any
+    base motion near the wall wants to be expressed in, because the two axes are
+    not interchangeable on this platform: the base can drive along the normal at
+    wheel speed but can only strafe along the tangent by rotating the chassis
+    (see ScanWall's transit crawl), and the standoff has to be held far more
+    tightly than the along-wall position, which the arm re-centres anyway.
+    """
+    outward = _outward_dir(ctx)
+    if outward is None:
+        return None
+    nx, ny = outward
+    return (nx, ny), (-ny, nx)
+
+
 def costmap_goal_ready(ctx, target_point) -> bool:
     """True when the global costmap is populated enough to place a base goal near
     ``target_point`` — i.e. a known, free cell exists along the exterior normal.

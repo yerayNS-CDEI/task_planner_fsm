@@ -7,6 +7,7 @@ from ..utils.costmap_utils import (
     plan_wall_partitions,
     reachable_wall_segments,
     publish_wall_segment_markers,
+    wall_axes,
     wall_parallel_goal,
 )
 from ..utils.wall_partitioning import next_backoff_length, sweep_line_order
@@ -178,6 +179,10 @@ class ScanWall(State):
         self._crawl_tol = None             # arrival tolerance (None = sweep_arrive_tol)
         self._crawl_started = 0.0
         self._crawl_distance = 0.0
+        self._crawl_axes = None            # ((nx,ny),(tx,ty)) when axis-split, else None
+        self._crawl_tol_normal = None      # standoff tolerance in axis-split mode
+        self._crawl_max_lateral = None     # achievable strafe speed, m/s
+        self._transit_retries = 0          # arrival-check retries of one transit
         self._sweep_crawl_deadline = None
         self._sweep_crawl_timer = None
 
@@ -2184,6 +2189,10 @@ class ScanWall(State):
         seg_no, seg_total = self._seg_idx + 1, len(self._segments)
 
         if self._seg_phase == "transit_clear":
+            # First phase of every segment's cycle, so this is where the transit
+            # retry budget is refreshed -- a partition abandoned for some other
+            # reason must not spend the next one's re-tries.
+            self._transit_retries = 0
             # Pull the plate back before ANY base motion. The arm has been stretched
             # out since the pre-approach, and the transit slides the whole robot
             # sideways along the wall — at the gap the previous sweep left (roughly
@@ -2434,12 +2443,18 @@ class ScanWall(State):
                 self._start_sweep_crawl(
                     ctx, goal_xy, yaw=goal_yaw,
                     speed=float(ctx.get("partition_transit_speed", 0.15)),
-                    # Far looser than the sweep's own 0.05 m. The scan pose is
-                    # accepted by NavigateToTarget at nav_pos_tolerance (0.30 m),
-                    # so demanding 0.05 m here is stricter than the pose the FSM
-                    # was happy with for partition 1 — and the arm re-measures its
-                    # own standoff afterwards anyway.
-                    tol=float(ctx.get("partition_transit_arrive_tol", 0.15)),
+                    # Split by axis: the along-wall position may sit loose (the
+                    # arm's lead-in re-centres on the partition and precision here
+                    # costs real time at the 0.033 m/s strafe limit), but the
+                    # standoff decides how far the arm has to reach and is held to
+                    # PARTITION_STANDOFF_TOL_M. One isotropic tolerance let the
+                    # base satisfy the whole test on the wall-normal axis alone,
+                    # which is how it kept parking at the wrong distance.
+                    tol=float(ctx.get("partition_transit_arrive_tol",
+                                      self.PARTITION_ALONG_WALL_TOL_M)),
+                    tol_normal=float(ctx.get("partition_standoff_tol",
+                                             self.PARTITION_STANDOFF_TOL_M)),
+                    axis_split=True,
                     timeout_pad=float(ctx.get("partition_transit_timeout_pad_s", 60.0)),
                     what=f"Partition {seg_no} transit",
                 )
@@ -2461,6 +2476,16 @@ class ScanWall(State):
                 # that ignored heading. Skipping it also avoids rotating the base
                 # away from the pose the partition geometry just established.
                 if self._use_arm_sweep(ctx):
+                    # ...but "the goal WAS the scan pose" only helps if the base
+                    # actually got there, and until this check nothing verified
+                    # that: the crawl reported success on its own position test
+                    # and this branch took it at face value. NavigateToTarget has
+                    # always re-read the pose before handing on; a partition
+                    # transit ends at exactly the same kind of scan pose and
+                    # deserves the same gate. A wrong standoff here is not
+                    # cosmetic — it is what the arm has to span on every press.
+                    if not self._transit_arrival_ok(ctx, seg_no):
+                        return
                     # The column was lowered for the transit, so it always has to
                     # be raised to this partition's scan height before sweeping --
                     # in both modes, not only when nesting.
@@ -3225,6 +3250,53 @@ class ScanWall(State):
     SWEEP_ARRIVE_TOL_M = 0.05         # stop when the base is within this of the goal
     SWEEP_KP_YAW = 0.9                # P-hold on the fixed sweep heading
     SWEEP_MAX_YAW_RATE = 0.3          # rad/s cap on the heading hold
+
+    # --- Platform anisotropy (the reason the partition transit is axis-split) ---
+    #
+    # The base is holonomic AT THE TURRET POINT, but only because a sideways move
+    # of that point is produced by ROTATING THE CHASSIS: theta_chassis_dot =
+    # y_chassis / d1, with d1 the turret's offset from the wheel axle. Two numbers
+    # follow, and both matter here:
+    #
+    #   max strafe speed = d1 * max_angular_base = 0.167 * 0.2 = 0.033 m/s
+    #   chassis wind-up  = 1 / d1 = 6.0 rad per metre strafed
+    #
+    # while motion along the turret's own +X (which is the WALL NORMAL at a scan
+    # pose) is limited only by wheel speed, ~0.2 m/s. That is a 6:1 anisotropy
+    # between the two axes of a partition transit, and driving a constant-magnitude
+    # vector at the goal through it converges on the fast axis (the wall normal)
+    # first -- so the base reached "within tolerance" largely by moving toward or
+    # away from the wall, and stopped wherever that left it. Hence the standoff
+    # being sometimes much closer and sometimes much further than commanded.
+    #
+    # Defaults mirror navi-wall's diffdrive_controllers.yaml; override through ctx
+    # if the platform is retuned.
+    BASE_CENTER_DISTANCE_M = 0.167    # d1: turret offset from the wheel axle
+    BASE_MAX_ANGULAR_BASE = 0.2       # rad/s cap on chassis rotation
+    # Arrival tolerances for a partition transit, split because the two axes carry
+    # very different consequences. The standoff sets how far the arm has to reach
+    # and how hard force mode presses, so it is held tight; the along-wall position
+    # only has to be close enough for the executor's lead-in to find the partition
+    # start, and buying precision there costs real time at 0.033 m/s.
+    PARTITION_STANDOFF_TOL_M = 0.05
+    PARTITION_ALONG_WALL_TOL_M = 0.15
+    # Bounded re-tries of the whole transit when the arrival check fails.
+    PARTITION_TRANSIT_MAX_RETRIES = 2
+
+    def _max_lateral_speed(self, ctx):
+        """Fastest the base can strafe along the wall, in m/s.
+
+        ``d1 * max_angular_base``: a sideways move of the turret point is produced
+        by rotating the chassis, so the chassis rate limit IS the strafe limit.
+        Overridable wholesale with ``crawl_max_lateral_speed`` for a platform whose
+        controller has been retuned.
+        """
+        direct = ctx.get("crawl_max_lateral_speed")
+        if direct is not None:
+            return max(float(direct), 1e-3)
+        d1 = float(ctx.get("base_center_distance_m", self.BASE_CENTER_DISTANCE_M))
+        rate = float(ctx.get("base_max_angular_base", self.BASE_MAX_ANGULAR_BASE))
+        return max(abs(d1 * rate), 1e-3)
     SWEEP_CRAWL_TIMEOUT_PAD_S = 20.0  # grace beyond nominal (dist / speed) before aborting
 
     # Base frames tried when reading the map-frame base pose (turret_footprint
@@ -3260,7 +3332,8 @@ class ScanWall(State):
         return None
 
     def _start_sweep_crawl(self, ctx, target_xy, yaw=None, speed=None, tol=None,
-                           timeout_pad=None, what="Sweep crawl"):
+                           timeout_pad=None, what="Sweep crawl", axis_split=False,
+                           tol_normal=None):
         """Begin driving the base to ``target_xy`` (map frame) over /cmd_vel.
 
         Drives ``self._nav_status`` like a Nav2 goal: None while in flight,
@@ -3271,6 +3344,14 @@ class ScanWall(State):
         fixed along-wall sweep heading the legacy base sweep uses. The partition
         transit passes the scan-pose yaw instead, so the base arrives already
         square to the wall.
+
+        ``axis_split`` drives the wall-normal and along-wall axes as separate
+        components with separate tolerances (``tol_normal`` for the standoff,
+        ``tol`` for the along-wall position) instead of one vector at the goal.
+        See BASE_CENTER_DISTANCE_M for why the two axes are not interchangeable
+        on this base; the short version is that the standoff axis is ~6x faster
+        than the strafe axis and matters ~3x more, so a single isotropic
+        tolerance gets both wrong.
         """
         node = ctx["node"]
         if ctx.get("_cmd_vel_pub") is None:
@@ -3285,6 +3366,25 @@ class ScanWall(State):
         self._crawl_speed = float(speed)
         self._crawl_tol = tol
         self._crawl_started = time.time()
+        # Axis-split mode: resolve the wall frame ONCE per move. The base is parked
+        # for the whole crawl in the sense that matters here -- the wall does not
+        # move -- so re-deriving these every tick would only add TF jitter to the
+        # split. None falls back to the isotropic legacy behaviour, which is what
+        # the base-driven sweep still wants (it drives ALONG the wall by design and
+        # has no standoff of its own to hold).
+        self._crawl_axes = wall_axes(ctx) if axis_split else None
+        if axis_split and self._crawl_axes is None:
+            node.get_logger().warn(
+                f"[{self.name}] {what}: no wall normal, so the move cannot be split "
+                f"into standoff and along-wall axes; driving it as one vector and "
+                f"leaving the standoff to the arrival check."
+            )
+        self._crawl_max_lateral = self._max_lateral_speed(ctx)
+        self._crawl_tol_normal = (
+            float(ctx.get("partition_standoff_tol", self.PARTITION_STANDOFF_TOL_M))
+            if tol_normal is None else float(tol_normal)
+        )
+
         pose = self._base_xy_yaw_map(ctx)
         dist = (
             math.hypot(self._sweep_crawl_target[0] - pose[0],
@@ -3292,18 +3392,114 @@ class ScanWall(State):
             if pose else 0.0
         )
         self._crawl_distance = dist
-        # The base tracks a /cmd_vel command far more slowly than it is asked to
-        # (measured at roughly a seventh of the commanded speed on the omni base in
-        # Gazebo), so the nominal dist/speed is not a usable estimate on its own.
         pad = self.SWEEP_CRAWL_TIMEOUT_PAD_S if timeout_pad is None else float(timeout_pad)
-        self._sweep_crawl_deadline = time.time() + dist / max(speed, 1e-3) + pad
-        node.get_logger().info(
-            f"[{self.name}] {what} to ({self._sweep_crawl_target[0]:.2f}, "
-            f"{self._sweep_crawl_target[1]:.2f}) at {speed:.3f} m/s ({dist:.2f} m)."
-        )
+        # Budget the two axes at the speeds they can ACTUALLY run. Charging the
+        # whole distance at the commanded speed was ~4.5x optimistic for an
+        # along-wall move (0.15 m/s asked, 0.033 m/s available) and survived only
+        # on the pad -- which is why a long transit could run out of budget and be
+        # dropped as a failed segment.
+        if self._crawl_axes is not None and pose is not None:
+            (nx, ny), (tx, ty) = self._crawl_axes
+            ex = self._sweep_crawl_target[0] - pose[0]
+            ey = self._sweep_crawl_target[1] - pose[1]
+            d_n, d_t = abs(ex * nx + ey * ny), abs(ex * tx + ey * ty)
+            budget = d_n / max(speed, 1e-3) + d_t / max(self._crawl_max_lateral, 1e-3)
+            node.get_logger().info(
+                f"[{self.name}] {what} to ({self._sweep_crawl_target[0]:.2f}, "
+                f"{self._sweep_crawl_target[1]:.2f}): {d_n:.2f} m of standoff at "
+                f"{speed:.3f} m/s + {d_t:.2f} m along the wall at "
+                f"{self._crawl_max_lateral:.3f} m/s (the platform's strafe limit)."
+            )
+        else:
+            budget = dist / max(speed, 1e-3)
+            node.get_logger().info(
+                f"[{self.name}] {what} to ({self._sweep_crawl_target[0]:.2f}, "
+                f"{self._sweep_crawl_target[1]:.2f}) at {speed:.3f} m/s ({dist:.2f} m)."
+            )
+        self._sweep_crawl_deadline = time.time() + budget + pad
         self._sweep_crawl_timer = node.create_timer(
             1.0 / self.SWEEP_CRAWL_RATE_HZ, lambda: self._sweep_crawl_tick(ctx)
         )
+
+    def _transit_arrival_ok(self, ctx, seg_no):
+        """Verify the base actually reached this partition's scan pose.
+
+        Returns True to carry on to the sweep. Returns False having already set
+        the next phase: either a bounded re-try of the transit, or -- once those
+        are spent -- skipping the partition, because sweeping from a standoff the
+        arm cannot span is worse than not sweeping it.
+
+        Checked in the WALL frame, not as one distance: the standoff (wall-normal)
+        is what sets the arm's reach and is held to partition_standoff_tol, while
+        the along-wall position only has to be close enough for the executor's
+        lead-in and gets the loose tolerance. The heading is checked too -- a
+        parked arm sweep is only symmetric about the base centreline if the base
+        is square to the wall.
+        """
+        node = ctx["node"]
+        pose = self._base_xy_yaw_map(ctx)
+        target = (self._scan_poses or [None] * len(self._segments))[self._seg_idx]
+        axes = wall_axes(ctx)
+        if pose is None or target is None or axes is None:
+            node.get_logger().warn(
+                f"[{self.name}] Cannot verify the partition {seg_no} scan pose "
+                f"({'no base pose' if pose is None else 'no wall normal' if axes is None else 'no scan pose'}); "
+                f"trusting the transit and sweeping from here."
+            )
+            return True
+
+        (nx, ny), (tx, ty) = axes
+        ex, ey = target[0] - pose[0], target[1] - pose[1]
+        e_n, e_t = ex * nx + ey * ny, ex * tx + ey * ty
+        yaw_err = abs(atan2(sin(pose[2] - target[2]), cos(pose[2] - target[2])))
+        tol_n = float(ctx.get("partition_standoff_tol", self.PARTITION_STANDOFF_TOL_M))
+        tol_t = float(ctx.get("partition_transit_arrive_tol",
+                              self.PARTITION_ALONG_WALL_TOL_M))
+        yaw_tol = float(
+            ctx.get("partition_scan_yaw_tol", ctx.get("nav_yaw_tolerance", 0.25))
+        )
+        if abs(e_n) <= tol_n and abs(e_t) <= tol_t and yaw_err <= yaw_tol:
+            node.get_logger().info(
+                f"[{self.name}] Partition {seg_no} scan pose verified: standoff "
+                f"error {e_n:+.3f} m, along-wall {e_t:+.3f} m, yaw {yaw_err:.3f} rad."
+            )
+            self._transit_retries = 0
+            return True
+
+        max_retries = int(ctx.get("partition_transit_max_retries",
+                                  self.PARTITION_TRANSIT_MAX_RETRIES))
+        # Say which axis failed. "Off the scan pose" was the old level of detail
+        # and it is exactly what made this take a field trip to diagnose: a
+        # standoff miss and an along-wall miss have different causes and different
+        # consequences for the sweep.
+        why = ", ".join(
+            part for part in (
+                f"standoff off by {e_n:+.3f} m (> {tol_n:.2f})" if abs(e_n) > tol_n else "",
+                f"along-wall off by {e_t:+.3f} m (> {tol_t:.2f})" if abs(e_t) > tol_t else "",
+                f"heading off by {yaw_err:.3f} rad (> {yaw_tol:.2f})" if yaw_err > yaw_tol else "",
+            ) if part
+        )
+        if self._transit_retries < max_retries:
+            self._transit_retries += 1
+            node.get_logger().warn(
+                f"[{self.name}] Partition {seg_no} scan pose not reached ({why}); "
+                f"re-running the transit ({self._transit_retries}/{max_retries})."
+            )
+            # Back to `transit`, which re-reads the scan pose and re-decides
+            # whether the move is even needed -- the skip test there will accept
+            # the pose if a later measurement says it is fine after all.
+            self._seg_phase = "transit"
+            return False
+
+        node.get_logger().error(
+            f"[{self.name}] Partition {seg_no} scan pose still not reached after "
+            f"{max_retries} re-tries ({why}); skipping this partition rather than "
+            f"sweeping it from a pose the arm cannot span."
+        )
+        self._transit_retries = 0
+        self._seg_idx += 1
+        self._seg_phase = "transit_clear"
+        return False
 
     def _stop_sweep_crawl(self, ctx, publish_stop=False):
         timer = getattr(self, "_sweep_crawl_timer", None)
@@ -3338,11 +3534,34 @@ class ScanWall(State):
         ex, ey = self._sweep_crawl_target[0] - px, self._sweep_crawl_target[1] - py
         dist = math.hypot(ex, ey)
 
-        if dist <= tol:
+        # Split the error into standoff (wall normal) and along-wall (tangent)
+        # components. They get different tolerances because they mean different
+        # things: the standoff sets how far the arm has to reach and is the thing
+        # that was coming out wrong, while the along-wall position only has to be
+        # close enough for the arm's own lead-in to centre on the partition.
+        axes = getattr(self, "_crawl_axes", None)
+        if axes is not None:
+            (nx, ny), (tx, ty) = axes
+            e_n, e_t = ex * nx + ey * ny, ex * tx + ey * ty
+            tol_n = getattr(self, "_crawl_tol_normal", tol)
+            arrived = abs(e_n) <= tol_n and abs(e_t) <= tol
+        else:
+            e_n = e_t = None
+            tol_n = tol
+            arrived = dist <= tol
+
+        if arrived:
             self._stop_sweep_crawl(ctx, publish_stop=True)
-            node.get_logger().info(
-                f"[{self.name}] Base crawl reached its target ({dist:.3f} m)."
-            )
+            if axes is not None:
+                node.get_logger().info(
+                    f"[{self.name}] Base crawl reached its target: standoff error "
+                    f"{e_n:+.3f} m (tol {tol_n:.3f}), along-wall {e_t:+.3f} m "
+                    f"(tol {tol:.3f})."
+                )
+            else:
+                node.get_logger().info(
+                    f"[{self.name}] Base crawl reached its target ({dist:.3f} m)."
+                )
             self._nav_status = GoalStatus.STATUS_SUCCEEDED
             return
         if time.time() > self._sweep_crawl_deadline:
@@ -3359,10 +3578,26 @@ class ScanWall(State):
             self._nav_status = -1
             return
 
-        # Constant-magnitude velocity toward the target, rotated into the base
-        # frame (Twist is body-frame), plus a P-hold on the fixed sweep heading so
-        # the omni base strafes along the wall without turning.
-        vx_w, vy_w = speed * ex / dist, speed * ey / dist
+        # Velocity toward the target in the map frame, then rotated into the base
+        # frame below (Twist is body-frame), plus a P-hold on the heading.
+        if axes is not None:
+            # Per-axis speeds, so the along-wall component is commanded at what
+            # the base can actually strafe rather than 4.5x that. Asking for more
+            # does not go faster -- the controller scales the whole command down
+            # to the feasible set -- it just makes the standoff component shrink
+            # with it, which is how the fast axis ended up doing the converging.
+            # Each axis is zeroed once ITS OWN tolerance is met, so the last part
+            # of the move is along whichever axis is still out, not a diagonal.
+            v_n = 0.0 if abs(e_n) <= tol_n else math.copysign(speed, e_n)
+            v_t = (0.0 if abs(e_t) <= tol else
+                   math.copysign(min(self._crawl_max_lateral, speed), e_t))
+            # Do not overshoot on a tick: cap each component at the distance left.
+            step = 1.0 / self.SWEEP_CRAWL_RATE_HZ
+            v_n = math.copysign(min(abs(v_n), abs(e_n) / step), v_n) if v_n else 0.0
+            v_t = math.copysign(min(abs(v_t), abs(e_t) / step), v_t) if v_t else 0.0
+            vx_w, vy_w = v_n * nx + v_t * tx, v_n * ny + v_t * ty
+        else:
+            vx_w, vy_w = speed * ex / dist, speed * ey / dist
         cmd = Twist()
         cmd.linear.x = cos(yaw) * vx_w + sin(yaw) * vy_w
         cmd.linear.y = -sin(yaw) * vx_w + cos(yaw) * vy_w
