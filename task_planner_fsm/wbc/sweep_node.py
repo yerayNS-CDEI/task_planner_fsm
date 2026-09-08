@@ -347,6 +347,30 @@ class WholeBodySweepNode(Node):
         # 0 disables the filter and restores the binary gate the paragraph above
         # argues against. It is there for a bench test, not for the robot.
         self.declare_parameter("press_travel_tau", 1.5)            # s
+        # Whether the press gates the base's travel at all.
+        #
+        # True is what 9974b97 and 8e55536 argue for: the base holds until the
+        # wheel has found the wall, and afterwards its speed is scaled by the
+        # filtered contact authority, so the GPR never sweeps air.
+        #
+        # False decouples the two axes entirely — the press still regulates force
+        # on the normal, the arm still holds height and orientation, and the base
+        # travels at sweep_speed the way it did before either commit.
+        #
+        # IT IS CURRENTLY FALSE, AND THAT IS A DEBUGGING DEFAULT, NOT A VERDICT
+        # ON EITHER COMMIT. The 2026-09-08 runs never loaded the wheel — the
+        # approach schedule parked the plate ~1 cm off the wall reading -1 N — so
+        # the authority never rose and the base sat at 0.000 m/s all sweep. This
+        # switch is what separates "the gate is wrong" from "the press never
+        # reached the wall", and while it is false the answer to the second
+        # question is being gathered.
+        #
+        # What that costs, plainly: with the gate off nothing couples travel to
+        # contact, so a sweep can run its full length with the wheel in the air
+        # and report success. Treat GPR data recorded this way as suspect, and
+        # put the gate back on (press_gate_travel:=true, which still round-trips
+        # correctly from the command line) once the approach reaches the wall.
+        self.declare_parameter("press_gate_travel", False)
         # How long to wait for the wheel to reach the wall before giving up on
         # the segment. The base holds still for all of it (see _control_step),
         # so this is not a stall — but it has to be bounded, because a press that
@@ -1807,7 +1831,8 @@ class WholeBodySweepNode(Node):
         reachable = self.limits.max_speed_along(
             heading - yaw, heading - (yaw - phi)) * float(p("sweep_speed_margin").value)
         speed = min(self.sweep_speed, remaining, reachable)
-        if self.press is not None and not self.press.touched:
+        gate = bool(p("press_gate_travel").value)
+        if self.press is not None and gate and not self.press.touched:
             # No travel until the wheel has reached the wall. Otherwise the base
             # sets off at sweep_speed while the arm is still closing the standoff
             # at press_seek_speed, and the first stretch of the segment is
@@ -1844,6 +1869,17 @@ class WholeBodySweepNode(Node):
                     f"wheel against a {self.press.target_force:.0f} N target. "
                     f"Sweeping without contact would record air.")
                 return
+        elif self.press is not None and not gate:
+            # press_gate_travel:=false. The two axes are decoupled: the press
+            # keeps regulating force on the normal, and the base travels at
+            # sweep_speed regardless of what the wheel is doing.
+            #
+            # Pin the authority at 1.0 rather than leaving it where it was. It is
+            # reported in the log line and read by the no_progress watchdog to
+            # decide WHICH fault to name, and with the gate off "the wheel came
+            # off the wall — so the base stopped itself" is never the right
+            # answer: the base did not stop, nothing here would have stopped it.
+            self.travel_authority = 1.0
         elif self.press is not None:
             # Armed. From here the travel is SCALED by a continuous authority
             # rather than released outright: the live contact state is filtered

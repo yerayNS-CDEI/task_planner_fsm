@@ -2459,6 +2459,14 @@ class ScanWall(State):
         # sweep holds a standoff, which on the real robot means the GPR wheel
         # never touches the wall — the thing the whole sweep exists to do.
         cmd += ["-p", f"press_enabled:={'true' if self._wbc_press_enabled(ctx) else 'false'}"]
+        # Whether the press gates the base's travel. Reachable from a run because
+        # it is the switch that separates "the gate is wrong" from "the press is
+        # wrong" when a sweep will not move — but it is a DIAGNOSTIC, and a sweep
+        # with it false can scan air without anything noticing. Absent from ctx
+        # the node keeps its own default, which is on.
+        if ctx.get("wbc_press_gate_travel") is not None:
+            cmd += ["-p", "press_gate_travel:="
+                    f"{'true' if bool(ctx['wbc_press_gate_travel']) else 'false'}"]
         for key, param in (("wbc_control_rate", "control_rate"),
                            # How finely the arm setpoint moves between solves.
                            # Reachable from here for the same reason the control
