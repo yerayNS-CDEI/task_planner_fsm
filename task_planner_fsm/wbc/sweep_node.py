@@ -262,12 +262,43 @@ class WholeBodySweepNode(Node):
         # see wbc/admittance.py.
         self.declare_parameter("press_tare_seconds", 0.5)          # s
         self.declare_parameter("press_tare_min_distance", 0.05)   # m
-        # How long the base takes to reach sweep_speed once the wheel has found
-        # the wall. Without it the travel gate opens as a STEP: base_accel_max is
-        # 0.3 m/s^2, which at the 0.1 s cycle the robot was achieving authorises
-        # the whole 0.03 m/s in a single cycle, and it lands on the one sample
-        # where the contact force is least well known.
-        self.declare_parameter("press_travel_ramp", 1.0)           # s
+        # Time constant of the base's TRAVEL AUTHORITY: a continuous 0..1 factor
+        # on the sweep speed, filtered from "is the wheel in contact right now".
+        #
+        # It replaces two things at once. The gate used to be one-shot — it
+        # opened on first contact and never closed again — so a wall that
+        # RECEDED mid-segment (a bay, a reveal, the avoidance barrier walking the
+        # base off the plane) left the base travelling at full speed while the
+        # arm chased it, and the GPR recorded air. And the ramp that eased the
+        # base in from that opening is now simply the authority's first rise from
+        # zero, so it no longer needs a knob of its own.
+        #
+        # The filter is what makes a LIVE contact signal usable here at all.
+        # Gating the base on the contact state directly would stop and restart it
+        # several times a sweep — the press legitimately drops back to SEEK over
+        # a hollow or a lip — and each restart is a step against a loaded wheel,
+        # which scrubs it sideways instead of rolling it. Measured against the
+        # simulated wall at 1.5 s, base travel as a fraction of sweep_speed:
+        #
+        #     a 0.3 s hollow          dips to 90% and recovers
+        #     wall gone for 1 s               59%
+        #                      2 s            31%
+        #                      3 s            16%
+        #                      5 s             4%
+        #
+        # So a lip costs a tenth of the speed for a second or so, and a wall that
+        # is genuinely gone stops the base on its own — no second timeout to
+        # tune, and nothing that has to DETECT the event to act on it.
+        #
+        # Slow BY DESIGN, and that is what keeps it compatible with
+        # base_constant_travel above. It can only move the travel speed on a
+        # ~1.5 s timescale, so it is a gradual ease rather than the per-cycle dip
+        # that smears a line scan — and where it does slow the base, the wheel is
+        # off the wall, so what is being stretched is air.
+        #
+        # 0 disables the filter and restores the binary gate the paragraph above
+        # argues against. It is there for a bench test, not for the robot.
+        self.declare_parameter("press_travel_tau", 1.5)            # s
         # How long to wait for the wheel to reach the wall before giving up on
         # the segment. The base holds still for all of it (see _control_step),
         # so this is not a stall — but it has to be bounded, because a press that
@@ -683,8 +714,11 @@ class WholeBodySweepNode(Node):
         # before the press is updated, and the press must measure the gap since
         # it last ran, not since the last cycle that got that far.
         self.press_stamp = None
-        # When the travel gate opened, for the ramp that replaces the step.
-        self.press_touch_stamp = None
+        # The base's travel authority, 0..1: how much of the sweep speed the
+        # wheel's contact currently justifies. Starts closed, opens as the press
+        # holds contact, and closes again on its own if the wall goes away. See
+        # press_travel_tau.
+        self.travel_authority = 0.0
         self.surface = SurfaceEstimator(ema_alpha=float(p("ema_alpha").value))
         self.q_posture = None
         self.holding_since = None
@@ -1606,10 +1640,25 @@ class WholeBodySweepNode(Node):
         else:
             stall = float(self.get_parameter("no_progress_timeout").value)
             if now - self.progress_stamp > stall:
+                # Two different faults arrive here and they have different
+                # fixes, so name which one it is. A plate that is HELD has full
+                # travel authority and still is not moving. A plate that has
+                # LOST THE WALL closed its own authority and stopped itself —
+                # and that case deliberately has no timeout of its own: the
+                # authority decays, the base stops, and this watchdog is what
+                # eventually notices. One timeout, not two.
+                if (self.press is not None and self.travel_authority < 0.5
+                        and self.press.force < self.press.release_force):
+                    why = (f"the wheel came off the wall — {self.press.force:+.1f} N "
+                           f"against a {self.press.target_force:.0f} N target, travel "
+                           f"authority {self.travel_authority:.2f}, so the base stopped "
+                           f"itself rather than sweep air")
+                else:
+                    why = "something is holding the plate"
                 self.finish(
                     "failed",
                     f"no progress for {stall:.0f}s at {self.progress:.2f}/{length:.2f} m "
-                    f"(something is holding the plate)")
+                    f"({why})")
                 return
 
         # --- The sensed surface frame ---------------------------------------
@@ -1689,14 +1738,17 @@ class WholeBodySweepNode(Node):
             # at press_seek_speed, and the first stretch of the segment is
             # crossed with the GPR scanning air.
             #
-            # Gated on ``touched``, which LATCHES on the first contact, not on
-            # ``in_contact``, which tracks the live contact state. That
-            # distinction is the whole of this change: the press legitimately
-            # drops back to SEEK over a hollow, a lip or a noisy reading, and
-            # tying the base to it would stop and restart the base several times
-            # a sweep — each restart a step from 0 to sweep_speed against a
-            # loaded wheel, which scrubs it sideways instead of rolling it.
-            # Once the wall has been found, the base sweeps to the end.
+            # ARMED on ``touched``, which LATCHES, rather than on ``in_contact``,
+            # which does not. That distinction still matters, but only here: the
+            # latch is what carries the contact dwell and the two-sample rule, so
+            # it is the one test the sensor's noise cannot pass. Arming this
+            # first release on the live state instead would let the +2.4 N swings
+            # of an untouched wheel creep the base — the failure 13ed27e fixed.
+            #
+            # What happens AFTER the first contact is no longer this branch's
+            # business. It belongs to the travel authority below, which is
+            # continuous, so the base is never again given blanket permission to
+            # sweep on the strength of one contact several metres back.
             #
             # Zero the tangent only. The normal, height and orientation tasks
             # keep running, which is what closes the gap in the first place.
@@ -1718,18 +1770,46 @@ class WholeBodySweepNode(Node):
                     f"Sweeping without contact would record air.")
                 return
         elif self.press is not None:
-            # The gate has opened. Ease the travel in rather than releasing it
-            # as a step: base_accel_max (0.3 m/s^2) authorises the whole
-            # sweep_speed in one cycle at the rate the robot actually achieves,
-            # and the cycle it would do that on is the first contact sample —
-            # the one where the force is least well known and the wheel is
-            # already loaded. Ramping over press_travel_ramp costs a centimetre
-            # of scan at the start of the segment.
-            if self.press_touch_stamp is None:
-                self.press_touch_stamp = now
-            ramp = float(p("press_travel_ramp").value)
-            if ramp > 0.0:
-                speed *= min(1.0, (now - self.press_touch_stamp) / ramp)
+            # Armed. From here the travel is SCALED by a continuous authority
+            # rather than released outright: the live contact state is filtered
+            # into a 0..1 factor, so a brief loss costs a little speed and a
+            # sustained one brings the base to a crawl. The first rise from zero
+            # is also the ramp that eases the base in against a newly loaded
+            # wheel, which is why there is no separate ramp any more.
+            # See press_travel_tau for the sizing and for why it is filtered.
+            #
+            # Read off the LOAD, not off ``in_contact``. The two differ only on
+            # the way back in: re-entering PRESS costs the contact dwell and the
+            # two-sample rule, and those exist to keep the ARMING honest against
+            # noise. Inheriting them here would charge every hollow an extra
+            # 0.15 s of closed gate for no safety gained — the wheel is already
+            # known to have been on this wall, and the 1.5 s filter below is a
+            # far better noise defence than a dwell. So the question here is the
+            # simpler one the release threshold already answers: is the wheel
+            # loaded right now?
+            health = 1.0 if self.press.force >= self.press.release_force else 0.0
+            tau = float(p("press_travel_tau").value)
+            # Against the press's own MEASURED period, so the time constant is
+            # 1.5 s of wall clock whatever rate the loop achieves — the same
+            # reason every constant inside AdmittancePress is in seconds.
+            alpha = (1.0 - math.exp(-press_dt / tau)) if tau > 0.0 else 1.0
+            self.travel_authority += alpha * (health - self.travel_authority)
+            speed *= self.travel_authority
+            if not health and self.travel_authority < 0.5:
+                # Say it out loud. A base crawling along a wall for no visible
+                # reason is the kind of thing that gets diagnosed as a stuck
+                # solver; it is in fact the loop declining to scan air.
+                #
+                # Both halves, or this fires on the way IN as well: the first
+                # rise from zero spends about a second under 0.5 with the wheel
+                # loaded and everything working, and "wheel is off the wall" is
+                # exactly the wrong thing to print there.
+                self.get_logger().warn(
+                    f"Wheel is off the wall ({self.press.force:+.1f} N against a "
+                    f"{self.press.target_force:.0f} N target): base is down to "
+                    f"{self.travel_authority * 100:.0f}% of sweep speed while the arm "
+                    f"closes the gap. It stops itself if the wall does not come back.",
+                    throttle_duration_sec=2.0)
         v_ref = speed * t_hat + v_normal * m_hat + v_height * np.array([0.0, 0.0, 1.0])
 
         R_target = plate_orientation_target(m_hat)
@@ -2232,8 +2312,10 @@ class WholeBodySweepNode(Node):
     #                                           /joint_states)
     #   [8+2n+n_arm]
     #              measured STREAM period, s
+    #   [8+2n+n_arm+1]
+    #              base travel authority, 0..1 (NaN when not pressing)
     #
-    # The last entry is APPENDED rather than folded into the header, so that
+    # The last entries are APPENDED rather than folded into the header, so that
     # every index a recorded bag or a plotting script already knows keeps the
     # meaning it had. [1] likewise keeps its own: it was the measured control
     # period when solving and streaming were the same thing, and it is still the
@@ -2275,6 +2357,12 @@ class WholeBodySweepNode(Node):
         row.extend(float(v) for v in np.asarray(u_published, dtype=float)[:n])
         row.extend(measured)
         row.append(self.stream_cycle_period)
+        # Plotted against [6], this is how press_travel_tau gets tuned: the
+        # force says what the wheel felt, this says what the base did about it.
+        # NaN rather than 0 without a press, which is the row's own convention
+        # for "not applicable" — a zero here would read as a closed gate on a
+        # sweep whose travel nothing was gating.
+        row.append(float("nan") if self.press is None else self.travel_authority)
         self.diag_pub.publish(Float64MultiArray(data=row))
 
     def _log_cycle(self, solution, distance, remaining, phi):
@@ -2298,7 +2386,8 @@ class WholeBodySweepNode(Node):
             press = (f"press={self.press.force:+.1f}N(raw{self.press.raw:+.1f})"
                      f"/{self.press.target_force:.0f} "
                      f"[{self.press.state.upper() if self.press.state != SEEK else 'seek'}] "
-                     f"{approach}bias={self.press.bias:+.1f}N | ")
+                     f"{approach}bias={self.press.bias:+.1f}N "
+                     f"auth={self.travel_authority:.2f} | ")
         self.get_logger().info(
             f"{press}d={distance * 100:.1f}cm tilt={math.degrees(self.surface.tilt()):.1f}deg "
             f"left={remaining:.2f}m | base{'*' if self.base_travel_pinned else ''}"

@@ -142,6 +142,11 @@ other failure on that run followed from it: the base travelled into the obstacle
 influence radius, the avoidance barrier engaged, and from then on the barrier was
 pushing the base off the wall faster than the arm was closing on it.
 
+The threshold and the dwell below stop the latch firing on NOISE. They do nothing
+about a wall that recedes after a genuine contact, which is the same failure
+arriving later, so ``touched`` now only ARMS the base: the travel speed is scaled
+by a filtered ``in_contact`` (``press_travel_tau``) and closes again on its own.
+
 The threshold was 1.0 N against a sensor whose de-biased noise measures sigma
 0.95 N. That is 1.1 sigma, and an approach gets several hundred independent
 tries at it. No threshold alone is enough at any level worth using, which is why
@@ -329,11 +334,18 @@ class AdmittancePress:
         self._tare_samples = []
         self._tare_elapsed = 0.0
         # Whether the wheel has EVER reached the wall in this segment. Latching,
-        # and deliberately so: it is what the sweep gates its travel on, and the
-        # thing it must not do is follow the contact state back down. ``state``
-        # legitimately drops back to SEEK over a hollow or a lip, several times
-        # in a sweep, and a base that stopped and restarted on each of those
-        # would scrub the wheel instead of rolling it.
+        # and deliberately so: it is what ARMS the sweep's travel, and an arming
+        # test must not follow the contact state back down. It carries the dwell
+        # and the sample count below, which is the only test here that the
+        # sensor's noise cannot talk its way past.
+        #
+        # It is no longer what SETS the travel speed. The sweep scales that by a
+        # filtered version of ``in_contact`` instead (``press_travel_tau`` in
+        # sweep_node), so a wall that recedes after a genuine contact slows the
+        # base rather than being ignored for the rest of the segment. The old
+        # objection to reading the live state there — that stopping and
+        # restarting a loaded wheel scrubs it — is answered by the filter, not by
+        # the latch.
         self.touched = False
 
     # ------------------------------------------------------------------
