@@ -42,6 +42,10 @@ class NavigateToTarget(State):
         self._servo_start = 0.0
         # True while the fine-correction servo is commanding yaw only.
         self._servo_rotate_only = False
+        # Last angular command, so the next one can be slew-limited off it.
+        self._servo_ang_cmd = 0.0
+        # Deadline of the current stop-and-settle wait, or None while turning.
+        self._servo_settle_until = None
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -463,8 +467,32 @@ class NavigateToTarget(State):
     SERVO_KP_LIN = 0.6
     SERVO_KP_ANG = 0.9
     SERVO_MAX_LIN = 0.12   # m/s
-    SERVO_MAX_ANG = 0.35   # rad/s
-    SERVO_TIMEOUT_S = 30.0
+    # 60 s, not 30: the rotation ceiling below is deliberately a third of what it
+    # was, and the cancel-on-arrival path can hand this servo a yaw error of most
+    # of a turn (arrival is judged on POSITION alone). Half a turn at 0.12 rad/s
+    # is ~26 s, which the old budget would have failed as a timeout.
+    SERVO_TIMEOUT_S = 60.0
+    # Rotation profile. The heading is the last thing set before the arm scans,
+    # and it was overshooting: at 0.35 rad/s the servo ran at the clamp right up
+    # to the 0.25 rad accept tolerance and then commanded zero, so the base coasted
+    # past square-to-the-wall and the run started tilted. Three changes, all
+    # overridable from ctx:
+    #   * a slower ceiling -- 0.12 rad/s is ~7 deg/s, and the whole correction is
+    #     a fraction of a turn, so the time cost is a second or two;
+    #   * a deceleration ramp (SERVO_ANG_ACCEL) used BOTH to slew-limit the
+    #     command between ticks and to cap it by the braking distance left, so the
+    #     rotation eases into the target instead of stopping dead at it;
+    #   * a servo target (SERVO_YAW_TOL_RAD) tighter than the accept tolerance, so
+    #     "converged" means square rather than "within 14 deg of square".
+    SERVO_MAX_ANG = 0.12   # rad/s
+    SERVO_ANG_ACCEL = 0.25  # rad/s^2, ramp up and braking profile
+    SERVO_MIN_ANG = 0.03   # rad/s, floor that gets the base moving off stiction
+    SERVO_YAW_TOL_RAD = 0.04
+    # Zero-command coast before convergence is judged. The base carries momentum,
+    # so a yaw error read while it is still turning is not the error it comes to
+    # rest at -- which is exactly how a heading that looked converged settled
+    # tilted. Stop first, then measure.
+    SERVO_SETTLE_S = 1.0
 
     def _start_fine_correction(self, ctx, rotate_only=False):
         """Servo the omni base onto the standoff pose over /cmd_vel (through the
@@ -481,6 +509,8 @@ class NavigateToTarget(State):
         self._stop_fine_correction(ctx)  # no duplicate timers
         self._servo_rotate_only = bool(rotate_only)
         self._servo_start = time.time()
+        self._servo_ang_cmd = 0.0        # ramp up from rest, never from a stale command
+        self._servo_settle_until = None
         self._servo_timer = node.create_timer(
             1.0 / self.SERVO_RATE_HZ, lambda: self._fine_correction_tick(ctx)
         )
@@ -491,6 +521,8 @@ class NavigateToTarget(State):
             timer.cancel()
             ctx["node"].destroy_timer(timer)
             self._servo_timer = None
+        self._servo_ang_cmd = 0.0
+        self._servo_settle_until = None
         if publish_stop and ctx.get("_cmd_vel_pub") is not None:
             ctx["_cmd_vel_pub"].publish(Twist())  # zero twist
 
@@ -509,8 +541,48 @@ class NavigateToTarget(State):
         # pure chassis rotation traces it around a small circle -- demanding the
         # position tolerance too could leave this spinning until it times out.
         rotate_only = self._servo_rotate_only
-        converged = yaw_err <= yaw_tol and (rotate_only or pos_err <= pos_tol)
-        if converged:
+        settle_s = float(ctx.get("fine_correction_settle_s", self.SERVO_SETTLE_S))
+        # The servo aims tighter than the gate it has to pass. Aiming AT the gate
+        # is what let the base stop 14 deg off square: the tolerance is what is
+        # acceptable to hand on, not what to aim for. Never looser than the gate.
+        servo_yaw_tol = min(
+            yaw_tol, float(ctx.get("fine_correction_yaw_tol", self.SERVO_YAW_TOL_RAD))
+        )
+
+        # Stop-and-settle. Convergence is judged from a base at REST, never from
+        # one still turning, because the coast after the command goes to zero is
+        # precisely the overshoot that left the heading tilted. On first reaching
+        # the servo target, command zero, wait settle_s, and re-read the pose.
+        settled = False
+        if self._servo_settle_until is not None:
+            if time.time() < self._servo_settle_until:
+                ctx["_cmd_vel_pub"].publish(Twist())    # hold the stop
+                return
+            self._servo_settle_until = None
+            if yaw_err > yaw_tol:
+                # It coasted past (or short of) the gate. Correct again -- from
+                # rest and a small error, so this pass is slow by construction.
+                node.get_logger().warn(
+                    f"[{self.name}] Heading settled {yaw_err:.3f} rad off the goal "
+                    f"(> {yaw_tol:.2f} tolerance) after the base came to rest; "
+                    f"correcting again."
+                )
+                self._servo_ang_cmd = 0.0
+            else:
+                # Heading is good at rest. The full servo still owes the position
+                # tolerance; rotation-only judges the drift below instead.
+                settled = rotate_only or pos_err <= pos_tol
+        elif yaw_err <= servo_yaw_tol and (rotate_only or pos_err <= pos_tol):
+            node.get_logger().info(
+                f"[{self.name}] Heading within {servo_yaw_tol:.3f} rad; stopping and "
+                f"letting the base settle for {settle_s:.1f}s before verifying."
+            )
+            self._servo_settle_until = time.time() + settle_s
+            self._servo_ang_cmd = 0.0
+            ctx["_cmd_vel_pub"].publish(Twist())
+            return
+
+        if settled:
             self._stop_fine_correction(ctx, publish_stop=True)
             if rotate_only and pos_err > pos_tol:
                 # The rotation walked the base off the standoff point. Hand back
@@ -558,8 +630,45 @@ class NavigateToTarget(State):
         if not self._servo_rotate_only:
             cmd.linear.x = clamp(self.SERVO_KP_LIN * ex_b, self.SERVO_MAX_LIN)
             cmd.linear.y = clamp(self.SERVO_KP_LIN * ey_b, self.SERVO_MAX_LIN)
-        cmd.angular.z = clamp(self.SERVO_KP_ANG * dyaw, self.SERVO_MAX_ANG)
+        cmd.angular.z = self._angular_command(ctx, dyaw, servo_yaw_tol)
         ctx["_cmd_vel_pub"].publish(cmd)
+
+    def _angular_command(self, ctx, dyaw, servo_yaw_tol):
+        """Angular velocity for one servo tick: a P term that is braked into the
+        target and slew-limited off the last command.
+
+        Plain ``clamp(kp * dyaw, max)`` runs at the ceiling until the tolerance
+        trips and then steps to zero, so the base's own deceleration carries it
+        past the goal -- the overshoot that left the first base placement tilted.
+        Two limits fix that without adding a second gain to tune:
+
+          brake  the fastest this tick may go and still stop AT the target under
+                 ``accel``: ``sqrt(2 * accel * remaining)``. It shrinks to zero as
+                 the error does, so the rotation eases in rather than stopping dead.
+          slew   the command may change by at most ``accel * dt`` per tick, which
+                 also ramps the START of the rotation instead of stepping to the
+                 ceiling (the same deceleration limit read the other way).
+
+        ``min_ang`` is a stiction floor so the last few milliradians still move
+        the base; it only binds inside ~2 mrad of the target, where a tick moves
+        less than the tolerance anyway.
+        """
+        max_ang = float(ctx.get("fine_correction_max_ang", self.SERVO_MAX_ANG))
+        accel = float(ctx.get("fine_correction_ang_accel", self.SERVO_ANG_ACCEL))
+        min_ang = float(ctx.get("fine_correction_min_ang", self.SERVO_MIN_ANG))
+        dt = 1.0 / self.SERVO_RATE_HZ
+
+        remaining = max(abs(dyaw) - servo_yaw_tol, 0.0)
+        brake = math.sqrt(2.0 * accel * remaining)
+        limit = min(max_ang, brake)
+        want = max(-limit, min(limit, self.SERVO_KP_ANG * dyaw))
+        if remaining > 0.0 and abs(want) < min_ang:
+            want = math.copysign(min_ang, dyaw)
+
+        step = accel * dt
+        delta = max(-step, min(step, want - self._servo_ang_cmd))
+        self._servo_ang_cmd += delta
+        return self._servo_ang_cmd
 
     # Base frames tried (in order) when looking up the map-frame base pose.
     # Fallback frame order when nav_base_frame is unavailable. turret_footprint
