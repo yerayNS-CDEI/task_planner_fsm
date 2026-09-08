@@ -442,6 +442,12 @@ class ScanWall(State):
             "-p", f"scan_standoff_m:={float(ctx.get('sweep_scan_standoff_m', 0.20))}",
             "-p", f"approach_retract_m:={float(ctx.get('sweep_approach_retract_m', 0.0))}",
             "-p", f"max_traverse_m:={float(ctx.get('sweep_max_traverse_m', 1.10))}",
+            # Diagnostic only. Once force mode has the plate on the wall the
+            # executor sweeps from that contact pose rather than nudging it back
+            # onto the commanded line height; this is how far off that line the
+            # pressed plate may sit before the executor says so in the log.
+            "-p", f"press_height_tolerance_m:="
+                  f"{float(ctx.get('sweep_press_height_tolerance_m', 0.05))}",
             "-p", f"trajectory_timeout_factor:="
                   f"{float(ctx.get('sweep_timeout_factor', 4.0))}",
             "-p", f"trajectory_timeout_pad_s:="
