@@ -1,5 +1,6 @@
 from ..state import State
 from ..utils.column_control import ColumnController
+from ..utils.hyperspectral_sampler import HyperspectralSampler
 from ..utils.costmap_utils import (
     COSTMAP_WAIT_TIMEOUT_S,
     base_standoff_goal,
@@ -248,6 +249,15 @@ class ScanWall(State):
         self._gpr_trigger_tf_warned = False
         self._ee_frame = None               # cached map->EE frame name
 
+        # Hyperspectral: sampled on the same plate travel as the GPR triggers,
+        # but two orders of magnitude coarser (10 cm vs 0.5 cm) because one
+        # sample is a service round-trip plus an integration time, not a pulse.
+        # Off unless ctx["hyperspectral_enabled"], exactly like the GPR probe,
+        # and it never aborts a line: a failed point is recorded and skipped.
+        # Records RAW spectra only -- reflectance and material prediction run
+        # afterwards, in SensorDataProcessing.
+        self._hs = HyperspectralSampler(name)
+
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering scanning state.")
@@ -314,11 +324,17 @@ class ScanWall(State):
         self.gpr_measurement_active = False
         self.gpr_line_active = False
         self._stop_gpr_triggers(ctx, log_summary=False)   # clear any stale timer
+        self._hs.stop_timer(ctx)                          # ditto, hyperspectral
         self._ee_frame = None
         ctx["error_triggered"] = False
 
         self.column.reset()
         self.column.configure(node, ctx)
+
+        # Binds the session directory and the raw record on first entry, and
+        # re-attaches to them on every later line and wall -- the session spans
+        # the whole mission. No-op when hyperspectral sampling is disabled.
+        self._hs.configure(node, ctx)
 
         if self.position_client is None:
             self.position_client = node.create_client(SendPosition, "/send_position")
@@ -1475,6 +1491,49 @@ class ScanWall(State):
             node.get_logger().debug(text)
 
     # ------------------------------------------------------------------
+    # Hyperspectral sampling
+    # ------------------------------------------------------------------
+    def _start_hyperspectral(self, ctx, seg_start, seg_end):
+        """Arm the hyperspectral sampler for the segment about to be swept.
+
+        Deliberately reuses the GPR trigger sampler's answers to the two
+        questions both sensors have to get right, rather than deciding them
+        again: WHICH FRAME the plate travel is measured in (an arm sweep parks
+        the base, so arm_base keeps localisation drift out of the spacing; a
+        base sweep only moves relative to the world) and WHICH DIRECTION counts
+        as forward along the wall. Two sensors on one plate disagreeing about
+        either would be a subtle, permanent misalignment between the GPR traces
+        and the material samples taken at the same instant.
+
+        The plate lookup is handed over as a closure over _lookup_plate_xyz for
+        the same reason: one TF fallback chain and one cached EE frame, shared.
+        """
+        if not self._hs.enabled(ctx):
+            return
+        ref = self._gpr_trigger_frame(ctx)
+        axis_xy = self._sweep_axis(seg_start, seg_end)
+        if axis_xy is None:
+            sweep_yaw = 2.0 * atan2(self._sweep_qz, self._sweep_qw)
+            axis_xy = (cos(sweep_yaw), sin(sweep_yaw))
+        axis = self._axis_in_frame(ctx, ref, axis_xy)
+        if axis is None:
+            ctx["node"].get_logger().warn(
+                f"[{self.name}] hyperspectral: cannot express the sweep "
+                f"direction in '{ref}'; measuring in map instead."
+            )
+            ref, axis = "map", (axis_xy[0], axis_xy[1], 0.0)
+        self._hs.start_line(
+            ctx, seg_start, seg_end,
+            pose_fn=lambda frame, timeout: self._lookup_plate_xyz(
+                ctx, frame, timeout_s=timeout),
+            ref=ref,
+            axis=axis,
+            wall_index=ctx.get("current_wall_index"),
+            line_idx=ctx.get("current_line_idx", 0),
+            seg_idx=self._seg_idx,
+        )
+
+    # ------------------------------------------------------------------
     # Column height from the map-frame line z
     # ------------------------------------------------------------------
     def _lookup_plate_xyz(self, ctx, ref_frame="map", timeout_s=1.0):
@@ -1864,6 +1923,15 @@ class ScanWall(State):
     # ------------------------------------------------------------------
     def run(self, ctx):
         node = ctx["node"]
+
+        # Fetch GDS/GRF once per mission. Non-blocking and re-entrant: it walks
+        # GET_GDS -> GET_GRF -> GET_MTI over the ticks of the pre-approach, so
+        # the calibration is cached well before the first sweep -- and an
+        # uncalibrated or unreachable camera is discovered while the arm is
+        # still moving into place, not after a wall has been swept against a
+        # calibration that does not exist.
+        if self._hs.enabled(ctx):
+            self._hs.calibration_ready(ctx)
 
         if ctx.get("walls_left", 0) <= 0:
             node.get_logger().info(f"[{self.name}] No walls left to scan.")
@@ -2852,6 +2920,7 @@ class ScanWall(State):
             # Plate is on the wall and the base is moving: start clocking the GPR
             # with one trigger per gpr_trigger_distance_m of plate travel.
             self._start_gpr_triggers(ctx, seg_start, seg_end)
+            self._start_hyperspectral(ctx, seg_start, seg_end)
             self._seg_phase = "sweep_wait"
             return
 
@@ -2883,11 +2952,13 @@ class ScanWall(State):
                     # a bare arm call would restart the counter each second.
                     if self._gpr_trigger_timer is None:
                         self._start_gpr_triggers(ctx, seg_start, seg_end)
+                        self._start_hyperspectral(ctx, seg_start, seg_end)
                 # The executor owns the sweep's own watchdogs and reports one
                 # outcome; everything after it here is unchanged.
                 if self._sweep_result is None:
                     return
                 self._stop_gpr_triggers(ctx)   # the plate has stopped scanning
+                self._hs.stop_line(ctx)
                 succeeded, reason, detail = self._sweep_result
                 self._sweep_result = None
                 status = GoalStatus.STATUS_SUCCEEDED if succeeded else GoalStatus.STATUS_ABORTED
@@ -2911,6 +2982,7 @@ class ScanWall(State):
                 status = self._nav_status
                 self._stop_sweep_crawl(ctx, publish_stop=True)   # ensure base is stopped
                 self._stop_gpr_triggers(ctx)     # no triggers once the plate stops moving
+                self._hs.stop_line(ctx)
                 self._restore_sweep_speed(ctx)   # clear the slow-sweep cap for the next transit
             # Release hardware/process state first (safety), regardless of outcome.
             node.get_logger().info(
@@ -3795,6 +3867,7 @@ class ScanWall(State):
         ## alignment nodes.
         self._stop_sweep_crawl(ctx, publish_stop=True)
         self._stop_gpr_triggers(ctx, log_summary=False)
+        self._hs.abort(ctx)   # disarm, close the open segment, persist metrics
         self._restore_sweep_speed(ctx)
         self._cancel_sweep_goal(ctx)
         self._set_trajectory_bridge_hold(ctx, False)   # never leave the arm stack muted
