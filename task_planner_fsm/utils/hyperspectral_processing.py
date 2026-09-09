@@ -99,6 +99,47 @@ PROCESSING_OUTCOMES = (
 )
 
 
+class PredictionUnavailable(Exception):
+    """The ML service itself is not answering.
+
+    Distinct from the model rejecting a sample: a rejection is a verdict about
+    the spectrum and belongs in the record, while this says nothing was asked
+    successfully at all. The processor counts these separately and stops calling
+    after a few in a row, rather than spending the per-call timeout on every
+    remaining sample of the mission.
+    """
+
+
+def classify_capture(result, spectrum_length=SPECTRUM_LENGTH):
+    """Classify a HyperspectralCommand response into a collection outcome.
+
+    Returns ``(outcome, detail, vis, nir)``; the spectra are None unless the
+    outcome is OK. Duck-typed on the response object, so this module still
+    imports no ROS.
+
+    Shared by the sweep sampler and the bench-timing tool on purpose: the
+    latter exists to size the sampler's parameters, and it can only do that if
+    both agree on what counts as a successful capture.
+    """
+    if result is None:
+        return FAILED_NO_RESPONSE, "service returned no result", None, None
+    if not (getattr(result, "vis_ok", False) and getattr(result, "nir_ok", False)):
+        detail = (
+            f"vis_ok={getattr(result, 'vis_ok', None)} "
+            f"status={getattr(result, 'vis_status', None)}, "
+            f"nir_ok={getattr(result, 'nir_ok', None)} "
+            f"status={getattr(result, 'nir_status', None)}: "
+            f"{getattr(result, 'message', '')}"
+        )
+        return FAILED_SENSOR, detail, None, None
+    vis = list(result.vis_spectrum)
+    nir = list(result.nir_spectrum)
+    if len(vis) != spectrum_length or len(nir) != spectrum_length:
+        # A short spectrum is a truncated TCP frame, not a short reading.
+        return FAILED_LENGTH, f"vis={len(vis)}, nir={len(nir)}", None, None
+    return OK, "", vis, nir
+
+
 # ----------------------------------------------------------------------
 # Reflectance
 # ----------------------------------------------------------------------
@@ -660,131 +701,238 @@ def is_ml_rejection(material):
     return str(material).upper().startswith(ML_REJECT_PREFIXES)
 
 
-def process_session(session_dir, predict_fn=None, limits=None,
-                    min_valid_fraction=0.5, logger=None):
-    """Turn a recorded session into reflectance rows and coverage metrics.
+class SessionProcessor:
+    """Resumable processing pass over one recorded session.
 
-    Pure with respect to the camera: it reads only what the sweep wrote. Safe to
-    run repeatedly -- the processing counters are cleared first and the CSV is
-    rewritten from scratch, so re-running after a model change gives a clean
-    result rather than an appended second copy.
+    Exists in this shape because the FSM state that drives it must stay
+    responsive: it is called from ``run()`` a batch at a time, so every tick
+    stays bounded, the RViz panel gets a real progress count, and a mission with
+    thousands of samples cannot freeze the state machine. :func:`process_session`
+    wraps it for offline use, where running to completion in one call is fine.
 
-    ``predict_fn(vis, nir) -> (material, confidence)`` wraps the PredictMaterial
-    service; pass None to compute reflectance and quality without labelling
-    (which is also the offline path, where no ROS graph is running).
-
-    Rejected samples are written to the CSV like any other, with their status
-    and reason in dedicated columns. They are evidence of where the sweep
-    struggled, and dropping them -- which is what the CLI does -- is what makes
-    a bad wall indistinguishable from a wall nobody scanned.
+    Safe to run repeatedly on the same session: the processing counters are
+    cleared up front and the CSV is written to a temporary file that only
+    replaces the real one on :meth:`finish`, so an interrupted pass leaves the
+    previous report intact rather than a half-written one.
     """
-    calibration = load_calibration(session_dir)
-    if calibration is None:
-        raise FileNotFoundError(
-            f"no {CALIBRATION_FILENAME} in {session_dir}: the sweep never "
-            f"recorded its GDS/GRF, so reflectance cannot be computed"
-        )
 
-    gds_vis = np.asarray(calibration["gds_vis"], dtype=np.float64)
-    gds_nir = np.asarray(calibration["gds_nir"], dtype=np.float64)
-    grf_vis = np.asarray(calibration["grf_vis"], dtype=np.float64)
-    grf_nir = np.asarray(calibration["grf_nir"], dtype=np.float64)
+    # Consecutive PredictionUnavailable errors after which labelling is dropped
+    # for the rest of the pass. Without this, an ML node that is up but wedged
+    # costs the per-call timeout on every remaining sample -- minutes to hours
+    # on a real mission -- to produce nothing but rejections.
+    ML_FAILURE_LIMIT = 5
 
-    metrics = SweepMetrics.load(session_dir)
-    metrics.clear_processing()
+    def __init__(self, session_dir, predict_fn=None, limits=None,
+                 min_valid_fraction=0.5, logger=None,
+                 ml_failure_limit=ML_FAILURE_LIMIT):
+        self.session_dir = session_dir
+        self.predict_fn = predict_fn
+        self.limits = limits
+        self.min_valid_fraction = min_valid_fraction
+        self.logger = logger
+        self.ml_failure_limit = ml_failure_limit
 
-    vis_wls = vis_wavelengths()
-    nir_wls = nir_wavelengths()
-    csv_path = os.path.join(session_dir, REFLECTANCE_FILENAME)
-    tmp_csv = csv_path + ".tmp"
+        calibration = load_calibration(session_dir)
+        if calibration is None:
+            raise FileNotFoundError(
+                f"no {CALIBRATION_FILENAME} in {session_dir}: the sweep never "
+                f"recorded its GDS/GRF, so reflectance cannot be computed"
+            )
+        self._gds_vis = np.asarray(calibration["gds_vis"], dtype=np.float64)
+        self._gds_nir = np.asarray(calibration["gds_nir"], dtype=np.float64)
+        self._grf_vis = np.asarray(calibration["grf_vis"], dtype=np.float64)
+        self._grf_nir = np.asarray(calibration["grf_nir"], dtype=np.float64)
 
-    processed = 0
-    with open(tmp_csv, "w", newline="") as handle:
-        writer = csv.writer(handle)
+        self.metrics = SweepMetrics.load(session_dir)
+        self.metrics.clear_processing()
+
+        self.processed = 0
+        self.done = False
+        self._ml_consecutive_failures = 0
+        self._ml_disabled = False
+
+        # Counted up front so the caller can show progress. One cheap pass over
+        # the file; the spectra are not parsed.
+        self.total = self._count_capturable(session_dir)
+
+        self._csv_path = os.path.join(session_dir, REFLECTANCE_FILENAME)
+        self._tmp_path = self._csv_path + ".tmp"
+        self._handle = open(self._tmp_path, "w", newline="")
+        self._writer = csv.writer(self._handle)
+        self._writer.writerow(self._header())
+        self._samples = read_raw_samples(session_dir)
+
+    @staticmethod
+    def _count_capturable(session_dir):
+        """Number of raw lines that carry a spectrum to process."""
+        path = os.path.join(session_dir, RAW_FILENAME)
+        if not os.path.isfile(path):
+            return 0
+        count = 0
+        with open(path) as handle:
+            for line in handle:
+                # Substring test rather than a full JSON parse: this runs over
+                # every line of a mission-long file just to size a progress bar.
+                if '"outcome": "ok"' in line:
+                    count += 1
+        return count
+
+    @staticmethod
+    def _header():
         header = [
             "Seq", "Timestamp", "Wall_Index", "Line_Idx", "Seg_Idx",
             "Trigger_Idx", "Travel_m", "Frame", "X", "Y", "Z",
             "Status", "Reason", "Material", "Confidence",
         ]
-        header += [f"VIS_{wl:.1f}" for wl in vis_wls]
-        header += [f"NIR_{wl:.1f}" for wl in nir_wls]
-        writer.writerow(header)
+        header += [f"VIS_{wl:.1f}" for wl in vis_wavelengths()]
+        header += [f"NIR_{wl:.1f}" for wl in nir_wavelengths()]
+        return header
 
-        for row in read_raw_samples(session_dir):
+    def step(self, budget=25):
+        """Process up to ``budget`` samples. Returns how many were handled.
+
+        Sets ``self.done`` when the record is exhausted; the caller then calls
+        :meth:`finish`.
+        """
+        if self.done:
+            return 0
+        handled = 0
+        while handled < budget:
+            row = next(self._samples, None)
+            if row is None:
+                self.done = True
+                break
             if row.get("outcome") != OK:
-                # A capture that never produced a spectrum. Already counted on
-                # the collection side during the sweep; nothing to process.
+                # Never produced a spectrum. Already counted on the collection
+                # side during the sweep; nothing to process here.
                 continue
-            vis_raw = row.get("vis")
-            nir_raw = row.get("nir")
-            if vis_raw is None or nir_raw is None:
+            if row.get("vis") is None or row.get("nir") is None:
                 continue
+            self._process_one(row)
+            handled += 1
+            self.processed += 1
+        return handled
 
-            wall_index = row.get("wall_index")
-            line_idx = row.get("line_idx")
-            seg_idx = row.get("seg_idx")
-            processed += 1
+    def _process_one(self, row):
+        wall_index = row.get("wall_index")
+        line_idx = row.get("line_idx")
+        seg_idx = row.get("seg_idx")
 
-            vis_norm, vis_ok, vis_reason = reflectance(
-                vis_raw, gds_vis, grf_vis, min_valid_fraction)
-            nir_norm, nir_ok, nir_reason = reflectance(
-                nir_raw, gds_nir, grf_nir, min_valid_fraction)
+        vis_norm, vis_ok, vis_reason = reflectance(
+            row["vis"], self._gds_vis, self._grf_vis, self.min_valid_fraction)
+        nir_norm, nir_ok, nir_reason = reflectance(
+            row["nir"], self._gds_nir, self._grf_nir, self.min_valid_fraction)
 
-            material, confidence = "", ""
-            if not (vis_ok and nir_ok):
-                status = REJECTED_CALIBRATION
-                reason = vis_reason or nir_reason
+        material, confidence = "", ""
+        if not (vis_ok and nir_ok):
+            status = REJECTED_CALIBRATION
+            reason = vis_reason or nir_reason
+        else:
+            stable, reason = check_stability(vis_norm, nir_norm, self.limits)
+            if not stable:
+                status = REJECTED_STABILITY
+            elif self.predict_fn is None or self._ml_disabled:
+                status, reason = ACCEPTED, ""
             else:
-                stable, reason = check_stability(vis_norm, nir_norm, limits)
-                if not stable:
-                    status = REJECTED_STABILITY
-                elif predict_fn is None:
-                    status = ACCEPTED
-                    reason = ""
-                else:
-                    try:
-                        material, confidence = predict_fn(vis_norm, nir_norm)
-                    except Exception as exc:            # noqa: BLE001
-                        material, confidence = "", ""
-                        status, reason = REJECTED_ML, f"predict failed: {exc}"
-                    else:
-                        if is_ml_rejection(material):
-                            status = REJECTED_ML
-                            reason = f"model returned {material!r}"
-                            material = ""
-                        else:
-                            status, reason = ACCEPTED, ""
+                status, reason, material, confidence = self._predict(
+                    vis_norm, nir_norm)
 
-            metrics.record_processing(
-                wall_index, line_idx, seg_idx, status, reason)
+        self.metrics.record_processing(
+            wall_index, line_idx, seg_idx, status, reason)
 
-            pose = row.get("pose") or [None, None, None]
-            data_row = [
-                row.get("seq"), row.get("t"), wall_index, line_idx, seg_idx,
-                row.get("trigger_idx"), row.get("travel_m"), row.get("frame"),
-                pose[0], pose[1], pose[2],
-                status, reason, material, confidence,
-            ]
-            data_row += [f"{v:.6f}" for v in vis_norm]
-            data_row += [f"{v:.6f}" for v in nir_norm]
-            writer.writerow(data_row)
+        pose = row.get("pose") or [None, None, None]
+        data_row = [
+            row.get("seq"), row.get("t"), wall_index, line_idx, seg_idx,
+            row.get("trigger_idx"), row.get("travel_m"), row.get("frame"),
+            pose[0], pose[1], pose[2],
+            status, reason, material, confidence,
+        ]
+        data_row += [f"{v:.6f}" for v in vis_norm]
+        data_row += [f"{v:.6f}" for v in nir_norm]
+        self._writer.writerow(data_row)
 
-    os.replace(tmp_csv, csv_path)
-    metrics_path = metrics.save(
-        session_dir,
-        extra={"processed_at": _utc_now(), "processed_samples": processed},
-    )
-    if logger is not None:
-        logger.info(metrics.summary_line("mission"))
-        reasons = metrics.reject_reasons()
-        if reasons:
-            top = ", ".join(f"{k} x{v}" for k, v in list(reasons.items())[:5])
-            logger.info(f"hyperspectral rejection reasons: {top}")
+    def _predict(self, vis_norm, nir_norm):
+        """Label one sample, tripping the breaker if the service stops answering."""
+        try:
+            material, confidence = self.predict_fn(vis_norm, nir_norm)
+        except PredictionUnavailable as exc:
+            self._ml_consecutive_failures += 1
+            if self._ml_consecutive_failures >= self.ml_failure_limit:
+                self._ml_disabled = True
+                if self.logger is not None:
+                    self.logger.warn(
+                        f"ML service failed {self._ml_consecutive_failures} times "
+                        f"in a row; labelling is off for the rest of this pass. "
+                        f"Reflectance and coverage metrics are unaffected, and "
+                        f"labels can be added later from the same raw file."
+                    )
+            return REJECTED_ML, f"ML service unavailable: {exc}", "", ""
+        except Exception as exc:            # noqa: BLE001
+            # A bug in the model or the wrapper: real, but not a reason to stop.
+            return REJECTED_ML, f"predict failed: {exc}", "", ""
 
-    return {
-        "session_dir": session_dir,
-        "reflectance_csv": csv_path,
-        "metrics_json": metrics_path,
-        "processed_samples": processed,
-        "metrics": metrics,
-    }
+        self._ml_consecutive_failures = 0
+        if is_ml_rejection(material):
+            return REJECTED_ML, f"model returned {material!r}", "", ""
+        return ACCEPTED, "", material, confidence
+
+    def finish(self):
+        """Publish the report: swap in the CSV and save the metrics."""
+        self._handle.close()
+        os.replace(self._tmp_path, self._csv_path)
+        metrics_path = self.metrics.save(
+            self.session_dir,
+            extra={"processed_at": _utc_now(),
+                   "processed_samples": self.processed,
+                   "labelling_aborted": self._ml_disabled},
+        )
+        if self.logger is not None:
+            self.logger.info(self.metrics.summary_line("mission"))
+            reasons = self.metrics.reject_reasons()
+            if reasons:
+                top = ", ".join(f"{k} x{v}" for k, v in list(reasons.items())[:5])
+                self.logger.info(f"hyperspectral rejection reasons: {top}")
+        return {
+            "session_dir": self.session_dir,
+            "reflectance_csv": self._csv_path,
+            "metrics_json": metrics_path,
+            "processed_samples": self.processed,
+            "metrics": self.metrics,
+            "labelling_aborted": self._ml_disabled,
+        }
+
+    def close(self):
+        """Abandon the pass without touching the existing report."""
+        if self._handle is not None and not self._handle.closed:
+            self._handle.close()
+        if os.path.isfile(self._tmp_path):
+            try:
+                os.remove(self._tmp_path)
+            except OSError:
+                pass
+
+
+def process_session(session_dir, predict_fn=None, limits=None,
+                    min_valid_fraction=0.5, logger=None):
+    """Process a whole session in one call.
+
+    The offline entry point, and the one the tests use. The FSM drives
+    :class:`SessionProcessor` directly instead, so it can process in batches
+    without blocking the state machine.
+
+    Pure with respect to the camera: it reads only what the sweep wrote, so a
+    mission can be re-processed days later, on another machine, with a retrained
+    model. Rejected samples are written to the CSV like any other, with their
+    status and reason -- they are evidence of where the sweep struggled, and
+    dropping them is what makes a bad wall indistinguishable from an unscanned one.
+    """
+    processor = SessionProcessor(
+        session_dir, predict_fn=predict_fn, limits=limits,
+        min_valid_fraction=min_valid_fraction, logger=logger)
+    try:
+        while not processor.done:
+            processor.step(budget=256)
+    except BaseException:
+        processor.close()
+        raise
+    return processor.finish()

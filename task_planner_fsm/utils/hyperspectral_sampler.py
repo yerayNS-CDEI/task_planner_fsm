@@ -564,27 +564,8 @@ class HyperspectralSampler:
                          trigger_idx=trigger_idx, travel_m=travel)
             return
 
-        if result is None:
-            self._record(ctx, hp.FAILED_NO_RESPONSE, xyz,
-                         detail="service returned no result",
-                         trigger_idx=trigger_idx, travel_m=travel)
-            return
-        if not (result.vis_ok and result.nir_ok):
-            self._record(
-                ctx, hp.FAILED_SENSOR, xyz,
-                detail=(f"vis_ok={result.vis_ok} status={result.vis_status}, "
-                        f"nir_ok={result.nir_ok} status={result.nir_status}: "
-                        f"{result.message}"),
-                trigger_idx=trigger_idx, travel_m=travel)
-            return
-        vis, nir = list(result.vis_spectrum), list(result.nir_spectrum)
-        if len(vis) != hp.SPECTRUM_LENGTH or len(nir) != hp.SPECTRUM_LENGTH:
-            # A short spectrum is a truncated TCP frame, not a short reading.
-            self._record(ctx, hp.FAILED_LENGTH, xyz,
-                         detail=f"vis={len(vis)}, nir={len(nir)}",
-                         trigger_idx=trigger_idx, travel_m=travel)
-            return
-        self._record(ctx, hp.OK, xyz, vis=vis, nir=nir,
+        outcome, detail, vis, nir = hp.classify_capture(result)
+        self._record(ctx, outcome, xyz, detail=detail, vis=vis, nir=nir,
                      trigger_idx=trigger_idx, travel_m=travel)
 
     def _record(self, ctx, outcome, xyz, detail="", vis=None, nir=None,

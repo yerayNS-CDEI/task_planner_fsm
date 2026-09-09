@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+
+import sys
+
+from task_planner_fsm.hyperspectral_bench import main
+
+
+if __name__ == "__main__":
+    sys.exit(main())

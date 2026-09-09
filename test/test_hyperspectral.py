@@ -7,6 +7,7 @@ touching the camera.
 """
 
 import json
+import os
 import types
 
 import numpy as np
@@ -430,3 +431,154 @@ def test_sampling_without_a_calibration_is_refused(tmp_path):
 def test_sampling_is_off_by_default():
     """Mirrors gpr_enabled: the hardware is not on the robot for every mission."""
     assert HyperspectralSampler.enabled({}) is False
+
+
+# ----------------------------------------------------------------------
+# Resumable processing
+# ----------------------------------------------------------------------
+def _recorded_session(rig, distance_m=1.0):
+    """Record a sweep and return its session directory."""
+    _sweep(rig, distance_m=distance_m)
+    rig.sampler.stop_line(rig.ctx)
+    rig.sampler.abort(rig.ctx)
+    return rig.ctx["hyperspectral_session_dir"]
+
+
+def test_processing_can_be_pumped_a_batch_at_a_time(rig):
+    """The FSM state drives this from run(), so no single call may process the
+    whole mission."""
+    session = _recorded_session(rig)
+    processor = hp.SessionProcessor(session)
+    assert processor.total == 9
+
+    assert processor.step(budget=4) == 4
+    assert processor.processed == 4 and not processor.done
+    assert processor.step(budget=4) == 4
+    assert processor.processed == 8 and not processor.done
+    processor.step(budget=4)
+    assert processor.done
+
+    result = processor.finish()
+    assert result["processed_samples"] == 9
+    assert result["metrics"].totals()[hp.ACCEPTED] == 9
+
+
+def test_an_abandoned_pass_leaves_the_previous_report_intact(rig):
+    """An error transition mid-pass must not replace a good CSV with a partial
+    one."""
+    session = _recorded_session(rig)
+    first = hp.process_session(session, predict_fn=lambda v, n: ("Guix", 0.9))
+    original = open(first["reflectance_csv"]).read()
+
+    processor = hp.SessionProcessor(session, predict_fn=lambda v, n: ("Other", 0.9))
+    processor.step(budget=3)
+    processor.close()
+
+    assert open(first["reflectance_csv"]).read() == original
+    assert not os.path.exists(first["reflectance_csv"] + ".tmp")
+
+
+def test_the_ml_breaker_trips_after_repeated_service_failures(rig):
+    """An ML node that is up but wedged would otherwise cost the per-call
+    timeout on every remaining sample of the mission."""
+    session = _recorded_session(rig)
+    calls = []
+
+    def dead_service(vis, nir):
+        calls.append(1)
+        raise hp.PredictionUnavailable("no reply within 5.0 s")
+
+    processor = hp.SessionProcessor(
+        session, predict_fn=dead_service, ml_failure_limit=3)
+    while not processor.done:
+        processor.step(budget=4)
+    result = processor.finish()
+
+    # Tried three times, then stopped asking for the remaining six samples.
+    assert len(calls) == 3
+    assert result["labelling_aborted"] is True
+    totals = result["metrics"].totals()
+    assert totals[hp.REJECTED_ML] == 3
+    # The samples after the breaker tripped are still good data, just unlabelled.
+    assert totals[hp.ACCEPTED] == 6
+
+
+def test_the_ml_breaker_ignores_a_model_that_merely_rejects(rig):
+    """A rejection is a verdict about the spectrum, not a transport failure. It
+    must never stop the pass."""
+    session = _recorded_session(rig)
+    processor = hp.SessionProcessor(
+        session,
+        predict_fn=lambda v, n: ("REBUTJAT_BAIXA_CONFIANCA", 0.2),
+        ml_failure_limit=3,
+    )
+    while not processor.done:
+        processor.step(budget=4)
+    result = processor.finish()
+    assert result["labelling_aborted"] is False
+    assert result["metrics"].totals()[hp.REJECTED_ML] == 9
+
+
+def test_an_intermittent_ml_service_does_not_trip_the_breaker(rig):
+    """Only CONSECUTIVE failures count; a service that recovers keeps labelling."""
+    session = _recorded_session(rig)
+    state = {"n": 0}
+
+    def flaky(vis, nir):
+        state["n"] += 1
+        if state["n"] % 2:
+            raise hp.PredictionUnavailable("timeout")
+        return "Guix", 0.9
+
+    processor = hp.SessionProcessor(session, predict_fn=flaky, ml_failure_limit=3)
+    while not processor.done:
+        processor.step(budget=4)
+    result = processor.finish()
+    assert result["labelling_aborted"] is False
+    totals = result["metrics"].totals()
+    assert totals[hp.ACCEPTED] > 0 and totals[hp.REJECTED_ML] > 0
+
+
+# ----------------------------------------------------------------------
+# The processing state's phase machine
+# ----------------------------------------------------------------------
+def test_the_processing_state_walks_its_phases_without_blocking(rig):
+    """Each tick does bounded work; the FSM keeps ticking throughout."""
+    from task_planner_fsm.states.sensor_data_processing import SensorDataProcessing
+
+    session = _recorded_session(rig)
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = {
+        "node": rig.node,
+        "hyperspectral_session_dir": session,
+        "hyperspectral_predict_material": False,   # no ML service in this test
+        "hyperspectral_batch_size": 4,
+    }
+    state.on_enter(ctx)
+    assert state._phase == "hyperspectral"
+
+    ticks = 0
+    while state._phase == "hyperspectral" and ticks < 20:
+        state.run(ctx)
+        ticks += 1
+    # 9 samples at 4 per tick cannot have been done in one call.
+    assert ticks >= 3, f"processed too eagerly in {ticks} tick(s)"
+    assert ctx["hyperspectral_processed"] is True
+    assert ctx["hyperspectral_totals"][hp.ACCEPTED] == 9
+    # The GPR phase is a stub today and must fall straight through to the
+    # external service rather than stalling the state.
+    state.run(ctx)
+    assert state._phase == "external"
+
+
+def test_the_processing_state_skips_hyperspectral_when_nothing_was_recorded():
+    """A mission with sampling disabled must walk straight past the phase."""
+    from task_planner_fsm.states.sensor_data_processing import SensorDataProcessing
+
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = {"node": _Node(_Client())}
+    state.on_enter(ctx)
+    state.run(ctx)
+    assert state._phase == "gpr"
+    state.run(ctx)
+    assert state._phase == "external"
