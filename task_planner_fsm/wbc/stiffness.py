@@ -62,16 +62,19 @@ class ContactStiffness:
     returns the current estimate in N/m, which is also available as ``value``.
     """
 
-    def __init__(self, floor=2000.0, ceiling=5.0e4, tau=3.0,
+    def __init__(self, floor=2.0e4, ceiling=5.0e4, tau=3.0,
                  min_travel_sigma=2.0e-5, min_samples=8.0):
         # What the row assumes before it has learned anything, and the value a
-        # fit is never allowed to go below. 2000 N/m is deliberately stiffer
-        # than the ~500 N/m the caster bars flexing would suggest: the bars
-        # bottom out, and past that the plate is loading concrete at ~2e4, so a
-        # single linear stiffness that has to cover both should sit toward the
-        # stiff end. At 2000 with alpha = 1 the bound is 12.5 mm/s at the 5 N
-        # target and 2.5 mm/s at 25 N, which binds late and hard — the shape
-        # the row wants.
+        # fit is never allowed to go below. Concrete through a hard wheel, the
+        # same ~2e4 N/m the press's own gain is sized against — not the 2000
+        # it was, which was a floor for the caster bars flexing. The bars
+        # bottom out, and on 2026-09-14 the fit had no time to converge before
+        # the plate was loading concrete: at 2000 the row allowed 13 mm/s of
+        # approach with 3.6 N on the wheel, and the wall then made 26 N in one
+        # 140 ms cycle. At 2e4 with alpha = 1 the bound is 1.25 mm/s at the
+        # 5 N target and 0.25 mm/s at 25 N. That is tight enough that the row
+        # is only built while the wheel is LOADED (see the sweep node): at 0 N
+        # it would cap the whole approach at 1.5 mm/s.
         self.floor = float(floor)
         # Only to stop a fit driven by noise from clamping the press to a stop.
         # Above concrete's own ~2e4, so it never binds on a real surface.

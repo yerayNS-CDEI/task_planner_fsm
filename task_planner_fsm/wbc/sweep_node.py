@@ -307,7 +307,18 @@ class WholeBodySweepNode(Node):
         # assumes before it has learned anything, and conservative here means
         # HIGH: overestimating K_e tightens the bound and costs a slow press,
         # underestimating it loosens the bound and costs the plate.
-        self.declare_parameter("press_stiffness_floor", 2000.0)     # N/m
+        #
+        # 2e4, not the 2000 it was. On 2026-09-14 the fit never converged (the
+        # press was overloaded 0.6 s after it began) and the row ran on its
+        # floor throughout — which at 2000 N/m allowed 13 mm/s of approach with
+        # 3.6 N already on the wheel, against a wall that then made 26 N in a
+        # single 140 ms cycle. That is a floor for the caster bars flexing, not
+        # for the concrete they bottom out against, and the press's own gain
+        # is sized against 2e4 for exactly that surface. At 2e4 the row only
+        # makes sense while the wheel is LOADED — at 0 N it would cap the
+        # whole approach at 1.5 mm/s — so it is now built only in PRESS; the
+        # approach schedule bounds the closing speed on distance until then.
+        self.declare_parameter("press_stiffness_floor", 2.0e4)      # N/m
         self.declare_parameter("press_stiffness_ceiling", 5.0e4)    # N/m
         self.declare_parameter("press_stiffness_tau", 3.0)          # s
         # Every time constant below is in SECONDS, not cycles. They used to be
@@ -2094,9 +2105,15 @@ class WholeBodySweepNode(Node):
                                         name="obstacle"))
         force_alpha = float(p("press_force_alpha").value)
         self.force_cap = float("inf")
-        if self.press is not None and force_alpha > 0.0 and self.press.state != TARE:
-            # Not during TARE: the bias has not been measured yet, so the force
-            # in the barrier would be a payload offset rather than a contact.
+        if self.press is not None and force_alpha > 0.0 and self.press.state == PRESS:
+            # Only while LOADED. Before contact the force is noise and the row
+            # would bound the approach by headroom over a wall that is not
+            # there — at a concrete-stiff floor that is 1.5 mm/s from 22 cm
+            # out, a two-minute approach. The schedule bounds the approach on
+            # DISTANCE, which is the sensor that actually knows the gap; this
+            # row takes over once the wheel is on the wall and the force is
+            # the sensor that knows. (In TARE the bias is not yet measured
+            # either, so that case was already excluded.)
             normal_row = m_hat @ J[:3, :]
             rows, lower = force_limit_rows(
                 normal_row, self.press.force, self.press.force_limit,
