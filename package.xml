@@ -15,6 +15,19 @@
   <exec_depend>navi_wall</exec_depend>
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>arm_control</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <!-- Sensor processing (task_planner_fsm/sensors). The vendored DISCOVER
+       pipelines also need obspy, torch, torchvision, openpyxl and xgboost,
+       which have no rosdep keys: pip install -r requirements-sensors.txt -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pandas</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-sklearn</exec_depend>
+  <exec_depend>python3-joblib</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

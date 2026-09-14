@@ -1,0 +1,7 @@
+../GPRTools/              Shared supplied GPRTools snapshot at parent level; only optional-dependency import guards are documented in GPRTools/CHANGES_DISCOVER.md.
+tahzeeb_original/*.py     Supplied Tahzeeb post-processing/tiling/inference files; preserved unchanged.
+tahzeeb_original/config.yaml  Exact config.yaml supplied by Tahzeeb on 2026-09-10; preserved unchanged.
+models/best.pt            Exact Mask R-CNN ResNet101 weights supplied on 2026-09-10.
+gpr_integration/          New DISCOVER robot-integration/orchestration code.
+run_gpr_pipeline.py       New CLI wrapper.
+check_setup.py             New setup/consistency check.

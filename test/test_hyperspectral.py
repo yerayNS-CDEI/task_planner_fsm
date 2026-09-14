@@ -136,7 +136,7 @@ def rig(tmp_path):
         client.calls[-1][1].settle(response)
     assert sampler.calibration_ready(ctx)
     return types.SimpleNamespace(
-        sampler=sampler, ctx=ctx, node=node, client=client)
+        sampler=sampler, ctx=ctx, node=node, client=client, tmp_path=tmp_path)
 
 
 def _sweep(rig, distance_m, step_m=0.02, respond=_ok_response,
@@ -436,6 +436,47 @@ def test_sampling_is_off_by_default():
 # ----------------------------------------------------------------------
 # Resumable processing
 # ----------------------------------------------------------------------
+def test_the_raw_record_carries_a_map_pose_next_to_the_sweep_frame_pose(rig):
+    """An arm sweep measures in arm_base, which the base carries away between
+    partitions; the POKEYE clustering needs where the sample was in the world,
+    looked up at capture time."""
+    plate = [0.0, 0.0, 1.0]
+
+    def pose_fn(frame, timeout):
+        # arm_base is offset from map by (10, 20) in this rig.
+        return tuple(plate) if frame == "arm_base" else (plate[0] + 10.0, plate[1] + 20.0, plate[2])
+
+    rig.sampler.start_line(rig.ctx, (0.0, 0.0), (0.2, 0.0), pose_fn=pose_fn,
+                           ref="arm_base", axis=(1.0, 0.0, 0.0),
+                           wall_index=3, line_idx=0, seg_idx=1)
+    tick = rig.node.timers[-1].callback
+    for i in range(1, 7):                  # 0.02 m steps: the first capture lands at 0.10
+        plate[0] = round(0.02 * i, 2)
+        tick()
+        request, future = rig.client.calls[-1]
+        if request.command == "GSM" and not future.done():
+            future.settle(_ok_response())
+            break
+    assert plate[0] == 0.10
+    rig.sampler.stop_line(rig.ctx)
+    rig.sampler.abort(rig.ctx)
+
+    rows = [r for r in hp.read_raw_samples(rig.ctx["hyperspectral_session_dir"])
+            if r["outcome"] == hp.OK]
+    assert len(rows) == 1
+    assert rows[0]["frame"] == "arm_base"
+    assert rows[0]["pose"] == [0.1, 0.0, 1.0]
+    assert rows[0]["pose_map"] == [10.1, 20.0, 1.0]
+
+    # And the reflectance CSV exposes both.
+    result = hp.process_session(rig.ctx["hyperspectral_session_dir"])
+    with open(result["reflectance_csv"]) as handle:
+        header = handle.readline().strip().split(",")
+        data = handle.readline().strip().split(",")
+    row = dict(zip(header, data))
+    assert (row["X"], row["Map_X"], row["Map_Y"]) == ("0.1", "10.1", "20.0")
+
+
 def _recorded_session(rig, distance_m=1.0):
     """Record a sweep and return its session directory."""
     _sweep(rig, distance_m=distance_m)
@@ -551,8 +592,11 @@ def test_the_processing_state_walks_its_phases_without_blocking(rig):
     ctx = {
         "node": rig.node,
         "hyperspectral_session_dir": session,
-        "hyperspectral_predict_material": False,   # no ML service in this test
         "hyperspectral_batch_size": 4,
+        "sensor_data_dir": str(rig.tmp_path / "data"),
+        # No classifier on this machine: the phase must skip, not stall.
+        "hsi_model_path": str(rig.tmp_path / "missing.joblib"),
+        "gpr_processing_enabled": False,
     }
     state.on_enter(ctx)
     assert state._phase == "hyperspectral"
@@ -565,20 +609,48 @@ def test_the_processing_state_walks_its_phases_without_blocking(rig):
     assert ticks >= 3, f"processed too eagerly in {ticks} tick(s)"
     assert ctx["hyperspectral_processed"] is True
     assert ctx["hyperspectral_totals"][hp.ACCEPTED] == 9
-    # The GPR phase is a stub today and must fall straight through to the
-    # external service rather than stalling the state.
+    # Reflectance done -> classification (skipped: no model) -> GPR (disabled)
+    # -> decision. Nothing was classified, so POKEYE is not required and the
+    # state is done: no mock service is consulted on a real-robot run.
+    assert state._phase == "hsi_classify"
     state.run(ctx)
-    assert state._phase == "external"
+    assert state._phase == "gpr"
+    state.run(ctx)
+    assert state._phase == "decision"
+    state.run(ctx)
+    assert state._phase == "done"
+    assert ctx["data_processed"] is True
+    assert ctx["drilling_required"] is False
+    assert ctx["pokeye_targets"] == []
+    assert state.check_transition(ctx) == "ArmFolding"
 
 
-def test_the_processing_state_skips_hyperspectral_when_nothing_was_recorded():
+def test_the_processing_state_skips_hyperspectral_when_nothing_was_recorded(tmp_path):
     """A mission with sampling disabled must walk straight past the phase."""
     from task_planner_fsm.states.sensor_data_processing import SensorDataProcessing
 
     state = SensorDataProcessing("SensorDataProcessing")
-    ctx = {"node": _Node(_Client())}
+    ctx = {"node": _Node(_Client()), "sensor_data_dir": str(tmp_path),
+           "gpr_processing_enabled": False}
     state.on_enter(ctx)
     state.run(ctx)
     assert state._phase == "gpr"
     state.run(ctx)
+    assert state._phase == "decision"
+    state.run(ctx)
+    assert state._phase == "done"
+    assert ctx["drilling_required"] is False
+
+
+def test_the_processing_state_keeps_the_mock_service_in_simulation(tmp_path):
+    """Gazebo has no sensor data; the legacy /sensor_data_processing mock still
+    decides there so the FSM keeps walking the SendDataToPokeye cycle."""
+    from task_planner_fsm.states.sensor_data_processing import SensorDataProcessing
+
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = {"node": _Node(_Client()), "sim": True, "sensor_data_dir": str(tmp_path),
+           "gpr_processing_enabled": False}
+    state.on_enter(ctx)
+    for _ in range(3):
+        state.run(ctx)
     assert state._phase == "external"

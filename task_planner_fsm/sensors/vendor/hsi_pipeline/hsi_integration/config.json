@@ -1,0 +1,6 @@
+{
+  "confidence_threshold": 0.8,
+  "output_root": "outputs",
+  "model_path": "benjamin_original/classifier.joblib",
+  "keep_columns": ["Measure Type", "Date", "Time", "Label", "Class", "Counter"]
+}

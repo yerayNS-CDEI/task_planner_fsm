@@ -1,0 +1,131 @@
+# ============================================================================
+# GPR post-processing configuration
+# Edit the CALIBRATION block with your Proceq GP8800 survey settings.
+# Values left at the defaults are PLACEHOLDERS and must be confirmed per survey.
+# ============================================================================
+
+io:
+  detections_csv: 'C:\Users\tahze\Documents\PhD_GPR\results\inference\maskrcnn_inference\coco_real_only\Resnet101\resnet101_real_only_s42_initseed42_Real_CDEI_Lab_castelldefels_wall_overlap035_tiles_v9-masks\detections.csv'          # your inference output
+  crop_manifest: 'C:\Users\tahze\Documents\PhD_GPR\data\upc_1_data_building_lands_roads_random\2026_02_20_C_Real_CDEI_Lab_Castelldefels_Wall\Real_CDEI_Lab_castelldefels_wall_overlap020_tiles_v9\crop_manifest.csv'         # v9 tiler manifest (rename your crop_manifest_<timestamp>.csv to this, or set the path); comment out if unavailable      # input: model detections (image,class,confidence,x1,y1,x2,y2,inference_ms)
+  masks_file: 'C:\Users\tahze\Documents\PhD_GPR\results\inference\maskrcnn_inference\coco_real_only\Resnet101\resnet101_real_only_s42_initseed42_Real_CDEI_Lab_castelldefels_wall_overlap035_tiles_v9-masks\masks.json'                    # set to results/inference/masks.json (from inference --save-masks) for per-object velocity fitting
+  results_dir: 'C:\Users\tahze\Documents\PhD_GPR\post_processing\results'   # absolute: avoids a stray post_processing\results dir when run from the package folder
+  bscan_images:        # OPTIONAL: per-element full B-scan PNGs for the step-5 overlays (set to your paths)
+    floor001:  'C:\Users\tahze\Documents\PhD_GPR\data\upc_1_data_building_lands_roads_random\2026_02_20_C_Real_CDEI_Lab_Castelldefels_Wall\Real_CDEI_Lab_castelldefels_wall_overlap020\floor001_20260219_133707_20260224_124005.png'
+    Wall_1001: 'C:\Users\tahze\Documents\PhD_GPR\data\upc_1_data_building_lands_roads_random\2026_02_20_C_Real_CDEI_Lab_Castelldefels_Wall\Real_CDEI_Lab_castelldefels_wall_overlap020\Wall_1001_20260219_105033_20260224_123736.png'
+    Wall_2001: 'C:\Users\tahze\Documents\PhD_GPR\data\upc_1_data_building_lands_roads_random\2026_02_20_C_Real_CDEI_Lab_Castelldefels_Wall\Real_CDEI_Lab_castelldefels_wall_overlap020\Wall_2001_20260219_114240_20260224_123905.png'
+    Wall_3001: 'C:\Users\tahze\Documents\PhD_GPR\data\upc_1_data_building_lands_roads_random\2026_02_20_C_Real_CDEI_Lab_Castelldefels_Wall\Real_CDEI_Lab_castelldefels_wall_overlap020\Wall_3001_20260219_123239_20260224_123940.png'
+  # OPTIONAL — embedded into gpr_data.json by 04_export.py --embed-images so the platform
+  # loads them on import (set your real paths; leave commented to skip / upload manually).
+  # element_photos:        # site photo per element  (platform key: <id>)
+  #   Wall_2001: 'C:\path\to\Wall_2001_photo.jpg'
+  # element_drawings:      # element elevation/drawing per element (platform key: draw_<id>)
+  #   Wall_2001: 'C:\path\to\Wall_2001_elevation.png'
+  site_plan: 'C:\Users\tahze\Documents\PhD_GPR\Research_paper\drawings_rawdata\castelldefelsfloorplan\cdei_dra.png'   # whole-site drawing (platform key: plan)
+  seed: 42
+
+# --- tiling geometry (must match the tiler that produced the detections) ----
+tiling:
+  tile_size: 640        # px (square sliding window, imgsz)
+  overlap_x: 0.35       # horizontal overlap fraction used during tiling
+  overlap_y: 0.0        # vertical overlap fraction
+  # grid index is parsed from the image name pattern ..._r{row}_c{col}.png
+
+# --- step 1: consolidation -------------------------------------------------
+consolidate:
+  envelope_width_factor: 2.0   # drop boxes wider than factor x median width (spurious multi-hyperbola envelopes)
+  nms_iou: 0.45                # class-agnostic NMS IoU threshold for de-duplication across tile overlaps
+  min_confidence: 0.25         # discard detections below this score
+  # --- opt-in extra filters (added 2026-06-15; defaults are NO-OP so the validated
+  #     gold-standard output is unchanged until you enable them) -----------------
+  nms_iomin: null              # intersection-over-min-area suppression: kills a smaller box
+                               # mostly CONTAINED in a higher-conf one (wrongly-overlapping
+                               # detections on ONE object that plain IoU misses). Try 0.70.
+  fill_rate_max: null          # drop boxes whose area exceeds this fraction of one tile
+                               # (spurious envelope blobs). Try 0.10. null = off.
+  mask_overlap_iomin: 0.8      # REAL polygon mask-overlap suppression (needs masks_file with
+                               # full polygons). Drops the lower-confidence of any pair whose
+                               # masks overlap > this fraction of the smaller mask (confidence-
+                               # ranked, so the strong hyperbola is kept). ADOPTED 2026-06-15,
+                               # candidate-validated on the radargrams: removes Wall_1001 crossing-
+                               # leg artifacts (lower layer) + Wall_3001 double-detections, while
+                               # genuine evenly-spaced rebar (floor001) is spared at >=0.7.
+                               # Keep MODERATE-HIGH (0.7-0.8); at 0.5 it removed genuine floor
+                               # rebar. Visualise with 05d_visualize_overlap.py. null = off.
+
+# --- CALIBRATION (set from GP8800!) ----------------------------------------
+calibration:
+  px_per_m: 200.0       # 2 scans/cm; PNG ~282 (floor 2400px/8.51m) to ~299 (wall 3000px/10.04m)
+  time_window_ns: 16.0  # GP8800 export (real)
+  image_height_px: 1200 # rendered B-scan height (655 native samples)
+  epsilon_r: 6.0
+  scan_distance_m:        # per-element survey length (m) from the GP8800 info.txt; px/m = source_w/scan_distance
+    floor001: 8.51
+    Wall_1001: 10.04
+    Wall_2001: 8.95       # TODO: set from Wall_2001 info.txt (falls back to default px_per_m)
+    Wall_3001: 8.63       # TODO: set from Wall_3001 info.txt        # concrete/masonry host (v = c/sqrt(eps_r) = 0.122 m/ns)
+  apex_frac: 0.15       # apex sits this fraction below the box top (y1 + frac*(y2-y1))
+                       # (used only as fallback when masks_file is absent)
+  pulse_offset_samples: 21  # half-pulse-width in SOURCE image pixels added to ridge min-y to
+                            # place the apex dot at the visually bright amplitude peak rather
+                            # than the leading edge (~0.28 ns, consistent with 1.6 GHz antenna)
+  antenna_freq_ghz: 1.6     # GP8800 centre frequency; sets the resolution gate (~lambda/4)
+                            # used by 02c_size_estimate.py to flag sub-resolution diameters
+
+# --- step 3: quantification ------------------------------------------------
+quantify:
+  element_overrides:     # your confirmed element types (override name-based guess)
+    floor001: floor_slab
+    Wall_1001: partition_pladur
+    Wall_2001: brick_wall
+    Wall_3001: retaining_wall
+  bar_diameter_mm: 12.0     # assumed reinforcement bar diameter for mass estimate
+  steel_density: 7850.0     # kg/m^3
+  layer_gap_cm: 3.0         # min depth gap to split into two reinforcement layers
+  min_layer_count: 2        # both clusters must have ≥ this many objects to report 2 layers
+                           # (Wall_3001 rear-face rebar forms a 2-object cluster; 5 was too strict)
+  element_height_m:         # second dimension (height/width) by element type for area/mass
+    wall: 3.0
+    partition: 3.0
+    floor_slab: 4.0
+    ground_slab: 4.0
+    column: 0.4
+    beam: 0.4
+    roof_slab: 4.0
+    foundation: 1.0
+    default: 3.0
+
+# --- economics (indicative EU recovered-material prices; localise) ---------
+economics:
+  steel_eur_per_kg: 0.40
+  brick_eur_per_m2: 14.0
+  co2_kg_per_kg_steel: 1.6
+
+# --- step 2b: duplicate-hyperbola removal (apex space) -----------------------
+dedup:
+  x_tol_m: 0.06        # two apices closer than this in distance ...
+  depth_tol_cm: 4.0    # ... AND this in depth are the same hyperbola -> keep best
+  max_depth_cm: 40.0   # drop reflectors deeper than this (ringing/multiples); raise for deep elements
+  multiple_removal: true           # remove first-order ringing multiples (~2x depth of a primary)
+  multiple_x_tol_m: 0.15          # horizontal search radius for primary-multiple pairing
+  multiple_ratio_min: 1.4          # depth ratio lower bound (2× ± 30%)
+  multiple_ratio_max: 2.6          # depth ratio upper bound
+  multiple_min_primary_conf: 0.70  # primary must exceed this confidence to trigger removal
+  max_depth_cm_by_element:
+    Wall_3001: 45      # thick RC retaining wall: 2 confirmed layers (6.9 cm front + 32.7 cm rear).
+                       # Objects at 25.6 cm and 39.7 cm are the rear rebar layer, NOT ringing multiples
+                       # (ringing would fall at exact 2x/3x of surface depths; these do not).
+                       # 45 cm drops anything genuinely outside the wall thickness.
+
+# --- step 2c: object-size (diameter) estimation from the mask ridge ----------
+size:
+  max_radius_m: 0.30   # upper bound for the fitted finite-radius parameter (30 cm radius)
+                       # diameter is flagged size_reliable=False when 2r < antenna resolution
+                       # (~lambda/4) or the fit CI half-width exceeds r. Rebar at 1.6 GHz is
+                       # below resolution -> geometric diameter is reported but flagged unreliable.
+  v_consistency_tol: 0.10  # max |v_app - v_medium|/v_medium for a radius to be trusted.
+                           # If the apparent (curvature) velocity disagrees with the calibrated
+                           # medium velocity by more than this, the "radius" is a velocity
+                           # discrepancy, not object size -> size_reliable=False.
+  max_rel_uncertainty: 0.50  # max diameter_ci/diameter for size_reliable=True (>= ~2 sigma from
+                             # zero). The CI includes the velocity-degeneracy term, so cm-scale
+                             # rebar at 1.6 GHz fails this and is honestly flagged unmeasurable.

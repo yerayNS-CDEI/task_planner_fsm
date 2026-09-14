@@ -1,0 +1,38 @@
+# DISCOVER / OLIWALL GPR line-segmentation configuration.
+# Paths are resolved relative to this file unless stated otherwise.
+
+preprocessing:
+  # For line detection the B-scan is intentionally NOT time-zero cropped and
+  # background removal is NOT applied. The detector sees only a gain-adjusted
+  # version of the complete acquisition so a shallow line cannot be cropped away.
+  gain_db: 40.0
+  plot:
+    colormap: gray
+    axes: false
+    plot_scale: 8.0
+    aspect_ratio: null
+    render_upsample: 3.0
+
+# Time zero is computed on the original raw matrix in a separate branch.
+# It is used only after line detection to translate image coordinates to
+# time/depth; it never crops the image passed to Berta's detector.
+time_zero_reference:
+  method: 2
+  threshold: 0.20
+  start_sample: 0
+  backup_samples: 0
+
+calibration:
+  # GPRTools/segy_info.py applies the Proceq-confirmed -4 ns correction.
+  expected_corrected_time_window_ns: 12.0
+  epsilon_r_assumed: 6.0
+  epsilon_r_basis: "representative concrete relative permittivity; assumed, not sensor-measured"
+  c_m_per_ns: 0.299792458
+  # Time-zero has priority over the line detector. Any detected line before
+  # time-zero is snapped exactly to time-zero (robot coordinate = 0).
+  clamp_before_time_zero: true
+
+outputs:
+  output_dir: outputs
+  save_annotated_image: true
+  save_time_zero_overlay: true

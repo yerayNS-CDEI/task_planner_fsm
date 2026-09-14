@@ -1,0 +1,33 @@
+# Python dependencies of the vendored DISCOVER sensor pipelines
+# (task_planner_fsm/sensors/vendor). Union of the delivered requirements.txt
+# files. The FSM boots without them; SensorDataProcessing skips the affected
+# phase with a warning until they are installed.
+#
+#   pip install -r requirements-sensors.txt
+#
+# On the Jetson install torch/torchvision from NVIDIA's aarch64 wheels instead
+# of PyPI, then the rest of this file.
+
+# shared
+# The delivered classifier.joblib was pickled with numpy >= 2 and scikit-learn
+# 1.8. It loads on numpy 1.24 / sklearn 1.7 (ROS Humble) thanks to a module
+# alias in task_planner_fsm/sensors/__init__.py, with an "unpickle from a newer
+# version" warning; matching versions on the Jetson are still preferable.
+numpy
+pandas
+scipy
+pyyaml
+pillow
+matplotlib
+opencv-python
+
+# GPR (GPRTools SEGY reader, Tahzeeb Mask R-CNN, audit workbook)
+obspy
+torch
+torchvision
+openpyxl
+
+# hyperspectral (Benjamin's XGBoost bundle)
+scikit-learn
+xgboost
+joblib

@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from example_interfaces.srv import SetBool
+from arm_control.srv import SendPokeyeTargets
 import time
 
 class MockServer(Node):
@@ -30,9 +31,9 @@ class MockServer(Node):
         self.get_logger().info("Server /sensor_data_processing ready.")
         self.get_logger().info("\033[1;32mUse: ros2 service call /sensor_data_processing example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
 
-        self.srv = self.create_service(SetBool, '/send_data_to_pokeye', self.handle_request_send_data_to_pokeye)
-        self.get_logger().info("Server /send_data_to_pokeye ready.")
-        self.get_logger().info("\033[1;32mUse: ros2 service call /send_data_to_pokeye example_interfaces/srv/SetBool \"{data: true}\"\033[0m")
+        # Stands in for the real POKEYE side: accepts every target it is handed.
+        self.srv = self.create_service(SendPokeyeTargets, '/send_data_to_pokeye', self.handle_request_send_data_to_pokeye)
+        self.get_logger().info("Server /send_data_to_pokeye ready (arm_control/srv/SendPokeyeTargets).")
 
     def handle_request_mapping(self, request, response):
         self.get_logger().info("Received request to start mapping.")
@@ -89,12 +90,19 @@ class MockServer(Node):
         return response
 
     def handle_request_send_data_to_pokeye(self, request, response):
-        self.get_logger().info("Received request to send data to Pokeye.")
+        n = len(request.positions)
+        self.get_logger().info(
+            f"Received {n} Pokeye target(s) for wall {request.wall_index} "
+            f"(session {request.session_id}, frame {request.frame_id}).")
+        for tid, pos, reason in zip(request.target_ids, request.positions, request.reasons):
+            self.get_logger().info(f"  {tid}: ({pos.x:.2f}, {pos.y:.2f}, {pos.z:.2f}) [{reason}]")
+        if request.request_json_path:
+            self.get_logger().info(f"  detail: {request.request_json_path}")
         delay = 1   # seconds
-        self.get_logger().info(f"Waiting {delay} seconds.")
         time.sleep(delay)
         response.success = True
-        response.message = "Data sent to Pokeye succesfully."
+        response.accepted_count = n
+        response.message = f"Mock Pokeye accepted {n} target(s)."
         return response
 
 def main(args=None):

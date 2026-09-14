@@ -548,11 +548,36 @@ class HyperspectralSampler:
         trigger_idx = self._trigger_count
         travel = self._travel
         sample_xyz = tuple(xyz)
+        # Looked up NOW, not in the done-callback: the plate keeps moving while
+        # the camera integrates, and the map pose must be where the sample was
+        # taken, not where the reply arrived.
+        sample_map = self._map_pose(xyz)
         future.add_done_callback(
-            lambda fut: self._on_capture(ctx, fut, trigger_idx, travel, sample_xyz)
+            lambda fut: self._on_capture(ctx, fut, trigger_idx, travel, sample_xyz, sample_map)
         )
 
-    def _on_capture(self, ctx, future, trigger_idx, travel, xyz):
+    def _map_pose(self, xyz):
+        """The plate in ``map`` at this instant, or None.
+
+        The sweep frame (``self._ref``) is what the spacing is measured in; for
+        an arm sweep that is ``arm_base``, which the base carries away between
+        partitions of the same wall. Anything that later has to put samples
+        from different partitions on one wall -- the POKEYE target clustering
+        -- needs a world position captured at the same instant, so it is
+        recorded alongside. Zero timeout: a miss costs the map pose of one
+        sample, never a stall of the sampling tick.
+        """
+        if self._ref == "map":
+            return tuple(xyz)
+        if self._pose_fn is None:
+            return None
+        try:
+            pose = self._pose_fn("map", 0.0)
+        except Exception:                           # noqa: BLE001
+            return None
+        return None if pose is None else tuple(pose)
+
+    def _on_capture(self, ctx, future, trigger_idx, travel, xyz, xyz_map=None):
         """Done-callback: classify the response and append it to the record."""
         if future is self._pending:
             self._pending = None
@@ -561,20 +586,22 @@ class HyperspectralSampler:
             result = future.result()
         except Exception as exc:                    # noqa: BLE001
             self._record(ctx, hp.FAILED_EXCEPTION, xyz, detail=str(exc),
-                         trigger_idx=trigger_idx, travel_m=travel)
+                         trigger_idx=trigger_idx, travel_m=travel, xyz_map=xyz_map)
             return
 
         outcome, detail, vis, nir = hp.classify_capture(result)
         self._record(ctx, outcome, xyz, detail=detail, vis=vis, nir=nir,
-                     trigger_idx=trigger_idx, travel_m=travel)
+                     trigger_idx=trigger_idx, travel_m=travel, xyz_map=xyz_map)
 
     def _record(self, ctx, outcome, xyz, detail="", vis=None, nir=None,
-                trigger_idx=None, travel_m=None):
+                trigger_idx=None, travel_m=None, xyz_map=None):
         """Count the outcome and append it to the raw file."""
         self.metrics.record_collection(
             outcome, self._wall_index, self._line_idx, self._seg_idx)
         if self._recorder is None:
             return
+        if xyz_map is None and xyz is not None:
+            xyz_map = self._map_pose(xyz)
         self._recorder.write(
             outcome,
             wall_index=self._wall_index,
@@ -587,6 +614,7 @@ class HyperspectralSampler:
             detail=detail,
             vis=vis,
             nir=nir,
+            pose_map=xyz_map,
         )
         if outcome != hp.OK:
             ctx["node"].get_logger().warn(

@@ -1,68 +1,88 @@
-"""Turn what the scan states recorded into results.
+"""Turn what the scan states recorded into results, and decide about POKEYE.
 
-Runs as a small phase machine rather than one blocking pass, because it has
-three tenants with very different shapes and only the first exists today:
+Runs as a small phase machine rather than one blocking pass, because the
+tenants have very different shapes and costs:
 
-    hyperspectral -> gpr -> external -> done
+    hyperspectral -> hsi_classify -> gpr -> decision -> [external] -> done
 
-``hyperspectral`` is local file work, but a mission-sized record is thousands of
-samples and labelling each one is a service call, so it is pumped a batch per
-tick instead of run to completion in one. ``gpr`` is a placeholder: that data
-lives on the Proceq/iPad and never enters ROS, so retrieving it will be a
-network fetch with its own waiting and retries -- the phase is here so it drops
-in beside the others instead of forcing a restructure. ``external`` is the
-existing /sensor_data_processing service call, unchanged.
+``hyperspectral`` is the reflectance pass over the sweep's raw record, pumped a
+batch per tick (thousands of samples, cheap each). ``hsi_classify`` runs the
+DISCOVER material classifier over that reflectance -- one XGBoost call over
+the whole session, seconds -- in a background thread. ``gpr`` runs the
+delivered hyperbola and line segmentation over whatever GP8800 exports have
+reached ``data/raw/gpr/incoming`` (Mask R-CNN: minutes on a CPU), also in a
+background thread. ``decision`` applies the sensor team's POKEYE policy to
+every classified sample and clusters the flagged ones into a handful of drill
+targets for the wall just scanned. ``external`` is the old
+/sensor_data_processing mock, kept only for simulation runs with no sensor data
+so the FSM still exercises SendDataToPokeye there.
 
-Keeping every phase inside run() is what makes each tick bounded: the FSM keeps
-ticking, the RViz panel gets a live progress count, and a wedged service cannot
-freeze the state machine in a callback nothing can interrupt.
+Keeping every phase inside run() is what makes each tick bounded: the FSM
+keeps ticking, the RViz panel gets live progress, and neither a wedged service
+nor a five-minute model can freeze the state machine.
+
+Every sensor phase is non-fatal. The raw records are on disk and can be
+re-processed offline (``ros2 run task_planner_fsm process_sensor_session``);
+losing a report is recoverable, losing the wall is not. Only the mock service
+path still raises Error, as it always did.
 """
 
 import os
+import time
 
-import rclpy
 from example_interfaces.srv import SetBool
 
-from arm_control.srv import PredictMaterial
-
+from ..sensors import VendorUnavailable, gpr, hsi, paths, pokeye
+from ..sensors.background_job import BackgroundJob
 from ..state import State
 from ..utils import hyperspectral_processing as hp
 
 
 class SensorDataProcessing(State):
-    # Samples processed per tick. Small enough that a tick stays well inside the
-    # FSM period even when every sample costs an ML round trip, large enough
-    # that a few thousand samples do not take minutes of ticking.
+    # Samples processed per tick in the reflectance pass. Small enough that a
+    # tick stays well inside the FSM period, large enough that a few thousand
+    # samples do not take minutes of ticking.
     HYPERSPECTRAL_BATCH = 25
+
+    PHASES = ("hyperspectral", "hsi_classify", "gpr", "decision", "external", "done")
 
     def __init__(self, name):
         super().__init__(name)
         self.client = None
         self.future = None
-        self.ml_client = None
         self._phase = "hyperspectral"
         self._processor = None
+        self._job = None
+        self._gpr_wait_started = None
+        self._hsi = None            # result of sensors.hsi.classify_session
+        self._gpr = None            # result of sensors.gpr.process_incoming
 
+    # ------------------------------------------------------------------
+    # State protocol
+    # ------------------------------------------------------------------
     def on_enter(self, ctx):
         node = ctx["node"]
         ctx["data_processed"] = False
         ctx["drilling_required"] = False
         ctx["error_triggered"] = False
+        ctx["pokeye_targets"] = []
         self.future = None
         self._processor = None
+        self._job = None
+        self._gpr_wait_started = None
+        self._hsi = None
+        self._gpr = None
         self._phase = "hyperspectral"
-        node.get_logger().info(f"[{self.name}] Processing recorded sensor data.")
+        ctx["sensor_results_dir"] = str(paths.processed_dir(ctx))
+        node.get_logger().info(
+            f"[{self.name}] Processing recorded sensor data "
+            f"(results in {ctx['sensor_results_dir']})."
+        )
 
     def run(self, ctx):
-        if self._phase == "hyperspectral":
-            self._run_hyperspectral(ctx)
-            return
-        if self._phase == "gpr":
-            self._run_gpr(ctx)
-            return
-        if self._phase == "external":
-            self._run_external(ctx)
-            return
+        handler = getattr(self, f"_run_{self._phase}", None)
+        if handler is not None:
+            handler(ctx)
 
     def check_transition(self, ctx):
         if ctx.get("error_triggered"):
@@ -80,39 +100,45 @@ class SensorDataProcessing(State):
         if self._processor is not None:
             self._processor.close()
             self._processor = None
+        if self._job is not None and not self._job.done:
+            # A thread cannot be killed; it is a daemon and finishes on its own
+            # with its files intact. Just stop listening to it.
+            ctx["node"].get_logger().warn(
+                f"[{self.name}] leaving with the {self._job.name} job still "
+                f"running; its output will land on disk but not in ctx."
+            )
+        self._job = None
+
+    def _advance(self, ctx, next_phase):
+        self._phase = next_phase
 
     # ------------------------------------------------------------------
-    # Phase 1: hyperspectral
+    # Phase 1: reflectance
     # ------------------------------------------------------------------
     def _run_hyperspectral(self, ctx):
-        """Turn the sweep's raw spectra into reflectance, labels and metrics.
+        """Turn the sweep's raw spectra into reflectance and coverage metrics.
 
         The second half of the collect/process split: ScanWall recorded raw GSM
         counts and the session's GDS/GRF while the robot moved, and everything
         produced here is a pure function of that record. Nothing touches the
-        camera, so a camera since switched off -- or a mission re-processed days
-        later with a retrained model -- both work.
+        camera, so a camera since switched off -- or a mission re-processed
+        days later -- both work.
 
-        Deliberately non-fatal. The GPR is the primary sensor and the drilling
-        decision does not depend on material labels, so a failure here is logged
-        and the state moves on. The raw record is already on disk and can be
-        re-processed by hand at any time: losing the report is recoverable,
-        losing the wall is not.
+        Material labels are NOT assigned here any more. The per-sample service
+        round trip to arm_control's ml_inference_node is gone; the DISCOVER
+        classifier runs over the finished reflectance.csv in the next phase.
         """
         node = ctx["node"]
         session_dir = ctx.get("hyperspectral_session_dir")
         if not session_dir:
-            self._phase = "gpr"          # sampling was disabled, or no sweep ran
+            self._advance(ctx, "gpr")          # sampling was disabled, or no sweep ran
             return
         session_dir = os.path.expanduser(str(session_dir))
 
         if self._processor is None:
             try:
                 self._processor = hp.SessionProcessor(
-                    session_dir,
-                    predict_fn=self._make_predict_fn(ctx),
-                    logger=node.get_logger(),
-                )
+                    session_dir, predict_fn=None, logger=node.get_logger())
             except Exception as exc:            # noqa: BLE001
                 node.get_logger().error(
                     f"[{self.name}] hyperspectral processing could not start: "
@@ -120,7 +146,7 @@ class SensorDataProcessing(State):
                     f"be re-processed."
                 )
                 ctx["hyperspectral_processed"] = False
-                self._phase = "gpr"
+                self._advance(ctx, "gpr")
                 return
             node.get_logger().info(
                 f"[{self.name}] processing {self._processor.total} hyperspectral "
@@ -129,7 +155,7 @@ class SensorDataProcessing(State):
 
         self.set_activity(
             ctx,
-            f"Processing hyperspectral samples "
+            f"Computing reflectance "
             f"({self._processor.processed}/{self._processor.total})",
             progress_current=self._processor.processed,
             progress_total=max(1, self._processor.total),
@@ -146,7 +172,7 @@ class SensorDataProcessing(State):
             self._processor.close()
             self._processor = None
             ctx["hyperspectral_processed"] = False
-            self._phase = "gpr"
+            self._advance(ctx, "gpr")
             return
 
         if not self._processor.done:
@@ -160,11 +186,11 @@ class SensorDataProcessing(State):
             self._processor.close()
             self._processor = None
             ctx["hyperspectral_processed"] = False
-            self._phase = "gpr"
+            self._advance(ctx, "gpr")
             return
         self._processor = None
         self._publish_hyperspectral(ctx, result)
-        self._phase = "gpr"
+        self._advance(ctx, "hsi_classify")
 
     def _publish_hyperspectral(self, ctx, result):
         """Record the outcome in ctx and log the per-wall coverage summary."""
@@ -193,86 +219,246 @@ class SensorDataProcessing(State):
                 f"[{self.name}]   rejections: "
                 + ", ".join(f"{k} x{v}" for k, v in reasons.items())
             )
-        if result.get("labelling_aborted"):
-            node.get_logger().warn(
-                f"[{self.name}]   material labels are incomplete: the ML service "
-                f"stopped answering part-way. Reflectance and coverage metrics "
-                f"are unaffected."
-            )
         node.get_logger().info(
             f"[{self.name}] hyperspectral report: {result['reflectance_csv']}")
 
-    def _make_predict_fn(self, ctx):
-        """Return a ``predict_fn(vis, nir)`` for the ML service, or None.
+    # ------------------------------------------------------------------
+    # Phase 2: material classification (DISCOVER HSI pipeline)
+    # ------------------------------------------------------------------
+    def _run_hsi_classify(self, ctx):
+        """Classify every spectrum of the session with Benjamin's classifier.
 
-        Blocking is acceptable HERE and nowhere else in this integration: the
-        robot is stationary, no sweep is in flight, nothing is being timed, and
-        the batching in _run_hyperspectral bounds how many of these land in one
-        tick. That is exactly what deferring the prediction buys.
+        One call over the whole reflectance.csv, in a background thread: the
+        model is loaded once and XGBoost is vectorised, so the whole session
+        costs seconds -- but seconds we still do not spend inside a tick.
 
-        Returns None when the service is absent, so a mission without the ML
-        node still produces reflectance and the full coverage metrics; the
-        labels can be added later from the same raw file.
+        The whole session, not just this wall, because the record spans the
+        mission and the classifier is cheap; the decision phase then narrows to
+        the wall just scanned.
         """
         node = ctx["node"]
-        if not bool(ctx.get("hyperspectral_predict_material", True)):
-            return None
-        if self.ml_client is None:
-            self.ml_client = node.create_client(
-                PredictMaterial,
-                str(ctx.get("hyperspectral_ml_service",
-                            "hyperspectral/predict_material")),
+        if self._job is None:
+            session_dir = ctx.get("hyperspectral_session_dir")
+            if not session_dir or not ctx.get("hyperspectral_processed"):
+                self._advance(ctx, "gpr")
+                return
+            model = paths.hsi_model_path(ctx)
+            if not model.is_file():
+                node.get_logger().error(
+                    f"[{self.name}] HSI classifier not found at {model}; skipping "
+                    f"material classification (see models/README.md)."
+                )
+                self._advance(ctx, "gpr")
+                return
+            node.get_logger().info(f"[{self.name}] classifying materials with {model.name}")
+            self._job = BackgroundJob(
+                hsi.classify_session,
+                os.path.expanduser(str(session_dir)),
+                paths.hsi_results_dir(ctx),
+                model,
+                confidence_threshold=float(
+                    ctx.get("hsi_confidence_threshold", hsi.DEFAULT_CONFIDENCE_THRESHOLD)),
+                logger=node.get_logger(),
+                name="hsi-classify",
             )
-        timeout = float(ctx.get("hyperspectral_ml_timeout_s", 5.0))
-        if not self.ml_client.wait_for_service(timeout_sec=timeout):
-            node.get_logger().warn(
-                f"[{self.name}] ML service unavailable; writing reflectance and "
-                f"metrics without material labels."
-            )
-            return None
 
-        def predict(vis, nir):
-            request = PredictMaterial.Request()
-            # float32[] on the wire; the model casts to float64 internally.
-            request.vis_spectrum = [float(v) for v in vis]
-            request.nir_spectrum = [float(v) for v in nir]
-            future = self.ml_client.call_async(request)
-            rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
-            if not future.done():
-                self.ml_client.remove_pending_request(future)
-                # Not a verdict about the sample -- the service did not answer.
-                # Raised so the processor can trip its breaker and stop paying
-                # this timeout on every remaining sample of the mission.
-                raise hp.PredictionUnavailable(f"no reply within {timeout:.1f} s")
-            response = future.result()
-            if response is None:
-                raise hp.PredictionUnavailable("service returned no result")
-            return response.material, float(response.confidence)
+        self.set_activity(
+            ctx, f"Classifying materials ({self._job.elapsed_s:.0f} s)")
+        if not self._job.done:
+            return
 
-        return predict
+        job, self._job = self._job, None
+        if job.failed:
+            level = "warn" if isinstance(job.error, VendorUnavailable) else "error"
+            getattr(node.get_logger(), level)(
+                f"[{self.name}] material classification skipped: {job.error}")
+            if level == "error":
+                node.get_logger().debug(job.traceback)
+            self._advance(ctx, "gpr")
+            return
+
+        self._hsi = job.result
+        ctx["hsi_result_json"] = self._hsi["hsi_result_json"]
+        ctx["hsi_samples_csv"] = self._hsi["samples_csv"]
+        ctx["hsi_samples"] = self._hsi["samples"]
+        node.get_logger().info(
+            f"[{self.name}] classified {self._hsi['n_classified']} spectra in "
+            f"{job.elapsed_s:.1f} s (threshold {self._hsi['confidence_threshold']:.2f})"
+        )
+        for wall, bucket in sorted(self._hsi["by_wall"].items(),
+                                   key=lambda kv: (kv[0] is None, kv[0])):
+            node.get_logger().info(f"[{self.name}]   {hsi.describe_wall(wall, bucket)}")
+        self._advance(ctx, "gpr")
 
     # ------------------------------------------------------------------
-    # Phase 2: GPR
+    # Phase 3: GPR
     # ------------------------------------------------------------------
     def _run_gpr(self, ctx):
-        """Placeholder for the GPR post-processing.
+        """Run the hyperbola and line pipelines over new GP8800 exports.
 
-        Nothing to do yet: the traces never enter ROS -- ScanWall only starts and
-        stops the line, and the data stays on the Proceq/iPad. Retrieving and
-        processing it will mean a network fetch, so it belongs here, as a phase
-        that can wait across ticks, rather than inline in another state.
+        The traces never enter ROS: ScanWall starts and stops the line, the GPR
+        API is meant to drop the export into ``data/raw/gpr/incoming``. That
+        hand-off is untested, so this phase waits at most ``gpr_wait_timeout_s``
+        (default 0: process what is already there) and never blocks the
+        mission on a file that may not come.
 
-        Structured as its own phase now so adding it is additive.
+        Per v1 policy GPR results are stored and logged; they do not vote on
+        POKEYE.
         """
-        self._phase = "external"
+        node = ctx["node"]
+        if not bool(ctx.get("gpr_processing_enabled", True)):
+            self._advance(ctx, "decision")
+            return
+
+        if self._job is None:
+            incoming = paths.gpr_incoming_dir(ctx)
+            out_dir = paths.gpr_results_dir(ctx)
+            pending = gpr.pending_files(incoming, out_dir)
+            if not pending:
+                timeout = float(ctx.get("gpr_wait_timeout_s", 0.0))
+                if self._gpr_wait_started is None:
+                    self._gpr_wait_started = time.monotonic()
+                waited = time.monotonic() - self._gpr_wait_started
+                if waited < timeout:
+                    self.set_activity(
+                        ctx, f"Waiting for GPR exports in {incoming} ({waited:.0f}/{timeout:.0f} s)")
+                    return
+                node.get_logger().info(
+                    f"[{self.name}] no new GPR exports in {incoming}; skipping GPR processing.")
+                self._advance(ctx, "decision")
+                return
+
+            weights = paths.gpr_weights_path(ctx)
+            run_hyp = bool(ctx.get("gpr_run_hyperbolae", True))
+            if run_hyp and not weights.is_file():
+                node.get_logger().warn(
+                    f"[{self.name}] GPR weights not found at {weights}; running the "
+                    f"line pipeline only (see models/README.md).")
+                run_hyp = False
+            node.get_logger().info(
+                f"[{self.name}] processing {len(pending)} GPR export(s) from {incoming}")
+            self._job = BackgroundJob(
+                gpr.process_incoming,
+                incoming,
+                paths.gpr_manifest_path(ctx),
+                out_dir,
+                weights,
+                logger=node.get_logger(),
+                run_hyperbolae=run_hyp,
+                run_lines=bool(ctx.get("gpr_run_lines", True)),
+                name="gpr-process",
+            )
+
+        self.set_activity(ctx, f"Processing GPR scans ({self._job.elapsed_s:.0f} s)")
+        if not self._job.done:
+            return
+
+        job, self._job = self._job, None
+        if job.failed:
+            level = "warn" if isinstance(job.error, VendorUnavailable) else "error"
+            getattr(node.get_logger(), level)(
+                f"[{self.name}] GPR processing skipped: {job.error}")
+            if level == "error":
+                node.get_logger().debug(job.traceback)
+            self._advance(ctx, "decision")
+            return
+
+        self._gpr = job.result
+        ctx["gpr_results"] = self._gpr
+        ctx["gpr_summary_json"] = self._gpr["summary_json"]
+        node.get_logger().info(
+            f"[{self.name}] GPR: {self._gpr['n_new']} scan(s) processed in "
+            f"{job.elapsed_s:.0f} s, {self._gpr['n_associated']} tied to a scanned "
+            f"line, {self._gpr['n_hyperbolae']} hyperbolae, {self._gpr['n_lines']} "
+            f"lines, {self._gpr['n_failed']} failed"
+        )
+        for entry in self._gpr["entries"]:
+            node.get_logger().info(f"[{self.name}]   {gpr.describe_entry(entry)}")
+        self._advance(ctx, "decision")
 
     # ------------------------------------------------------------------
-    # Phase 3: the external processing service
+    # Phase 4: the POKEYE decision
+    # ------------------------------------------------------------------
+    def _use_mock(self, ctx):
+        """Whether the legacy /sensor_data_processing service decides instead.
+
+        Explicit ``sensor_processing_mock`` wins. Otherwise only a simulation run
+        with nothing classified falls back to it, so Gazebo keeps walking the
+        full SendDataToPokeye cycle exactly as before.
+        """
+        explicit = ctx.get("sensor_processing_mock")
+        if explicit is not None:
+            return bool(explicit)
+        return bool(ctx.get("sim", False)) and not (self._hsi and self._hsi["samples"])
+
+    def _run_decision(self, ctx):
+        """Per-sample POKEYE decisions, clustered into targets for this wall."""
+        node = ctx["node"]
+        if self._use_mock(ctx):
+            self._advance(ctx, "external")
+            return
+
+        samples = (self._hsi or {}).get("samples") or []
+        wall_index = ctx.get("current_wall_index")
+        if not samples:
+            node.get_logger().info(
+                f"[{self.name}] no classified spectra; nothing to decide, POKEYE not required.")
+            self._finish(ctx, targets=[], decisions=[])
+            return
+
+        self.set_activity(ctx, f"Deciding POKEYE targets for wall {wall_index}")
+        try:
+            threshold = float((self._hsi or {}).get(
+                "confidence_threshold", hsi.DEFAULT_CONFIDENCE_THRESHOLD))
+            decisions = pokeye.decide_samples(samples, threshold)
+            params = pokeye.ClusterParams.from_ctx(ctx)
+            targets, stats = pokeye.cluster_targets(decisions, params, wall_index=wall_index)
+            decisions_json, targets_json = pokeye.write_outputs(
+                paths.pokeye_results_dir(ctx), decisions, targets, stats)
+        except VendorUnavailable as exc:
+            node.get_logger().warn(
+                f"[{self.name}] POKEYE decision package unavailable ({exc}); "
+                f"POKEYE not required by default.")
+            self._finish(ctx, targets=[], decisions=[])
+            return
+        except Exception as exc:                # noqa: BLE001
+            node.get_logger().error(
+                f"[{self.name}] POKEYE decision failed: {exc}; POKEYE not required by default.")
+            self._finish(ctx, targets=[], decisions=[])
+            return
+
+        dstats = pokeye.decision_stats(decisions)
+        node.get_logger().info(
+            f"[{self.name}] POKEYE decisions over {dstats['n']} samples: "
+            f"{dstats['n_pokeye_required']} require POKEYE, {dstats['n_no_action']} "
+            f"no action, {dstats['n_hold']} hold"
+            + (f" ({', '.join(f'{k} x{v}' for k, v in dstats['reasons'].items())})"
+               if dstats["reasons"] else "")
+        )
+        node.get_logger().info(
+            f"[{self.name}] wall {wall_index}: {stats['n_flagged']} flagged samples "
+            f"-> {stats['n_clusters']} clusters ({stats['n_clusters_too_small']} too "
+            f"small, {stats['n_unlocated']} without map pose) -> {stats['n_targets']} "
+            f"target(s): {pokeye.describe_targets(targets)}"
+        )
+        ctx["pokeye_decisions_json"] = decisions_json
+        ctx["pokeye_targets_json"] = targets_json
+        self._finish(ctx, targets=targets, decisions=decisions)
+
+    def _finish(self, ctx, targets, decisions):
+        ctx["pokeye_targets"] = targets
+        ctx["pokeye_n_decisions"] = len(decisions)
+        ctx["drilling_required"] = bool(targets)
+        ctx["data_processed"] = True
+        self._advance(ctx, "done")
+
+    # ------------------------------------------------------------------
+    # Phase 5 (fallback): the external mock service
     # ------------------------------------------------------------------
     def _run_external(self, ctx):
-        """Call /sensor_data_processing and wait for its verdict."""
+        """Call /sensor_data_processing and take its verdict (simulation only)."""
         node = ctx["node"]
-        self.set_activity(ctx, "Processing the scan sensor data")
+        self.set_activity(ctx, "Processing the scan sensor data (mock service)")
 
         if self.future is None:
             if self.client is None:
@@ -303,4 +489,7 @@ class SensorDataProcessing(State):
             node.get_logger().error(
                 f"[{self.name}] Error while processing sensor data.")
             ctx["error_triggered"] = True
-        self._phase = "done"
+        self._advance(ctx, "done")
+
+    def _run_done(self, ctx):
+        pass

@@ -401,7 +401,9 @@ The FSM consists of **17 states** that execute sequentially with conditional tra
 | **WallTargetSelection** | Next wall selection | Find closest unscanned wall to current robot position | Wall selected |
 | **NavigateToTarget** | Base navigation | Send Nav2 goal `/navigate_to_pose`, await result | Navigation complete |
 | **ArmUnfolding** | Arm extension | Send `/arm/send_position` for 'unfolded_fsm' pose | Arm movement done |
-| **ScanWall** | Wall scanning | Launch sensors, alignment; execute scan trajectory | Scan trajectory complete |
+| **ScanWall** | Wall scanning | Launch sensors, alignment; execute scan trajectory; record hyperspectral raw spectra + GPR line manifest | Scan trajectory complete |
+| **SensorDataProcessing** | Sensor post-processing | Reflectance pass → DISCOVER HSI classifier → GPR hyperbola/line pipelines → POKEYE decision + target clustering (see [Sensor Processing](#sensor-processing-hsi--gpr--pokeye)) | `drilling_required` → SendDataToPokeye, else ArmFolding |
+| **SendDataToPokeye** | Drill target hand-off | Write `pokeye_request.json`, call `/send_data_to_pokeye` (`arm_control/SendPokeyeTargets`), wait for the ack | Pokeye accepted the targets |
 | **ArmFolding** | Arm retraction | Sequential folding: unfolded → folded via `/arm/send_position` | Arm folded |
 | **AreasOfInterest** | Interest analysis | Call `/compute_areas_of_interest` service (mock) | Interest areas computed |
 | **WallDiscretization** | Cell grid generation | Call `/compute_wall_discretization` for each wall, generate panels & cells | All walls discretized |
@@ -1014,11 +1016,21 @@ task_planner_fsm/
 │   │   ├── finished.py
 │   │   ├── error.py
 │   │   └── proc_utils.py         # Process management
+│   ├── sensors/                  # Sensor post-processing (see Sensor Processing)
+│   │   ├── hsi.py, gpr.py, pokeye.py, paths.py, manifest.py, background_job.py
+│   │   └── vendor/               # DISCOVER pipelines as delivered (VERSIONS.md)
 │   ├── mock_server.py            # Mock service provider
+│   ├── check_sensor_setup.py     # deps / models / folders report
+│   ├── process_sensor_session.py # offline run of the processing chain
 │   └── goal_status_listener.py    # (unused, for future)
+├── data/                           # runtime sensor data (gitignored)
+├── models/                         # AI model weights (gitignored)
+├── requirements-sensors.txt        # pip deps of the vendored pipelines
 ├── scripts/                        # Entry point scripts
 │   ├── fsm_node
 │   ├── mock_server
+│   ├── check_sensor_setup
+│   ├── process_sensor_session
 │   └── goal_status_listener
 ├── task_planner_fsm_rviz_panel/   # RViz plugin
 │   ├── src/
@@ -1116,6 +1128,55 @@ the active route — `sweep_speed_mps` for the arm sweep, `sweep_crawl_speed` or
 `sweep_speed_limit` for the base one — and warns when sampling is too coarse for
 the spacing.
 
+### Sensor Processing (HSI + GPR + POKEYE)
+
+`SensorDataProcessing` turns what `ScanWall` recorded into results and decides
+whether POKEYE has to drill, using the pipelines delivered by the sensor team
+(vendored unmodified under `task_planner_fsm/sensors/vendor/`, see its
+`VERSIONS.md`). Phases, each bounded per tick:
+
+```
+hyperspectral  reflectance.csv from the raw sweep record (batched per tick)
+hsi_classify   Benjamin's XGBoost material classifier over the whole session (background thread)
+gpr            hyperbola + line segmentation over new GP8800 exports (background thread)
+decision       decide_pokeye() per sample -> clustered drill targets for this wall
+external       legacy /sensor_data_processing mock (simulation only)
+```
+
+**Folders** (package root, gitignored; `data/README.md`, `models/README.md`):
+
+```
+data/raw/hyperspectral/session_<stamp>/   raw_samples.jsonl, calibration.json, reflectance.csv
+data/raw/gpr/incoming/                    drop <name>.sgy + <name>.csv exports here
+data/raw/gpr/session_<stamp>/gpr_lines.jsonl   one row per GPR line (ScanWall)
+data/processed/session_<stamp>/{hsi,gpr,pokeye}/
+models/hsi/classifier.joblib              27 MB, models/gpr/best.pt  241 MB
+```
+
+**Setup**: `pip install -r requirements-sensors.txt`, copy the two model files,
+then `ros2 run task_planner_fsm check_sensor_setup`. Without torch/obspy the
+GPR phase is skipped with a warning; without xgboost the HSI phase is. The
+classifier bundle was pickled with numpy ≥ 2; on ROS Humble's numpy 1.24 the
+adapter aliases `numpy._core` so it still loads (`sensors/__init__.py`).
+
+**Offline**: `ros2 run task_planner_fsm process_sensor_session <stamp> --wall 2`
+runs the same chain on a recorded session (re-processing, Jetson timing).
+
+**POKEYE targets**: per-sample decisions (policy v1, HSI only: `low_confidence`
+/ `quality_rejected` → POKEYE, `detected` → none, malformed → HOLD, GPR does not
+vote) are clustered per wall in the map frame: single linkage within
+`pokeye_cluster_radius_m` (0.15), clusters below `pokeye_cluster_min_samples`
+(3) dropped, one target per cluster at its centroid, targets closer than
+`pokeye_min_target_spacing_m` (0.30) merged, at most
+`pokeye_max_targets_per_wall` (5). HOLDs are logged, never drilled.
+
+**Parameters** (ctx / ROS params): `sensor_data_dir`, `sensor_models_dir`,
+`sensor_results_dir`, `hsi_model_path`, `hsi_confidence_threshold` (0.8),
+`gpr_processing_enabled`, `gpr_incoming_dir`, `gpr_weights_path`,
+`gpr_wait_timeout_s` (0), `gpr_run_hyperbolae`, `gpr_run_lines`,
+`sensor_processing_mock`, `pokeye_service`, `pokeye_service_timeout_s`, plus
+the four clustering knobs above.
+
 ### Integration Packages
 
 - **navi_wall**: Navigation and mapping
@@ -1124,7 +1185,7 @@ the spacing.
   - Actions: `/navigate_to_pose`
 
 - **arm_control**: Manipulator control
-  - Services: `/compute_wall_discretization`, `/compute_optimal_base`, `/arm/send_position`, `/arm/script_command`
+  - Services: `/compute_wall_discretization`, `/compute_optimal_base`, `/arm/send_position`, `/arm/script_command`, `/send_data_to_pokeye` (`SendPokeyeTargets`, served by POKEYE or `mock_server`)
   - Topics: `/joint_states`, `/execution_status`
   - Nodes: `wall_discretization_node`, `optimal_base_service`, `script_command_service_node`
 

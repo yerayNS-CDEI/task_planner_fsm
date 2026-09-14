@@ -1,0 +1,19 @@
+{
+  "decision_valid": true,
+  "pokeye_required": true,
+  "decision": "SEND_TO_POKEYE",
+  "reason": "HSI_LOW_CONFIDENCE",
+  "requested_action": "MATERIAL_IDENTIFICATION",
+  "message": "HSI classification confidence is insufficient; request destructive material identification.",
+  "hsi_evidence": {
+    "status": "low_confidence",
+    "detected": false,
+    "material": null,
+    "confidence": 0.7848,
+    "confidence_threshold": 0.8,
+    "sensor_reason": "confidence below threshold 0.800"
+  },
+  "mode": "single",
+  "confidence_threshold": 0.8,
+  "sample_index": 242
+}

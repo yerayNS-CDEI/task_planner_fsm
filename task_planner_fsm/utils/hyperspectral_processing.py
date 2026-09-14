@@ -10,9 +10,12 @@ processing are split (see HYPERSPECTRAL_FSM_INTEGRATION.md 5.3): storing only
 reflectance would be lossy, and running the ML per sample during the sweep buys
 nothing because no FSM decision depends on the label.
 
-The one impure hook is ``predict_fn`` in :func:`process_session` -- the caller
-passes a callable wrapping the ``PredictMaterial`` service, so this module never
-imports rclpy.
+The one impure hook is ``predict_fn`` in :func:`process_session` -- a callable
+labelling one sample -- so this module never imports rclpy. The FSM no longer
+uses it: material classification is a separate pass over the ``reflectance.csv``
+written here, run by :mod:`task_planner_fsm.sensors.hsi` with the DISCOVER
+classifier, so the ``Material``/``Confidence`` columns stay empty in a mission
+record and the verdicts live in ``processed/<session>/hsi/samples.csv``.
 
 Reflectance is the formula inherited from R&D and must not be "improved":
 
@@ -32,6 +35,8 @@ import os
 from datetime import datetime, timezone
 
 import numpy as np
+
+from ..sensors import paths as sensor_paths
 
 # Every spectrum from either sensor is 256 points. A response of any other
 # length means a truncated TCP frame, not a short spectrum.
@@ -286,20 +291,23 @@ CALIBRATION_FILENAME = "calibration.json"
 REFLECTANCE_FILENAME = "reflectance.csv"
 METRICS_FILENAME = "metrics.json"
 
-DEFAULT_ROOT = "~/hyperspectral_sweeps"
-
-
 def session_root(ctx=None):
-    """Directory holding all sessions. ``hyperspectral_output_dir`` overrides."""
-    root = DEFAULT_ROOT
-    if ctx is not None:
-        root = ctx.get("hyperspectral_output_dir") or DEFAULT_ROOT
-    return os.path.expanduser(str(root))
+    """Directory holding all sessions: ``data/raw/hyperspectral`` in the package
+    (see :mod:`task_planner_fsm.sensors.paths`). ``hyperspectral_output_dir``
+    overrides."""
+    override = ctx.get("hyperspectral_output_dir") if ctx is not None else None
+    if override:
+        return os.path.expanduser(str(override))
+    return str(sensor_paths.raw_hyperspectral_root(ctx))
 
 
 def new_session_dir(ctx=None, stamp=None):
-    """Create and return a fresh session directory."""
-    stamp = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    """Create and return a fresh session directory.
+
+    The stamp is the mission's ``sensor_session_id`` so the processed results
+    (``data/processed/session_<stamp>``) sit next to this raw record.
+    """
+    stamp = stamp or sensor_paths.session_id(ctx)
     path = os.path.join(session_root(ctx), f"session_{stamp}")
     os.makedirs(path, exist_ok=True)
     return path
@@ -589,8 +597,16 @@ class RawRecorder:
 
     def write(self, outcome, wall_index, line_idx, seg_idx, trigger_idx,
               travel_m=None, pose=None, frame=None, detail="",
-              vis=None, nir=None):
-        """Record one sample. Returns the sequence number, or None if unwritable."""
+              vis=None, nir=None, pose_map=None):
+        """Record one sample. Returns the sequence number, or None if unwritable.
+
+        ``pose`` is in the sweep's own frame (``arm_base`` for an arm sweep,
+        which the base leaves between partitions of the same wall), so it
+        cannot be turned into a world position after the fact. ``pose_map`` is
+        the same point looked up in ``map`` at capture time, for anything that
+        has to place samples from different partitions together -- the POKEYE
+        target clustering, for one.
+        """
         if self._handle is None:
             self.open()
         self._seq += 1
@@ -606,6 +622,7 @@ class RawRecorder:
             "travel_m": None if travel_m is None else round(float(travel_m), 5),
             "frame": frame,
             "pose": None if pose is None else [round(float(v), 5) for v in pose],
+            "pose_map": None if pose_map is None else [round(float(v), 5) for v in pose_map],
         }
         if vis is not None and nir is not None:
             # ints: these are raw uint16 ADC counts, and writing them as floats
@@ -782,6 +799,7 @@ class SessionProcessor:
         header = [
             "Seq", "Timestamp", "Wall_Index", "Line_Idx", "Seg_Idx",
             "Trigger_Idx", "Travel_m", "Frame", "X", "Y", "Z",
+            "Map_X", "Map_Y", "Map_Z",
             "Status", "Reason", "Material", "Confidence",
         ]
         header += [f"VIS_{wl:.1f}" for wl in vis_wavelengths()]
@@ -841,10 +859,12 @@ class SessionProcessor:
             wall_index, line_idx, seg_idx, status, reason)
 
         pose = row.get("pose") or [None, None, None]
+        pose_map = row.get("pose_map") or [None, None, None]
         data_row = [
             row.get("seq"), row.get("t"), wall_index, line_idx, seg_idx,
             row.get("trigger_idx"), row.get("travel_m"), row.get("frame"),
             pose[0], pose[1], pose[2],
+            pose_map[0], pose_map[1], pose_map[2],
             status, reason, material, confidence,
         ]
         data_row += [f"{v:.6f}" for v in vis_norm]

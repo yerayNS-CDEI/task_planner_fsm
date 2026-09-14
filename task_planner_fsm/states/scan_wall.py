@@ -1,6 +1,7 @@
 from ..state import State
 from ..utils.column_control import ColumnController
 from ..utils.hyperspectral_sampler import HyperspectralSampler
+from ..sensors import manifest as gpr_manifest
 from ..utils.costmap_utils import (
     COSTMAP_WAIT_TIMEOUT_S,
     base_standoff_goal,
@@ -247,6 +248,10 @@ class ScanWall(State):
         self._gpr_trigger_travel = 0.0      # total plate travel this segment
         self._gpr_trigger_count = 0         # triggers fired this segment
         self._gpr_trigger_tf_warned = False
+        # The line currently being scanned, for the GPR manifest (see
+        # _open_gpr_line_record): what SensorDataProcessing needs to put a
+        # hyperbola found "0.8 m along the scan" back onto the wall.
+        self._gpr_line_record = None
         self._ee_frame = None               # cached map->EE frame name
 
         # Hyperspectral: sampled on the same plate travel as the GPR triggers,
@@ -1217,6 +1222,11 @@ class ScanWall(State):
         the other way it would point backwards).
         """
         self._stop_gpr_triggers(ctx, log_summary=False)   # never two timers
+        # Opened here, not in _gpr_start_measurement_and_line: this is called
+        # exactly once per segment sweep with the segment it is about to sweep,
+        # whereas the probe start is re-entered every tick while the probe is
+        # disabled. The record is closed by _stop_gpr_triggers.
+        self._open_gpr_line_record(ctx, seg_start, seg_end)
         if not self._gpr_trigger_enabled(ctx):
             return
         node = ctx["node"]
@@ -1284,6 +1294,7 @@ class ScanWall(State):
 
     def _stop_gpr_triggers(self, ctx, log_summary=True):
         """Disarm the sampler (segment sweep finished, or state left)."""
+        self._close_gpr_line_record(ctx)
         timer = getattr(self, "_gpr_trigger_timer", None)
         if timer is not None:
             timer.cancel()
@@ -1297,6 +1308,57 @@ class ScanWall(State):
                     f"{self._gpr_trigger_travel:.3f} m of plate travel."
                 )
         self._gpr_trigger_last_xyz = None
+
+    # ------------------------------------------------------------------
+    # GPR line manifest -- one row per line scanned, for the post-processing
+    # ------------------------------------------------------------------
+    def _open_gpr_line_record(self, ctx, seg_start, seg_end):
+        """Remember what the post-processing will need about this line.
+
+        The probe keeps the traces and the export carries no robot pose, so the
+        segment geometry (map frame), the measurement name the probe was given
+        and the wall-clock window are the only handles for tying an exported
+        ``.sgy`` back to a place on the wall. Written regardless of whether the
+        probe is enabled: a file copied over by hand still deserves a position.
+        """
+        line_idx = int(ctx.get("current_line_idx", 0))
+
+        def _pt(p):
+            return None if p is None else [round(float(v), 4) for v in p]
+
+        self._gpr_line_record = {
+            "wall_index": ctx.get("current_wall_index"),
+            "line_idx": line_idx,
+            "seg_idx": self._seg_idx,
+            "seg_start": _pt(seg_start),
+            "seg_end": _pt(seg_end),
+            "frame": "map",
+            "measurement_name": f"scan_wall line {line_idx + 1} seg {self._seg_idx + 1}",
+            "arm_sweep": bool(self._use_arm_sweep(ctx)),
+            "probe_active": bool(self.gpr_line_active),
+            "t_start": gpr_manifest.utc_now(),
+            "t_start_epoch": round(time.time(), 3),
+        }
+
+    def _close_gpr_line_record(self, ctx):
+        """Append the open line record to the manifest (no-op if none is open)."""
+        record = self._gpr_line_record
+        if record is None:
+            return
+        self._gpr_line_record = None
+        record.update({
+            "probe_active": record["probe_active"] or bool(self.gpr_line_active),
+            "t_stop": gpr_manifest.utc_now(),
+            "t_stop_epoch": round(time.time(), 3),
+            "trigger_count": int(self._gpr_trigger_count),
+            "travel_m": round(float(self._gpr_trigger_travel), 4),
+        })
+        path = gpr_manifest.append_gpr_line(ctx, record)
+        if path is None:
+            ctx["node"].get_logger().warn(
+                f"[{self.name}] could not write the GPR line manifest; this "
+                f"line's scan will not be placed on the wall."
+            )
 
     def _gpr_trigger_spacing(self, ctx):
         """Configured trigger spacing in metres (never zero/negative)."""

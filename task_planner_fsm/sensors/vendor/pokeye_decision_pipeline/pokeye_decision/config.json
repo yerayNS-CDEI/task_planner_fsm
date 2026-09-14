@@ -1,0 +1,4 @@
+{
+  "default_confidence_threshold": 0.8,
+  "pokeye_action": "MATERIAL_IDENTIFICATION"
+}
