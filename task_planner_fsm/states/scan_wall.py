@@ -2553,10 +2553,21 @@ class ScanWall(State):
         # it is the switch that separates "the gate is wrong" from "the press is
         # wrong" when a sweep will not move — but it is a DIAGNOSTIC, and a sweep
         # with it false can scan air without anything noticing. Absent from ctx
-        # the node keeps its own default, which is on.
+        # the node keeps its own default, which is currently OFF — so a run that
+        # does not set this sweeps ungated. See wbc/sweep_node.py, where the
+        # default is a debugging one and says so.
         if ctx.get("wbc_press_gate_travel") is not None:
             cmd += ["-p", "press_gate_travel:="
                     f"{'true' if bool(ctx['wbc_press_gate_travel']) else 'false'}"]
+        # The per-cycle trace. Off in the node by default because it is a message
+        # per control cycle and nothing reads it back, but it is the only place
+        # the solver's command, the command published and the velocity the arm
+        # reached appear together — the three that localise a press which is not
+        # closing. Reachable from here so a diagnostic run needs no node edit:
+        # set it, record /wbc_sweep/diagnostics, clear it again.
+        if ctx.get("wbc_publish_diagnostics") is not None:
+            cmd += ["-p", "publish_diagnostics:="
+                    f"{'true' if bool(ctx['wbc_publish_diagnostics']) else 'false'}"]
         for key, param in (("wbc_control_rate", "control_rate"),
                            # How finely the arm setpoint moves between solves.
                            # Reachable from here for the same reason the control
@@ -2575,7 +2586,15 @@ class ScanWall(State):
                            ("wbc_press_gain", "press_gain"),
                            ("wbc_press_v_max", "press_v_max"),
                            ("wbc_press_seek_speed", "press_seek_speed"),
-                           ("wbc_press_force_limit", "press_force_limit")):
+                           ("wbc_press_force_limit", "press_force_limit"),
+                           # How long the base waits for the wheel to reach the
+                           # wall before the segment is failed. Here because a
+                           # diagnostic approach wants longer than the 45 s the
+                           # node ships: the interesting part of a press that is
+                           # not arriving is where it PARKS and whether it is
+                           # still creeping, and the default cuts the run off
+                           # before that is answerable.
+                           ("wbc_press_contact_timeout", "press_contact_timeout")):
             if ctx.get(key) is not None:
                 cmd += ["-p", f"{param}:={float(ctx[key])}"]
 

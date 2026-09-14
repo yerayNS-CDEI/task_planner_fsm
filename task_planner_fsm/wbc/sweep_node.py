@@ -357,20 +357,20 @@ class WholeBodySweepNode(Node):
         # on the normal, the arm still holds height and orientation, and the base
         # travels at sweep_speed the way it did before either commit.
         #
-        # IT IS CURRENTLY FALSE, AND THAT IS A DEBUGGING DEFAULT, NOT A VERDICT
-        # ON EITHER COMMIT. The 2026-09-08 runs never loaded the wheel — the
-        # approach schedule parked the plate ~1 cm off the wall reading -1 N — so
-        # the authority never rose and the base sat at 0.000 m/s all sweep. This
+        # IT IS TRUE AGAIN. It was flipped to False as a debugging default after
+        # the 2026-09-08 runs, which never loaded the wheel — the approach
+        # schedule parked the plate ~1 cm off the wall reading -1 N — so the
+        # authority never rose and the base sat at 0.000 m/s all sweep. The
         # switch is what separates "the gate is wrong" from "the press never
-        # reached the wall", and while it is false the answer to the second
-        # question is being gathered.
+        # reached the wall", and the answer was the second: the gate was right
+        # and the approach was not arriving.
         #
-        # What that costs, plainly: with the gate off nothing couples travel to
-        # contact, so a sweep can run its full length with the wheel in the air
-        # and report success. Treat GPR data recorded this way as suspect, and
-        # put the gate back on (press_gate_travel:=true, which still round-trips
-        # correctly from the command line) once the approach reaches the wall.
-        self.declare_parameter("press_gate_travel", False)
+        # What False costs, plainly, since it is still reachable: nothing couples
+        # travel to contact, so a sweep can run its full length with the wheel in
+        # the air and report success. Treat GPR data recorded that way as
+        # suspect. Reach for it only to prove a gate/approach question again, and
+        # put it back afterwards.
+        self.declare_parameter("press_gate_travel", True)
         # How long to wait for the wheel to reach the wall before giving up on
         # the segment. The base holds still for all of it (see _control_step),
         # so this is not a stall — but it has to be bounded, because a press that
@@ -381,11 +381,19 @@ class WholeBodySweepNode(Node):
         # schedule takes over, then the scheduled crawl over the last few
         # centimetres — measured end to end at 21-24 s from 0.22 m (worst of 20
         # noise seeds, 24.1 s), against the 2.7 s the old constant approach took
-        # to arrive at 40 N. 45 s still clears it, but the margin is now under 2x
-        # rather than ~20x, so raising press_approach_gain is the knob to reach
-        # for before raising this one. A distance sensor reading LONG eats into
-        # it further: -10 mm of bias puts contact at 27 s.
-        self.declare_parameter("press_contact_timeout", 45.0)     # s
+        # to arrive at 40 N. 45 s clears that, but the margin is under 2x rather
+        # than ~20x, so raising press_approach_gain is the knob to reach for
+        # before raising this one. A distance sensor reading LONG eats into it
+        # further: -10 mm of bias puts contact at 27 s.
+        #
+        # 120 s RATHER THAN THAT 45, AND IT IS A DIAGNOSTIC DEFAULT. While the
+        # approach is not reliably reaching the wall, the interesting part of a
+        # failed press is where the plate PARKS and whether it is still creeping,
+        # and 45 s cut the 2026-09-08 runs off before either was answerable. The
+        # cost is real and is paid per segment: a press that never arrives now
+        # holds the base still, arm loaded against the wall, for two minutes
+        # before the segment fails. Put it back to 45 once the approach lands.
+        self.declare_parameter("press_contact_timeout", 120.0)    # s
         # How hard the normal axis is held to what the force loop asks for. Large
         # because a press command is orders of magnitude smaller than the sweep
         # travel, and anything less lets it disappear into the pooled task's
@@ -396,13 +404,18 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("robot_description_topic", "/robot_description")
         self.declare_parameter("status_topic", "/wbc_sweep/status")
         # Per-cycle trace, for telling WHERE a jerky motion comes from instead
-        # of guessing. Off by default: it is a message per control cycle, and
-        # nothing in the loop reads it back. Turn it on for a diagnostic run,
-        # record it, turn it off again.
+        # of guessing. It is a message per control cycle and nothing in the loop
+        # reads it back, so it was off by default and belongs off again once the
+        # press is landing:
         #
-        #     ros2 run task_planner_fsm wbc_sweep_controller --ros-args \
-        #       -p publish_diagnostics:=true
         #     ros2 bag record /wbc_sweep/diagnostics
+        #
+        # ON by default for now, because the press's acquisition is under
+        # investigation and the run that answers it is started from the UI,
+        # where adding a parameter means editing the UI. The alternative was a
+        # field run that records everything EXCEPT the numbers the question
+        # needs, which is how the 2026-09-08 runs were spent. Costs one small
+        # message per cycle on a topic nobody subscribes to unless recording.
         #
         # The three traces that matter are the solver's own answer, the command
         # actually published, and the velocity the arm actually reached. Read in
@@ -411,7 +424,7 @@ class WholeBodySweepNode(Node):
         # streaming layer, and smooth on both with a rough arm is the driver,
         # the servo tuning or the speed scaling. Plot all three before changing
         # anything, rather than watching the robot and guessing.
-        self.declare_parameter("publish_diagnostics", False)
+        self.declare_parameter("publish_diagnostics", True)
         self.declare_parameter("diagnostics_topic", "/wbc_sweep/diagnostics")
         self.declare_parameter("turret_joint", "turret_joint")
         self.declare_parameter("arm_joints", ARM_JOINTS)

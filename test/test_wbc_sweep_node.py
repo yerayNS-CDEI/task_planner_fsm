@@ -1716,7 +1716,25 @@ def test_the_diagnostics_row_carries_all_three_velocities():
     assert np.isnan(row[-1]), "the contact stiffness"
 
 
-def test_diagnostics_stay_off_unless_asked_for():
-    """A message per control cycle that nothing reads back is not a default."""
+def test_diagnostics_are_on_by_default_while_the_press_is_under_investigation():
+    """The inverse of what this test used to assert, and deliberately temporary.
+
+    "A message per control cycle that nothing reads back is not a default" was
+    the original argument and it is still the right one for steady state. It
+    loses for now to a worse failure: the runs that have to answer where the
+    press stalls are started from the UI, so a parameter that must be passed on
+    the command line is a parameter that will not be set, and the 2026-09-08
+    runs were spent recording everything except the numbers the question needed.
+
+    When the approach reliably reaches the wall, flip the default back and
+    restore this test to asserting ``diag_pub is None``.
+    """
     node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.2, 0.0))
+    assert node.diag_pub is not None
+
+
+def test_diagnostics_can_still_be_turned_off():
+    """The cost is real, so switching it off must keep working."""
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.2, 0.0),
+                 publish_diagnostics=False)
     assert node.diag_pub is None
