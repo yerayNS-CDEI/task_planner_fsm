@@ -188,14 +188,15 @@ class WholeBodySweepNode(Node):
         # sit on the plate face, but the GPR body has length along the wall
         # normal and four bars with caster wheels stand off each corner, so when
         # the wheel and the casters are all riding the wall the plate is still
-        # ~0.13 m off it and that is what the ranges read. The plate BOTTOMS OUT
-        # there — measured on hardware, it cannot physically get closer.
+        # ~0.1375 m off it and that is what the ranges read. The plate BOTTOMS
+        # OUT there — measured on hardware 2026-09-14, it cannot physically get
+        # closer.
         #
         # So an envelope near zero can never be crossed and protects nothing,
         # which is exactly what the old 0.005 did. What it must catch is the
         # plate being driven PAST its own stop, i.e. something deforming because
         # a bad force reading kept SEEK pushing. That means sitting just below
-        # 0.13, with enough room for sensor noise.
+        # the stop, with enough room for sensor noise.
         #
         # Mind that room, because the ranges are noisy. The per-sensor sigma is
         # 0.010 m and the plane fit over six of them measures out at 4.2 mm
@@ -206,8 +207,8 @@ class WholeBodySweepNode(Node):
         #     0.120 ->  1.0% of cycles      0.110 -> never
         #
         # 0.115 is the value that buys a real guard without crying wolf. It sits
-        # 1.5 cm inside the stop, which is far more travel than the bars have in
-        # them, and about 3.5 sigma clear of the noise.
+        # over 2 cm inside the stop, which is far more travel than the bars have
+        # in them, and over 5 sigma clear of the noise.
         #
         # A trip is cheap either way: it clamps the approach to zero for that
         # one cycle, and the stall counter resets on any untripped cycle, so
@@ -228,7 +229,19 @@ class WholeBodySweepNode(Node):
         # Where the plate STOPS: the range reading with the wheel and all four
         # caster bars riding the wall. Same measurement press_min_distance is
         # sized off, and the gap the schedule closes is measured from it.
-        self.declare_parameter("press_contact_distance", 0.13)     # m
+        # MEASURED 2026-09-14: the plate bottomed out at 13.75 cm, with the
+        # wheel first loading at 14.4 and 3 N by 14.15. The 0.13 before it was
+        # a comment, not a run.
+        self.declare_parameter("press_contact_distance", 0.1375)   # m
+        # How far outside that stop the ranges may read while a force is still
+        # believed to be contact. The dwell above is sized against sensor
+        # noise; a transient from the arm's own motion is not noise, and one
+        # latched ``touched`` at 20.8 cm on 2026-09-14 — 6.5 cm from anything
+        # the wheel could touch — which is what opened the base's gate 16 s
+        # early and put 36 N on the wheel when contact finally came. The
+        # ranges know where the wheel is; a force sensor cannot. See
+        # wbc/admittance.py for the sizing.
+        self.declare_parameter("press_contact_window", 0.03)       # m
         # 1/s. This sets how much room the approach has to decelerate in --
         # contact_distance + margin + seek_speed/gain is where it starts slowing.
         # At 3.0 that was 4.9 mm against a contact the robot has since measured at
@@ -975,7 +988,8 @@ class WholeBodySweepNode(Node):
                 approach_margin=float(p("press_approach_margin").value),
                 approach_min_speed=float(p("press_approach_min_speed").value),
                 distance_tau=float(p("press_distance_tau").value),
-                force_limit_dwell=float(p("press_force_limit_dwell").value))
+                force_limit_dwell=float(p("press_force_limit_dwell").value),
+                contact_window=float(p("press_contact_window").value))
             self.stiffness = ContactStiffness(
                 floor=float(p("press_stiffness_floor").value),
                 ceiling=float(p("press_stiffness_ceiling").value),
@@ -1128,6 +1142,7 @@ class WholeBodySweepNode(Node):
         # driving the wheel back into the wall.
         ("press_approach_gain", "approach_gain"),
         ("press_contact_distance", "contact_distance"),
+        ("press_contact_window", "contact_window"),
     )
 
     def _refresh_press_tuning(self):

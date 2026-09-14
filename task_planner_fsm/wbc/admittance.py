@@ -161,6 +161,21 @@ Note the first column: with no dwell, EVERY threshold tested latches on noise
 eventually. Time over the threshold is what separates contact from noise; the
 threshold only sets how long that takes.
 
+**And contact has to be PLAUSIBLE on distance, because the dwell is sized for
+noise and the sensor also sees inertia.** The 2026-09-14 field run latched
+``touched`` 5.9 s after the tare with the plate at 20.8 cm — 6.5 cm short of
+where the wheel can physically touch — on a filtered +5.3 N that lasted three
+cycles. That is not the 0.95 N sigma the table above is built on; it is the
+GPR's mass on an arm being jerked at 4-18 Hz, and a 6-sigma transient will beat
+any dwell that is sized against Gaussian noise. So the latch also asks the
+ranges: a force reading with the plate more than ``contact_window`` beyond
+``contact_distance`` is refused outright, however long it lasts, for the same
+reason the tare trusts distance over force — the ranges can say where the wheel
+is, and a force sensor cannot. The cost of that false latch was the whole run:
+the gate opened 16 s before real contact, so when load did arrive the base set
+off at 20 mm/s during SEEK, before the force loop was in charge, and drove the
+wheel from 3.6 N to 36 N in three cycles of a starved loop.
+
 **The distance sensors do not go away.** They stop being the setpoint and become
 the safety envelope: the press may never drive the plate closer than
 ``min_distance`` to the sensed plane, whatever the force says. A force reading
@@ -216,9 +231,10 @@ class AdmittancePress:
                  contact_dwell=0.15,
                  force_limit=30.0, min_distance=0.005, filter_tau=0.1,
                  stall_seconds=2.0, tare_seconds=0.5, tare_min_distance=0.05,
-                 contact_distance=0.13, approach_gain=0.3,
+                 contact_distance=0.1375, approach_gain=0.3,
                  approach_margin=0.0126, approach_min_speed=0.0008,
-                 distance_tau=0.15, force_limit_dwell=0.06):
+                 distance_tau=0.15, force_limit_dwell=0.06,
+                 contact_window=0.03):
         self.target_force = float(target_force)
         self.gain = float(gain)
         self.v_max = float(v_max)
@@ -270,8 +286,16 @@ class AdmittancePress:
         # Where the plate STOPS: the range reading when the wheel and the four
         # caster bars are all riding the wall. The plate cannot physically get
         # closer, so this — not zero — is what the approach is closing on and
-        # what the gap is measured from.
+        # what the gap is measured from. 0.1375 m is the reading the plate
+        # bottomed out at on 2026-09-14 (first load at 14.4 cm, 3 N at 14.15);
+        # the 0.13 it was came from a comment rather than a run.
         self.contact_distance = float(contact_distance)
+        # How far beyond the stop the ranges may read while a force is still
+        # believed to be contact. The wheel first loads about 7 mm outside the
+        # stop and the plane fit has 4.2 mm sigma, so 3 cm is over 5 sigma clear
+        # of a real contact — and 3.5 cm short of the 20.8 cm the 2026-09-14
+        # transient latched at. See the module docstring.
+        self.contact_window = float(contact_window)
         # 1/s, and the single most important number in this file. It sets where
         # the approach STARTS to slow:
         #
@@ -331,6 +355,7 @@ class AdmittancePress:
         self._over_limit = 0.0  # seconds the raw force has been over the limit
         self._contact_held = 0.0    # seconds the force has been over contact_force
         self._contact_n = 0         # ...and how many readings in a row
+        self._loaded = False        # over contact_force THIS cycle, plausible or not
         self._tare_samples = []
         self._tare_elapsed = 0.0
         # Whether the wheel has EVER reached the wall in this segment. Latching,
@@ -494,7 +519,26 @@ class AdmittancePress:
             # Held over the threshold, in TIME, and never on the seeding cycle.
             # Anything short of the dwell resets it: contact is a sustained load,
             # and noise that happens to cross once is not one.
-            if self.force >= self.contact_force and not seeding:
+            #
+            # And never with the plate where the wheel cannot be touching. The
+            # dwell is sized against sensor noise, and a transient from the
+            # arm's own motion is neither noise nor contact — it beat the dwell
+            # at 20.8 cm on 2026-09-14. The FILTERED distance, the same one the
+            # schedule reads: at the 0.8 mm/s the plate arrives at, its lag is
+            # a tenth of a millimetre. With no distance at all there is nothing
+            # to check against and force is the only sensor left, so it is
+            # believed — the sweep's own data-age strike covers that case.
+            #
+            # The guard is on the LATCH only. A load the ranges call impossible
+            # still halts the approach below, because if the ranges are ever
+            # the sensor that is wrong, that is precisely the moment to stop
+            # pushing — the halt costs nothing and the alternative is driving
+            # at the schedule's speed into a wall the ranges deny. What such a
+            # load may not do is arm the base.
+            self._loaded = self.force >= self.contact_force and not seeding
+            plausible = (self.distance is None or
+                         self.distance <= self.contact_distance + self.contact_window)
+            if self._loaded and plausible:
                 self._contact_held += dt
                 self._contact_n += 1
             else:
@@ -512,6 +556,7 @@ class AdmittancePress:
             self.state = SEEK
             self._contact_held = 0.0
             self._contact_n = 0
+            self._loaded = False
 
         if self.state == PRESS:
             # v_max bounds the FORCE loop only. It is sized for contact — a few
@@ -520,9 +565,10 @@ class AdmittancePress:
             v = float(np.clip(self.gain * self.error(), -self.v_max, self.v_max))
             self.approach_speed = 0.0
         else:
-            if self._contact_held > 0.0:
+            if self._loaded:
                 # Candidate contact: the force is over the threshold but has not
-                # held for the dwell yet. STOP while confirming, rather than
+                # held for the dwell yet — or the ranges say it cannot be
+                # contact at all. STOP either way while it lasts, rather than
                 # carrying on into the wall for another dwell's worth of travel.
                 #
                 # This is not a detail. The dwell is detection latency, and

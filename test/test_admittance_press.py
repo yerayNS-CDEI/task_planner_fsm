@@ -8,7 +8,7 @@ sweep node's to control, so the press has to be safe at whatever rate it gets.
 
 The wall model is the one wbc/admittance.py sizes its own gain against:
 ``K_e ~ 2e4 N/m`` for concrete with a hard wheel, 30-50 ms of servo lag, and the
-plate bottoming out at 0.13 m because the caster bars reach the wall before the
+plate bottoming out at ~0.14 m because the caster bars reach the wall before the
 plate face does. The range noise is the 4.2 mm sigma the plane fit measures.
 """
 
@@ -270,12 +270,18 @@ def test_the_approach_stops_while_contact_is_being_confirmed():
 
 
 def test_contact_is_confirmed_when_the_load_persists():
-    """The other half: a real load must still be recognised, and promptly."""
+    """The other half: a real load must still be recognised, and promptly.
+
+    At a distance where the wheel CAN be touching. The latch also asks the
+    ranges now (2026-09-14: a transient at 20.8 cm armed the base), so a load
+    at 0.20 m is refused by design; this test is about promptness, so it puts
+    the plate where the robot actually meets the wall.
+    """
     press = AdmittancePress(tare_seconds=0.0, contact_dwell=0.15)
-    press.update(0.0, 0.20, 0.02)
+    press.update(0.0, BOTTOM, 0.02)
     held = 0.0
     while not press.touched and held < 1.0:
-        press.update(50.0, 0.20, 0.02)
+        press.update(50.0, BOTTOM, 0.02)
         held += 0.02
     assert press.touched
     # The dwell plus the filter's own lag in reaching the threshold. Bounded so

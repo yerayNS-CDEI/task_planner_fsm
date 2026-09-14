@@ -30,9 +30,13 @@ with the SAME plane fit the sweep uses, so both sides agree about where the
 wall is. Past ``contact_distance`` the wall behaves as a spring. Below it,
 nothing touches and the force is zero.
 
-Contact is at ~0.13 m of PLATE distance, not at zero: the GPR body has length
+Contact is at ~0.144 m of PLATE distance, not at zero: the GPR body has length
 along the wall normal and four bars with caster wheels stand off the plate's
-corners, so everything is riding the surface while the plate still reads 13 cm.
+corners, so the wheel is loading while the plate still reads over 14 cm. That
+is where the force first appeared on the robot on 2026-09-14 (the plate then
+bottomed out at 13.75, which is the sweep's ``press_contact_distance``); a fake
+wall at the stop itself sits inside the schedule's asymptote and flatters the
+approach, which is the configuration that hid the real problem for a week.
 
 The published force also carries a constant offset, because a real untared TCP
 sensor reads several newtons of payload against a 5 N target. That offset is
@@ -85,7 +89,7 @@ class FakeWrenchPublisher(Node):
         # Plate distance at which the GPR wheel and all four caster bars are
         # riding the wall. This is the contact point, and it is nowhere near
         # zero -- see the module docstring.
-        self.declare_parameter("contact_distance", 0.13)      # m
+        self.declare_parameter("contact_distance", 0.144)     # m
         # Wall stiffness. The default is a soft-ish concrete that the shipped
         # press gain settles against cleanly. Real concrete through rigid bars
         # is far stiffer; raise this to reproduce the overshoot at first touch

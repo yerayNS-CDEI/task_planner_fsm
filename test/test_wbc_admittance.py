@@ -115,6 +115,62 @@ def test_contact_needs_the_load_to_last_rather_than_just_to_cross():
     assert _into_contact(press) > 1, "and contact can never be one update"
 
 
+def test_a_load_with_the_wheel_nowhere_near_the_wall_is_not_contact():
+    """The 2026-09-14 field run's failure, in miniature.
+
+    The dwell is sized against sensor noise. What beat it on the robot was not
+    noise: a +5.3 N transient from the GPR's mass on a jerked arm, held for
+    three cycles, with the plate at 20.8 cm and the wheel 6.5 cm from anything
+    it could touch. The ranges knew that; the force sensor could not. So a
+    sustained load outside ``contact_window`` of the stop is refused however
+    long it lasts, and it must leave no trace in the dwell counter either — a
+    transient every dwell must not accumulate into a latch.
+
+    It still HALTS the approach while it lasts. If the ranges are ever the
+    sensor that is wrong, a load with the plate "far away" is exactly the
+    moment to stop pushing; the halt is free, and what the guard refuses is
+    only the arming of the base.
+    """
+    press = _press(filter_tau=NO_FILTER, contact_distance=0.03,
+                   contact_window=0.03, distance_tau=NO_FILTER)
+    press.update(0.0, 0.20, DT)                  # seed the filter clear of the wall
+    for _ in range(50):                          # a whole second of "contact"
+        v = press.update(9.0, 0.10, DT)          # ...with the plate 7 cm out
+        assert v == 0.0, "an impossible load still halts the approach"
+    assert press.state == SEEK, "a load the ranges say is impossible is not contact"
+    assert not press.touched, "and it must not arm the base's travel"
+    assert press._contact_held == 0.0, "nor leave the dwell part-way to a latch"
+
+    # The same load with the ranges agreeing is contact, as before.
+    assert _into_contact(press, force=9.0, distance=0.05) > 1
+
+
+def test_the_distance_guard_is_a_window_not_a_point():
+    """The wheel loads ~7 mm outside the stop and the plane fit has 4.2 mm of
+    sigma, so contact has to be believed a little outside ``contact_distance``
+    — the guard is a window above the stop, and the edge of it is inclusive of
+    a real, slightly-long reading."""
+    press = _press(filter_tau=NO_FILTER, contact_distance=0.03,
+                   contact_window=0.03, distance_tau=NO_FILTER)
+    press.update(0.0, 0.20, DT)
+    assert _into_contact(press, force=9.0, distance=0.059) > 1, \
+        "inside the window: contact"
+    press = _press(filter_tau=NO_FILTER, contact_distance=0.03,
+                   contact_window=0.03, distance_tau=NO_FILTER)
+    press.update(0.0, 0.20, DT)
+    with pytest.raises(AssertionError):
+        _into_contact(press, force=9.0, distance=0.061)  # just outside: never
+
+
+def test_without_ranges_force_is_the_only_sensor_and_is_believed():
+    """No distance at all means nothing to check against. Refusing contact
+    there would make a press with a dead range topic seek forever; the sweep's
+    data-age strike is what covers that, not this guard."""
+    press = _press(filter_tau=NO_FILTER, contact_window=0.03)
+    press.update(0.0, None, DT)
+    assert _into_contact(press, force=9.0, distance=None) > 1
+
+
 def test_it_pushes_harder_when_light_and_backs_off_when_heavy():
     press = _press(target_force=5.0, gain=1e-4, filter_tau=NO_FILTER)
     _into_contact(press)
