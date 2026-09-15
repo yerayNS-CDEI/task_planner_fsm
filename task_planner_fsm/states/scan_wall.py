@@ -160,6 +160,13 @@ class ScanWall(State):
         # rather than the GPR call itself: that call blocks on HTTP round trips to
         # the Proceq and must not run inside an executor callback.
         self._sweep_scanning = False
+        # Latched once the GPR line, its triggers and the hyperspectral sampler
+        # have been armed for the sweep in flight. Its own flag rather than
+        # "is the trigger timer running": with gpr_trigger_enabled off there is
+        # no timer, and keying on it re-armed the samplers every tick -- which
+        # reset the hyperspectral travel counter each second, so no capture
+        # could ever accumulate its spacing.
+        self._sweep_samplers_armed = False
         self._arm_goal_pub = None        # /arm/goal_pose publisher (created once)
         self._arm_goal_start = None      # planner wait deadline for the Z move
         self._recenter_future = None     # /send_position call for the pre-transit re-pose
@@ -315,6 +322,7 @@ class ScanWall(State):
         self._sweep_result = None
         self._sweep_goal_handle = None
         self._sweep_scanning = False
+        self._sweep_samplers_armed = False
         self._sweep_from = None
         self._sweep_to = None
         self._stop_sweep_crawl(ctx)   # clear any stale timer from a re-entry
@@ -1575,6 +1583,47 @@ class ScanWall(State):
         """
         if not self._hs.enabled(ctx):
             return
+        ref, axis = self._hyperspectral_frame_and_axis(ctx, seg_start, seg_end)
+        self._hs.start_line(
+            ctx, seg_start, seg_end,
+            pose_fn=self._plate_pose_fn(ctx),
+            ref=ref,
+            axis=axis,
+            world=self._world_frame(ctx),
+            wall_index=ctx.get("current_wall_index"),
+            line_idx=ctx.get("current_line_idx", 0),
+            seg_idx=self._seg_idx,
+        )
+
+    def _begin_hyperspectral_segment(self, ctx, seg_start, seg_end):
+        """Open the hyperspectral segment and take sample #0 at the sweep start.
+
+        Called the moment the plate is pressed on the wall with its orientation
+        corrected -- before the sweep goal is sent -- so the first spectrum is
+        taken with the plate at rest exactly at d = 0, where the GPR's first
+        trace also lands. The distance sampler itself is armed later, by
+        _start_hyperspectral on the executor's "sweep" feedback, and its
+        counters carry on from this point.
+        """
+        if not self._hs.enabled(ctx):
+            return
+        ref, _axis = self._hyperspectral_frame_and_axis(ctx, seg_start, seg_end)
+        if self._hs.begin_segment(
+            ctx, self._plate_pose_fn(ctx), ref=ref, world=self._world_frame(ctx),
+            wall_index=ctx.get("current_wall_index"),
+            line_idx=ctx.get("current_line_idx", 0),
+            seg_idx=self._seg_idx,
+        ):
+            self._hs.capture_at_start(ctx)
+
+    def _plate_pose_fn(self, ctx):
+        """The plate lookup handed to the sampler: one TF fallback chain and
+        one cached EE frame, shared with the GPR triggers."""
+        return lambda frame, timeout: self._lookup_plate_xyz(ctx, frame, timeout_s=timeout)
+
+    def _hyperspectral_frame_and_axis(self, ctx, seg_start, seg_end):
+        """``(ref, axis)`` for the segment: the GPR trigger frame and the sweep
+        direction expressed in it, falling back to the world frame."""
         ref = self._gpr_trigger_frame(ctx)
         axis_xy = self._sweep_axis(seg_start, seg_end)
         if axis_xy is None:
@@ -1588,17 +1637,7 @@ class ScanWall(State):
                 f"direction in '{ref}'; measuring in {world} instead."
             )
             ref, axis = world, (axis_xy[0], axis_xy[1], 0.0)
-        self._hs.start_line(
-            ctx, seg_start, seg_end,
-            pose_fn=lambda frame, timeout: self._lookup_plate_xyz(
-                ctx, frame, timeout_s=timeout),
-            ref=ref,
-            axis=axis,
-            world=self._world_frame(ctx),
-            wall_index=ctx.get("current_wall_index"),
-            line_idx=ctx.get("current_line_idx", 0),
-            seg_idx=self._seg_idx,
-        )
+        return ref, axis
 
     # ------------------------------------------------------------------
     # Column height from the map-frame line z
@@ -2973,6 +3012,12 @@ class ScanWall(State):
             if not self._wall_contact_ready(ctx):
                 return
 
+            # The plate is on the wall, orientation corrected, nothing moving
+            # yet: this is d = 0 of the sweep. Take the first hyperspectral
+            # sample here, at rest, in BOTH sweep routes -- the distance
+            # sampler armed later carries on from it.
+            self._begin_hyperspectral_segment(ctx, seg_start, seg_end)
+
             # Wheel is pressed against the wall. GPR: connect, create the LINE_SCAN
             # measurement and start the line now (real robot only).
             #
@@ -3055,17 +3100,18 @@ class ScanWall(State):
                 # this feedback is also why none of the three no-sweep paths into
                 # sweep_wait (column failure, lead-in dispatch, lead-in failure)
                 # can arm the sampler.
-                if self._sweep_scanning and not self.gpr_line_active:
+                # Armed once per sweep, not once per tick: neither the probe
+                # (off by default, so gpr_line_active never latches) nor the
+                # trigger timer (absent when gpr_trigger_enabled is off) can
+                # stand in for "already armed", so the flag is explicit. Set
+                # before the probe call so a failed start cannot re-arm either.
+                if self._sweep_scanning and not self._sweep_samplers_armed:
+                    self._sweep_samplers_armed = True
                     self._gpr_start_measurement_and_line(ctx)
                     if ctx.get("error_triggered"):
                         return
-                    # Armed once per sweep, not once per tick: with the probe
-                    # disabled (the default) gpr_line_active never latches, so
-                    # this block is re-entered every tick for the whole sweep and
-                    # a bare arm call would restart the counter each second.
-                    if self._gpr_trigger_timer is None:
-                        self._start_gpr_triggers(ctx, seg_start, seg_end)
-                        self._start_hyperspectral(ctx, seg_start, seg_end)
+                    self._start_gpr_triggers(ctx, seg_start, seg_end)
+                    self._start_hyperspectral(ctx, seg_start, seg_end)
                 # The executor owns the sweep's own watchdogs and reports one
                 # outcome; everything after it here is unchanged.
                 if self._sweep_result is None:
@@ -3323,6 +3369,7 @@ class ScanWall(State):
         self._sweep_result = None
         self._sweep_goal_handle = None
         self._sweep_scanning = False
+        self._sweep_samplers_armed = False
         future = self._sweep_client.send_goal_async(
             goal, feedback_callback=self._on_sweep_feedback
         )

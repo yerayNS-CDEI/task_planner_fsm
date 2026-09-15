@@ -292,6 +292,105 @@ def test_a_retreat_costs_at_most_one_spacing(rig):
 
 
 # ----------------------------------------------------------------------
+# Sample #0 at the sweep start
+# ----------------------------------------------------------------------
+def _contact_then_sweep(rig, distance_m, step_m=0.02, capture_at_start=True):
+    """ScanWall's order of events: the plate is pressed and still (begin +
+    sample #0), then the executor sweeps (start_line + ticks)."""
+    plate = [0.0, 0.0, 1.0]
+    pose_fn = lambda frame, timeout: tuple(plate)          # noqa: E731
+    rig.ctx["hyperspectral_capture_at_start"] = capture_at_start
+    assert rig.sampler.begin_segment(rig.ctx, pose_fn, ref="map", world="map",
+                                     wall_index=0, line_idx=0, seg_idx=0)
+    rig.sampler.capture_at_start(rig.ctx)
+    for request, future in rig.client.calls:
+        if request.command == "GSM" and not future.done():
+            future.settle(_ok_response())
+    rig.sampler.start_line(
+        rig.ctx, (0.0, 0.0), (distance_m, 0.0), pose_fn=pose_fn,
+        ref="map", axis=(1.0, 0.0, 0.0), wall_index=0, line_idx=0, seg_idx=0,
+    )
+    tick = rig.node.timers[-1].callback
+    seen = 0
+    for i in range(1, int(round(distance_m / step_m)) + 1):
+        plate[0] = i * step_m
+        tick()
+        while seen < len(rig.client.calls):
+            request, future = rig.client.calls[seen]
+            seen += 1
+            if request.command == "GSM" and not future.done():
+                future.settle(_ok_response())
+    rig.sampler.stop_line(rig.ctx)
+    rig.sampler.abort(rig.ctx)
+    return list(hp.read_raw_samples(rig.sampler._session_dir))
+
+
+def test_the_first_sample_lands_at_d_equals_zero(rig):
+    """Pressed on the wall, orientation corrected, not yet moving: sample #0 is
+    taken there, at rest, exactly where the GPR's first trace lands. The moving
+    samples then keep their numbering, trigger k at k x spacing."""
+    rows = _contact_then_sweep(rig, distance_m=0.36)
+    assert [r["trigger_idx"] for r in rows] == [0, 1, 2, 3]
+    # Sample #0 exactly at rest; the rest on the 10 cm grid, to within the 2 cm
+    # polling step the sweep is driven with.
+    assert rows[0]["travel_m"] == 0.0 and rows[0]["pose"][0] == 0.0
+    for r in rows[1:]:
+        assert r["travel_m"] == pytest.approx(0.1 * r["trigger_idx"], abs=0.021)
+        assert r["pose"][0] == pytest.approx(r["travel_m"], abs=1e-9)
+    assert all(r["outcome"] == hp.OK for r in rows)
+
+
+def test_the_start_sample_belongs_to_the_same_segment_record(rig):
+    """begin_segment then start_line is ONE segment, not two: the metrics
+    record opened at contact carries on through the sweep."""
+    _contact_then_sweep(rig, distance_m=0.36)
+    segments = rig.sampler.metrics.segments
+    assert len(segments) == 1
+    assert segments[0]["triggered"] == 4
+    assert segments[0]["collection"][hp.OK] == 4
+    assert segments[0]["travel_m"] == pytest.approx(0.36)
+
+
+def test_the_start_sample_can_be_switched_off(rig):
+    rows = _contact_then_sweep(rig, distance_m=0.36, capture_at_start=False)
+    assert [r["trigger_idx"] for r in rows] == [1, 2, 3]
+
+
+def test_a_segment_opened_at_contact_closes_even_if_the_sweep_never_starts(rig):
+    """The executor can reject the sweep goal after the press; the d = 0
+    sample is still real data and the record must not be left open."""
+    plate = (0.0, 0.0, 1.0)
+    rig.sampler.begin_segment(rig.ctx, lambda f, t: plate, ref="map", world="map",
+                              wall_index=0, line_idx=0, seg_idx=0)
+    rig.sampler.capture_at_start(rig.ctx)
+    rig.client.calls[-1][1].settle(_ok_response())
+    rig.sampler.stop_line(rig.ctx)
+    assert rig.sampler.metrics.current is None
+    assert rig.sampler.metrics.segments[0]["triggered"] == 1
+    assert rig.sampler._segment_open is False
+
+
+def test_begin_segment_is_idempotent_for_the_same_segment(rig):
+    plate = (0.0, 0.0, 1.0)
+    pose_fn = lambda f, t: plate                                # noqa: E731
+    rig.sampler.begin_segment(rig.ctx, pose_fn, ref="map", world="map",
+                              wall_index=0, line_idx=0, seg_idx=0)
+    rig.sampler.capture_at_start(rig.ctx)
+    rig.sampler.begin_segment(rig.ctx, pose_fn, ref="map", world="map",
+                              wall_index=0, line_idx=0, seg_idx=0)
+    assert len(rig.sampler.metrics.segments) == 1 or rig.sampler.metrics.current is not None
+    assert rig.sampler._trigger_count == 0                      # not reset
+    assert sum(1 for r, _ in rig.client.calls if r.command == "GSM") == 1
+
+
+def test_no_start_sample_without_a_plate_pose(rig):
+    rig.sampler.begin_segment(rig.ctx, lambda f, t: None, ref="map", world="map",
+                              wall_index=0, line_idx=0, seg_idx=0)
+    assert rig.sampler.capture_at_start(rig.ctx) is False
+    assert not [r for r, _ in rig.client.calls if r.command == "GSM"]
+
+
+# ----------------------------------------------------------------------
 # Failure and skip accounting
 # ----------------------------------------------------------------------
 def test_a_sensor_failure_is_recorded_rather_than_dropped(rig):

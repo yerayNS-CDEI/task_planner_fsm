@@ -402,7 +402,7 @@ The FSM consists of **17 states** that execute sequentially with conditional tra
 | **WallTargetSelection** | Next wall selection | Find closest unscanned wall to current robot position | Wall selected |
 | **NavigateToTarget** | Base navigation | Send Nav2 goal `/navigate_to_pose`, await result | Navigation complete |
 | **ArmUnfolding** | Arm extension | Send `/arm/send_position` for 'unfolded_fsm' pose | Arm movement done |
-| **ScanWall** | Wall scanning | Launch sensors, alignment; execute scan trajectory; record hyperspectral raw spectra + GPR line manifest | Scan trajectory complete |
+| **ScanWall** | Wall scanning | Launch sensors, alignment; execute scan trajectory; record hyperspectral raw spectra (sample #0 at the pressed start point, then one per `hyperspectral_sample_spacing_m` of plate travel) + GPR line manifest | Scan trajectory complete |
 | **SensorDataProcessing** | Sensor post-processing | Reflectance pass → DISCOVER HSI classifier → GPR hyperbola/line pipelines → POKEYE decision + target clustering (see [Sensor Processing](#sensor-processing-hsi--gpr--pokeye)) | `drilling_required` → SendDataToPokeye, else ArmFolding |
 | **SendDataToPokeye** | Drill target hand-off | Write `pokeye_request.json`, call `/send_data_to_pokeye` (`arm_control/SendPokeyeTargets`), wait for the ack | Pokeye accepted the targets |
 | **ArmFolding** | Arm retraction | Sequential folding: unfolded → folded via `/arm/send_position` | Arm folded |
@@ -1246,6 +1246,14 @@ gpr            hyperbola + line segmentation over new GP8800 exports (background
 decision       decide_pokeye() per sample -> clustered drill targets for this wall
 external       legacy /sensor_data_processing mock (simulation only)
 ```
+
+**Hyperspectral sampling during the sweep**: the first spectrum (`trigger_idx`
+0, `travel_m` 0) is taken the moment the plate is pressed on the wall with its
+orientation corrected, before the arm moves laterally — the same point the
+GPR's first trace lands on. The distance sampler is armed on the executor's
+sweep feedback and carries on from there, so sample *k* sits at
+*k* × `hyperspectral_sample_spacing_m` along the segment. Set
+`hyperspectral_capture_at_start:=false` to skip sample #0.
 
 **Folders** (package root, gitignored; `data/README.md`, `models/README.md`):
 

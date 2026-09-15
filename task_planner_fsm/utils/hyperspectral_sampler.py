@@ -35,6 +35,16 @@ WHAT IT DELIBERATELY DOES NOT DO
 * **No median of N captures.** The 5-capture median in arm_control's CLI is a
   stationary-sample concept: at 0.05 m/s five captures 0.7 s apart span about
   25 cm, so the median would mix five different spots. One capture per point.
+
+WHERE THE FIRST SAMPLE LANDS
+----------------------------
+At d = 0, like the GPR's first trace. ScanWall opens the segment
+(:meth:`begin_segment`) the moment the plate is pressed on the wall with its
+orientation corrected -- before the executor is even asked to sweep -- and
+takes sample #0 there, while the plate is still. The distance timer
+(:meth:`start_line`) is only armed later, on the executor's "sweep" feedback,
+so samples #1, #2, ... land one spacing apart from that resting point and
+``trigger_idx * spacing`` is each sample's nominal position along the segment.
 """
 
 import math
@@ -112,6 +122,9 @@ class HyperspectralSampler:
         self._wall_index = None
         self._line_idx = None
         self._seg_idx = None
+        # True between begin_segment and stop_line: the metrics record is open
+        # and sample #0 may already be on file, so start_line must not reset.
+        self._segment_open = False
 
     # ------------------------------------------------------------------
     # Configuration
@@ -280,6 +293,83 @@ class HyperspectralSampler:
     # ------------------------------------------------------------------
     # Segment lifecycle
     # ------------------------------------------------------------------
+    def _ready_to_sample(self, ctx):
+        """Enabled, client up, calibration cached -- or say why not."""
+        if not self.enabled(ctx) or self._client is None:
+            return False
+        if not self._calibration_ready:
+            # Sampling without GDS/GRF would record spectra that can never be
+            # turned into reflectance. Skip the segment loudly instead: the GPR
+            # is the primary sensor and its line must still run.
+            ctx["node"].get_logger().warn(
+                f"[{self.owner_name}] no calibration cached; this segment will "
+                f"not be sampled. Run the interactive GDS/GRF calibration on "
+                f"hyperspectral_node before the mission."
+            )
+            return False
+        return True
+
+    def begin_segment(self, ctx, pose_fn, ref="map", world="map",
+                      wall_index=None, line_idx=None, seg_idx=None):
+        """Open the segment record at the plate's resting point on the wall.
+
+        Called when contact is established and the orientation corrected, i.e.
+        at d = 0 of the sweep to come. Sets the identity every sample carries,
+        zeroes the travel counters and opens the metrics record; it does NOT
+        start the distance timer -- that is :meth:`start_line`, once the plate
+        actually moves. Idempotent for the same segment.
+        """
+        key = (wall_index, line_idx, seg_idx)
+        if self._segment_open and self._segment_key() == key:
+            return True
+        self.stop_line(ctx)                        # never two open segments
+        if not self._ready_to_sample(ctx):
+            return False
+        self._ref = ref
+        self._world = str(world)
+        self._pose_fn = pose_fn
+        self._axis = None
+        self._last_xyz = None
+        self._wall_index = wall_index
+        self._line_idx = line_idx
+        self._seg_idx = seg_idx
+        self._residual = 0.0
+        self._travel = 0.0
+        self._trigger_count = 0
+        self._tf_warned = False
+        self._last_capture_t = 0.0
+        self.metrics.begin_segment(wall_index, line_idx, seg_idx, self.spacing(ctx))
+        self._segment_open = True
+        return True
+
+    def capture_at_start(self, ctx):
+        """Sample #0: the plate pressed on the wall, not yet moving.
+
+        Recorded as trigger 0 at 0.000 m, so the moving samples keep their
+        numbering (trigger k at k x spacing). Off with
+        ``hyperspectral_capture_at_start`` false. Needs an open segment.
+        """
+        if not self._segment_open or self._pose_fn is None:
+            return False
+        if not bool(ctx.get("hyperspectral_capture_at_start", True)):
+            return False
+        xyz = self._pose_fn(self._ref, 1.0)
+        if xyz is None:
+            ctx["node"].get_logger().warn(
+                f"[{self.owner_name}] {self._ref}->plate transform unavailable at "
+                f"the sweep start; no d = 0 sample."
+            )
+            return False
+        self.metrics.record_trigger()
+        self._dispatch_capture(ctx, xyz)
+        ctx["node"].get_logger().info(
+            f"[{self.owner_name}] sample #0 taken at the sweep start (d = 0)."
+        )
+        return True
+
+    def _segment_key(self):
+        return (self._wall_index, self._line_idx, self._seg_idx)
+
     def start_line(self, ctx, seg_start, seg_end, pose_fn, ref="map", axis=None,
                    wall_index=None, line_idx=None, seg_idx=None, world="map"):
         """Arm the sampler for the segment sweep that is about to start.
@@ -299,41 +389,24 @@ class HyperspectralSampler:
         -- ``map`` in a mission, whatever ``scan_world_frame`` says otherwise
         (``odom`` on a bench run without localisation).
 
-        Counters restart per segment. Unlike the GPR there is no d = 0 sample:
-        the plate has just settled against the wall and the first capture would
-        overlap the press, so the first sample lands one spacing in.
+        The segment is normally already open from :meth:`begin_segment`, with
+        sample #0 on file: then only the axis and the timer are set up here and
+        every counter carries on, so sample #1 lands one spacing from the
+        resting point. Without a prior begin_segment (a caller that has no
+        contact event) the segment is opened here instead and the first sample
+        lands one spacing in.
         """
         self.stop_timer(ctx)                       # never two timers
-        if not self.enabled(ctx) or self._client is None:
+        if not self.begin_segment(ctx, pose_fn, ref=ref, world=world,
+                                  wall_index=wall_index, line_idx=line_idx,
+                                  seg_idx=seg_idx):
             return False
         node = ctx["node"]
-        if not self._calibration_ready:
-            # Sampling without GDS/GRF would record spectra that can never be
-            # turned into reflectance. Skip the segment loudly instead: the GPR
-            # is the primary sensor and its line must still run.
-            node.get_logger().warn(
-                f"[{self.owner_name}] no calibration cached; this segment will "
-                f"not be sampled. Run the interactive GDS/GRF calibration on "
-                f"hyperspectral_node before the mission."
-            )
-            return False
-
-        self._ref = ref
-        self._world = str(world)
         self._axis = axis
         self._pose_fn = pose_fn
-        self._wall_index = wall_index
-        self._line_idx = line_idx
-        self._seg_idx = seg_idx
-        self._residual = 0.0
-        self._travel = 0.0
-        self._trigger_count = 0
         self._tf_warned = False
-        self._last_capture_t = 0.0
         self._last_xyz = pose_fn(ref, 1.0)
-
         spacing = self.spacing(ctx)
-        self.metrics.begin_segment(wall_index, line_idx, seg_idx, spacing)
 
         rate = max(1.0, float(
             ctx.get("hyperspectral_sample_rate_hz", self.SAMPLE_RATE_HZ)))
@@ -348,9 +421,11 @@ class HyperspectralSampler:
     def stop_line(self, ctx, aborted=False):
         """Disarm at the end of a segment and close its metrics record."""
         if self._timer is None and self.metrics.current is None:
+            self._segment_open = False
             return
         node = ctx["node"]
         self.stop_timer(ctx)
+        self._segment_open = False
         # A capture dispatched just before the sweep ended is still valid data --
         # the plate was on the wall when it fired -- so let it land rather than
         # cancelling it. It is attributed to the segment that is closing here,
@@ -408,6 +483,7 @@ class HyperspectralSampler:
         self._trigger_count = 0
         self._pending = None
         self._pending_meta = None
+        self._segment_open = False
 
     # ------------------------------------------------------------------
     # Distance trigger
