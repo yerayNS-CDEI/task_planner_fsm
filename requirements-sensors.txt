@@ -5,15 +5,32 @@
 #
 #   pip install -r requirements-sensors.txt
 #
-# On the Jetson install torch/torchvision from NVIDIA's aarch64 wheels instead
-# of PyPI, then the rest of this file.
+# On the Jetson install torch/torchvision from the JetPack CUDA wheels, NOT
+# from PyPI: at equal version pip prefers PyPI's manylinux wheel, which is
+# CPU-only ("2.8.0+cpu", CUDA available: False). Verified 2026-09-15 on
+# JetPack 6.2 / L4T R36.4.4 / CUDA 12.6 / Python 3.10:
+#
+#   B=https://pypi.jetson-ai-lab.io/jp6/cu126
+#   pip3 install --user --no-deps \
+#     $B/+f/62a/1beee9f2f1470/torch-2.8.0-cp310-cp310-linux_aarch64.whl \
+#     $B/+f/907/c4c1933789645/torchvision-0.23.0-cp310-cp310-linux_aarch64.whl
+#   pip3 install --user filelock fsspec networkx sympy   # torch's pure-python deps
+#
+# then the rest of this file. That index is slow (a 216 MB wheel can take
+# 15+ min); point PIP_CACHE_DIR/TMPDIR at the SSD if the root disk is tight.
 
 # shared
 # The delivered classifier.joblib was pickled with numpy >= 2 and scikit-learn
 # 1.8. It loads on numpy 1.24 / sklearn 1.7 (ROS Humble) thanks to a module
 # alias in task_planner_fsm/sensors/__init__.py, with an "unpickle from a newer
 # version" warning; matching versions on the Jetson are still preferable.
-numpy
+#
+# numpy MUST stay 1.x here. The apt scipy/pandas/matplotlib (and the ROS
+# Python stack) on the Jetson are compiled against numpy 1.x; an unpinned
+# install pulled numpy 2.2 into ~/.local on 2026-09-15 and every one of them
+# failed with "_ARRAY_API not found". scikit-learn needs >= 1.22, apt's
+# scipy 1.8 refuses >= 1.25.
+numpy>=1.22,<1.25
 pandas
 scipy
 pyyaml
