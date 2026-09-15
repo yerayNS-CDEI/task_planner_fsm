@@ -596,6 +596,7 @@ ros2 run task_planner_fsm fsm_node --sim true \
 <!-- | **NavigateToTarget** | Test navigation only | URSim not needed, Nav2 required | -->
 <!-- | **ArmUnfolding** | Test arm control | URSim required, Nav2 not needed | -->
 | **ScanWall** | Test wall scanning | URSim + sensors required |  
+| **SensorDataProcessing** | Process the latest recorded sensor session offline | Nothing — no robot stack is launched (see below) |
 | **AreasOfInterest** | Test exhaustive scanning | All services required |
 <!-- | **ExhaustiveScan** | Test exhaustive coverage | All services required | -->
 <!-- | **WallDiscretization** | Test discretization | wall_discretization_node required | -->
@@ -618,6 +619,28 @@ topics and then `collision_ready_timeout` (180 s) for the arm planner's
 collision service; both return as soon as the stack is up, so the budget only
 matters when it is slow. An in-front wall then waits `bootstrap_tf_timeout_s`
 (120 s) for the first base transform.
+
+### Offline: process a recorded session
+
+```bash
+ros2 run task_planner_fsm fsm_node --initial-state SensorDataProcessing
+# a specific session instead of the latest one
+ros2 run task_planner_fsm fsm_node --initial-state SensorDataProcessing \
+  --ros-args -p hyperspectral_session_dir:=data/raw/hyperspectral/session_20260915_142215
+```
+
+Also available from the arm_control UI's *Initial State* combo. Starting at
+`SensorDataProcessing` is an **offline run**: no robot stack is launched and
+nothing prompts for walls. The state processes the **most recent**
+`data/raw/hyperspectral/session_<stamp>/` (or the one named with
+`hyperspectral_session_dir`), the GPR line manifest sharing that stamp, and
+any GP8800 exports in `data/raw/gpr/incoming/`; results land in
+`data/processed/session_<stamp>/`. POKEYE targets are clustered for every wall
+in the record. The run then ends in `Finished` (`fsm_stop_after` defaults to
+`SensorDataProcessing` here; `--stop-after SendDataToPokeye` continues to the
+POKEYE hand-off instead), and the legacy simulation mock is disabled so a real
+record is never replaced by the fake verdict. `process_sensor_session` remains
+the non-ROS way to do the same.
 
 `scan_world_frame` (ctx / ROS param, default `map`): the fixed frame the wall
 geometry, the arm-sweep goal, the column's line-height lookup and the recorded

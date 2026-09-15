@@ -93,6 +93,25 @@ def raw_hyperspectral_root(ctx=None) -> Path:
     return data_dir(ctx) / "raw" / "hyperspectral"
 
 
+def raw_session_dirs(ctx=None):
+    """Every ``session_<stamp>`` under the raw hyperspectral root, oldest first.
+
+    Stamps are ``YYYYMMDD_HHMMSS`` so lexical order is chronological; the
+    directories the sampler creates always carry one, and anything else in
+    that folder (the camera node's own CSVs, notes) is not a session.
+    """
+    root = raw_hyperspectral_root(ctx)
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith("session_"))
+
+
+def latest_raw_session_dir(ctx=None):
+    """The most recent recorded session, or None when there is none yet."""
+    sessions = raw_session_dirs(ctx)
+    return sessions[-1] if sessions else None
+
+
 def gpr_incoming_dir(ctx=None) -> Path:
     """Where the GP8800 exports (``.sgy`` + ``.csv``) land (``gpr_incoming_dir``)."""
     return _expand(_get(ctx, "gpr_incoming_dir", data_dir(ctx) / "raw" / "gpr" / "incoming"))
