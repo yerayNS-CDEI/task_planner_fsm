@@ -49,7 +49,9 @@ from task_planner_fsm.states.proc_utils import (
     stop_all,
     wait_stack_ready,
     wait_services_ready,
+    COLLISION_READY_TIMEOUT_S,
     ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
+    STACK_READY_TIMEOUT_S,
 )
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
 from task_planner_fsm.utils.wall_geometry import build_wall_data, left_scan_endpoint
@@ -857,7 +859,7 @@ class RobotFSMNode(Node):
                 "stack_ready_topics",
                 default_ready_topics,
             )
-            ready_timeout = float(self.ctx.get("stack_ready_timeout", 90.0))
+            ready_timeout = float(self.ctx.get("stack_ready_timeout", STACK_READY_TIMEOUT_S))
             self.get_logger().info(
                 f"[FSM] Waiting (up to {ready_timeout:.0f}s) for navigation + localization stack to become ready..."
             )
@@ -873,7 +875,9 @@ class RobotFSMNode(Node):
                     "collision_ready_services",
                     ["/collision/check_collision_pose"],
                 )
-                collision_timeout = float(self.ctx.get("collision_ready_timeout", 60.0))
+                collision_timeout = float(
+                    self.ctx.get("collision_ready_timeout", COLLISION_READY_TIMEOUT_S)
+                )
                 self.get_logger().info(
                     f"[FSM] Waiting (up to {collision_timeout:.0f}s) for collision checking service to come up..."
                 )

@@ -101,8 +101,10 @@ from task_planner_fsm.states.proc_utils import (
     wait_processes_gone,
     kill_stale_stack,
     stop_timeout_for,
+    COLLISION_READY_TIMEOUT_S,
     ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
     SIM_STACK_PATTERNS,
+    STACK_READY_TIMEOUT_S,
 )
 
 # The navi_wall wall detector + persistent aggregator, launched by ObjectID before
@@ -588,7 +590,7 @@ class ObjectID(State):
             if requested_sim:
                 default_ready_topics = ["/clock"] + default_ready_topics
             required_topics = ctx.get("stack_ready_topics", default_ready_topics)
-            ready_timeout = float(ctx.get("stack_ready_timeout", 90.0))
+            ready_timeout = float(ctx.get("stack_ready_timeout", STACK_READY_TIMEOUT_S))
             node.get_logger().info(
                 f"[{self.name}] Waiting up to {ready_timeout:.0f}s for navigation + localization stack..."
             )
@@ -604,7 +606,9 @@ class ObjectID(State):
                     "collision_ready_services",
                     ["/collision/check_collision_pose"],
                 )
-                collision_timeout = float(ctx.get("collision_ready_timeout", 60.0))
+                collision_timeout = float(
+                    ctx.get("collision_ready_timeout", COLLISION_READY_TIMEOUT_S)
+                )
                 node.get_logger().info(
                     f"[{self.name}] Waiting up to {collision_timeout:.0f}s for collision checking service..."
                 )

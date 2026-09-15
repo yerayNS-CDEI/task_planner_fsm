@@ -70,6 +70,19 @@ ROBOT_STACK_STOP_TIMEOUT = 25.0
 # teardown, so this cannot hang the FSM.
 ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS = ["sigkill_timeout:=30"]
 
+# How long the robot stack (move_robot.launch.py) gets to come up before the
+# FSM gives up on it: first the topics (/tf, /joint_states, odometry), then the
+# collision-checking service the arm planner depends on. Shared by ObjectID,
+# which launches the stack mid-mission, and the bootstrap, which launches it
+# for a checkpoint start, so the two cannot drift apart. On the real robot the
+# UR driver, the lidar drivers, rtabmap and Nav2 all start in one launch and
+# a 90 s budget was seen to expire with nodes still starting; a generous
+# budget costs nothing when the stack is quick, since the wait returns as soon
+# as everything is up. Override with ``stack_ready_timeout`` /
+# ``collision_ready_timeout``.
+STACK_READY_TIMEOUT_S = 300.0
+COLLISION_READY_TIMEOUT_S = 180.0
+
 
 def stop_timeout_for(key: str) -> float:
     """Graceful-shutdown budget to give the launch registered under ``key``."""
