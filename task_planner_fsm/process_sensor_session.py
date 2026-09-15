@@ -67,6 +67,8 @@ def main(argv=None):
     parser.add_argument("--models-dir", default=None, help="override sensor_models_dir")
     parser.add_argument("--threshold", type=float, default=hsi.DEFAULT_CONFIDENCE_THRESHOLD,
                         help="HSI confidence threshold (default %(default)s)")
+    parser.add_argument("--hsi-device", default=hsi.DEFAULT_DEVICE,
+                        help="where XGBoost predicts, cpu or cuda (default %(default)s)")
     parser.add_argument("--skip-reflectance", action="store_true",
                         help="reuse the existing reflectance.csv")
     parser.add_argument("--skip-gpr", action="store_true", help="do not run the GPR pipelines")
@@ -108,7 +110,8 @@ def main(argv=None):
     try:
         t0 = time.monotonic()
         result = hsi.classify_session(session_dir, paths.hsi_results_dir(ctx),
-                                      paths.hsi_model_path(ctx), threshold, logger=log)
+                                      paths.hsi_model_path(ctx), threshold, logger=log,
+                                      device=args.hsi_device)
         samples = result["samples"]
         log.info(f"hsi: {result['n_classified']} spectra classified in {time.monotonic() - t0:.1f} s")
         for wall, bucket in sorted(result["by_wall"].items(), key=lambda kv: (kv[0] is None, kv[0])):

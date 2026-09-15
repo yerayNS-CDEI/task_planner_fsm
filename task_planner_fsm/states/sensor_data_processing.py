@@ -259,6 +259,7 @@ class SensorDataProcessing(State):
                 confidence_threshold=float(
                     ctx.get("hsi_confidence_threshold", hsi.DEFAULT_CONFIDENCE_THRESHOLD)),
                 logger=node.get_logger(),
+                device=str(ctx.get("hsi_device", hsi.DEFAULT_DEVICE)),
                 name="hsi-classify",
             )
 

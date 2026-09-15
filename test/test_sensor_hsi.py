@@ -155,3 +155,48 @@ def test_a_missing_classifier_stack_is_one_clear_error(tmp_path):
     model.write_bytes(b"x")
     with pytest.raises(VendorUnavailable, match="xgboost"):
         hsi.classify_session(tmp_path, tmp_path / "out", model)
+
+
+# ----------------------------------------------------------------------
+# Where the classifier runs
+# ----------------------------------------------------------------------
+class _FakeXGB:
+    """Quacks like an XGBClassifier: the two attributes _place_models keys on."""
+
+    def __init__(self):
+        self.params = {"device": "cuda"}
+
+    def get_booster(self):
+        return None
+
+    def set_params(self, **kw):
+        self.params.update(kw)
+
+
+def test_models_loaded_inside_the_block_are_pinned_to_the_device(tmp_path, monkeypatch):
+    """The delivered bundle carries device="cuda"; on a machine whose xgboost
+    has no kernels for its GPU every predict dies. The vendored pipeline loads
+    the bundle itself, so the loader is wrapped for the duration of the call."""
+    import joblib
+    bundle = {"model": _FakeXGB(), "scaler": object(), "wl": [1, 2, 3]}
+    monkeypatch.setattr(joblib, "load", lambda *a, **kw: bundle)
+    original = joblib.load
+
+    with hsi.models_on("cpu"):
+        loaded = joblib.load("whatever.joblib")
+        assert loaded is bundle
+        assert loaded["model"].params["device"] == "cpu"
+    assert joblib.load is original                     # restored afterwards
+
+
+def test_an_empty_device_leaves_the_model_as_pickled(monkeypatch):
+    import joblib
+    bundle = {"model": _FakeXGB()}
+    monkeypatch.setattr(joblib, "load", lambda *a, **kw: bundle)
+    with hsi.models_on(""):
+        joblib.load("x")
+    assert bundle["model"].params["device"] == "cuda"
+
+
+def test_the_default_device_is_the_cpu():
+    assert hsi.DEFAULT_DEVICE == "cpu"

@@ -1307,6 +1307,9 @@ vote) are clustered per wall in the map frame: single linkage within
 
 **Parameters** (ctx / ROS params): `sensor_data_dir`, `sensor_models_dir`,
 `sensor_results_dir`, `hsi_model_path`, `hsi_confidence_threshold` (0.8),
+`hsi_device` (`cpu`: the delivered bundle says `cuda`, but the pip xgboost on
+the Jetson has no kernels for the Orin and the model is milliseconds on the
+CPU anyway),
 `gpr_processing_enabled`, `gpr_incoming_dir`, `gpr_weights_path`,
 `gpr_wait_timeout_s` (0), `gpr_run_hyperbolae`, `gpr_run_lines`,
 `sensor_processing_mock`, `pokeye_service`, `pokeye_service_timeout_s`, plus

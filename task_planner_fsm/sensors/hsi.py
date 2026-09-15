@@ -20,6 +20,7 @@ Everything here is a blocking function meant to run inside a
 :class:`~task_planner_fsm.sensors.background_job.BackgroundJob`; no ROS.
 """
 
+import contextlib
 import csv
 import json
 import os
@@ -223,9 +224,56 @@ def write_samples_csv(samples, path):
 # ----------------------------------------------------------------------
 # The whole thing
 # ----------------------------------------------------------------------
+# Where the XGBoost classifier runs. The delivered bundle was saved with
+# device="cuda" and keeps that on load, but the pip xgboost wheel on the Jetson
+# is a CUDA build without kernels for the Orin (sm_87): every predict_proba
+# died with cudaErrorNoKernelImageForDevice. The model is ~4 ms per hundred
+# spectra on the CPU, so nothing is lost by pinning it there.
+DEFAULT_DEVICE = "cpu"
+
+
+def _place_models(obj, device):
+    """Set ``device`` on every XGBoost model inside a loaded joblib object."""
+    if isinstance(obj, dict):
+        for value in obj.values():
+            _place_models(value, device)
+    elif hasattr(obj, "get_booster") and hasattr(obj, "set_params"):
+        obj.set_params(device=device)
+    return obj
+
+
+@contextlib.contextmanager
+def models_on(device):
+    """Force every model ``joblib.load`` returns inside the block onto ``device``.
+
+    The vendored pipeline loads the bundle itself, deep in the original
+    ``predict.py``, and offers no hook for the device; wrapping the loader
+    for the duration of the call is the one seam that leaves that code
+    untouched. Empty/None leaves the models as pickled.
+    """
+    import joblib
+    if not device:
+        yield
+        return
+    original = joblib.load
+
+    def load(*args, **kwargs):
+        return _place_models(original(*args, **kwargs), device)
+
+    joblib.load = load
+    try:
+        yield
+    finally:
+        joblib.load = original
+
+
 def classify_session(session_dir, out_dir, model_path,
-                     confidence_threshold=DEFAULT_CONFIDENCE_THRESHOLD, logger=None):
+                     confidence_threshold=DEFAULT_CONFIDENCE_THRESHOLD, logger=None,
+                     device=DEFAULT_DEVICE):
     """Classify every spectrum of a processed session. Blocking.
+
+    ``device`` is where XGBoost predicts (``hsi_device`` in ctx; see
+    DEFAULT_DEVICE for why it is the CPU).
 
     Returns::
 
@@ -279,8 +327,9 @@ def classify_session(session_dir, out_dir, model_path,
 
     # Imported here, not at module load: this is where xgboost/joblib are needed.
     hsi_integration = import_vendor("hsi_integration")
-    hsi_result = hsi_integration.run_hyperspectral_pipeline(
-        str(input_csv), output_dir=str(out_dir), config_path=str(config_path))
+    with models_on(device):
+        hsi_result = hsi_integration.run_hyperspectral_pipeline(
+            str(input_csv), output_dir=str(out_dir), config_path=str(config_path))
 
     samples = join_results(metadata, hsi_result)
     result["samples"] = samples
