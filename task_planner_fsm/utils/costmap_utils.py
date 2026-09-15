@@ -206,7 +206,7 @@ def publish_base_goal_markers(ctx, scan_xy, goal_xy, mode: str):
 
     def _marker(mid, mtype, x, y, z, r, g, b, scale):
         m = Marker()
-        m.header.frame_id = "map"
+        m.header.frame_id = world_frame(ctx)
         m.header.stamp = stamp
         m.ns = "base_goal"
         m.id = mid
@@ -502,7 +502,7 @@ def publish_wall_segment_markers(ctx, segments):
         ctx["wall_marker_pub"] = pub
 
     m = Marker()
-    m.header.frame_id = "map"
+    m.header.frame_id = world_frame(ctx)
     m.header.stamp = node.get_clock().now().to_msg()
     m.ns = "wall_segments"
     m.id = 0
@@ -722,6 +722,18 @@ def wall_parallel_goal(ctx, state_name: str, goal_xy, current_xy) -> Tuple[float
 DEFAULT_NAV_BASE_FRAME = "turret_footprint"
 TURRET_FRAME = "turret_link"
 
+# The fixed frame the wall geometry, the sweep goals and the scan-pose
+# bookkeeping live in. ``map`` in a mission; a bench run on a parked robot can
+# set ``scan_world_frame`` to ``odom`` and need no localisation at all -- the
+# base does not move during an arm sweep, so any frame that is fixed for the
+# duration serves. Nav2 goals and its speed limit keep their own map frame.
+DEFAULT_WORLD_FRAME = "map"
+
+
+def world_frame(ctx) -> str:
+    """Fixed frame the scan geometry is expressed in (``scan_world_frame``)."""
+    return str(ctx.get("scan_world_frame", DEFAULT_WORLD_FRAME))
+
 
 def _nav_base_frame(ctx) -> str:
     """Frame Nav2 steers (its ``robot_base_frame``), ctx-overridable."""
@@ -924,7 +936,7 @@ def publish_partition_markers(ctx, partitions, scan_poses=None):
 
     def _base(mid, ns, mtype):
         m = Marker()
-        m.header.frame_id = "map"
+        m.header.frame_id = world_frame(ctx)
         m.header.stamp = stamp
         m.ns = ns
         m.id = mid

@@ -12,6 +12,7 @@ A ROS2 Finite State Machine (FSM) package that orchestrates complete autonomous 
 - [FSM States](#fsm-states)
 - [Workflow](#workflow)
 - [Checkpoint Resume (Debugging)](#checkpoint-resume-debugging)
+- [Hyperspectral Bench Run](#hyperspectral-bench-run-scanwall-on-a-hand-parked-robot)
 - [Key Features](#key-features)
 - [Important Notes](#important-notes)
 - [Troubleshooting](#troubleshooting)
@@ -602,6 +603,105 @@ ros2 run task_planner_fsm fsm_node --sim true \
 
 ---
 
+### Other bootstrap flags
+
+| Flag | Meaning |
+|------|---------|
+| `--wall-source yaml` (default) | Pick the wall(s) interactively from navi_wall's `detected_walls.yaml`, as above |
+| `--wall-source in-front` | Synthesise ONE short wall from where the robot stands (TF `map -> turret_footprint`): the base is taken to be parked at its scan pose, facing the wall. Phase-1 wall-scanning starts only. Knobs: `bootstrap_wall_length_m` (default one partition, 0.8 m), `bootstrap_wall_lines_z` (heights; prompted if unset), `bootstrap_tf_timeout_s` (120). Also switches on `scan_wall_assume_parked` (see below) |
+| `--no-launch-stack` | The robot stack (`move_robot.launch.py`) is already running in another terminal: attach to it (still waiting for it to be ready) instead of launching a second copy |
+| `--stop-after STATE` | Last state to run; its onward transition goes to `Finished` instead (so a bench run does not carry on to `HomePosition`). Self-loops and the Error path are unaffected |
+
+Stack readiness on a checkpoint start (and in `ObjectID`, which launches the
+same stack mid-mission) waits up to `stack_ready_timeout` (300 s) for the
+topics and then `collision_ready_timeout` (180 s) for the arm planner's
+collision service; both return as soon as the stack is up, so the budget only
+matters when it is slow. An in-front wall then waits `bootstrap_tf_timeout_s`
+(120 s) for the first base transform.
+
+`scan_world_frame` (ctx / ROS param, default `map`): the fixed frame the wall
+geometry, the arm-sweep goal, the column's line-height lookup and the recorded
+sample poses live in. Set to `odom` to run the scan states without a map or
+localisation. Nav2 goals keep Nav2's own map frame regardless.
+
+`scan_wall_assume_parked` (ctx / ROS param, default `false`, arm-sweep mode
+only): ScanWall treats the base's current pose as the scan pose of every
+partition. It partitions the raw scan line without consulting the costmap and
+skips the partition transit, so the base never moves during the state. Meant
+for a scan line short enough for ONE partition; further partitions would be
+swept from the same spot and rejected by the executor as out of reach.
+
+---
+
+## Hyperspectral Bench Run (ScanWall on a hand-parked robot)
+
+`hyperspectral_wall_test` exercises the hyperspectral collection half of the
+pipeline on the real robot without the rest of the mission: no mapping, no
+wall detection, no navigation. The operator parks the robot square to a wall
+at the scan standoff; the tool then runs the **real** `ArmUnfolding` and
+`ScanWall` states against a wall synthesised from where the robot stands and
+stops:
+
+```
+ArmUnfolding (unfolded_front_fsm)  ->  ScanWall (one partition, camera sampling)  ->  Finished
+```
+
+* `hyperspectral_enabled` on, `gpr_enabled` off (the GPR distance triggers stay
+  on: they are only a topic, and the hyperspectral sampler shares their sweep
+  frame and axis).
+* Only **raw** spectra are recorded, to
+  `data/raw/hyperspectral/session_<stamp>/` (`raw_samples.jsonl`,
+  `calibration.json`, `metrics.json`). Reflectance and material labels are
+  `SensorDataProcessing`'s job; the run stops before it by default.
+* **No map, no localisation.** The wall, the sweep goal and every recorded
+  pose are expressed in `odom` (`scan_world_frame`), which the robot stack
+  publishes from lidar/wheel odometry whether or not rtabmap localisation is
+  up; a parked base does not move relative to it for the length of a sweep.
+  Readiness is gated on `/tf` and `/joint_states` only, so a reduced stack
+  without rtabmap passes. `--world-frame map` restores the mission frame (the
+  `pose_map` column then really is map-frame).
+
+```bash
+# Prerequisites: hyperspectral_node up and calibrated (interactive GDS/GRF);
+# robot parked facing the wall, base centre ~1.15 m from the wall face
+# (partition_base_standoff_m). The FSM launches move_robot.launch.py itself.
+ros2 run task_planner_fsm hyperspectral_wall_test --line-z 1.0
+
+# Two heights at the same base stop; stack already running in another terminal
+ros2 run task_planner_fsm hyperspectral_wall_test --line-z 0.9 1.4 --no-launch-stack
+
+# Run the processing state in place instead of stopping after ScanWall
+ros2 run task_planner_fsm hyperspectral_wall_test --line-z 1.0 --stop-after SensorDataProcessing
+
+# Any ScanWall / sampler knob passes through
+ros2 run task_planner_fsm hyperspectral_wall_test --line-z 1.0 \
+  --ros-args -p hyperspectral_sample_spacing_m:=0.08 -p sweep_speed_mps:=0.04
+```
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--line-z Z [Z ...]` | `1.0` | Map-frame height(s) of the scan line; the column brings the plate there. Several values sweep every height at this one base stop |
+| `--length` | `0.8` | Scan-line length, centred on the robot. Keep it within one partition: the base never moves |
+| `--stop-after` | `ScanWall` | `ScanWall`, `SensorDataProcessing` or `ArmFolding` |
+| `--no-launch-stack` | off | Attach to a running robot stack instead of launching it |
+| `--skip-preflight` | off | Skip the camera check (service present + GDS/GRF calibrated) that otherwise runs before anything moves |
+| `--spacing`, `--min-period`, `--speed` | sampler / sweep defaults | `hyperspectral_sample_spacing_m`, `hyperspectral_min_sample_period_s`, `sweep_speed_mps` |
+| `--world-frame` | `odom` | Fixed frame for the wall and sweep; `map` needs localisation |
+| `--sim true` | off | Gazebo (no dashboard play, no force-mode press) |
+
+What it does NOT change: the plate approach, lead-in, FT tare, force-mode press
+and the arm sweep all run exactly as in a mission. The wall face is *assumed*
+`partition_base_standoff_m` ahead of the base only to place the sweep laterally
+and to derive the heading; the distance to the real wall is measured by the
+plate sensors before every approach, as always. Process the session afterwards
+with `ros2 run task_planner_fsm process_sensor_session <stamp>`.
+
+Under the hood it is `fsm_node --initial-state ArmUnfolding --wall-source
+in-front --stop-after ScanWall` plus the parameters above; the composed command
+is printed at start.
+
+---
+
 ## Key Features
 
 ### Two-Phase Scanning Strategy
@@ -1022,6 +1122,8 @@ task_planner_fsm/
 │   ├── mock_server.py            # Mock service provider
 │   ├── check_sensor_setup.py     # deps / models / folders report
 │   ├── process_sensor_session.py # offline run of the processing chain
+│   ├── hyperspectral_bench.py    # time the camera round trip, size the sampler
+│   ├── hyperspectral_wall_test.py # bench run: sweep the wall in front with the camera on
 │   └── goal_status_listener.py    # (unused, for future)
 ├── data/                           # runtime sensor data (gitignored)
 ├── models/                         # AI model weights (gitignored)
@@ -1031,6 +1133,8 @@ task_planner_fsm/
 │   ├── mock_server
 │   ├── check_sensor_setup
 │   ├── process_sensor_session
+│   ├── hyperspectral_bench
+│   ├── hyperspectral_wall_test
 │   └── goal_status_listener
 ├── task_planner_fsm_rviz_panel/   # RViz plugin
 │   ├── src/

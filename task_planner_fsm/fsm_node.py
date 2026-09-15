@@ -8,6 +8,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import rclpy
+import rclpy.time
 from geometry_msgs.msg import Point, Pose, Quaternion, WrenchStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry, OccupancyGrid
@@ -54,7 +55,17 @@ from task_planner_fsm.states.proc_utils import (
     STACK_READY_TIMEOUT_S,
 )
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
-from task_planner_fsm.utils.wall_geometry import build_wall_data, left_scan_endpoint
+from task_planner_fsm.utils.costmap_utils import (
+    DEFAULT_NAV_BASE_FRAME,
+    DEFAULT_PARTITION_BASE_STANDOFF,
+    DEFAULT_SCAN_LINE_OFFSET,
+    world_frame,
+)
+from task_planner_fsm.utils.wall_geometry import (
+    build_wall_data,
+    build_wall_in_front,
+    left_scan_endpoint,
+)
 
 FSM_STATE_ORDER = [
     "Initialization",
@@ -175,6 +186,32 @@ PREDEFINED_WALLS = [
 BOOTSTRAP_WALL_DEFAULT_Z = 0.0
 
 
+class BootstrapError(RuntimeError):
+    """The bootstrap could not assemble what the initial state needs.
+
+    Raised instead of flagging ``error_triggered``, because the first state's
+    ``on_enter`` clears that flag and would run anyway -- for a bench start
+    that means unfolding the arm with no wall to sweep. Whatever the bootstrap
+    launched has already been stopped when this is raised.
+    """
+
+
+# Where a bootstrap gets its walls from.
+#   yaml      navi_wall's detected_walls.yaml, chosen interactively (the default)
+#   in-front  ONE short wall synthesised from where the robot stands: the base is
+#             taken to be parked at its scan pose already, facing the wall. For
+#             bench runs of the scan states on a hand-placed robot -- no
+#             navigation, no map-derived walls. See _wall_in_front_of_robot.
+WALL_SOURCES = ("yaml", "in-front")
+
+# Frames tried, in order, for the base pose an in-front wall is built from.
+# Mirrors ScanWall.BASE_FRAMES: the first is Nav2's base frame, which is also
+# what the partition scan pose is expressed in.
+BOOTSTRAP_BASE_FRAMES = (
+    DEFAULT_NAV_BASE_FRAME, "base_footprint", "base_link", "base", "chassis",
+)
+
+
 class RobotFSMNode(Node):
     def __init__(
         self,
@@ -182,6 +219,9 @@ class RobotFSMNode(Node):
         initial_state: str = "Initialization",
         scan_phase: Optional[int] = None,
         planner_backend: str = "legacy",
+        wall_source: str = "yaml",
+        launch_stack: bool = True,
+        stop_after: Optional[str] = None,
     ):
         # Auto-declare any parameter passed as an override (e.g. via
         # `--ros-args -p create_map_sweep_axis:=perpendicular` or a launch file),
@@ -194,6 +234,16 @@ class RobotFSMNode(Node):
         self.initial_state = initial_state
         self._stdin_warned = False
         self.planner_backend = str(planner_backend).strip().lower()
+        if wall_source not in WALL_SOURCES:
+            raise ValueError(
+                f"Invalid wall source '{wall_source}'. Valid options: {', '.join(WALL_SOURCES)}"
+            )
+        self.wall_source = wall_source
+        # False: the robot stack (move_robot.launch.py) is already up in another
+        # terminal; the bootstrap only waits for it instead of launching a second
+        # copy on top of it.
+        self.launch_stack = bool(launch_stack)
+        self._stack_ensured = False
 
         # NOTE: Do NOT set use_sim_time=True here!
         # The FSM timer must run on wall time even in simulation mode,
@@ -255,6 +305,11 @@ class RobotFSMNode(Node):
                 continue
             self.ctx.setdefault(pname, param.value)
             self.get_logger().info(f"[FSM] ctx param override: {pname}={param.value!r}")
+        # Last state to run; its onward transition goes to Finished instead
+        # (StateMachine.step). The flag wins over a same-named param; unset,
+        # the mission runs to its natural end.
+        if stop_after:
+            self.ctx["fsm_stop_after"] = stop_after
 
         # Wall-detection defaults MUST be seeded before the bootstrap: when the
         # FSM starts at a state past ObjectID, the bootstrap stands in for it and
@@ -755,9 +810,12 @@ class RobotFSMNode(Node):
 
         wall_idx = self._prompt_int(">> Target wall index", 1, len(walls_data), 1) - 1
         endpoint = self._prompt_int(">> Target endpoint (1=start, 2=end)", 1, 2, 1) - 1
+        self._set_phase1_target(wall_idx, walls_data[wall_idx]["scan_line"][endpoint])
 
+    def _set_phase1_target(self, wall_idx: int, target_scan_point):
+        """Point the phase-1 states at one wall and one of its scan-line ends."""
+        walls_data = self.ctx.get("walls_data", [])
         target_scan_wall = walls_data[wall_idx]["scan_line"]
-        target_scan_point = target_scan_wall[endpoint]
         self.ctx["current_wall_index"] = wall_idx
         self.ctx["target_scan_wall"] = target_scan_wall
         self.ctx["target_scan_point"] = target_scan_point
@@ -769,6 +827,112 @@ class RobotFSMNode(Node):
             f"[FSM] Phase-1 bootstrap target set: wall #{wall_idx}, point={target_scan_point}, "
             f"lines z={self.ctx['current_wall_scan_lines']}"
         )
+
+    def _wait_for_base_pose(self, timeout_s: float):
+        """Block until ``<world> -> <base frame>`` resolves, spinning the node so
+        the TF listener actually receives anything. Returns ``(frame, (x, y, yaw))``
+        or None on timeout. Only ever called from the bootstrap, before the FSM
+        timer exists, so the spin services nothing but TF.
+
+        The world frame is ``scan_world_frame`` -- ``map`` unless the run has
+        opted out of localisation with ``odom``.
+        """
+        world = world_frame(self.ctx)
+        primary = str(self.ctx.get("nav_base_frame", DEFAULT_NAV_BASE_FRAME))
+        frames = (primary,) + tuple(f for f in BOOTSTRAP_BASE_FRAMES if f != primary)
+        deadline = time.time() + float(timeout_s)
+        announced = False
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.2)
+            for frame in frames:
+                try:
+                    if not self.tf_buffer.can_transform(world, frame, rclpy.time.Time()):
+                        continue
+                    tf = self.tf_buffer.lookup_transform(world, frame, rclpy.time.Time())
+                except Exception:
+                    continue
+                t, q = tf.transform.translation, tf.transform.rotation
+                yaw = math.atan2(
+                    2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                )
+                return frame, (float(t.x), float(t.y), yaw)
+            if not announced:
+                self.get_logger().info(
+                    f"[FSM Bootstrap] Waiting (up to {timeout_s:.0f}s) for {world}->{primary} "
+                    f"so the wall can be placed in front of the robot..."
+                )
+                announced = True
+        return None
+
+    def _bootstrap_wall_lines_z(self) -> List[float]:
+        """Scan-line heights for an in-front wall: ``bootstrap_wall_lines_z``
+        (a float or a list of floats, e.g. ``-p bootstrap_wall_lines_z:=[0.9,1.4]``)
+        or, failing that, the same interactive prompt the YAML path uses.
+        """
+        raw = self.ctx.get("bootstrap_wall_lines_z")
+        if raw is None:
+            return self._prompt_wall_lines(1)
+        values = [float(raw)] if isinstance(raw, (int, float)) else [float(v) for v in raw]
+        if not values:
+            return self._prompt_wall_lines(1)
+        return sorted(values)
+
+    def _wall_in_front_of_robot(self) -> Dict[str, Tuple]:
+        """One wall placed where the robot is already looking (``--wall-source in-front``).
+
+        The wall face is put ``partition_base_standoff_m`` ahead of the base along
+        its heading, so the partition scan pose of the resulting line is the base
+        pose itself and ScanWall has nothing to drive to. The line is
+        ``bootstrap_wall_length_m`` long (default: one partition), centred on the
+        robot. Which is also why ``scan_wall_assume_parked`` is switched on here:
+        the geometry says the base is at its scan pose, and the knob stops the
+        costmap from arguing.
+
+        Needs the robot stack's TF, so the caller must have brought the stack up
+        first. Raises on timeout rather than guessing a pose: a wall placed at the
+        map origin would send the arm sweeping thin air.
+        """
+        timeout = float(self.ctx.get("bootstrap_tf_timeout_s", 120.0))
+        found = self._wait_for_base_pose(timeout)
+        if found is None:
+            world = world_frame(self.ctx)
+            raise RuntimeError(
+                f"No {world}->base transform within {timeout:.0f}s; cannot place a wall "
+                f"in front of the robot. Is the robot stack up"
+                f"{' and localised' if world == 'map' else ''}?"
+            )
+        frame, (x, y, yaw) = found
+
+        standoff = float(
+            self.ctx.get("partition_base_standoff_m", DEFAULT_PARTITION_BASE_STANDOFF)
+        )
+        offset = float(self.ctx.get("wall_scan_line_offset_m", DEFAULT_SCAN_LINE_OFFSET))
+        max_len = float(self.ctx.get("partition_max_length_m", 0.8))
+        length = float(self.ctx.get("bootstrap_wall_length_m", max_len))
+        lines_z = self._bootstrap_wall_lines_z()
+
+        wall = build_wall_in_front(
+            (x, y), yaw, standoff, length, offset=offset, scan_lines_z=lines_z
+        )
+        self.ctx.setdefault("scan_wall_assume_parked", True)
+        if length > max_len + 1e-6:
+            self.get_logger().warn(
+                f"[FSM Bootstrap] bootstrap_wall_length_m {length:.2f} m exceeds one "
+                f"partition ({max_len:.2f} m). The base will NOT move between "
+                f"partitions (scan_wall_assume_parked); partitions beyond the arm's "
+                f"reach are re-cut or skipped by the executor, not driven to."
+            )
+        line = wall["scan_line"]
+        self.get_logger().info(
+            f"[FSM Bootstrap] Wall placed in front of the robot: {frame} at "
+            f"({x:.2f}, {y:.2f}, yaw {yaw:.2f} rad) in '{world_frame(self.ctx)}', "
+            f"wall face assumed {standoff:.2f} m "
+            f"ahead; scan line ({line[0][0]:.2f}, {line[0][1]:.2f}) -> "
+            f"({line[1][0]:.2f}, {line[1][1]:.2f}), {length:.2f} m, heights {lines_z}. "
+            f"The arm measures the true wall distance itself; only the heading and "
+            f"the lateral placement are trusted from this pose."
+        )
+        return wall
 
     def _prompt_phase2_base(self):
         base_positions = self.ctx.get("optimal_base_results", {})
@@ -808,6 +972,9 @@ class RobotFSMNode(Node):
         )
 
     def _ensure_nav_sim_running(self):
+        if self._stack_ensured:
+            return
+        self._stack_ensured = True
         p = self.ctx.get("_procs", {}).get("nav_sim")
         if p and p.poll() is None:
             self.get_logger().info(f"[FSM] Navigation simulation already running (pid={p.pid}).")
@@ -816,32 +983,38 @@ class RobotFSMNode(Node):
         sim_value = "true" if self.ctx.get("sim", False) else "false"
         planner_backend = str(self.ctx.get("planner_backend", "legacy")).strip().lower()
         try:
-            start_proc(
-                self.ctx,
-                "nav_sim",
-                [
-                    "ros2",
-                    "launch",
-                    "navi_wall",
-                    "move_robot.launch.py",
-                    f"sim:={sim_value}",
-                    "mode:=full",
-                    "controller_type:=omni",
-                    "database_name:=rtabmap_fsm",
-                    "headless:=true",
-                    f"use_sim_time:={sim_value}",
-                    "hybrid_sim:=false",
-                    f"planner_backend:={planner_backend}",
-                    # This launch starts wall_detection_node itself, so it must
-                    # write the very file GeometryReconstruction reads back.
-                    f"wall_file_path:={self.ctx['geometry_reconstruction_wall_file_path']}",
-                    # Push out launch's own SIGKILL deadline so ros2_control survives
-                    # long enough to retract the column on shutdown.
-                    *ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
-                ],
-            )
-            time.sleep(2.0)
-            self.get_logger().info("[FSM] Navigation + localization simulation started by bootstrap.")
+            if not self.launch_stack:
+                self.get_logger().info(
+                    "[FSM] --no-launch-stack: attaching to the robot stack already "
+                    "running; waiting for it to be ready instead of launching it."
+                )
+            else:
+                start_proc(
+                    self.ctx,
+                    "nav_sim",
+                    [
+                        "ros2",
+                        "launch",
+                        "navi_wall",
+                        "move_robot.launch.py",
+                        f"sim:={sim_value}",
+                        "mode:=full",
+                        "controller_type:=omni",
+                        "database_name:=rtabmap_fsm",
+                        "headless:=true",
+                        f"use_sim_time:={sim_value}",
+                        "hybrid_sim:=false",
+                        f"planner_backend:={planner_backend}",
+                        # This launch starts wall_detection_node itself, so it must
+                        # write the very file GeometryReconstruction reads back.
+                        f"wall_file_path:={self.ctx['geometry_reconstruction_wall_file_path']}",
+                        # Push out launch's own SIGKILL deadline so ros2_control survives
+                        # long enough to retract the column on shutdown.
+                        *ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
+                    ],
+                )
+                time.sleep(2.0)
+                self.get_logger().info("[FSM] Navigation + localization simulation started by bootstrap.")
 
             # Mirror ObjectID's readiness gates. When the FSM is started at a
             # non-initial state this bootstrap path replaces ObjectID, so without
@@ -894,6 +1067,15 @@ class RobotFSMNode(Node):
                 f"[FSM] Failed to start navigation + localization simulation during bootstrap: {exc}"
             )
 
+    def _abort_bootstrap(self, reason: str):
+        """Stop whatever the bootstrap launched and refuse to start the machine."""
+        self.get_logger().error(f"[FSM Bootstrap] {reason}; not starting the FSM.")
+        try:
+            stop_all(self.ctx)
+        except Exception as exc:   # noqa: BLE001 - report, then still refuse
+            self.get_logger().warn(f"[FSM Bootstrap] cleanup after the failure: {exc}")
+        raise BootstrapError(reason)
+
     def _ensure_nav_client(self):
         if self.ctx.get("nav_client") is None:
             self.ctx["nav_client"] = ActionClient(self, NavigateToPose, "/navigate_to_pose")
@@ -930,8 +1112,30 @@ class RobotFSMNode(Node):
         # Skip external start gate when starting from any non-initial state.
         self.ctx["start"] = True
 
+        in_front = self.wall_source == "in-front"
+        if in_front and initial_state not in WALL_DATA_REQUIRED_INITIAL_STATES:
+            raise ValueError(
+                f"--wall-source in-front needs a wall-scanning initial state "
+                f"({', '.join(sorted(WALL_DATA_REQUIRED_INITIAL_STATES))}), not '{initial_state}'."
+            )
+        if in_front and resolved_scan_phase != 1:
+            raise ValueError("--wall-source in-front is a phase-1 (wall sweep) bootstrap.")
+
         if initial_state in WALL_DATA_REQUIRED_INITIAL_STATES:
-            walls_data = self._prompt_walls_data()
+            if in_front:
+                # The wall is built from where the robot stands, and that pose
+                # comes from the stack's TF -- so the stack goes up first here,
+                # not at the end of the bootstrap as for a prompted wall.
+                if initial_state in NAV_SIM_REQUIRED_START_STATES:
+                    self._ensure_nav_sim_running()
+                    if self.ctx.get("error_triggered"):
+                        self._abort_bootstrap("the robot stack did not come up")
+                try:
+                    walls_data = [self._wall_in_front_of_robot()]
+                except RuntimeError as exc:
+                    self._abort_bootstrap(str(exc))
+            else:
+                walls_data = self._prompt_walls_data()
             self.ctx["walls_data"] = walls_data
             self.ctx["wall_inward_normals"] = [w["inward_normal"] for w in walls_data]
             self.ctx["wall_ee_rpy_deg"] = [w["ee_rpy_deg"] for w in walls_data]
@@ -969,7 +1173,15 @@ class RobotFSMNode(Node):
             self.ctx["panels_left"] = max(0, len(optimal_base_results) - len(completed))
 
         if resolved_scan_phase == 1 and initial_state in PHASE1_TARGET_REQUIRED_INITIAL_STATES:
-            self._prompt_phase1_target()
+            if in_front:
+                # One wall, swept from the robot's left end -- the same end
+                # WallTargetSelection would pick.
+                wall = self.ctx["walls_data"][0]
+                self._set_phase1_target(
+                    0, left_scan_endpoint(wall["scan_line"], wall.get("inward_normal"))
+                )
+            else:
+                self._prompt_phase1_target()
         if resolved_scan_phase == 2:
             self.ctx["scan_done"] = True
             self.ctx.setdefault("aoi_data", self.ctx.get("walls_data", []))
@@ -1163,6 +1375,31 @@ def main(args=None):
         choices=["legacy", "moveit"],
         help="Planner backend to use when the FSM launches move_robot.launch.py.",
     )
+    parser.add_argument(
+        "--wall-source",
+        type=str,
+        default="yaml",
+        choices=list(WALL_SOURCES),
+        help="Where a bootstrapped wall-scanning start gets its wall: 'yaml' "
+             "(pick from detected_walls.yaml, the default) or 'in-front' (one "
+             "short wall synthesised from where the robot stands, base assumed "
+             "parked at its scan pose; ctx knobs bootstrap_wall_length_m, "
+             "bootstrap_wall_lines_z).",
+    )
+    parser.add_argument(
+        "--no-launch-stack",
+        action="store_true",
+        help="Do not launch move_robot.launch.py during the bootstrap; the robot "
+             "stack is already running. The bootstrap still waits for it to be ready.",
+    )
+    parser.add_argument(
+        "--stop-after",
+        type=str,
+        default=None,
+        choices=FSM_STATE_ORDER,
+        help="Last state to run: its onward transition goes to Finished instead "
+             "(bench runs that must not carry on to HomePosition).",
+    )
 
     # Use sys.argv if args is None
     argv = args if args is not None else sys.argv[1:]
@@ -1172,12 +1409,21 @@ def main(args=None):
     # Initialize rclpy with remaining args (ROS-specific arguments)
     rclpy.init(args=remaining_args)
 
-    node = RobotFSMNode(
-        sim=sim,
-        initial_state=parsed_args.initial_state,
-        scan_phase=parsed_args.scan_phase,
-        planner_backend=parsed_args.planner_backend,
-    )
+    try:
+        node = RobotFSMNode(
+            sim=sim,
+            initial_state=parsed_args.initial_state,
+            scan_phase=parsed_args.scan_phase,
+            planner_backend=parsed_args.planner_backend,
+            wall_source=parsed_args.wall_source,
+            launch_stack=not parsed_args.no_launch_stack,
+            stop_after=parsed_args.stop_after,
+        )
+    except BootstrapError as exc:
+        # Already logged and cleaned up by the bootstrap; exit without a
+        # traceback so the cause is the last line on the terminal.
+        rclpy.shutdown()
+        sys.exit(f"[FSM] bootstrap failed: {exc}")
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

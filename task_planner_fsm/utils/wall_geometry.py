@@ -132,3 +132,44 @@ def build_wall_data(p1, p2, offset: float = 0.6, scan_lines_z=None, outward_norm
         "ee_rpy_deg": ee_rpy_deg,
         "scan_lines_z": scan_lines_z,
     }
+
+
+def build_wall_in_front(base_xy, base_yaw, face_distance, scan_length,
+                        offset: float = 0.6, scan_lines_z=None):
+    """Wall data for a virtual wall the robot is already parked in front of.
+
+    For bench runs that skip navigation: the operator drives the base to its
+    scan pose by hand, and this describes "whatever is ahead of the robot" in
+    the same shape ``build_wall_data`` produces, so every downstream state runs
+    unchanged. The wall face lies ``face_distance`` ahead of ``base_xy`` along
+    ``base_yaw``, perpendicular to it; its scan line is ``scan_length`` long and
+    centred on the robot's centreline.
+
+    Choosing ``face_distance = partition_base_standoff_m`` makes the partition
+    scan pose of that line coincide with the base pose exactly, so ScanWall's
+    transit is a no-op. The distance to the real wall is not trusted from this
+    number anyway -- the arm measures it with the plate sensors before every
+    approach -- but the lateral and vertical placement of the sweep are, so the
+    robot must genuinely be facing the wall.
+
+    ``scan_length`` is the length of the SCAN LINE; the wall endpoints are
+    pulled out by ``offset`` at each end because ``build_wall_data`` pulls the
+    scan line in by the same amount. The endpoints are ordered left to right as
+    seen from the robot, so ``scan_line[0]`` is the robot's left end.
+    """
+    if face_distance <= 0.0:
+        raise ValueError("face_distance must be positive.")
+    if scan_length <= 0.0:
+        raise ValueError("scan_length must be positive.")
+    hx, hy = math.cos(base_yaw), math.sin(base_yaw)   # heading: robot -> wall
+    tx, ty = -hy, hx                                    # tangent: robot's left
+    cx = base_xy[0] + face_distance * hx
+    cy = base_xy[1] + face_distance * hy
+    half = scan_length / 2.0 + offset
+    z = float(min(scan_lines_z)) if scan_lines_z else 0.0
+    p_left = (cx + half * tx, cy + half * ty, z)
+    p_right = (cx - half * tx, cy - half * ty, z)
+    return build_wall_data(
+        p_left, p_right, offset=offset, scan_lines_z=scan_lines_z,
+        outward_normal=(hx, hy),
+    )

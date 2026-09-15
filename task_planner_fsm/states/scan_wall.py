@@ -11,6 +11,7 @@ from ..utils.costmap_utils import (
     publish_wall_segment_markers,
     wall_axes,
     wall_parallel_goal,
+    world_frame,
 )
 from ..utils.wall_partitioning import next_backoff_length, sweep_line_order
 from ..utils.wall_approach import unfolded_pose_name
@@ -1237,11 +1238,12 @@ class ScanWall(State):
         ref = self._gpr_trigger_frame(ctx)
         axis = self._axis_in_frame(ctx, ref, axis_xy)
         if axis is None:
+            world = self._world_frame(ctx)
             node.get_logger().warn(
                 f"[{self.name}] GPR triggers: cannot express the sweep direction in "
-                f"'{ref}' (no {ref}<-map transform); measuring in map instead."
+                f"'{ref}' (no {ref}<-{world} transform); measuring in {world} instead."
             )
-            ref = "map"
+            ref = world
             axis = (axis_xy[0], axis_xy[1], 0.0)
         self._gpr_trigger_ref = ref
         self._gpr_trigger_axis = axis
@@ -1332,7 +1334,7 @@ class ScanWall(State):
             "seg_idx": self._seg_idx,
             "seg_start": _pt(seg_start),
             "seg_end": _pt(seg_end),
-            "frame": "map",
+            "frame": self._world_frame(ctx),
             "measurement_name": f"scan_wall line {line_idx + 1} seg {self._seg_idx + 1}",
             "arm_sweep": bool(self._use_arm_sweep(ctx)),
             "probe_active": bool(self.gpr_line_active),
@@ -1390,7 +1392,7 @@ class ScanWall(State):
             return str(ref)
         if self._use_arm_sweep(ctx):
             return str(ctx.get("arm_base_frame", "arm_base"))
-        return "map"
+        return self._world_frame(ctx)
 
     @staticmethod
     def _rotate_vec(q, v):
@@ -1414,18 +1416,19 @@ class ScanWall(State):
         valid for the sweep. Doing it per sample would put the very TF chain this
         parameter exists to avoid back into every measurement.
         """
-        if ref_frame == "map":
+        world = self._world_frame(ctx)
+        if ref_frame == world:
             return (axis_xy[0], axis_xy[1], 0.0)
         tf_buffer = ctx.get("tf_buffer")
         if tf_buffer is None:
             return None
         try:
             if not tf_buffer.can_transform(
-                ref_frame, "map", rclpy.time.Time(), Duration(seconds=1.0)
+                ref_frame, world, rclpy.time.Time(), Duration(seconds=1.0)
             ):
                 return None
             tf = tf_buffer.lookup_transform(
-                ref_frame, "map", rclpy.time.Time(), Duration(seconds=1.0))
+                ref_frame, world, rclpy.time.Time(), Duration(seconds=1.0))
         except Exception:
             return None
         vx, vy, vz = self._rotate_vec(
@@ -1579,17 +1582,19 @@ class ScanWall(State):
             axis_xy = (cos(sweep_yaw), sin(sweep_yaw))
         axis = self._axis_in_frame(ctx, ref, axis_xy)
         if axis is None:
+            world = self._world_frame(ctx)
             ctx["node"].get_logger().warn(
                 f"[{self.name}] hyperspectral: cannot express the sweep "
-                f"direction in '{ref}'; measuring in map instead."
+                f"direction in '{ref}'; measuring in {world} instead."
             )
-            ref, axis = "map", (axis_xy[0], axis_xy[1], 0.0)
+            ref, axis = world, (axis_xy[0], axis_xy[1], 0.0)
         self._hs.start_line(
             ctx, seg_start, seg_end,
             pose_fn=lambda frame, timeout: self._lookup_plate_xyz(
                 ctx, frame, timeout_s=timeout),
             ref=ref,
             axis=axis,
+            world=self._world_frame(ctx),
             wall_index=ctx.get("current_wall_index"),
             line_idx=ctx.get("current_line_idx", 0),
             seg_idx=self._seg_idx,
@@ -1643,8 +1648,8 @@ class ScanWall(State):
         return None
 
     def _lookup_ee_world_z(self, ctx):
-        """Return the current end-effector height in the map frame, or None."""
-        xyz = self._lookup_plate_xyz(ctx, "map")
+        """Return the current end-effector height in the world frame, or None."""
+        xyz = self._lookup_plate_xyz(ctx, self._world_frame(ctx))
         return None if xyz is None else xyz[2]
 
     def _column_target_for_line(self, ctx, line_z):
@@ -2070,6 +2075,30 @@ class ScanWall(State):
         """
         return bool(ctx.get("sweep_use_arm", True))
 
+    def _world_frame(self, ctx):
+        """Fixed frame of the wall geometry and sweep goals (``scan_world_frame``)."""
+        return world_frame(ctx)
+
+    def _assume_parked(self, ctx):
+        """True when the base is taken to be AT its scan pose already, by fiat.
+
+        The bench-test knob behind ``fsm_node --wall-source in-front``: the
+        operator parked the robot facing the wall by hand, and the wall data
+        was synthesised from that pose, so there is nothing to drive to and no
+        costmap to consult. Two things change:
+
+        * ``_plan_line`` partitions the raw scan line instead of asking the
+          costmap which stretches of it are reachable -- the base is where it
+          is, and reachability is the operator's assertion.
+        * the ``transit`` phase is skipped for every partition, so the base
+          never moves during the state. Only sensible with a scan line short
+          enough for ONE partition; further partitions would be swept from the
+          same spot and rejected by the executor as out of reach.
+
+        Arm-sweep mode only: the base-driven sweep IS base motion.
+        """
+        return self._use_arm_sweep(ctx) and bool(ctx.get("scan_wall_assume_parked", False))
+
     # Failures that mean "this partition is too long for the arm", as opposed to
     # a transient or a setup problem. Only these are worth re-cutting for: the
     # arm could not reach along the partition, so a shorter one might.
@@ -2172,7 +2201,17 @@ class ScanWall(State):
         node = ctx["node"]
         arm_sweep = self._use_arm_sweep(ctx)
 
-        if arm_sweep:
+        if arm_sweep and self._assume_parked(ctx):
+            # No costmap stage: the whole line is the one reachable segment,
+            # because the base is standing in front of it by construction.
+            # Uncached (as every caller-supplied split is), which is fine --
+            # nesting means one plan per wall anyway.
+            whole = [(tuple(self._sweep_from), tuple(self._sweep_to))]
+            plan = plan_wall_partitions(
+                ctx, self.name, self._sweep_from, self._sweep_to, segments=whole
+            )
+            segments, poses = ([], None) if plan is None else plan
+        elif arm_sweep:
             plan = plan_wall_partitions(
                 ctx, self.name, self._sweep_from, self._sweep_to
             )
@@ -2433,6 +2472,18 @@ class ScanWall(State):
             # the base at its arrived standoff; here the standoff is the point of
             # the goal) and no separate park correction afterwards.
             arm_sweep = self._use_arm_sweep(ctx)
+            if arm_sweep and self._assume_parked(ctx):
+                # The base is at its scan pose by fiat (bench run on a
+                # hand-parked robot); never drive it. Same hand-off as the
+                # geometric skip below: no transit means the column was never
+                # lowered, so line_column is a no-op unless nesting moved on.
+                node.get_logger().info(
+                    f"[{self.name}] scan_wall_assume_parked: treating the base's "
+                    f"current pose as partition {seg_no}'s scan pose; no transit."
+                )
+                self.column_commanded = False
+                self._seg_phase = "line_column"
+                return
             if arm_sweep:
                 pose = (self._scan_poses or [None] * len(self._segments))[self._seg_idx]
                 if pose is None:
@@ -3251,7 +3302,7 @@ class ScanWall(State):
         goal.end = Point(x=float(seg_end[0]), y=float(seg_end[1]), z=line_z)
         goal.partition_index = int(self._seg_idx)
         goal.partition_count = int(len(self._segments))
-        goal.frame_id = "map"
+        goal.frame_id = self._world_frame(ctx)
         goal.speed = float(ctx.get("sweep_speed_mps", 0.05))
         # Sim has no force_mode controller, so the sweep runs contact-free at the
         # plate offset (§11.2) and the contact watchdog must not fire.
@@ -3446,16 +3497,17 @@ class ScanWall(State):
         tf_buffer = ctx.get("tf_buffer")
         if tf_buffer is None:
             return None
+        world = self._world_frame(ctx)
         primary = str(ctx.get("nav_base_frame", "turret_footprint"))
         frames = (primary,) + tuple(f for f in self.BASE_FRAMES if f != primary)
         for frame in frames:
             try:
                 if not tf_buffer.can_transform(
-                    "map", frame, rclpy.time.Time(), Duration(seconds=0.2)
+                    world, frame, rclpy.time.Time(), Duration(seconds=0.2)
                 ):
                     continue
                 tf = tf_buffer.lookup_transform(
-                    "map", frame, rclpy.time.Time(), Duration(seconds=0.5)
+                    world, frame, rclpy.time.Time(), Duration(seconds=0.5)
                 )
             except Exception:
                 continue

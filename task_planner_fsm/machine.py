@@ -297,6 +297,24 @@ class StateMachine:
             if next_state == "Error":
                 next_state, transition_reason = self._resolve_error_transition("Error requested")
 
+            # Bench runs end early: fsm_stop_after names the last state that
+            # should run, and its onward transition goes to Finished instead.
+            # Self-loops (ScanWall re-entering for the next line) and the error
+            # path (retry of the same state, or Error) are left alone.
+            stop_after = self.ctx.get("fsm_stop_after")
+            if (
+                stop_after
+                and next_state
+                and next_state not in ("Error", self.current_state.name)
+                and self.current_state.name == stop_after
+                and "Finished" in self.states
+            ):
+                node.get_logger().info(
+                    f"[FSM] fsm_stop_after={stop_after}: stopping here instead of "
+                    f"entering '{next_state}'."
+                )
+                next_state, transition_reason = "Finished", f"stop_after:{stop_after}"
+
             if next_state and next_state in self.states:
                 self._apply_transition(next_state, transition_reason)
         except Exception:

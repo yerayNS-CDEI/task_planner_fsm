@@ -94,6 +94,7 @@ class HyperspectralSampler:
         self._timer = None
         self._axis = None                   # unit sweep direction in _ref
         self._ref = "map"
+        self._world = "map"                 # frame pose_map is recorded in
         self._pose_fn = None
         self._last_xyz = None
         self._residual = 0.0
@@ -280,7 +281,7 @@ class HyperspectralSampler:
     # Segment lifecycle
     # ------------------------------------------------------------------
     def start_line(self, ctx, seg_start, seg_end, pose_fn, ref="map", axis=None,
-                   wall_index=None, line_idx=None, seg_idx=None):
+                   wall_index=None, line_idx=None, seg_idx=None, world="map"):
         """Arm the sampler for the segment sweep that is about to start.
 
         ``pose_fn(ref_frame, timeout_s)`` returns the plate position in
@@ -293,6 +294,10 @@ class HyperspectralSampler:
         arm sweep parks the base, so ``arm_base`` keeps localisation drift out
         of the spacing; a base sweep only moves relative to the world) and
         expressed the sweep direction in it.
+
+        ``world`` is the fixed frame every sample's ``pose_map`` is recorded in
+        -- ``map`` in a mission, whatever ``scan_world_frame`` says otherwise
+        (``odom`` on a bench run without localisation).
 
         Counters restart per segment. Unlike the GPR there is no d = 0 sample:
         the plate has just settled against the wall and the first capture would
@@ -314,6 +319,7 @@ class HyperspectralSampler:
             return False
 
         self._ref = ref
+        self._world = str(world)
         self._axis = axis
         self._pose_fn = pose_fn
         self._wall_index = wall_index
@@ -557,7 +563,7 @@ class HyperspectralSampler:
         )
 
     def _map_pose(self, xyz):
-        """The plate in ``map`` at this instant, or None.
+        """The plate in the world frame at this instant, or None.
 
         The sweep frame (``self._ref``) is what the spacing is measured in; for
         an arm sweep that is ``arm_base``, which the base carries away between
@@ -567,12 +573,12 @@ class HyperspectralSampler:
         recorded alongside. Zero timeout: a miss costs the map pose of one
         sample, never a stall of the sampling tick.
         """
-        if self._ref == "map":
+        if self._ref == self._world:
             return tuple(xyz)
         if self._pose_fn is None:
             return None
         try:
-            pose = self._pose_fn("map", 0.0)
+            pose = self._pose_fn(self._world, 0.0)
         except Exception:                           # noqa: BLE001
             return None
         return None if pose is None else tuple(pose)

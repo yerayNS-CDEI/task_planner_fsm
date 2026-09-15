@@ -44,6 +44,7 @@ setup(
         'scripts/mock_server',
         'scripts/goal_status_listener',
         'scripts/hyperspectral_bench',
+        'scripts/hyperspectral_wall_test',
         'scripts/check_sensor_setup',
         'scripts/process_sensor_session',
     ],
