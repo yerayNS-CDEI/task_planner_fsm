@@ -335,11 +335,12 @@ class SensorDataProcessing(State):
     def _run_gpr(self, ctx):
         """Run the hyperbola and line pipelines over new GP8800 exports.
 
-        The traces never enter ROS: ScanWall starts and stops the line, the GPR
-        API is meant to drop the export into ``data/raw/gpr/incoming``. That
-        hand-off is untested, so this phase waits at most ``gpr_wait_timeout_s``
-        (default 0: process what is already there) and never blocks the
-        mission on a file that may not come.
+        The traces never enter ROS: ScanWall starts and stops the line, pulls
+        the export off the app and unpacks it into ``data/raw/gpr/incoming``
+        (see ``ScanWall._gpr_export``). Exports can also be copied there by
+        hand, so this phase waits at most ``gpr_wait_timeout_s`` (default 0:
+        process what is already there) and never blocks the mission on a file
+        that may not come.
 
         Per v2 policy GPR still does not vote on whether POKEYE is needed.
         What it does produce is a veto: each hyperbola becomes a NO_DRILL

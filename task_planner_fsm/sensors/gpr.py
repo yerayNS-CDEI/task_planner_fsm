@@ -1,10 +1,11 @@
 """GPR post-processing: exported GP8800 scans -> hyperbolae and lines on the wall.
 
-The probe keeps its traces. ScanWall only starts and stops each line over HTTP,
-and the GPR API is meant to drop the export -- ``<name>.sgy`` plus its
-``<name>.csv`` sidecar -- into ``data/raw/gpr/incoming/``. Nothing about that
-hand-off is tested yet and there is no naming convention, so this module makes
-the fewest assumptions it can:
+The probe keeps its traces. ScanWall starts and stops each line over HTTP and,
+after the line stop, pulls ``POST /measurement/export/raw`` -- a zip holding
+``<name>_<stamp>/<name>.sgy`` plus the ``.csv`` sidecar (and a ``.json``) --
+and unpacks it flat into ``data/raw/gpr/incoming/`` with the line key as a
+prefix (``unpack_export``). Files can also be dropped there by hand, so this
+module keeps the fewest assumptions it can:
 
 * any ``.sgy`` with a sidecar in the incoming folder is a scan;
 * a scan is tied to a line from ScanWall's manifest by name if the file name
@@ -32,6 +33,7 @@ redo earlier walls. Blocking functions for a BackgroundJob; no ROS.
 
 import json
 import os
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +44,42 @@ from .manifest import read_gpr_lines
 
 REGISTRY_FILENAME = "processed_files.json"
 SUMMARY_FILENAME = "gpr_summary.json"
+
+
+# ----------------------------------------------------------------------
+# Unpacking the app's export into the incoming folder
+# ----------------------------------------------------------------------
+EXPORT_MEMBER_SUFFIXES = (".sgy", ".segy", ".csv", ".json")
+
+
+def unpack_export(zip_path, incoming_dir, key):
+    """Flatten the ``.sgy``/``.csv``/``.json`` members of an export zip into
+    ``incoming_dir`` as ``<key>_<original name>``. Returns the paths written.
+
+    The pipeline finds a scan by its ``.sgy`` and needs the same-stem ``.csv``
+    beside it, so the sidecars are written first and the ``.sgy`` last: a
+    directory listing taken mid-way sees no half-delivered scan. Member paths
+    are reduced to their basename (no directory traversal from the archive).
+    """
+    incoming_dir = Path(os.path.expanduser(str(incoming_dir)))
+    incoming_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    with zipfile.ZipFile(zip_path) as zf:
+        members = [
+            m for m in zf.infolist()
+            if not m.is_dir() and m.filename.lower().endswith(EXPORT_MEMBER_SUFFIXES)
+        ]
+        # sidecars first, traces last
+        members.sort(key=lambda m: m.filename.lower().endswith((".sgy", ".segy")))
+        for m in members:
+            name = os.path.basename(m.filename)
+            target = incoming_dir / f"{key}_{name}"
+            partial = target.with_name(target.name + ".part")
+            with zf.open(m) as src, open(partial, "wb") as dst:
+                dst.write(src.read())
+            os.replace(partial, target)
+            written.append(str(target))
+    return written
 
 
 # ----------------------------------------------------------------------

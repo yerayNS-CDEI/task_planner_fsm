@@ -1258,6 +1258,45 @@ the active route — `sweep_speed_mps` for the arm sweep, `sweep_crawl_speed` or
 `sweep_speed_limit` for the base one — and warns when sampling is too coarse for
 the spacing.
 
+### GPR Probe (GP API, ScanWall)
+
+On the real robot ScanWall drives the GP8800 through the GP App's HTTP API
+(`gpr_enabled`, on by default outside sim) in the order the GP API flow chart
+prescribes, spread over the segment so each step is visible on the app:
+
+| Step | When | Call |
+|------|------|------|
+| connect | `ft_zero_wait`, before force mode presses the plate | `POST /probe/connect` `{serialNumber, ip}` (406 = already connected) |
+| open the measurement | same moment | `POST /measurement/start` `{type: LINE_SCAN, name}` |
+| start the line | plate on the wall and about to move (`press_settle` for a base sweep, the executor's `sweep` feedback for an arm sweep) | `POST /measurement/line/start` |
+| stop the line | plate stopped, before the press is released | `POST /measurement/line/stop` |
+| export | right after the line stop | `POST /measurement/export/raw` → zip, unpacked into `data/raw/gpr/incoming/` |
+| close the measurement | last | `POST /measurement/stop` |
+
+Every response is status-checked. A failed connect, measurement start or line
+start aborts the scan (a sweep without GPR data is pointless), and the line is
+never started unless the two calls before it succeeded. The stop/export/stop
+tail is best-effort: failures are logged, the export outcome is written into
+the line's manifest row (`export: {ok, status, zip, files}`), and an
+unreachable app skips the remaining calls instead of waiting out each timeout.
+
+The export answers with a zip (`<name>_<stamp>/<name>.sgy` + `.csv` sidecar +
+`.json`). ScanWall keeps it as `data/raw/gpr/session_<stamp>/exports/<key>_<stamp>.zip`
+and unpacks the members flat into `data/raw/gpr/incoming/` as
+`<key>_<original name>` — the line key prefix (`w02_l01_s00`) is what
+SensorDataProcessing matches the scan to its manifest row by. The sidecar is
+written before the `.sgy`, so a listing never sees a half-delivered scan.
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `gpr_base_url` | `http://192.168.1.239:9000` | GP App API server |
+| `gpr_serial` | `GP88-007-0081` | Probe serial sent to `/probe/connect` |
+| `gpr_ip` | `192.168.1.99` | Probe static IP sent to `/probe/connect`; without it the app waits for a manual accept |
+| `gpr_timeout` | `30.0` | Per-request timeout (s) |
+| `gpr_export_enabled` | `true` | Export the line between line stop and measurement stop |
+| `gpr_export_path` | `/measurement/export/raw` | Export endpoint (no body; the response is the zip) |
+| `gpr_incoming_dir` | `data/raw/gpr/incoming` | Where the unpacked `.sgy` + `.csv` land (shared with SensorDataProcessing) |
+
 ### Sensor Processing (HSI + GPR + POKEYE)
 
 `SensorDataProcessing` turns what `ScanWall` recorded into results and decides
@@ -1279,7 +1318,7 @@ one sensor without the other:
 | Sensor | Sweep (ScanWall) | Processing (SensorDataProcessing) |
 |--------|------------------|-----------------------------------|
 | Hyperspectral | `hyperspectral_enabled` (default `false`) | `hyperspectral_processing_enabled`, **defaulting to `hyperspectral_enabled`** |
-| GPR | `gpr_enabled` (default `false`) for the probe, `gpr_trigger_enabled` (default `true`) for the distance triggers | `gpr_processing_enabled` (default `true`) |
+| GPR | `gpr_enabled` (default `true` on the real robot, `false` in sim) for the probe, `gpr_trigger_enabled` (default `true`) for the distance triggers | `gpr_processing_enabled` (default `true`) |
 
 The hyperspectral default differs on purpose. The GPR phase processes exports
 that have not been processed yet and simply finds none when the probe was off,

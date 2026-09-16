@@ -81,6 +81,36 @@ def test_only_scans_with_a_sidecar_are_found_oldest_first(tmp_path):
     assert gpr.find_scan_files(tmp_path / "missing") == []
 
 
+def test_export_zip_is_unpacked_flat_under_the_line_key(tmp_path):
+    """The app's export nests everything in a folder named after the
+    measurement; the pipeline wants <stem>.sgy + <stem>.csv flat in the
+    incoming folder, and the line key in the name is what the matcher keys on."""
+    import zipfile
+    zip_path = tmp_path / "export.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("GPR API Test002_20260916/GPR API Test002_20260916.sgy", b"segy")
+        zf.writestr("GPR API Test002_20260916/GPR API Test002_20260916.csv", b"csv")
+        zf.writestr("GPR API Test002_20260916/GPR API Test002_20260916.json", b"{}")
+        zf.writestr("GPR API Test002_20260916/thumb.png", b"png")     # not wanted
+        zf.writestr("../escape.sgy", b"x")                            # basename only
+    incoming = tmp_path / "incoming"
+    written = gpr.unpack_export(zip_path, incoming, "w02_l01_s00")
+    names = sorted(os.path.basename(w) for w in written)
+    assert names == [
+        "w02_l01_s00_GPR API Test002_20260916.csv",
+        "w02_l01_s00_GPR API Test002_20260916.json",
+        "w02_l01_s00_GPR API Test002_20260916.sgy",
+        "w02_l01_s00_escape.sgy",
+    ]
+    assert not (tmp_path / "escape.sgy").exists()
+    # the .sgy is written last, after its sidecar
+    assert written[-1].endswith(".sgy") and written[0].endswith((".csv", ".json"))
+    found = gpr.find_scan_files(incoming)
+    assert [f["stem"] for f in found] == ["w02_l01_s00_GPR API Test002_20260916"]
+    lines = [{"key": "w02_l01_s00", "measurement_name": "scan_wall line 2 seg 1001"}]
+    assert gpr.match_files_to_lines(found, lines)[0][1]["key"] == "w02_l01_s00"
+
+
 def test_scans_match_lines_by_name_first_then_by_time(tmp_path):
     lines = [
         {"key": "w02_l00_s00", "measurement_name": "scan_wall line 1 seg 1", "t_start_epoch": 100},
