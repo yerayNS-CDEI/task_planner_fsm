@@ -478,7 +478,7 @@ class WholeBodySweepNode(Node):
         # 200 Hz is four setpoints per nominal solve, and is what the receiving
         # end is built for: the UR's servoj interpolates at 500 Hz internally,
         # and moveit_servo streams to it in this range for the same reason.
-        self.declare_parameter("stream_rate", 200.0)
+        self.declare_parameter("stream_rate", 100.0)
         # How far past the nominal period the acceleration bound on the
         # PUBLISHED command may follow the measured one. See _publish.
         #
