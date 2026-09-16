@@ -394,6 +394,16 @@ class RobotFSMNode(Node):
         self.create_subscription(
             Float32MultiArray, "/distance_sensors", self.distance_sensors_callback, 10
         )
+        # Link status of the GPR trigger bridge (gpr_trigger_bridge node: JSON
+        # once a second with alive/acked/lost counters for the ESP32 fake
+        # encoder on the robot Wi-Fi). ScanWall refuses to sweep on a dead link
+        # when gpr_trigger_bridge_required is set (real robot with the ESP32).
+        self.create_subscription(
+            String,
+            str(self.ctx.get("gpr_trigger_bridge_status_topic", "/gpr_trigger_bridge/status")),
+            self.gpr_trigger_bridge_status_callback,
+            10,
+        )
         # Nav2 global costmap (latched) so states can project scan goals onto the
         # nearest cell the base can actually occupy. See costmap_utils.
         costmap_qos = QoSProfile(
@@ -1403,6 +1413,17 @@ class RobotFSMNode(Node):
         if len(msg.data) == 6:
             self.ctx["plate_distances"] = [float(v) for v in msg.data]
             self.ctx["plate_distances_stamp"] = time.time()
+
+    def gpr_trigger_bridge_status_callback(self, msg: String):
+        # Latest bridge snapshot + arrival time; the stamp lets ScanWall tell a
+        # bridge that died from one that is merely reporting alive=false.
+        try:
+            status = json.loads(msg.data)
+        except ValueError:
+            return
+        if isinstance(status, dict):
+            self.ctx["gpr_trigger_bridge_status"] = status
+            self.ctx["gpr_trigger_bridge_status_stamp"] = time.time()
 
     def mapping_callback(self, msg):
         self.ctx["map_ready"] = msg.data

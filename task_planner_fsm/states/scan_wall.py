@@ -363,6 +363,13 @@ class ScanWall(State):
         # the whole mission. No-op when hyperspectral sampling is disabled.
         self._hs.configure(node, ctx)
 
+        # Same check the sweep makes before arming the triggers, but here it
+        # costs nothing: better to fail at the door than after the approach.
+        ok, reason = self._gpr_trigger_bridge_ready(ctx)
+        if not ok:
+            node.get_logger().error(f"[{self.name}] {reason}; not starting the scan.")
+            return self.fail(ctx, reason)
+
         if self.position_client is None:
             self.position_client = node.create_client(SendPosition, "/send_position")
 
@@ -1372,6 +1379,11 @@ class ScanWall(State):
     # logging each one would drown the console); the rest go to debug.
     GPR_TRIGGER_LOG_EVERY = 20
 
+    # A bridge status older than this means the gpr_trigger_bridge node is
+    # gone (it publishes once a second); one that is fresh but says
+    # alive=false means the ESP32 stopped answering.
+    GPR_TRIGGER_BRIDGE_MAX_AGE_S = 3.0
+
     def _gpr_trigger_enabled(self, ctx):
         """Whether to emit distance triggers during the sweep.
 
@@ -1380,6 +1392,37 @@ class ScanWall(State):
         the probe itself is off.
         """
         return bool(ctx.get("gpr_trigger_enabled", True))
+
+    def _gpr_trigger_bridge_required(self, ctx):
+        """Whether a sweep must not start unless the ESP32 fake encoder is
+        answering. Off by default so sim runs and bench tests without the board
+        keep working (the triggers still go out on the topic); switch it on with
+        the ``gpr_trigger_bridge_required`` ctx/ROS param on the real robot, where
+        a sweep the GPR never clocked is a wasted wall."""
+        return self._gpr_trigger_enabled(ctx) and bool(
+            ctx.get("gpr_trigger_bridge_required", False)
+        )
+
+    def _gpr_trigger_bridge_ready(self, ctx):
+        """(ok, reason) from the last gpr_trigger_bridge status (see
+        fsm_node.gpr_trigger_bridge_status_callback). ok is True whenever the
+        bridge is not required, so callers can gate unconditionally."""
+        if not self._gpr_trigger_bridge_required(ctx):
+            return True, ""
+        status = ctx.get("gpr_trigger_bridge_status")
+        stamp = ctx.get("gpr_trigger_bridge_status_stamp")
+        topic = ctx.get("gpr_trigger_bridge_status_topic", "/gpr_trigger_bridge/status")
+        if not isinstance(status, dict) or stamp is None:
+            return False, f"no GPR trigger bridge status on '{topic}' (is gpr_trigger_bridge running?)"
+        age = time.time() - float(stamp)
+        if age > self.GPR_TRIGGER_BRIDGE_MAX_AGE_S:
+            return False, f"GPR trigger bridge status is {age:.1f}s old (node stopped?)"
+        if not status.get("alive"):
+            return False, (
+                f"GPR trigger receiver {status.get('receiver', '?')} is not answering "
+                f"(last reply {status.get('last_rx_age_s', '?')}s ago)"
+            )
+        return True, ""
 
     def _start_gpr_triggers(self, ctx, seg_start=None, seg_end=None):
         """Arm the distance-trigger sampler for the segment sweep that is about to
@@ -1404,6 +1447,13 @@ class ScanWall(State):
         if not self._gpr_trigger_enabled(ctx):
             return
         node = ctx["node"]
+        # The plate is about to travel: every trigger from here on is a trace
+        # the GPR either records or loses. Abort rather than sweep blind
+        # (on_exit cancels the sweep goal / stops the base).
+        ok, reason = self._gpr_trigger_bridge_ready(ctx)
+        if not ok:
+            node.get_logger().error(f"[{self.name}] {reason}; aborting scan.")
+            return self.fail(ctx, reason)
         axis_xy = self._sweep_axis(seg_start, seg_end)
         if axis_xy is None:
             sweep_yaw = 2.0 * atan2(self._sweep_qz, self._sweep_qw)
@@ -1720,12 +1770,16 @@ class ScanWall(State):
             self._emit_gpr_trigger(ctx)
 
     def _emit_gpr_trigger(self, ctx):
-        """Fire one trigger.
+        """Fire one trigger: a message on ``gpr_trigger_topic`` carrying the
+        trigger index within this segment, plus a log line.
 
-        For now this is the debug stand-in for the fake encoder: a message on
-        ``gpr_trigger_topic`` carrying the trigger index within this segment, plus
-        a log line. Swap the publish for the fake-encoder hardware call once that
-        interface exists — the distance bookkeeping above does not change.
+        The hardware hop is deliberately not here. The gpr_trigger_bridge node
+        subscribes to the topic and sends one UDP datagram per message to the
+        ESP32 fake encoder (ESP32/GPR_RX_FINALE.ino), which clocks the GPR; the
+        sweep is gated on the bridge's link status instead
+        (_gpr_trigger_bridge_ready). Keeping the publish here means sim and
+        bench runs work with nothing plugged in, and this callback -- on the
+        50 Hz trigger timer -- never waits on the Wi-Fi.
         """
         node = ctx["node"]
         self._gpr_trigger_count += 1
