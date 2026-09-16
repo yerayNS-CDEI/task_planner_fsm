@@ -690,6 +690,7 @@ def test_the_processing_state_walks_its_phases_without_blocking(rig):
     state = SensorDataProcessing("SensorDataProcessing")
     ctx = {
         "node": rig.node,
+        "hyperspectral_enabled": True,
         "hyperspectral_session_dir": session,
         "hyperspectral_batch_size": 4,
         "sensor_data_dir": str(rig.tmp_path / "data"),

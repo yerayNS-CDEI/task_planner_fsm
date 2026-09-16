@@ -5,6 +5,7 @@ the (fake) POKEYE service."""
 import importlib
 import json
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -146,6 +147,7 @@ def test_processing_state_classifies_decides_and_clusters_off_the_tick(tmp_path)
     state = SensorDataProcessing("SensorDataProcessing")
     ctx = {
         "node": node, "sim": False,
+        "hyperspectral_enabled": True,
         "hyperspectral_session_dir": session,
         "hyperspectral_batch_size": 50,
         "sensor_data_dir": str(tmp_path),
@@ -190,13 +192,54 @@ def test_processing_state_skips_classification_when_the_model_is_missing(tmp_pat
     session = _synthetic_session(tmp_path, n_per_line=5, lines=1, bad=(9, 9))
     node = _Node()
     state = SensorDataProcessing("SensorDataProcessing")
-    ctx = {"node": node, "hyperspectral_session_dir": session,
+    ctx = {"node": node, "hyperspectral_enabled": True,
+           "hyperspectral_session_dir": session,
            "sensor_data_dir": str(tmp_path), "hsi_model_path": str(tmp_path / "no.joblib"),
            "gpr_processing_enabled": False, "current_wall_index": 2}
     state.on_enter(ctx)
     _tick_until(state, ctx, "done")
     assert ctx["drilling_required"] is False
     assert any("classifier not found" in msg for level, msg in node.logger.lines if level == "error")
+
+
+def test_hyperspectral_phase_is_skipped_when_the_camera_is_disabled(tmp_path):
+    """A session on disk is NOT processed when the camera was off for the sweep.
+
+    The record can then only be an older run's (the camera lives in another
+    setup), and its reflectance and material labels must not be published as
+    this mission's -- the GPR-only field runs.
+    """
+    session = _synthetic_session(tmp_path, n_per_line=5, lines=1, bad=(9, 9))
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = {"node": node, "hyperspectral_session_dir": session,
+           "sensor_data_dir": str(tmp_path), "gpr_processing_enabled": False,
+           "current_wall_index": 2}
+    state.on_enter(ctx)
+    _tick_until(state, ctx, "done")
+
+    assert "hyperspectral_processed" not in ctx
+    assert "hsi_samples" not in ctx
+    assert not (Path(session) / hp.REFLECTANCE_FILENAME).is_file()
+    assert ctx["data_processed"] is True          # the state still completes
+    assert ctx["drilling_required"] is False
+    assert any("hyperspectral disabled" in msg for _, msg in node.logger.lines)
+
+
+def test_hyperspectral_processing_can_be_forced_on_without_the_camera(tmp_path):
+    """Re-processing a recorded session: the explicit flag wins over the camera
+    one, which is what the offline bootstrap sets."""
+    session = _synthetic_session(tmp_path, n_per_line=5, lines=1, bad=(9, 9))
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = {"node": node, "hyperspectral_session_dir": session,
+           "hyperspectral_processing_enabled": True,
+           "sensor_data_dir": str(tmp_path), "gpr_processing_enabled": False,
+           "current_wall_index": 2}
+    state.on_enter(ctx)
+    _tick_until(state, ctx, "done")
+    assert ctx["hyperspectral_processed"] is True
+    assert (Path(session) / hp.REFLECTANCE_FILENAME).is_file()
 
 
 def test_gpr_phase_waits_for_exports_then_gives_up(tmp_path, monkeypatch):
