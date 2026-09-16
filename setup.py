@@ -47,5 +47,6 @@ setup(
         'scripts/hyperspectral_wall_test',
         'scripts/check_sensor_setup',
         'scripts/process_sensor_session',
+        'scripts/gpr_trigger_bridge',
     ],
 )

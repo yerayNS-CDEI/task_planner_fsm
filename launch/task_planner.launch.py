@@ -20,6 +20,27 @@ def generate_launch_description():
             name='mock_server',
             output='screen',
         ),
+        # GPR fake-encoder bridge: /gpr/trigger -> UDP -> ESP32 (ESP32/GPR_RX_FINALE.ino).
+        # Real robot only; set receiver_ip to the board's address on Oliwall_2G and
+        # run the FSM with gpr_trigger_bridge_required:=true so a sweep never
+        # starts on a dead link. Defaults reproduce the calibrated handheld
+        # (ESP32/GPR_TX_01): fake wheel encoder, 16 quadrature cycles per cm,
+        # 800 us half period; cycles per trigger follow trigger_distance_m,
+        # which must equal the FSM's gpr_trigger_distance_m.
+        # Node(
+        #     package='task_planner_fsm',
+        #     executable='gpr_trigger_bridge',
+        #     name='gpr_trigger_bridge',
+        #     output='screen',
+        #     parameters=[{
+        #         'receiver_ip': '192.168.1.50',
+        #         'receiver_port': 5005,
+        #         'mode': 1,
+        #         'encoder_cycles_per_cm': 16.0,
+        #         'trigger_distance_m': 0.005,
+        #         'half_period_us': 800,
+        #     }],
+        # ),
         # Node(
         #     package='arm_control',
         #     executable='optimal_base_service',
