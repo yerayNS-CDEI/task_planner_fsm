@@ -2,3 +2,12 @@ __pycache__/
 *.log
 /log
 /task_planner_fsm/states/legacy/
+/data/**
+!/data/README.md
+!/data/**/
+!/data/**/.gitkeep
+/models/**
+!/models/README.md
+!/models/**/
+!/models/**/.gitkeep
+/task_planner_fsm/sensors/vendor/**/outputs/
