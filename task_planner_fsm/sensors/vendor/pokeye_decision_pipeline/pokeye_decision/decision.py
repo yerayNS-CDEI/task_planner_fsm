@@ -23,6 +23,120 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
+def build_gpr_drilling_constraints(gpr_result: dict | None) -> dict:
+    """Build NO-DRILL constraints from the GPR hyperbola result.
+
+    Important scope distinction:
+    - GPR does NOT decide whether POKEYE is requested.
+    - GPR only constrains where destructive drilling may be performed.
+
+    Coordinates are intentionally kept in the local GPR/B-scan frame. The software
+    integration layer must transform them to the robot/world frame before applying
+    them to a drill target.
+
+    No exclusion radius is invented here. A validated safety/tolerance margin must
+    be defined by the project integration/safety logic.
+    """
+    if gpr_result is None:
+        return {
+            "gpr_result_provided": False,
+            "constraint_valid": False,
+            "coordinate_frame": "gpr_scan_local",
+            "n_no_drill_positions": 0,
+            "no_drill_positions": [],
+            "requires_coordinate_transform": True,
+            "requires_exclusion_tolerance_definition": True,
+            "message": "No GPR hyperbola result was provided; no GPR-based drilling constraints are available.",
+        }
+
+    if not isinstance(gpr_result, dict):
+        return {
+            "gpr_result_provided": True,
+            "constraint_valid": False,
+            "coordinate_frame": "gpr_scan_local",
+            "n_no_drill_positions": 0,
+            "no_drill_positions": [],
+            "requires_coordinate_transform": True,
+            "requires_exclusion_tolerance_definition": True,
+            "message": "GPR result is not a dictionary/object.",
+        }
+
+    detections = gpr_result.get("detections")
+    if detections is None:
+        detections = []
+    if not isinstance(detections, list):
+        return {
+            "gpr_result_provided": True,
+            "constraint_valid": False,
+            "coordinate_frame": "gpr_scan_local",
+            "n_no_drill_positions": 0,
+            "no_drill_positions": [],
+            "requires_coordinate_transform": True,
+            "requires_exclusion_tolerance_definition": True,
+            "message": "GPR result does not contain a valid detections list.",
+        }
+
+    no_drill = []
+    for i, det in enumerate(detections):
+        if not isinstance(det, dict):
+            continue
+        det_type = str(det.get("type", "hyperbola")).strip().lower()
+        if det_type not in {"hyperbola", ""}:
+            continue
+
+        pos = det.get("position") if isinstance(det.get("position"), dict) else {}
+        depth = det.get("depth") if isinstance(det.get("depth"), dict) else {}
+        geometry = det.get("geometry") if isinstance(det.get("geometry"), dict) else {}
+
+        x_m = _as_float(pos.get("x_m"))
+        x_cm = _as_float(pos.get("x_cm"))
+        x_relative = _as_float(pos.get("x_relative"))
+        if x_m is None and x_cm is not None:
+            x_m = x_cm / 100.0
+        if x_cm is None and x_m is not None:
+            x_cm = x_m * 100.0
+
+        # A hyperbola without a usable horizontal location cannot become an
+        # actionable no-drill constraint, so it is skipped rather than guessed.
+        if x_m is None and x_relative is None:
+            continue
+
+        no_drill.append({
+            "source_detection_id": det.get("id", f"H{i + 1:03d}"),
+            "reason": "GPR_HYPERBOLA_DETECTED",
+            "instruction": "NO_DRILL",
+            "x_m": x_m,
+            "x_cm": x_cm,
+            "x_relative": x_relative,
+            "depth_cm_approx": _as_float(depth.get("depth_cm")),
+            "confidence": _as_float(
+                (det.get("robustness") or {}).get("confidence_mean")
+                if isinstance(det.get("robustness"), dict)
+                else det.get("confidence")
+            ),
+            "diagnostic_arc_half_width_m": _as_float(geometry.get("arc_half_width_m")),
+        })
+
+    hyperbola_flag = bool(gpr_result.get("hyperbola_detected", len(no_drill) > 0))
+    return {
+        "gpr_result_provided": True,
+        "constraint_valid": True,
+        "hyperbola_detected": hyperbola_flag,
+        "coordinate_frame": "gpr_scan_local",
+        "policy": "A detected GPR hyperbola creates a NO_DRILL location. GPR does not itself trigger POKEYE.",
+        "n_no_drill_positions": len(no_drill),
+        "no_drill_positions": no_drill,
+        "requires_coordinate_transform": True,
+        "requires_exclusion_tolerance_definition": True,
+        "exclusion_tolerance_m": None,
+        "warning": (
+            "The GPR x coordinate is local to the B-scan. Software must transform it "
+            "to the robot/world frame and apply a project-approved spatial tolerance. "
+            "diagnostic_arc_half_width_m is not a validated safety radius."
+        ),
+    }
+
+
 def _single_measurement_decision(
     hsi: dict,
     *,
@@ -31,14 +145,14 @@ def _single_measurement_decision(
 ) -> dict:
     """Decide whether POKEYE is required for one HSI classification result.
 
-    This function is deliberately transport-agnostic. `hsi` can be the dict returned
-    by the hyperspectral pipeline directly or a dict reconstructed from a ROS2 message.
-
-    Policy v1:
-      - valid HSI detection at/above threshold -> no POKEYE
+    Policy v2 keeps the v1 trigger logic unchanged:
+      - valid HSI detection at/above threshold -> no POKEYE request
       - HSI low confidence -> POKEYE material identification
       - HSI quality rejection -> POKEYE material identification
-      - malformed/inconsistent message -> HOLD/ERROR, never trigger POKEYE automatically
+      - malformed/inconsistent HSI message -> HOLD/ERROR
+
+    GPR is intentionally not used here as a trigger. GPR drilling constraints are
+    attached separately by ``decide_pokeye``.
     """
     if not isinstance(hsi, dict):
         return {
@@ -67,7 +181,6 @@ def _single_measurement_decision(
         "sensor_reason": sensor_reason,
     }
 
-    # Explicit sensor outcomes from the HSI pipeline are authoritative.
     if status == "quality_rejected":
         return {
             "decision_valid": True,
@@ -91,8 +204,6 @@ def _single_measurement_decision(
         }
 
     if status == "detected":
-        # A 'detected' status must still be internally coherent. Invalid messages do
-        # not cause an automatic destructive action; they are returned as HOLD.
         if detected is not True:
             return {
                 "decision_valid": False,
@@ -124,7 +235,6 @@ def _single_measurement_decision(
                 "hsi_evidence": evidence,
             }
         if confidence < confidence_threshold:
-            # Defensive check in case the ROS2 message and HSI threshold become inconsistent.
             return {
                 "decision_valid": True,
                 "pokeye_required": True,
@@ -140,11 +250,10 @@ def _single_measurement_decision(
             "decision": "NO_ACTION",
             "reason": "HSI_CONFIDENT_CLASSIFICATION",
             "requested_action": "NONE",
-            "message": "HSI material classification is sufficiently confident; POKEYE is not required.",
+            "message": "HSI material classification is sufficiently confident; POKEYE is not required by HSI.",
             "hsi_evidence": evidence,
         }
 
-    # Compatibility fallback for a minimal ROS2 payload that might omit `status`.
     if status is None and isinstance(detected, bool):
         if detected is True and material not in (None, "") and confidence is not None:
             if confidence >= confidence_threshold:
@@ -154,7 +263,7 @@ def _single_measurement_decision(
                     "decision": "NO_ACTION",
                     "reason": "HSI_CONFIDENT_CLASSIFICATION",
                     "requested_action": "NONE",
-                    "message": "HSI material classification is sufficiently confident; POKEYE is not required.",
+                    "message": "HSI material classification is sufficiently confident; POKEYE is not required by HSI.",
                     "hsi_evidence": evidence,
                 }
             return {
@@ -168,8 +277,6 @@ def _single_measurement_decision(
             }
 
         if detected is False:
-            # Without an explicit status we cannot distinguish quality rejection from
-            # low confidence. Both are valid reasons for the same v1 POKEYE action.
             return {
                 "decision_valid": True,
                 "pokeye_required": True,
@@ -194,19 +301,20 @@ def _single_measurement_decision(
 def decide_pokeye(
     hsi_result: dict,
     *,
+    gpr_result: dict | None = None,
     config_path: str | Path | None = None,
     target_context: dict | None = None,
 ) -> dict:
-    """Return a POKEYE decision from the HSI result.
+    """Return the HSI-based POKEYE decision plus optional GPR no-drill constraints.
 
-    Preferred ROS2 usage is one HSI measurement at a time. For convenience, the
-    function also accepts a full `hsi_result.json` containing `samples`; in that case
-    it returns one decision per sample and an `any_pokeye_required` summary. It does
-    not invent a navigation target or aggregate multiple spectra into one material.
+    ``pokeye_required`` is still decided exclusively from HSI. If a GPR hyperbola
+    result is provided, it is converted into drilling constraints that must also be
+    respected when POKEYE drills for another reason, including RANDOM drilling.
     """
     cfg = load_config(config_path)
     default_threshold = float(cfg.get("default_confidence_threshold", 0.8))
     pokeye_action = str(cfg.get("pokeye_action", "MATERIAL_IDENTIFICATION"))
+    drilling_constraints = build_gpr_drilling_constraints(gpr_result)
 
     if not isinstance(hsi_result, dict):
         decision = _single_measurement_decision(
@@ -214,6 +322,7 @@ def decide_pokeye(
             confidence_threshold=default_threshold,
             pokeye_action=pokeye_action,
         )
+        decision["drilling_constraints"] = drilling_constraints
         if target_context is not None:
             decision["target_context"] = target_context
         return decision
@@ -223,7 +332,6 @@ def decide_pokeye(
         threshold = default_threshold
 
     samples = hsi_result.get("samples")
-    # Full HSI output / batch mode.
     if isinstance(samples, list) and not all(k in hsi_result for k in ("status", "detected")):
         decisions = []
         for i, sample in enumerate(samples):
@@ -246,13 +354,13 @@ def decide_pokeye(
             "n_hold": sum(int(d["decision"] == "HOLD") for d in decisions),
             "any_pokeye_required": any(d["pokeye_required"] for d in decisions),
             "decisions": decisions,
+            "drilling_constraints": drilling_constraints,
             "note": "Batch summary only. Navigation/action should use the per-sample decision associated with a known robot target.",
         }
         if target_context is not None:
             result["target_context"] = target_context
         return result
 
-    # Single operational measurement.
     decision = _single_measurement_decision(
         hsi_result,
         confidence_threshold=threshold,
@@ -260,12 +368,12 @@ def decide_pokeye(
     )
     decision["mode"] = "single"
     decision["confidence_threshold"] = threshold
+    decision["drilling_constraints"] = drilling_constraints
     if "sample_index" in hsi_result:
         decision["sample_index"] = hsi_result.get("sample_index")
     if hsi_result.get("metadata"):
         decision["metadata"] = hsi_result.get("metadata")
     if target_context is not None:
-        # Opaque pass-through: this package never interprets poses/frames.
         decision["target_context"] = target_context
     return decision
 
@@ -273,6 +381,7 @@ def decide_pokeye(
 def decide_from_json_file(
     input_json: str | Path,
     *,
+    gpr_json: str | Path | None = None,
     output_json: str | Path | None = None,
     config_path: str | Path | None = None,
     target_context: dict | None = None,
@@ -280,8 +389,15 @@ def decide_from_json_file(
     input_path = Path(input_json)
     with input_path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
+
+    gpr_payload = None
+    if gpr_json is not None:
+        with Path(gpr_json).open("r", encoding="utf-8") as f:
+            gpr_payload = json.load(f)
+
     result = decide_pokeye(
         payload,
+        gpr_result=gpr_payload,
         config_path=config_path,
         target_context=target_context,
     )

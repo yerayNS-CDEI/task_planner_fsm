@@ -1,4 +1,9 @@
 {
   "default_confidence_threshold": 0.8,
-  "pokeye_action": "MATERIAL_IDENTIFICATION"
+  "pokeye_action": "MATERIAL_IDENTIFICATION",
+  "notes": {
+    "pokeye_trigger": "HSI only",
+    "gpr_role": "Hyperbola detections create NO_DRILL constraints but do not trigger POKEYE",
+    "gpr_exclusion_tolerance": "Not defined in the sensor package; must be agreed and applied by software/safety integration after coordinate transformation"
+  }
 }

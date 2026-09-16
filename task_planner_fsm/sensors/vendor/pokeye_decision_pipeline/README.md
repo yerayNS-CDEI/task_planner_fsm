@@ -1,54 +1,53 @@
-# DISCOVER — OLIWALL -> POKEYE decision layer (v1)
+# DISCOVER — OLIWALL -> POKEYE decision layer (v2)
 
-Task **(3)**. This package decides whether POKEYE should be requested based **only on the hyperspectral (HSI) result**.
+Task **(3)**. This package has two deliberately separate responsibilities:
 
-## Scope v1
+1. **Decide whether HSI requires POKEYE material identification.**
+2. **Convert detected GPR hyperbolae into NO-DRILL constraints** that POKEYE must respect whenever it drills, including externally requested **RANDOM** drilling.
 
-The current policy is intentionally small and conservative:
+## Important scope rule
 
-- HSI `detected` with confidence >= threshold -> **POKEYE not required**.
-- HSI `low_confidence` -> **send to POKEYE** for `MATERIAL_IDENTIFICATION`.
-- HSI `quality_rejected` -> **send to POKEYE** for `MATERIAL_IDENTIFICATION`.
-- malformed/inconsistent HSI message -> **HOLD / ERROR**. It does **not** automatically trigger a destructive action.
+**GPR does not trigger POKEYE.** The decision `pokeye_required` is still based only on the HSI result.
 
-GPR hyperbola/line results are deliberately not used in v1.
+A GPR hyperbola has a different role: if a hyperbola is detected at a horizontal GPR position, that position is returned as **NO_DRILL**, because the reflector may correspond to metal/rebar/pipe/cable or another subsurface object that should not be drilled blindly.
 
-## ROS2 boundary
+## HSI trigger policy
 
-This package does **not** implement ROS2 topics/messages. The software team can deserialize its HSI ROS2 message into a Python dict, call the function below, then serialize the returned dict into its preferred ROS2 interface.
-
-Preferred operational input (one measurement at a time):
-
-```python
-{
-    "detected": True,
-    "material": "gypsum",
-    "confidence": 0.994,
-    "status": "detected",
-    "reason": None,
-    "confidence_threshold": 0.8
-}
+```text
+HSI detected with confidence >= threshold -> NO_ACTION
+HSI low_confidence                     -> SEND_TO_POKEYE
+HSI quality_rejected                   -> SEND_TO_POKEYE
+invalid/inconsistent HSI message       -> HOLD
 ```
 
-The function also accepts the `hsi_result.json` produced by `HYPERSPECTRAL_DISCOVER_pipeline_v2`. If that file contains multiple `samples`, a decision is returned for each sample. That batch result is for inspection/integration; it is **not** an instruction to navigate to an unspecified position.
+## GPR drilling policy
+
+```text
+GPR hyperbola detected at x -> NO_DRILL at that GPR-local position
+No hyperbola                -> no GPR-derived forbidden position
+```
+
+This constraint applies independently of why POKEYE is drilling. In particular, **RANDOM drilling must also avoid all GPR hyperbola locations**.
+
+### Coordinate warning
+
+The GPR horizontal coordinate is **local to the B-scan / scan path**. It is not a robot/world coordinate. The software team must transform the local GPR position to the robot/global frame using the scan pose, GPR extrinsics and scan direction.
+
+The sensor package intentionally does **not** invent a safety radius around a hyperbola. The project must agree a spatial tolerance/exclusion radius and software must apply it after coordinate transformation. `arc_half_width_m` is included only as diagnostic geometry and is **not** a validated drilling safety radius.
 
 ## Python API
 
 ```python
 from pokeye_decision import decide_pokeye
 
-hsi_msg = {
-    "detected": False,
-    "material": None,
-    "confidence": 0.63,
-    "status": "low_confidence",
-    "reason": "confidence below threshold 0.800",
-}
-
-decision = decide_pokeye(hsi_msg)
+decision = decide_pokeye(
+    hsi_result=hsi_msg,
+    gpr_result=gpr_result,       # optional gpr_result.json content
+    target_context=target_context,
+)
 ```
 
-Result:
+A typical output is:
 
 ```python
 {
@@ -57,45 +56,65 @@ Result:
     "decision": "SEND_TO_POKEYE",
     "reason": "HSI_LOW_CONFIDENCE",
     "requested_action": "MATERIAL_IDENTIFICATION",
-    "hsi_evidence": {...}
+    "hsi_evidence": {...},
+    "drilling_constraints": {
+        "coordinate_frame": "gpr_scan_local",
+        "n_no_drill_positions": 2,
+        "no_drill_positions": [
+            {
+                "source_detection_id": "H001",
+                "instruction": "NO_DRILL",
+                "reason": "GPR_HYPERBOLA_DETECTED",
+                "x_m": 0.55,
+                "x_cm": 55.0,
+                "x_relative": 0.31,
+                "depth_cm_approx": 4.2
+            }
+        ],
+        "requires_coordinate_transform": True,
+        "requires_exclusion_tolerance_definition": True,
+        "exclusion_tolerance_m": None
+    }
 }
 ```
 
-If software already knows the robot target/pose, it can be passed through without this package interpreting it:
+A confident HSI classification can still return `pokeye_required=false` while carrying GPR drilling constraints. This is intentional: POKEYE may later be requested for another reason, including RANDOM drilling.
 
-```python
-decision = decide_pokeye(
-    hsi_msg,
-    target_context={"frame_id": "map", "target_id": "surface_004"}
-)
-```
+## ROS2 boundary
 
-`target_context` is opaque metadata: this package does not invent coordinates or navigation commands.
+ROS2 is not implemented here. Recommended integration is:
 
-## CLI / JSON test
+1. deserialize the HSI result into a Python `dict`;
+2. optionally provide the latest associated `gpr_result.json` / GPR dict;
+3. call `decide_pokeye(...)`;
+4. publish the HSI decision and the transformed NO-DRILL constraints using project-defined ROS2 interfaces.
+
+The software layer owns measurement/pose association and coordinate transforms.
+
+## CLI
 
 ```bash
 python check_setup.py
 python test_decision.py
-python run_pokeye_decision.py examples/hsi_detected.json
-python run_pokeye_decision.py examples/hsi_low_confidence.json
-python run_pokeye_decision.py examples/hsi_quality_rejected.json
+python run_pokeye_decision.py examples/hsi_low_confidence.json \
+    --gpr-json examples/gpr_hyperbolas.json
 ```
 
-Default CLI output:
+Default output:
 
 ```text
 outputs/<input_name>/pokeye_decision.json
 ```
 
-## Output meanings
+## Main fields
 
-- `pokeye_required`: boolean operational decision when `decision_valid=true`.
+- `pokeye_required`: whether HSI requests POKEYE.
 - `decision`: `NO_ACTION`, `SEND_TO_POKEYE`, or `HOLD`.
-- `reason`: machine-readable reason.
-- `requested_action`: currently only `MATERIAL_IDENTIFICATION`, `NONE`, or `HOLD`.
-- `hsi_evidence`: HSI material/confidence/status copied into the decision for traceability.
+- `requested_action`: currently `MATERIAL_IDENTIFICATION`, `NONE`, or `HOLD`.
+- `drilling_constraints.no_drill_positions[]`: GPR-derived local positions where drilling is forbidden.
+- `drilling_constraints.constraint_valid`: whether the GPR constraint payload could be interpreted.
+- `target_context`: optional opaque metadata passed through from software.
 
 ## Confidence threshold
 
-By default the decision threshold is `0.80`, matching the current HSI integration. If the HSI message includes `confidence_threshold`, that value takes precedence so the two components remain synchronized.
+Default HSI threshold: `0.80`. If the HSI message contains `confidence_threshold`, that value takes precedence so the decision layer remains synchronized with HSI.

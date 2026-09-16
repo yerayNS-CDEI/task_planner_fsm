@@ -96,6 +96,25 @@ class MockServer(Node):
             f"(session {request.session_id}, frame {request.frame_id}).")
         for tid, pos, reason in zip(request.target_ids, request.positions, request.reasons):
             self.get_logger().info(f"  {tid}: ({pos.x:.2f}, {pos.y:.2f}, {pos.z:.2f}) [{reason}]")
+        n_zones = len(request.no_drill_positions)
+        if n_zones or request.n_no_drill_unlocated:
+            self.get_logger().info(
+                f"  {n_zones} NO_DRILL zone(s), {request.n_no_drill_unlocated} "
+                f"hyperbola(e) that could not be placed")
+            for zid, pos, radius in zip(request.no_drill_ids, request.no_drill_positions,
+                                        request.no_drill_radii):
+                self.get_logger().info(
+                    f"    NO_DRILL {zid}: ({pos.x:.2f}, {pos.y:.2f}, {pos.z:.2f}) r={radius:.2f} m")
+        n_lines = len(request.scanned_line_starts)
+        self.get_logger().info(
+            f"  drillable region: {n_lines} scanned line(s), "
+            f"tolerance {request.scanned_line_tolerance:.2f} m"
+            + ("" if n_lines else " -- RANDOM drilling not permitted on this wall"))
+        for lid, start, end in zip(request.scanned_line_ids, request.scanned_line_starts,
+                                   request.scanned_line_ends):
+            self.get_logger().info(
+                f"    line {lid}: ({start.x:.2f}, {start.y:.2f}, {start.z:.2f}) -> "
+                f"({end.x:.2f}, {end.y:.2f}, {end.z:.2f})")
         if request.request_json_path:
             self.get_logger().info(f"  detail: {request.request_json_path}")
         delay = 1   # seconds

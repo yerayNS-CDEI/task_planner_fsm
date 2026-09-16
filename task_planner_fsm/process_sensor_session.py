@@ -2,7 +2,7 @@
 
 The same code the FSM state runs, minus ROS, in the foreground: reflectance
 pass, DISCOVER material classification, GPR pipelines over the incoming
-exports, POKEYE decisions and target clustering. For re-processing a mission
+exports, POKEYE decisions, target clustering and the GPR NO_DRILL screening. For re-processing a mission
 after the fact (a retrained model, a tuned clustering radius), for testing the
 sensor stack on a machine without the robot, and for the Jetson timing work.
 
@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from .sensors import VendorUnavailable, gpr, hsi, paths, pokeye
+from .sensors import VendorUnavailable, gpr, hsi, no_drill, paths, pokeye
 from .utils import hyperspectral_processing as hp
 
 
@@ -77,6 +77,18 @@ def main(argv=None):
     parser.add_argument("--min-samples", type=int, default=None, help="pokeye_cluster_min_samples")
     parser.add_argument("--spacing", type=float, default=None, help="pokeye_min_target_spacing_m")
     parser.add_argument("--max-targets", type=int, default=None, help="pokeye_max_targets_per_wall")
+    parser.add_argument("--no-drill-tolerance", type=float, default=None,
+                        help=f"exclusion radius around a GPR hyperbola, metres "
+                             f"(pokeye_no_drill_tolerance_m, default {no_drill.DEFAULT_TOLERANCE_M})")
+    parser.add_argument("--block-on-unlocated", action="store_true",
+                        help="refuse every target when a hyperbola could not be placed on the wall")
+    parser.add_argument("--scanned-line-tolerance", type=float, default=None,
+                        help=f"how far off a scanned GPR line a target may sit, metres "
+                             f"(pokeye_scanned_line_tolerance_m, default "
+                             f"{no_drill.DEFAULT_LINE_TOLERANCE_M})")
+    parser.add_argument("--no-gpr-coverage-required", action="store_true",
+                        help="allow targets on wall stretches no GPR line scanned "
+                             "(bring-up/simulation only)")
     args = parser.parse_args(argv)
 
     log = _Logger()
@@ -86,7 +98,13 @@ def main(argv=None):
                        ("pokeye_cluster_radius_m", args.radius),
                        ("pokeye_cluster_min_samples", args.min_samples),
                        ("pokeye_min_target_spacing_m", args.spacing),
-                       ("pokeye_max_targets_per_wall", args.max_targets)):
+                       ("pokeye_max_targets_per_wall", args.max_targets),
+                       ("pokeye_no_drill_tolerance_m", args.no_drill_tolerance),
+                       ("pokeye_no_drill_block_on_unlocated",
+                        args.block_on_unlocated or None),
+                       ("pokeye_scanned_line_tolerance_m", args.scanned_line_tolerance),
+                       ("pokeye_require_gpr_coverage",
+                        False if args.no_gpr_coverage_required else None)):
         if value is not None:
             ctx[key] = value
 
@@ -129,25 +147,70 @@ def main(argv=None):
                 run_hyperbolae=paths.gpr_weights_path(ctx).is_file())
             log.info(f"gpr: {result['n_new']} new scan(s) in {time.monotonic() - t0:.0f} s, "
                      f"{result['n_hyperbolae']} hyperbolae, {result['n_lines']} lines, "
-                     f"{result['n_failed']} failed")
+                     f"{result['n_failed']} failed, {result['n_no_drill']} NO_DRILL position(s)")
             for entry in result["entries"]:
                 log.info("  " + gpr.describe_entry(entry))
         except VendorUnavailable as exc:
             log.warn(f"gpr: skipped ({exc})")
 
-    # 4) decision + targets
+    # 4) what GPR allows: the forbidden points, and the only scanned region
+    zones, lines, zstats = [], [], {}
+    require_coverage = not args.no_gpr_coverage_required
+    line_tolerance = no_drill.line_tolerance_from_ctx(ctx)
+    try:
+        tolerance = no_drill.tolerance_from_ctx(ctx)
+        results = gpr.load_summary(paths.gpr_results_dir(ctx))
+        zones, zstats = no_drill.zones_from_gpr(
+            results, tolerance_m=tolerance, wall_index=args.wall)
+        lines, line_stats = no_drill.scanned_lines_from_gpr(results, wall_index=args.wall)
+        zstats.update(line_stats)
+        if require_coverage:
+            log.info(f"no-drill: drillable only within {line_tolerance} m of "
+                     f"{len(lines)} scanned+analysed GPR line(s)"
+                     + (f" ({line_stats['n_not_analysed']} not analysed, "
+                        f"{line_stats['n_unplaced']} not placed)"
+                        if line_stats["n_not_analysed"] or line_stats["n_unplaced"] else ""))
+        else:
+            log.warn("no-drill: GPR coverage not required; targets may land where "
+                     "nothing was scanned")
+        if zstats["n_no_drill_positions"]:
+            log.info(f"no-drill: {zstats['n_no_drill_positions']} position(s) -> "
+                     f"{zstats['n_zones']} zone(s) of r={tolerance} m, "
+                     f"{zstats['n_unlocated']} unplaceable")
+            log.info(f"  {no_drill.describe_zones(zones)}")
+        if args.no_drill_tolerance is None and zones:
+            log.warn(f"no-drill: using the FSM placeholder radius "
+                     f"{no_drill.DEFAULT_TOLERANCE_M} m (--no-drill-tolerance to set it)")
+    except VendorUnavailable as exc:
+        log.warn(f"no-drill: skipped ({exc})")
+
+    # 5) decision + targets, screened against those zones
     if samples:
         try:
             decisions = pokeye.decide_samples(samples, threshold)
             params = pokeye.ClusterParams.from_ctx(ctx)
             targets, stats = pokeye.cluster_targets(decisions, params, wall_index=args.wall)
-            d_path, t_path = pokeye.write_outputs(paths.pokeye_results_dir(ctx), decisions, targets, stats)
+            targets, blocked, screen_stats = no_drill.screen_targets(
+                targets, zones, lines, line_tolerance_m=line_tolerance,
+                require_coverage=require_coverage,
+                unlocated=zstats.get("n_unlocated", 0),
+                block_on_unlocated=args.block_on_unlocated)
+            stats["no_drill"] = dict(zstats, **screen_stats)
+            stats["n_targets"] = len(targets)
+            d_path, t_path = pokeye.write_outputs(
+                paths.pokeye_results_dir(ctx), decisions, targets, stats,
+                zones=zones, blocked=blocked)
             ds = pokeye.decision_stats(decisions)
             log.info(f"pokeye: {ds['n_pokeye_required']}/{ds['n']} samples require POKEYE, "
                      f"{ds['n_hold']} hold -> {stats['n_targets']} target(s) "
                      f"(radius {params.radius_m} m, min {params.min_samples} samples, "
                      f"spacing {params.min_spacing_m} m, cap {params.max_targets_per_wall})")
             log.info(f"  {pokeye.describe_targets(targets)}")
+            if blocked:
+                log.warn(f"pokeye: {len(blocked)} target(s) dropped by a drilling "
+                         f"constraint ("
+                         + ", ".join(f"{k} x{v}" for k, v in screen_stats["reasons"].items())
+                         + f"): {no_drill.describe_blocked(blocked)}")
             log.info(f"  {d_path}\n  {t_path}")
         except VendorUnavailable as exc:
             log.warn(f"pokeye: skipped ({exc})")

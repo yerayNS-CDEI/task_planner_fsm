@@ -153,6 +153,9 @@ def test_processing_state_classifies_decides_and_clusters_off_the_tick(tmp_path)
         "sensor_data_dir": str(tmp_path),
         "current_wall_index": 2,
         "gpr_processing_enabled": False,
+        # No GPR at all, so no wall stretch is drillable under the project rule;
+        # this test is about the classify -> cluster chain, screened separately.
+        "pokeye_require_gpr_coverage": False,
     }
     state.on_enter(ctx)
     _tick_until(state, ctx, "hsi_classify")
@@ -363,3 +366,334 @@ def test_send_data_to_pokeye_with_no_targets_moves_on(tmp_path):
     state.run(ctx)
     assert node.client.calls == []
     assert state.check_transition(ctx) == "ArmFolding"
+
+
+# ----------------------------------------------------------------------
+# The GPR NO_DRILL constraint, through both states
+# ----------------------------------------------------------------------
+def _scan_entry(key, line, x_m=None):
+    """One processed GPR scan, with a hyperbola at ``x_m`` along it if given."""
+    from task_planner_fsm.sensors import gpr, no_drill
+
+    detections = ([{"id": "H001", "type": "hyperbola",
+                    "position": {"x_m": x_m, "x_cm": x_m * 100},
+                    "depth": {"depth_cm": 5.0},
+                    "robustness": {"confidence_mean": 0.9}}] if x_m is not None else [])
+    constraints = no_drill.constraints_from_result(
+        {"hyperbola_detected": bool(detections),
+         "n_valid_detections": len(detections), "detections": detections},
+        to_map=gpr.map_transform(line), source_key=key)
+    return {"key": key, "line": line, "associated": line is not None,
+            "no_drill": constraints}
+
+
+def _write_gpr_summary(tmp_path, entries):
+    from task_planner_fsm.sensors import gpr
+
+    out_dir = tmp_path / "processed" / "session_20260101_000000" / "gpr"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / gpr.SUMMARY_FILENAME, "w") as handle:
+        json.dump({"entries": entries}, handle)
+
+
+def _scanned_line(wall=2):
+    return {"key": "w02_l00_s00", "wall_index": wall,
+            "seg_start": [5.0, 3.0, 1.0], "seg_end": [7.0, 3.0, 1.0]}
+
+
+def _gpr_summary_with_a_hyperbola(tmp_path, x_m=0.6, wall=2, located=True):
+    """A processed GPR record placing one hyperbola at (5.6, 3.0, 1.0) in map.
+
+    ``located=False`` adds a second, orphan export whose hyperbolae cannot be
+    placed, on top of a line that was scanned properly -- the only situation
+    where the unplaceable case is still interesting, since a wall with no
+    scanned line at all is already undrillable.
+    """
+    line = _scanned_line(wall)
+    entries = [_scan_entry("w02_l00_s00", line, x_m if located else None)]
+    if not located:
+        entries.append(_scan_entry("orphan", None, x_m))
+    _write_gpr_summary(tmp_path, entries)
+
+
+def _decision_ctx(tmp_path, node, **extra):
+    ctx = {"node": node, "sim": False, "sensor_data_dir": str(tmp_path),
+           "sensor_session_id": "20260101_000000", "current_wall_index": 2}
+    ctx.update(extra)
+    return ctx
+
+
+def _hsi_double(x0=5.55, n=6, wall=2):
+    """Flagged samples in a patch, as the classifier would have left them."""
+    return {"confidence_threshold": 0.8, "samples": [
+        {"seq": i, "wall_index": wall, "line_idx": 0, "seg_idx": 0, "frame": "map",
+         "pose": [x0 + 0.02 * i, 3.0, 1.0], "pose_map": [x0 + 0.02 * i, 3.0, 1.0],
+         "status": "low_confidence", "detected": False, "material": None,
+         "confidence": 0.4, "reason": "below threshold"} for i in range(n)]}
+
+
+def test_the_decision_phase_drops_a_target_sitting_on_a_hyperbola(tmp_path):
+    """HSI asks for a hole where GPR saw a reflector; no hole is requested, and
+    the wall is not sent to POKEYE at all because it was its only target."""
+    _gpr_summary_with_a_hyperbola(tmp_path)
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = _decision_ctx(tmp_path, node)
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    state._phase = "decision"
+    state.run(ctx)
+
+    assert ctx["data_processed"] is True
+    assert ctx["drilling_required"] is False
+    assert ctx["pokeye_targets"] == []
+    [blocked] = ctx["pokeye_blocked_targets"]
+    assert blocked["blocked_by"]["source_detection_id"] == "H001"
+    assert len(ctx["pokeye_no_drill_zones"]) == 1
+    assert ctx["pokeye_no_drill_zones"][0]["position"] == [5.6, 3.0, 1.0]
+    assert state.check_transition(ctx) == "ArmFolding"
+    assert any("NO_DRILL" in msg for level, msg in node.logger.lines if level == "warn")
+
+
+def test_a_hyperbola_elsewhere_on_the_wall_does_not_block_the_target(tmp_path):
+    _gpr_summary_with_a_hyperbola(tmp_path, x_m=1.8)         # map x = 6.8, far away
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = _decision_ctx(tmp_path, node)
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    state._phase = "decision"
+    state.run(ctx)
+
+    assert ctx["drilling_required"] is True
+    assert len(ctx["pokeye_targets"]) == 1
+    assert ctx["pokeye_blocked_targets"] == []
+    assert len(ctx["pokeye_no_drill_zones"]) == 1
+    assert state.check_transition(ctx) == "SendDataToPokeye"
+
+
+def test_the_exclusion_radius_is_the_projects_to_set(tmp_path):
+    """The placeholder blocks it; a tolerance the project narrows does not."""
+    _gpr_summary_with_a_hyperbola(tmp_path, x_m=0.70)        # map x = 5.70, 0.10 m away
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+
+    ctx = _decision_ctx(tmp_path, node)
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    state._phase = "decision"
+    state.run(ctx)
+    assert ctx["pokeye_targets"] == []
+    assert any("placeholder" in msg for level, msg in node.logger.lines if level == "warn")
+
+    ctx = _decision_ctx(tmp_path, node, pokeye_no_drill_tolerance_m=0.05)
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    state._phase = "decision"
+    state.run(ctx)
+    assert len(ctx["pokeye_targets"]) == 1
+    assert ctx["pokeye_no_drill_stats"]["tolerance_m"] == 0.05
+
+
+def test_an_unplaceable_hyperbola_is_reported_and_can_veto_the_wall(tmp_path):
+    """The line was scanned, so the target is covered; a second export carries
+    hyperbolae we cannot place anywhere."""
+    _gpr_summary_with_a_hyperbola(tmp_path, located=False)
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+
+    ctx = _decision_ctx(tmp_path, node)
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    state._phase = "decision"
+    state.run(ctx)
+    assert len(ctx["pokeye_targets"]) == 1               # reported, not enforced
+    assert ctx["pokeye_no_drill_stats"]["n_unlocated"] == 1
+    assert any("could not be placed" in msg for level, msg in node.logger.lines if level == "warn")
+
+    ctx = _decision_ctx(tmp_path, node, pokeye_no_drill_block_on_unlocated=True)
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    state._phase = "decision"
+    state.run(ctx)
+    assert ctx["pokeye_targets"] == []
+    assert ctx["pokeye_blocked_targets"][0]["blocked_by"]["reason"] == \
+        "GPR_NO_DRILL_POSITION_NOT_LOCATED"
+
+
+def test_the_request_carries_the_zones_pokeye_must_respect_on_its_own_drills(tmp_path):
+    """The targets were screened already; the zones travel anyway, because a
+    RANDOM drill POKEYE chooses itself has to avoid the same hyperbolae."""
+    node = _Node()
+    state = SendDataToPokeye("SendDataToPokeye")
+    ctx = _pokeye_ctx(tmp_path, node)
+    ctx["pokeye_no_drill_zones"] = [{
+        "zone_id": "w02_l00_s00_H001", "source_key": "w02_l00_s00",
+        "source_detection_id": "H001", "reason": "GPR_HYPERBOLA_DETECTED",
+        "instruction": "NO_DRILL", "frame_id": "map", "position": [6.8, 3.0, 1.0],
+        "radius_m": 0.15, "wall_index": 2, "depth_cm_approx": 5.0}]
+    ctx["pokeye_no_drill_stats"] = {"tolerance_m": 0.15, "n_unlocated": 1}
+    ctx["pokeye_blocked_targets"] = [{"target_id": "w02_c09"}]
+    state.on_enter(ctx)
+
+    with open(ctx["pokeye_request_json"]) as handle:
+        payload = json.load(handle)
+    constraints = payload["drilling_constraints"]
+    assert constraints["n_no_drill_zones"] == 1
+    assert constraints["coordinate_frame"] == "map"
+    assert constraints["targets_already_screened"] is True
+    assert constraints["exclusion_tolerance_m"] == 0.15
+    assert constraints["exclusion_tolerance_source"] == "fsm_placeholder_pending_project_approval"
+    assert constraints["n_unlocated"] == 1
+    assert payload["blocked_targets"][0]["target_id"] == "w02_c09"
+
+    state.run(ctx)
+    [(request, _)] = node.client.calls
+    assert list(request.no_drill_ids) == ["w02_l00_s00_H001"]
+    assert (request.no_drill_positions[0].x, request.no_drill_positions[0].y,
+            request.no_drill_positions[0].z) == (6.8, 3.0, 1.0)
+    assert request.no_drill_radii[0] == pytest.approx(0.15)
+    assert request.n_no_drill_unlocated == 1
+    # Still two targets: the constraint is not a filter POKEYE re-applies here.
+    assert len(request.positions) == 2
+
+
+def test_a_request_with_no_hyperbolae_carries_an_empty_constraint_block(tmp_path):
+    node = _Node()
+    state = SendDataToPokeye("SendDataToPokeye")
+    ctx = _pokeye_ctx(tmp_path, node)
+    state.on_enter(ctx)
+    state.run(ctx)
+    [(request, _)] = node.client.calls
+    assert list(request.no_drill_ids) == [] and request.n_no_drill_unlocated == 0
+    with open(ctx["pokeye_request_json"]) as handle:
+        assert json.load(handle)["drilling_constraints"]["n_no_drill_zones"] == 0
+
+
+def test_a_wall_no_gpr_line_scanned_yields_no_targets(tmp_path):
+    """The project rule: a place nobody has looked behind is not drillable,
+    however sure HSI is that something is wrong with it."""
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = _decision_ctx(tmp_path, node)          # no gpr_summary.json at all
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    state._phase = "decision"
+    state.run(ctx)
+
+    assert ctx["data_processed"] is True
+    assert ctx["drilling_required"] is False
+    assert ctx["pokeye_targets"] == []
+    assert ctx["pokeye_scanned_lines"] == []
+    assert ctx["pokeye_blocked_targets"][0]["blocked_by"]["reason"] == \
+        "NOT_ON_A_SCANNED_GPR_LINE"
+    assert any("nothing on it may be drilled" in msg
+               for level, msg in node.logger.lines if level == "warn")
+    assert state.check_transition(ctx) == "ArmFolding"
+
+
+def test_a_scanned_line_makes_its_own_stretch_drillable(tmp_path):
+    """The same samples, once the line under them has been scanned and read."""
+    _write_gpr_summary(tmp_path, [_scan_entry("w02_l00_s00", _scanned_line())])
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = _decision_ctx(tmp_path, node)
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    state._phase = "decision"
+    state.run(ctx)
+
+    assert ctx["drilling_required"] is True
+    assert len(ctx["pokeye_targets"]) == 1
+    assert [ln["line_id"] for ln in ctx["pokeye_scanned_lines"]] == ["w02_l00_s00"]
+    assert ctx["pokeye_no_drill_zones"] == []          # clean B-scan, nothing forbidden
+
+
+def test_a_scan_that_was_swept_but_never_analysed_does_not_count_as_scanned(tmp_path):
+    """The export arrived and the line is known, but the hyperbola pipeline
+    produced nothing readable — so the wall behind it is still unknown."""
+    entry = _scan_entry("w02_l00_s00", _scanned_line())
+    entry["no_drill"]["constraint_valid"] = False
+    _write_gpr_summary(tmp_path, [entry])
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = _decision_ctx(tmp_path, node)
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    state._phase = "decision"
+    state.run(ctx)
+
+    assert ctx["pokeye_targets"] == []
+    assert ctx["pokeye_scanned_lines"] == []
+    assert ctx["pokeye_no_drill_stats"]["n_not_analysed"] == 1
+
+
+def test_a_target_off_the_scanned_line_is_refused_even_on_a_scanned_wall(tmp_path):
+    """The line was swept at z = 1.0; these samples sit a metre above it."""
+    _write_gpr_summary(tmp_path, [_scan_entry("w02_l00_s00", _scanned_line())])
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = _decision_ctx(tmp_path, node)
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    for sample in state._hsi["samples"]:
+        sample["pose_map"] = [sample["pose_map"][0], 3.0, 2.0]
+    state._phase = "decision"
+    state.run(ctx)
+
+    assert ctx["pokeye_targets"] == []
+    assert ctx["pokeye_blocked_targets"][0]["blocked_by"]["reason"] == \
+        "NOT_ON_A_SCANNED_GPR_LINE"
+    assert len(ctx["pokeye_scanned_lines"]) == 1      # the wall was scanned, just not there
+
+
+def test_bring_up_can_opt_out_of_the_coverage_rule(tmp_path):
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = _decision_ctx(tmp_path, node, pokeye_require_gpr_coverage=False)
+    state.on_enter(ctx)
+    state._hsi = _hsi_double()
+    state._phase = "decision"
+    state.run(ctx)
+
+    assert len(ctx["pokeye_targets"]) == 1
+    assert any("pokeye_require_gpr_coverage is off" in msg
+               for level, msg in node.logger.lines if level == "warn")
+
+
+def test_the_request_carries_the_region_pokeye_may_drill_at_random(tmp_path):
+    node = _Node()
+    state = SendDataToPokeye("SendDataToPokeye")
+    ctx = _pokeye_ctx(tmp_path, node)
+    ctx["pokeye_scanned_lines"] = [{
+        "line_id": "w02_l00_s00", "wall_index": 2, "frame_id": "map",
+        "seg_start": [5.0, 3.0, 1.0], "seg_end": [7.0, 3.0, 1.0], "n_hyperbolae": 0}]
+    ctx["pokeye_no_drill_stats"] = {"tolerance_m": 0.15, "line_tolerance_m": 0.25,
+                                    "n_unlocated": 0}
+    state.on_enter(ctx)
+
+    with open(ctx["pokeye_request_json"]) as handle:
+        region = json.load(handle)["drillable_region"]
+    assert region["enforced"] is True
+    assert region["n_scanned_lines"] == 1
+    assert region["line_tolerance_m"] == 0.25
+    assert region["scanned_lines"][0]["line_id"] == "w02_l00_s00"
+
+    state.run(ctx)
+    [(request, _)] = node.client.calls
+    assert list(request.scanned_line_ids) == ["w02_l00_s00"]
+    assert (request.scanned_line_starts[0].x, request.scanned_line_starts[0].z) == (5.0, 1.0)
+    assert (request.scanned_line_ends[0].x, request.scanned_line_ends[0].z) == (7.0, 1.0)
+    assert request.scanned_line_tolerance == pytest.approx(0.25)
+
+
+def test_a_request_with_no_scanned_lines_tells_pokeye_not_to_drill_at_random(tmp_path):
+    node = _Node()
+    state = SendDataToPokeye("SendDataToPokeye")
+    ctx = _pokeye_ctx(tmp_path, node)
+    state.on_enter(ctx)
+    state.run(ctx)
+    [(request, _)] = node.client.calls
+    assert list(request.scanned_line_ids) == []
+    with open(ctx["pokeye_request_json"]) as handle:
+        assert json.load(handle)["drillable_region"]["n_scanned_lines"] == 0
