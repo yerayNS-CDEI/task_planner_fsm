@@ -1,12 +1,12 @@
 """From per-sample HSI verdicts to a short list of places POKEYE should drill.
 
-Two layers, deliberately separate:
+Three layers, deliberately separate:
 
 1. **Decision** -- the sensor team's ``decide_pokeye`` applied to every
-   classified sample, unchanged. Policy v1 uses the hyperspectral result only:
-   ``low_confidence`` / ``quality_rejected`` ask for POKEYE, ``detected`` does
-   not, and a malformed message is ``HOLD`` (never an action). GPR does not
-   vote.
+   classified sample, unchanged. Policy v2 keeps the v1 trigger rule: the
+   hyperspectral result alone decides, ``low_confidence`` / ``quality_rejected``
+   ask for POKEYE, ``detected`` does not, and a malformed message is ``HOLD``
+   (never an action). GPR still does not vote.
 
 2. **Aggregation** -- ours. A wall sweep yields hundreds of samples a few
    centimetres apart, so "one drill per flagged sample" is not a target list,
@@ -14,6 +14,11 @@ Two layers, deliberately separate:
    map frame, small clusters are dropped as noise, each surviving cluster
    becomes one target at its centroid, targets closer than a minimum spacing
    are merged, and the count per wall is capped. Every knob is a ctx param.
+
+3. **Screening** -- the other half of policy v2, in :mod:`.no_drill`. What GPR
+   does have is a veto: a target sitting on a detected hyperbola is dropped
+   before it is ever offered, whatever asked for it. A blocked target is kept
+   with the hyperbola that vetoed it rather than quietly disappearing.
 
 ``HOLD`` decisions are counted and logged but never drilled: an unreadable
 verdict is a reason to look at the data, not to put a hole in the wall.
@@ -91,7 +96,14 @@ def _target_context(sample):
 
 
 def decide_samples(samples, confidence_threshold, config_path=None):
-    """Run ``decide_pokeye`` on every sample. Returns the decisions, in order."""
+    """Run ``decide_pokeye`` on every sample. Returns the decisions, in order.
+
+    No ``gpr_result=`` is passed even though v2 accepts one. It would attach an
+    identical copy of the wall's drilling constraints to each of several
+    thousand per-sample decisions, and it cannot change any of them -- the
+    constraints are built once per scan in :mod:`.gpr` and applied once to the
+    finished targets. The trigger stays exactly what the sensor team wrote.
+    """
     pokeye = import_vendor("pokeye_decision")
     decisions = []
     for sample in samples:
@@ -261,7 +273,13 @@ def cluster_targets(decisions, params=None, wall_index=None):
 # ----------------------------------------------------------------------
 # Files
 # ----------------------------------------------------------------------
-def write_outputs(out_dir, decisions, targets, stats):
+def write_outputs(out_dir, decisions, targets, stats, zones=None, blocked=None):
+    """Write ``decisions.json`` and ``targets.json``. Returns both paths.
+
+    ``targets.json`` carries the NO_DRILL zones and the targets they vetoed
+    alongside the accepted ones, so the file answers "why is there no target
+    here?" without cross-reading the GPR summary.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     decisions_path = out_dir / DECISIONS_FILENAME
@@ -270,7 +288,18 @@ def write_outputs(out_dir, decisions, targets, stats):
         json.dump({"stats": decision_stats(decisions), "decisions": decisions},
                   handle, indent=2)
     with open(targets_path, "w") as handle:
-        json.dump({"stats": stats, "targets": targets}, handle, indent=2)
+        json.dump({
+            "stats": stats,
+            "targets": targets,
+            "blocked_targets": blocked or [],
+            "drilling_constraints": {
+                "coordinate_frame": "map",
+                "policy": "A detected GPR hyperbola forbids drilling at its "
+                          "position, whatever sent POKEYE there (RANDOM included).",
+                "n_no_drill_zones": len(zones or []),
+                "no_drill_zones": zones or [],
+            },
+        }, handle, indent=2)
     return str(decisions_path), str(targets_path)
 
 

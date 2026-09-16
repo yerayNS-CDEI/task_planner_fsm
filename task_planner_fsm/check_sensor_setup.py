@@ -31,13 +31,28 @@ def _check_module(name):
     return True, getattr(mod, "__version__", "")
 
 
+# Entry points the adapters call by name. An older delivery dropped in over
+# the vendor folder imports fine and then fails at the first wall, so the
+# version is checked by the function that has to be there, not by a number.
+_VENDOR_ENTRY_POINTS = {
+    "pokeye_decision": ("decide_pokeye", "build_gpr_drilling_constraints"),
+    "hsi_integration": ("run_hyperspectral_pipeline",),
+    "line_integration": ("run_line_pipeline",),
+    "gpr_integration": ("run_gpr_pipeline",),
+}
+
+
 def _check_vendor(name):
     try:
-        import_vendor(name)
+        module = import_vendor(name)
     except VendorUnavailable as exc:
         return False, str(exc)
     except Exception as exc:                    # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
+    absent = [fn for fn in _VENDOR_ENTRY_POINTS.get(name, ()) if not hasattr(module, fn)]
+    if absent:
+        return False, (f"imported, but {', '.join(absent)} is missing -- this looks "
+                       f"like an older delivery (see sensors/vendor/VERSIONS.md)")
     return True, ""
 
 

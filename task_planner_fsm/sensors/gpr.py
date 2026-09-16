@@ -18,6 +18,13 @@ horizontal-line segmentation. Their ``x_m`` is local to the scan; with the
 matched line's segment endpoints it becomes a map-frame point. Depth stays as
 the pipelines report it (approximate, epsilon_r = 6 assumed).
 
+Each hyperbola result is also handed to the POKEYE package, which turns it into
+NO_DRILL constraints (policy v2). They are attached to the entry as
+``no_drill``, already carried onto the wall by the same transform, because this
+is the only point in the mission where the raw ``gpr_result`` and the scanned
+line's endpoints are both in hand. GPR still does not send POKEYE anywhere --
+see ``no_drill.py`` for what the constraint then does.
+
 Files already processed in this session are remembered in
 ``processed_files.json`` so the state, which runs after every wall, does not
 redo earlier walls. Blocking functions for a BackgroundJob; no ROS.
@@ -30,6 +37,7 @@ from pathlib import Path
 import numpy as np
 
 from . import VendorUnavailable, import_vendor, require
+from . import no_drill
 from .manifest import read_gpr_lines
 
 REGISTRY_FILENAME = "processed_files.json"
@@ -128,7 +136,19 @@ def scan_to_map(x_m, seg_start, seg_end):
     return [round(float(v), 4) for v in start + unit * float(x_m)]
 
 
+def map_transform(line):
+    """``x_m -> [x, y, z]`` for a scanned line, or None when it has no geometry.
+
+    One place decides whether a scan can be placed on the wall at all, so the
+    compact detections and the NO_DRILL constraints can never disagree about it.
+    """
+    if not line or not line.get("seg_start") or not line.get("seg_end"):
+        return None
+    return lambda x_m: scan_to_map(x_m, line["seg_start"], line["seg_end"])
+
+
 def _compact_hyperbolae(result, line):
+    to_map = map_transform(line)
     dets = []
     for d in result.get("detections", []):
         pos = d.get("position", {})
@@ -142,8 +162,8 @@ def _compact_hyperbolae(result, line):
             "confidence": rob.get("confidence_max", rob.get("confidence_mean")),
             "gain_support": rob.get("gain_support"),
         }
-        if line and line.get("seg_start") and line.get("seg_end") and pos.get("x_m") is not None:
-            entry["position_map"] = scan_to_map(pos["x_m"], line["seg_start"], line["seg_end"])
+        if to_map is not None and pos.get("x_m") is not None:
+            entry["position_map"] = to_map(pos["x_m"])
         dets.append(entry)
     return {
         "detected": bool(result.get("hyperbola_detected")),
@@ -185,6 +205,7 @@ def process_scan(scan, line, out_dir, weights_path, logger=None,
         "associated": line is not None,
         "out_dir": str(scan_dir),
         "hyperbolae": None,
+        "no_drill": None,
         "lines": None,
         "errors": {},
     }
@@ -196,6 +217,10 @@ def process_scan(scan, line, out_dir, weights_path, logger=None,
                 scan["sgy"], output_dir=str(scan_dir / "hyperbolae"),
                 weights_path=str(weights_path))
             entry["hyperbolae"] = _compact_hyperbolae(result, line)
+            # The POKEYE package owns the NO_DRILL policy; the raw result goes
+            # to it unchanged, and only the frame is ours to supply.
+            entry["no_drill"] = no_drill.constraints_from_result(
+                result, to_map=map_transform(line), source_key=key)
         except BaseException as exc:            # noqa: BLE001 -- recorded per scan
             entry["errors"]["hyperbolae"] = f"{type(exc).__name__}: {exc}"
             if logger is not None:
@@ -226,6 +251,19 @@ def _load_registry(path):
 
 def _registry_key(scan):
     return f"{scan['sgy']}@{scan['mtime']:.0f}"
+
+
+def load_summary(out_dir):
+    """The cumulative ``gpr_summary.json`` for this session, or None.
+
+    Every pass appends to it, so this is the whole mission's GPR record --
+    which is what the NO_DRILL constraints have to be read from. The wall just
+    scanned is usually in the pass that just ran, but a scan that arrived late,
+    or a pass with no new exports at all, must not lose the wall its hyperbolae
+    belong to.
+    """
+    summary = _load_registry(Path(out_dir) / SUMMARY_FILENAME)
+    return summary if isinstance(summary, dict) and summary.get("entries") else None
 
 
 def pending_files(incoming_dir, out_dir):
@@ -290,6 +328,10 @@ def process_incoming(incoming_dir, manifest_path, out_dir, weights_path,
         "n_new": len(new_files),
         "n_associated": sum(1 for e in entries if e["associated"]),
         "n_hyperbolae": sum((e["hyperbolae"] or {}).get("n", 0) for e in entries),
+        "n_no_drill": sum((e["no_drill"] or {}).get("n_no_drill_positions", 0) for e in entries),
+        "n_no_drill_unlocated": sum(
+            (e["no_drill"] or {}).get("n_no_drill_positions", 0)
+            - (e["no_drill"] or {}).get("n_located", 0) for e in entries),
         "n_lines": sum((e["lines"] or {}).get("n", 0) for e in entries),
         "n_failed": sum(1 for e in entries if e["errors"]),
         "hyperbolae_skipped": hyperbolae_skipped,
@@ -312,6 +354,10 @@ def describe_entry(entry):
         parts.append("errors " + ", ".join(entry["errors"]))
     if hyp:
         parts.append(f"{hyp.get('n', 0)} hyperbolae")
+    nd = entry.get("no_drill") or {}
+    if nd.get("n_no_drill_positions"):
+        parts.append(f"{nd['n_no_drill_positions']} NO_DRILL "
+                     f"({nd.get('n_located', 0)} placed on the wall)")
     if lines:
         parts.append(f"{lines.get('n', 0)} lines")
     if not entry["associated"]:

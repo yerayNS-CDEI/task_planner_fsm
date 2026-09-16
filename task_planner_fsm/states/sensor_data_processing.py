@@ -12,8 +12,10 @@ the whole session, seconds -- in a background thread. ``gpr`` runs the
 delivered hyperbola and line segmentation over whatever GP8800 exports have
 reached ``data/raw/gpr/incoming`` (Mask R-CNN: minutes on a CPU), also in a
 background thread. ``decision`` applies the sensor team's POKEYE policy to
-every classified sample and clusters the flagged ones into a handful of drill
-targets for the wall just scanned. ``external`` is the old
+every classified sample, clusters the flagged ones into a handful of drill
+targets for the wall just scanned, and drops any target the GPR does not
+allow (POKEYE policy v2: GPR never sends POKEYE anywhere, but it forbids
+drilling on a hyperbola, and forbids drilling anywhere it has not scanned). ``external`` is the old
 /sensor_data_processing mock, kept only for simulation runs with no sensor data
 so the FSM still exercises SendDataToPokeye there.
 
@@ -32,7 +34,7 @@ import time
 
 from example_interfaces.srv import SetBool
 
-from ..sensors import VendorUnavailable, gpr, hsi, paths, pokeye
+from ..sensors import VendorUnavailable, gpr, hsi, no_drill, paths, pokeye
 from ..sensors.background_job import BackgroundJob
 from ..state import State
 from ..utils import hyperspectral_processing as hp
@@ -66,6 +68,9 @@ class SensorDataProcessing(State):
         ctx["drilling_required"] = False
         ctx["error_triggered"] = False
         ctx["pokeye_targets"] = []
+        ctx["pokeye_blocked_targets"] = []
+        ctx["pokeye_no_drill_zones"] = []
+        ctx["pokeye_scanned_lines"] = []
         self.future = None
         self._processor = None
         self._job = None
@@ -303,8 +308,11 @@ class SensorDataProcessing(State):
         (default 0: process what is already there) and never blocks the
         mission on a file that may not come.
 
-        Per v1 policy GPR results are stored and logged; they do not vote on
-        POKEYE.
+        Per v2 policy GPR still does not vote on whether POKEYE is needed.
+        What it does produce is a veto: each hyperbola becomes a NO_DRILL
+        position, built by the POKEYE package inside ``gpr.process_scan`` while
+        the scanned line's endpoints are still at hand, and applied to the
+        targets in the decision phase.
         """
         node = ctx["node"]
         if not bool(ctx.get("gpr_processing_enabled", True)):
@@ -371,7 +379,8 @@ class SensorDataProcessing(State):
             f"[{self.name}] GPR: {self._gpr['n_new']} scan(s) processed in "
             f"{job.elapsed_s:.0f} s, {self._gpr['n_associated']} tied to a scanned "
             f"line, {self._gpr['n_hyperbolae']} hyperbolae, {self._gpr['n_lines']} "
-            f"lines, {self._gpr['n_failed']} failed"
+            f"lines, {self._gpr['n_failed']} failed, "
+            f"{self._gpr.get('n_no_drill', 0)} NO_DRILL position(s)"
         )
         for entry in self._gpr["entries"]:
             node.get_logger().info(f"[{self.name}]   {gpr.describe_entry(entry)}")
@@ -392,11 +401,92 @@ class SensorDataProcessing(State):
             return bool(explicit)
         return bool(ctx.get("sim", False)) and not (self._hsi and self._hsi["samples"])
 
+    def _drilling_constraints(self, ctx):
+        """What GPR allows on this wall. ``(zones, lines, stats, ok)``.
+
+        Two outputs because the rule has two sides: ``zones`` are the places a
+        hyperbola forbids, ``lines`` are the only places that were scanned at
+        all and so the only places a drill may go.
+
+        Read back from the session's cumulative ``gpr_summary.json`` rather than
+        from this pass alone, so a wall whose exports arrived during an earlier
+        pass -- or a pass that processed nothing new -- still knows about its
+        own hyperbolae.
+
+        ``ok`` is False only if the constraints could not be read at all. That
+        is deliberately not the same as "no zones": a veto we failed to compute
+        must stop the drilling, not wave it through.
+        """
+        node = ctx["node"]
+        wall_index = ctx.get("current_wall_index")
+        tolerance = no_drill.tolerance_from_ctx(ctx)
+        try:
+            results = gpr.load_summary(paths.gpr_results_dir(ctx)) or self._gpr
+            zones, stats = no_drill.zones_from_gpr(
+                results, tolerance_m=tolerance, wall_index=wall_index)
+            lines, line_stats = no_drill.scanned_lines_from_gpr(results, wall_index=wall_index)
+        except Exception as exc:                # noqa: BLE001
+            node.get_logger().error(
+                f"[{self.name}] GPR drilling constraints could not be read ({exc}); "
+                f"refusing to drill this wall rather than drilling unconstrained.")
+            return [], [], {"error": str(exc)}, False
+
+        stats.update(line_stats)
+        stats["line_tolerance_m"] = no_drill.line_tolerance_from_ctx(ctx)
+        ctx["pokeye_no_drill_zones"] = zones
+        ctx["pokeye_scanned_lines"] = lines
+        ctx["pokeye_no_drill_stats"] = stats
+        if stats["n_no_drill_positions"] or stats["n_invalid"]:
+            node.get_logger().info(
+                f"[{self.name}] GPR NO_DRILL: {stats['n_no_drill_positions']} position(s) "
+                f"from {stats['n_scans_with_constraints']} scan(s) -> {stats['n_zones']} "
+                f"zone(s) of r={tolerance:.2f} m: {no_drill.describe_zones(zones)}"
+            )
+            if ctx.get("pokeye_no_drill_tolerance_m") in (None, ""):
+                node.get_logger().warn(
+                    f"[{self.name}] the NO_DRILL exclusion radius is the FSM placeholder "
+                    f"{no_drill.DEFAULT_TOLERANCE_M:.2f} m; the sensor package defines none "
+                    f"and the project value is not set (pokeye_no_drill_tolerance_m)."
+                )
+        if stats["n_unlocated"]:
+            node.get_logger().warn(
+                f"[{self.name}] {stats['n_unlocated']} GPR NO_DRILL position(s) could not be "
+                f"placed on the wall (scan not tied to a scanned line); they constrain nothing"
+                + (" and pokeye_no_drill_block_on_unlocated will veto this wall."
+                   if ctx.get("pokeye_no_drill_block_on_unlocated") else
+                   ". Set pokeye_no_drill_block_on_unlocated to stop instead of proceeding.")
+            )
+        if stats["n_invalid"]:
+            node.get_logger().warn(
+                f"[{self.name}] {stats['n_invalid']} GPR result(s) produced no readable "
+                f"NO_DRILL constraint.")
+
+        if not bool(ctx.get("pokeye_require_gpr_coverage", True)):
+            node.get_logger().warn(
+                f"[{self.name}] pokeye_require_gpr_coverage is off: targets will be "
+                f"accepted on wall stretches no GPR line scanned.")
+        elif lines:
+            node.get_logger().info(
+                f"[{self.name}] drillable only within {stats['line_tolerance_m']:.2f} m of "
+                f"{len(lines)} scanned GPR line(s): {no_drill.describe_lines(lines)}")
+        else:
+            node.get_logger().warn(
+                f"[{self.name}] no GPR line on this wall was both scanned and analysed "
+                f"({line_stats['n_not_analysed']} not analysed, {line_stats['n_unplaced']} "
+                f"not placed); nothing on it may be drilled.")
+        return zones, lines, stats, True
+
     def _run_decision(self, ctx):
-        """Per-sample POKEYE decisions, clustered into targets for this wall."""
+        """Per-sample POKEYE decisions, clustered into targets for this wall,
+        then screened against the GPR hyperbolae."""
         node = ctx["node"]
         if self._use_mock(ctx):
             self._advance(ctx, "external")
+            return
+
+        zones, lines, zstats, zones_ok = self._drilling_constraints(ctx)
+        if not zones_ok:
+            self._finish(ctx, targets=[], decisions=[])
             return
 
         samples = (self._hsi or {}).get("samples") or []
@@ -414,8 +504,20 @@ class SensorDataProcessing(State):
             decisions = pokeye.decide_samples(samples, threshold)
             params = pokeye.ClusterParams.from_ctx(ctx)
             targets, stats = pokeye.cluster_targets(decisions, params, wall_index=wall_index)
+            # The veto goes on after the clustering, not before: a target is
+            # only a place once its samples have been merged into one.
+            targets, blocked, screen_stats = no_drill.screen_targets(
+                targets, zones, lines,
+                line_tolerance_m=no_drill.line_tolerance_from_ctx(ctx),
+                require_coverage=bool(ctx.get("pokeye_require_gpr_coverage", True)),
+                unlocated=zstats.get("n_unlocated", 0),
+                block_on_unlocated=bool(ctx.get("pokeye_no_drill_block_on_unlocated", False)),
+            )
+            stats["no_drill"] = dict(zstats, **screen_stats)
+            stats["n_targets"] = len(targets)
             decisions_json, targets_json = pokeye.write_outputs(
-                paths.pokeye_results_dir(ctx), decisions, targets, stats)
+                paths.pokeye_results_dir(ctx), decisions, targets, stats,
+                zones=zones, blocked=blocked)
         except VendorUnavailable as exc:
             node.get_logger().warn(
                 f"[{self.name}] POKEYE decision package unavailable ({exc}); "
@@ -439,15 +541,24 @@ class SensorDataProcessing(State):
         node.get_logger().info(
             f"[{self.name}] wall {wall_index}: {stats['n_flagged']} flagged samples "
             f"-> {stats['n_clusters']} clusters ({stats['n_clusters_too_small']} too "
-            f"small, {stats['n_unlocated']} without map pose) -> {stats['n_targets']} "
-            f"target(s): {pokeye.describe_targets(targets)}"
+            f"small, {stats['n_unlocated']} without map pose) -> "
+            f"{screen_stats['n_targets_before']} candidate(s), "
+            f"{len(targets)} to drill: {pokeye.describe_targets(targets)}"
         )
+        if blocked:
+            node.get_logger().warn(
+                f"[{self.name}] {len(blocked)} target(s) dropped by a GPR drilling "
+                f"constraint ("
+                + ", ".join(f"{k} x{v}" for k, v in screen_stats["reasons"].items())
+                + f"): {no_drill.describe_blocked(blocked)}"
+            )
         ctx["pokeye_decisions_json"] = decisions_json
         ctx["pokeye_targets_json"] = targets_json
-        self._finish(ctx, targets=targets, decisions=decisions)
+        self._finish(ctx, targets=targets, decisions=decisions, blocked=blocked)
 
-    def _finish(self, ctx, targets, decisions):
+    def _finish(self, ctx, targets, decisions, blocked=None):
         ctx["pokeye_targets"] = targets
+        ctx["pokeye_blocked_targets"] = blocked or []
         ctx["pokeye_n_decisions"] = len(decisions)
         ctx["drilling_required"] = bool(targets)
         ctx["data_processed"] = True

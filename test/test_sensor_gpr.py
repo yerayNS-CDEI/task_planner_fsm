@@ -136,6 +136,39 @@ def test_hyperbolae_are_compacted_and_geo_referenced():
     assert "position_map" not in gpr._compact_hyperbolae(vendor_result, None)["detections"][0]
 
 
+def test_map_transform_is_none_when_the_line_has_no_geometry():
+    """One rule for whether a scan can be placed at all, shared by the compact
+    detections and the NO_DRILL constraints."""
+    assert gpr.map_transform(None) is None
+    assert gpr.map_transform({"key": "w02_l00_s00"}) is None
+    assert gpr.map_transform({"seg_start": [0, 0, 1], "seg_end": None}) is None
+    to_map = gpr.map_transform({"seg_start": [1.0, 0.0, 1.0], "seg_end": [3.0, 0.0, 1.0]})
+    assert to_map(0.5) == [1.5, 0.0, 1.0]
+
+
+def test_the_summary_is_read_back_across_passes(tmp_path):
+    """The NO_DRILL constraints are read from the session's whole GPR record,
+    not just the pass that happened to run last."""
+    assert gpr.load_summary(tmp_path) is None
+    with open(tmp_path / gpr.SUMMARY_FILENAME, "w") as handle:
+        json.dump({"entries": []}, handle)
+    assert gpr.load_summary(tmp_path) is None          # nothing processed yet
+    with open(tmp_path / gpr.SUMMARY_FILENAME, "w") as handle:
+        json.dump({"entries": [{"key": "w02_l00_s00"}]}, handle)
+    assert gpr.load_summary(tmp_path)["entries"][0]["key"] == "w02_l00_s00"
+
+
+def test_an_entry_reports_the_no_drill_positions_it_produced():
+    entry = {"key": "w02_l00_s00", "associated": True, "errors": {},
+             "hyperbolae": {"n": 2}, "lines": {"n": 1},
+             "no_drill": {"n_no_drill_positions": 2, "n_located": 1}}
+    text = gpr.describe_entry(entry)
+    assert "2 hyperbolae" in text
+    assert "2 NO_DRILL (1 placed on the wall)" in text
+    entry["no_drill"] = {"n_no_drill_positions": 0, "n_located": 0}
+    assert "NO_DRILL" not in gpr.describe_entry(entry)
+
+
 def test_pending_files_ignores_what_the_registry_already_has(tmp_path):
     incoming, out = tmp_path / "in", tmp_path / "out"
     a = _touch_scan(incoming, "a", 100)

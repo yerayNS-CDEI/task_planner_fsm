@@ -404,7 +404,7 @@ The FSM consists of **17 states** that execute sequentially with conditional tra
 | **ArmUnfolding** | Arm extension | Send `/arm/send_position` for 'unfolded_fsm' pose | Arm movement done |
 | **ScanWall** | Wall scanning | Launch sensors, alignment; execute scan trajectory; record hyperspectral raw spectra (sample #0 at the pressed start point, then one per `hyperspectral_sample_spacing_m` of plate travel) + GPR line manifest | Scan trajectory complete |
 | **SensorDataProcessing** | Sensor post-processing | Reflectance pass → DISCOVER HSI classifier → GPR hyperbola/line pipelines → POKEYE decision + target clustering (see [Sensor Processing](#sensor-processing-hsi--gpr--pokeye)) | `drilling_required` → SendDataToPokeye, else ArmFolding |
-| **SendDataToPokeye** | Drill target hand-off | Write `pokeye_request.json`, call `/send_data_to_pokeye` (`arm_control/SendPokeyeTargets`), wait for the ack | Pokeye accepted the targets |
+| **SendDataToPokeye** | Drill target hand-off | Write `pokeye_request.json`, call `/send_data_to_pokeye` (`arm_control/SendPokeyeTargets`) with the targets, the wall's GPR `NO_DRILL` zones and the scanned lines POKEYE may drill at random, wait for the ack | Pokeye accepted the targets |
 | **ArmFolding** | Arm retraction | Sequential folding: unfolded → folded via `/arm/send_position` | Arm folded |
 | **AreasOfInterest** | Interest analysis | Call `/compute_areas_of_interest` service (mock) | Interest areas computed |
 | **WallDiscretization** | Cell grid generation | Call `/compute_wall_discretization` for each wall, generate panels & cells | All walls discretized |
@@ -1140,7 +1140,7 @@ task_planner_fsm/
 │   │   ├── error.py
 │   │   └── proc_utils.py         # Process management
 │   ├── sensors/                  # Sensor post-processing (see Sensor Processing)
-│   │   ├── hsi.py, gpr.py, pokeye.py, paths.py, manifest.py, background_job.py
+│   │   ├── hsi.py, gpr.py, pokeye.py, no_drill.py, paths.py, manifest.py, background_job.py
 │   │   └── vendor/               # DISCOVER pipelines as delivered (VERSIONS.md)
 │   ├── mock_server.py            # Mock service provider
 │   ├── check_sensor_setup.py     # deps / models / folders report
@@ -1266,7 +1266,7 @@ whether POKEYE has to drill, using the pipelines delivered by the sensor team
 hyperspectral  reflectance.csv from the raw sweep record (batched per tick)
 hsi_classify   Benjamin's XGBoost material classifier over the whole session (background thread)
 gpr            hyperbola + line segmentation over new GP8800 exports (background thread)
-decision       decide_pokeye() per sample -> clustered drill targets for this wall
+decision       decide_pokeye() per sample -> clustered drill targets, screened against what GPR allows
 external       legacy /sensor_data_processing mock (simulation only)
 ```
 
@@ -1295,15 +1295,71 @@ classifier bundle was pickled with numpy ≥ 2; on ROS Humble's numpy 1.24 the
 adapter aliases `numpy._core` so it still loads (`sensors/__init__.py`).
 
 **Offline**: `ros2 run task_planner_fsm process_sensor_session <stamp> --wall 2`
-runs the same chain on a recorded session (re-processing, Jetson timing).
+runs the same chain on a recorded session (re-processing, Jetson timing);
+`--no-drill-tolerance`, `--scanned-line-tolerance`, `--block-on-unlocated`
+and `--no-gpr-coverage-required` set the drilling constraint policy there.
 
-**POKEYE targets**: per-sample decisions (policy v1, HSI only: `low_confidence`
-/ `quality_rejected` → POKEYE, `detected` → none, malformed → HOLD, GPR does not
-vote) are clustered per wall in the map frame: single linkage within
-`pokeye_cluster_radius_m` (0.15), clusters below `pokeye_cluster_min_samples`
-(3) dropped, one target per cluster at its centroid, targets closer than
-`pokeye_min_target_spacing_m` (0.30) merged, at most
-`pokeye_max_targets_per_wall` (5). HOLDs are logged, never drilled.
+**POKEYE targets**: per-sample decisions (policy v2 keeps the v1 trigger, HSI
+only: `low_confidence` / `quality_rejected` → POKEYE, `detected` → none,
+malformed → HOLD; GPR does not vote) are clustered per wall in the map frame:
+single linkage within `pokeye_cluster_radius_m` (0.15), clusters below
+`pokeye_cluster_min_samples` (3) dropped, one target per cluster at its
+centroid, targets closer than `pokeye_min_target_spacing_m` (0.30) merged, at
+most `pokeye_max_targets_per_wall` (5). HOLDs are logged, never drilled.
+
+**Where POKEYE may drill** (POKEYE policy v2, `sensors/no_drill.py`): GPR
+still never sends POKEYE anywhere, but it decides where a drill is allowed, in
+two rules. A target must satisfy both, and so must a RANDOM location POKEYE
+picks for itself:
+
+1. **On a scanned line.** Only the GPR lines of the wall that were swept *and*
+   analysed are drillable. Anywhere else nothing is known about what is behind
+   the plaster — a clean B-scan is evidence a place is safe, no B-scan is not
+   evidence of anything. A line whose export never arrived, or whose hyperbola
+   analysis failed, does not count as scanned.
+2. **Off every hyperbola.** A detection is a reflector, so possibly rebar, a
+   pipe or a cable; its position is forbidden.
+
+Note the asymmetry: rule 2 needs a detection to fire, rule 1 fires on the
+*absence* of data. ⚠️ **With GPR disabled or no exports, no wall produces any
+target.** That is the point of rule 1; `pokeye_require_gpr_coverage:=false`
+restores the old behaviour for simulation and bring-up.
+
+The vendor builds rule 2's constraint. The FSM supplies the four things the
+sensor package deliberately leaves to software:
+
+- **the frame** — the vendor's `x_m` is metres along the B-scan, so it is put
+  on the wall with the scanned line's endpoints from `gpr_lines.jsonl`, the
+  same transform the hyperbola positions already use;
+- **the exclusion radius** — `pokeye_no_drill_tolerance_m`. ⚠️ The sensor
+  package refuses to define one (`arc_half_width_m` is diagnostic geometry, not
+  a safety radius) and the project has not agreed one either, so the FSM
+  applies a **placeholder of 0.15 m** and warns on every wall that uses it;
+- **the width of a scanned line** — `pokeye_scanned_line_tolerance_m`, how far
+  off a swept segment a target may sit and still count as covered by it.
+  ⚠️ Also provisional at **0.25 m**: the GPR antenna's offset from the plate TCP
+  is not known yet and so is not applied, and a cluster centroid drifts from its
+  samples. 0.25 m reaches exactly halfway to the next line of a 0.5 m sweep, so
+  consecutive bands meet; tighten it to leave an honest unscanned gap between
+  lines;
+- **the rejection** — a target that fails either rule is dropped before the
+  hand-off, kept in `targets.json` under `blocked_targets` with the reason
+  (`NOT_ON_A_SCANNED_GPR_LINE`, `GPR_SCAN_NOT_ANALYSED`,
+  `GPR_HYPERBOLA_DETECTED`), and logged.
+
+A hyperbola from an export that matched no scanned line cannot be placed and so
+constrains nothing; it is counted and warned about, and
+`pokeye_no_drill_block_on_unlocated` turns it into a veto on the whole wall for
+a mission that would rather stop than proceed.
+
+Both rules travel in the `SendPokeyeTargets` request — the forbidden points as
+`no_drill_positions` / `no_drill_radii` / `no_drill_ids`, the drillable region
+as `scanned_line_starts` / `scanned_line_ends` / `scanned_line_ids` /
+`scanned_line_tolerance` — even though the targets in it have already been
+screened. POKEYE drills for reasons the FSM did not choose, and a RANDOM
+location it picks has to land on one of those segments and off every
+hyperbola. An empty `scanned_line_ids` means the wall has no drillable region
+at all.
 
 **Parameters** (ctx / ROS params): `sensor_data_dir`, `sensor_models_dir`,
 `sensor_results_dir`, `hsi_model_path`, `hsi_confidence_threshold` (0.8),
@@ -1312,8 +1368,12 @@ the Jetson has no kernels for the Orin and the model is milliseconds on the
 CPU anyway),
 `gpr_processing_enabled`, `gpr_incoming_dir`, `gpr_weights_path`,
 `gpr_wait_timeout_s` (0), `gpr_run_hyperbolae`, `gpr_run_lines`,
-`sensor_processing_mock`, `pokeye_service`, `pokeye_service_timeout_s`, plus
-the four clustering knobs above.
+`sensor_processing_mock`, `pokeye_service`, `pokeye_service_timeout_s`,
+`pokeye_no_drill_tolerance_m` (0.15, placeholder),
+`pokeye_scanned_line_tolerance_m` (0.25, placeholder),
+`pokeye_require_gpr_coverage` (**true**),
+`pokeye_no_drill_block_on_unlocated` (false), plus the four clustering knobs
+above.
 
 ### Integration Packages
 

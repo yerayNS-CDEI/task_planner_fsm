@@ -1,0 +1,55 @@
+{
+  "decision_valid": true,
+  "pokeye_required": true,
+  "decision": "SEND_TO_POKEYE",
+  "reason": "HSI_LOW_CONFIDENCE",
+  "requested_action": "MATERIAL_IDENTIFICATION",
+  "message": "HSI classification confidence is insufficient; request destructive material identification.",
+  "hsi_evidence": {
+    "status": "low_confidence",
+    "detected": false,
+    "material": null,
+    "confidence": 0.7848,
+    "confidence_threshold": 0.8,
+    "sensor_reason": "confidence below threshold 0.800"
+  },
+  "mode": "single",
+  "confidence_threshold": 0.8,
+  "drilling_constraints": {
+    "gpr_result_provided": true,
+    "constraint_valid": true,
+    "hyperbola_detected": true,
+    "coordinate_frame": "gpr_scan_local",
+    "policy": "A detected GPR hyperbola creates a NO_DRILL location. GPR does not itself trigger POKEYE.",
+    "n_no_drill_positions": 2,
+    "no_drill_positions": [
+      {
+        "source_detection_id": "H001",
+        "reason": "GPR_HYPERBOLA_DETECTED",
+        "instruction": "NO_DRILL",
+        "x_m": 0.55,
+        "x_cm": 55.0,
+        "x_relative": 0.31,
+        "depth_cm_approx": 4.2,
+        "confidence": 0.93,
+        "diagnostic_arc_half_width_m": 0.12
+      },
+      {
+        "source_detection_id": "H002",
+        "reason": "GPR_HYPERBOLA_DETECTED",
+        "instruction": "NO_DRILL",
+        "x_m": 1.12,
+        "x_cm": 112.0,
+        "x_relative": 0.63,
+        "depth_cm_approx": 7.8,
+        "confidence": 0.88,
+        "diagnostic_arc_half_width_m": 0.1
+      }
+    ],
+    "requires_coordinate_transform": true,
+    "requires_exclusion_tolerance_definition": true,
+    "exclusion_tolerance_m": null,
+    "warning": "The GPR x coordinate is local to the B-scan. Software must transform it to the robot/world frame and apply a project-approved spatial tolerance. diagnostic_arc_half_width_m is not a validated safety radius."
+  },
+  "sample_index": 242
+}
