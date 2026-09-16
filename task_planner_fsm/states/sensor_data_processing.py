@@ -6,7 +6,9 @@ tenants have very different shapes and costs:
     hyperspectral -> hsi_classify -> gpr -> decision -> [external] -> done
 
 ``hyperspectral`` is the reflectance pass over the sweep's raw record, pumped a
-batch per tick (thousands of samples, cheap each). ``hsi_classify`` runs the
+batch per tick (thousands of samples, cheap each); it is skipped unless the
+camera was enabled for the sweep (``hyperspectral_enabled``), so a mission run
+without it never re-publishes an older session's spectra. ``hsi_classify`` runs the
 DISCOVER material classifier over that reflectance -- one XGBoost call over
 the whole session, seconds -- in a background thread. ``gpr`` runs the
 delivered hyperbola and line segmentation over whatever GP8800 exports have
@@ -120,6 +122,28 @@ class SensorDataProcessing(State):
     # ------------------------------------------------------------------
     # Phase 1: reflectance
     # ------------------------------------------------------------------
+    def _hyperspectral_processing_enabled(self, ctx):
+        """Whether the hyperspectral record is processed at all.
+
+        The counterpart of ``gpr_processing_enabled``, with one deliberate
+        difference: it defaults to the capture flag (``hyperspectral_enabled``,
+        off) instead of to True. The GPR phase looks for exports that have not
+        been processed yet and simply finds none when the probe was off, but
+        this phase processes whatever session directory ctx points at. With the
+        camera off that can only be an older session -- a bench run from a
+        previous day -- whose reflectance and material labels would then be
+        published as if this mission had just measured them.
+
+        An explicit ``hyperspectral_processing_enabled`` wins, which is how a
+        deliberate re-processing run (``--initial-state SensorDataProcessing``,
+        see fsm_node._bootstrap_sensor_processing) processes a recorded session
+        with the camera long gone.
+        """
+        explicit = ctx.get("hyperspectral_processing_enabled")
+        if explicit is not None:
+            return bool(explicit)
+        return bool(ctx.get("hyperspectral_enabled", False))
+
     def _run_hyperspectral(self, ctx):
         """Turn the sweep's raw spectra into reflectance and coverage metrics.
 
@@ -134,6 +158,14 @@ class SensorDataProcessing(State):
         classifier runs over the finished reflectance.csv in the next phase.
         """
         node = ctx["node"]
+        if not self._hyperspectral_processing_enabled(ctx):
+            node.get_logger().info(
+                f"[{self.name}] hyperspectral disabled; skipping reflectance and "
+                f"material classification (no camera on this run, so any record on "
+                f"disk is from an earlier one)."
+            )
+            self._advance(ctx, "gpr")
+            return
         session_dir = ctx.get("hyperspectral_session_dir")
         if not session_dir:
             self._advance(ctx, "gpr")          # sampling was disabled, or no sweep ran
@@ -244,7 +276,8 @@ class SensorDataProcessing(State):
         node = ctx["node"]
         if self._job is None:
             session_dir = ctx.get("hyperspectral_session_dir")
-            if not session_dir or not ctx.get("hyperspectral_processed"):
+            if (not self._hyperspectral_processing_enabled(ctx)
+                    or not session_dir or not ctx.get("hyperspectral_processed")):
                 self._advance(ctx, "gpr")
                 return
             model = paths.hsi_model_path(ctx)

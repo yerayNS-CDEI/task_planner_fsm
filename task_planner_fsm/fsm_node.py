@@ -1099,7 +1099,9 @@ class RobotFSMNode(Node):
 
         No robot: no stack is launched, and the run ends in Finished rather
         than folding an arm that was never unfolded. The legacy simulation mock
-        is disabled so a real record is never replaced by the fake verdict.
+        is disabled so a real record is never replaced by the fake verdict, and
+        hyperspectral processing is forced on (the camera is off by definition
+        when re-processing).
         """
         explicit = self.ctx.get("hyperspectral_session_dir")
         if explicit:
@@ -1128,6 +1130,12 @@ class RobotFSMNode(Node):
         # Every wall in the record: there is no "wall just scanned" here.
         self.ctx.setdefault("current_wall_index", None)
         self.ctx.setdefault("sensor_processing_mock", False)
+        # Processing a recorded session IS the point here, so the phase runs even
+        # though the camera is off (hyperspectral_enabled, which normally gates
+        # it -- see SensorDataProcessing._hyperspectral_processing_enabled).
+        # setdefault: -p hyperspectral_processing_enabled:=false still wins, for
+        # re-running only the GPR half over an existing session.
+        self.ctx.setdefault("hyperspectral_processing_enabled", True)
         self.ctx.setdefault("fsm_stop_after", "SensorDataProcessing")
         self.get_logger().info(
             f"[FSM Bootstrap] Offline run: no robot stack; the FSM finishes after "

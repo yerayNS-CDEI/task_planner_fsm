@@ -639,7 +639,10 @@ any GP8800 exports in `data/raw/gpr/incoming/`; results land in
 in the record. The run then ends in `Finished` (`fsm_stop_after` defaults to
 `SensorDataProcessing` here; `--stop-after SendDataToPokeye` continues to the
 POKEYE hand-off instead), and the legacy simulation mock is disabled so a real
-record is never replaced by the fake verdict. `process_sensor_session` remains
+record is never replaced by the fake verdict. Hyperspectral processing is
+forced on (`hyperspectral_processing_enabled`), since the camera is off by
+definition when re-processing; `-p hyperspectral_processing_enabled:=false`
+re-runs only the GPR half over the session. `process_sensor_session` remains
 the non-ROS way to do the same.
 
 `scan_world_frame` (ctx / ROS param, default `map`): the fixed frame the wall
@@ -1270,8 +1273,29 @@ decision       decide_pokeye() per sample -> clustered drill targets, screened a
 external       legacy /sensor_data_processing mock (simulation only)
 ```
 
-**Hyperspectral sampling during the sweep**: the first spectrum (`trigger_idx`
-0, `travel_m` 0) is taken the moment the plate is pressed on the wall with its
+**Each sensor's half is gated by its own enable flag**, so a mission can run
+one sensor without the other:
+
+| Sensor | Sweep (ScanWall) | Processing (SensorDataProcessing) |
+|--------|------------------|-----------------------------------|
+| Hyperspectral | `hyperspectral_enabled` (default `false`) | `hyperspectral_processing_enabled`, **defaulting to `hyperspectral_enabled`** |
+| GPR | `gpr_enabled` (default `false`) for the probe, `gpr_trigger_enabled` (default `true`) for the distance triggers | `gpr_processing_enabled` (default `true`) |
+
+The hyperspectral default differs on purpose. The GPR phase processes exports
+that have not been processed yet and simply finds none when the probe was off,
+but the hyperspectral phase processes whatever session directory ctx points
+at. With the camera off (it lives in another setup) that can only be an older
+session, whose reflectance and material labels would otherwise be published as
+if this mission had just measured them — and, through the POKEYE decision, put
+drill targets on a wall from last week's spectra. So with
+`hyperspectral_enabled` off, both the reflectance and the classification phase
+are skipped with a log line and the state walks straight to `gpr`. The
+explicit `hyperspectral_processing_enabled` overrides this, which is what the
+offline re-processing run sets.
+
+**Hyperspectral sampling during the sweep** (`hyperspectral_enabled`, off by
+default): the first spectrum (`trigger_idx` 0, `travel_m` 0) is taken the
+moment the plate is pressed on the wall with its
 orientation corrected, before the arm moves laterally — the same point the
 GPR's first trace lands on. The distance sampler is armed on the executor's
 sweep feedback and carries on from there, so sample *k* sits at
@@ -1366,6 +1390,7 @@ at all.
 `hsi_device` (`cpu`: the delivered bundle says `cuda`, but the pip xgboost on
 the Jetson has no kernels for the Orin and the model is milliseconds on the
 CPU anyway),
+`hyperspectral_enabled`, `hyperspectral_processing_enabled`,
 `gpr_processing_enabled`, `gpr_incoming_dir`, `gpr_weights_path`,
 `gpr_wait_timeout_s` (0), `gpr_run_hyperbolae`, `gpr_run_lines`,
 `sensor_processing_mock`, `pokeye_service`, `pokeye_service_timeout_s`,
