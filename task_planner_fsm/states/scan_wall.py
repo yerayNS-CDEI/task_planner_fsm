@@ -247,6 +247,12 @@ class ScanWall(State):
         # in the session folder and unpacked into data/raw/gpr/incoming for
         # SensorDataProcessing. ``gpr_export_enabled`` (ctx) turns it off.
         self.gpr_export_path = "/measurement/export/raw"
+        # After line/stop: how long to wait for GET /measurement/line to report
+        # the line finished, the pause before the export, and the pause before
+        # the one retry an export failure gets (ctx overrides of the same name).
+        self.gpr_line_finish_timeout_s = 5.0
+        self.gpr_export_delay_s = 1.0
+        self.gpr_export_retry_delay_s = 2.0
         self.gpr_measurement_active = False
         self.gpr_line_active = False
         self._gpr_measurement_name = None   # name given to the open measurement
@@ -1145,19 +1151,25 @@ class ScanWall(State):
 
     @staticmethod
     def _gpr_data(resp):
-        """The ``data`` object of a GP API response, or None."""
-        if resp is None:
+        """The ``data`` object of a GP API response (or the bare object when the
+        app answers without the wrapper, as the swagger shows for some
+        endpoints), or None."""
+        if resp is None or not resp.content:
             return None
         try:
             payload = resp.json()
         except ValueError:
             return None
-        return payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        return data if isinstance(data, dict) else payload
 
-    def _gpr_connect(self, ctx):
+    def _gpr_connect(self, ctx, abort=True):
         """Connect to the probe. 200 = connected, 406 = already connected (both OK).
         Measurement calls 403 unless connected first, so a failure here aborts the
-        scan (a sweep with no GPR data is pointless).
+        scan (a sweep with no GPR data is pointless) -- unless ``abort`` is off,
+        for the export retry, where the sweep is already done.
 
         The body carries the probe's static ``ip`` as well as its serial: without
         the IP the connection request has to be accepted manually on the GP App
@@ -1175,8 +1187,11 @@ class ScanWall(State):
         if self._gpr_ok(resp, 406):
             node.get_logger().info(f"[{self.name}] GPR probe connected.")
             return True
-        node.get_logger().error(f"[{self.name}] GPR probe connection failed; aborting scan.")
-        self.fail(ctx, "GPR probe connection failed")
+        if abort:
+            node.get_logger().error(f"[{self.name}] GPR probe connection failed; aborting scan.")
+            self.fail(ctx, "GPR probe connection failed")
+        else:
+            node.get_logger().warn(f"[{self.name}] GPR probe re-connect failed.")
         return False
 
     def _gpr_measurement_name_for(self, ctx):
@@ -1212,11 +1227,16 @@ class ScanWall(State):
             node.get_logger().error(f"[{self.name}] GPR start measurement failed; aborting scan.")
             self.fail(ctx, "GPR failed to start the measurement")
             return
-        data = self._gpr_data(resp) or {}
-        # The app suffixes a 3-digit counter to the name it was given; remember
-        # what it actually called the measurement (that is what the export is
-        # named after).
-        self._gpr_measurement_name = str(data.get("name") or name)
+        # Keep the name WE asked for. The app's reply is not reliable: on the
+        # 2026-09-17 run it echoed the previous measurement's name ("seg 1" for
+        # segment 2) while the export it later produced carried the right one.
+        echoed = (self._gpr_data(resp) or {}).get("name")
+        if echoed and echoed != name:
+            node.get_logger().warn(
+                f"[{self.name}] GPR app named the measurement '{echoed}' "
+                f"(asked for '{name}'); recording the requested name."
+            )
+        self._gpr_measurement_name = name
         self.gpr_measurement_active = True
         node.get_logger().info(
             f"[{self.name}] GPR measurement '{self._gpr_measurement_name}' open; "
@@ -1255,9 +1275,11 @@ class ScanWall(State):
         ``POST /measurement/export/raw`` answers with a zip of the whole
         measurement (one line here): ``<name>_<stamp>/<name>.sgy`` + ``.csv`` +
         ``.json``. The zip is kept under the session's ``exports/`` folder and
-        its members are unpacked flat into ``data/raw/gpr/incoming`` prefixed
-        with this line's key, which is how SensorDataProcessing ties the scan
-        back to the segment (see sensors/gpr.py).
+        its members are unpacked flat into the session's own ``incoming/``
+        prefixed with this line's key, which is how SensorDataProcessing ties
+        the scan back to the segment (see sensors/gpr.py). Per session, not the
+        shared inbox: that one is read by every mission, and yesterday's
+        ``w00_l00_s00`` was being matched to today's segment 1.
 
         Returns a dict for the line manifest: ``ok``, HTTP status, the zip and
         the files written. Best-effort: the traces stay on the app whatever
@@ -1282,13 +1304,13 @@ class ScanWall(State):
             ctx.get("current_wall_index"), ctx.get("current_line_idx", 0), self._seg_idx
         )
         try:
-            exports_dir = sensor_paths.gpr_manifest_path(ctx).parent / "exports"
+            exports_dir = sensor_paths.gpr_session_dir(ctx) / "exports"
             exports_dir.mkdir(parents=True, exist_ok=True)
             zip_path = exports_dir / f"{key}_{time.strftime('%Y%m%d_%H%M%S')}.zip"
             zip_path.write_bytes(resp.content)
             result["zip"] = str(zip_path)
             files = gpr_export.unpack_export(
-                zip_path, sensor_paths.gpr_incoming_dir(ctx), key
+                zip_path, sensor_paths.gpr_session_incoming_dir(ctx), key
             )
         except (OSError, zipfile.BadZipFile) as e:
             result["error"] = str(e)
@@ -1307,16 +1329,50 @@ class ScanWall(State):
             node.get_logger().info(
                 f"[{self.name}] GPR line exported: {len(resp.content)} bytes -> "
                 f"{zip_path.name}, {len(files)} file(s) unpacked into "
-                f"{sensor_paths.gpr_incoming_dir(ctx)}."
+                f"{sensor_paths.gpr_session_incoming_dir(ctx)}."
             )
         return result
 
+    def _gpr_wait_line_finished(self, ctx):
+        """After line/stop, poll GET /measurement/line until the app reports the
+        line finished (or the timeout). Returns what the app said about the line
+        -- ``started``/``finished``/``scans``/``length`` -- for the manifest, or
+        None if it never answered. The 2026-09-16 run had an export come back 403
+        right after a 204 on the stop, and two exports with almost no traces;
+        this is the check (and the number) that tells the two apart.
+        """
+        node = ctx["node"]
+        timeout = float(ctx.get("gpr_line_finish_timeout_s", self.gpr_line_finish_timeout_s))
+        deadline = time.time() + timeout
+        info = None
+        while True:
+            data = self._gpr_data(self._gpr_request(ctx, "GET", "/measurement/line"))
+            if data is not None:
+                info = {k: data.get(k) for k in ("started", "finished", "scans", "length", "index")}
+                if info["finished"] or not info["started"]:
+                    node.get_logger().info(
+                        f"[{self.name}] GPR line finished: {info['scans']} scans over "
+                        f"{info['length']} (app units)."
+                    )
+                    return info
+            if time.time() >= deadline:
+                node.get_logger().warn(
+                    f"[{self.name}] GPR line not reported finished within {timeout:.0f} s "
+                    f"(last: {info}); exporting anyway."
+                )
+                return info
+            time.sleep(0.5)
+
     def _gpr_finish_line(self, ctx):
-        """Segment end: stop the line, export it, then stop the measurement --
-        the order the GP API flow chart prescribes. Best-effort: failures are
-        logged (and the export outcome goes into the open line record) but the
-        sweep is already done, so nothing aborts. Guarded by the flags so it is
-        a safe no-op when nothing was started.
+        """Segment end: stop the line, confirm it stopped, export it, then stop
+        the measurement -- the order the GP API flow chart prescribes.
+        Best-effort: failures are logged (and the line status + export outcome
+        go into the open line record) but the sweep is already done, so nothing
+        aborts. Guarded by the flags so it is a safe no-op when nothing was
+        started.
+
+        The export gets one retry after ``gpr_export_retry_delay_s``; a 403
+        (the app's "not connected to a probe") re-connects first.
 
         A transport failure on the first call means the app is unreachable, so
         the remaining calls are skipped rather than each waiting out its
@@ -1336,8 +1392,28 @@ class ScanWall(State):
             reachable = resp is not None
             if not self._gpr_ok(resp):
                 node.get_logger().warn(f"[{self.name}] GPR line stop failed.")
+            if reachable:
+                line_info = self._gpr_wait_line_finished(ctx)
+                if self._gpr_line_record is not None:
+                    self._gpr_line_record["probe_line"] = line_info
             if reachable and bool(ctx.get("gpr_export_enabled", True)):
+                time.sleep(float(ctx.get("gpr_export_delay_s", self.gpr_export_delay_s)))
                 export = self._gpr_export(ctx)
+                if not export["ok"]:
+                    retry_delay = float(
+                        ctx.get("gpr_export_retry_delay_s", self.gpr_export_retry_delay_s)
+                    )
+                    node.get_logger().warn(
+                        f"[{self.name}] GPR export: retrying once in {retry_delay:.0f} s."
+                    )
+                    time.sleep(retry_delay)
+                    if export["status"] == 403:
+                        self._gpr_connect(ctx, abort=False)
+                    first = export
+                    export = self._gpr_export(ctx)
+                    export["first_attempt"] = {
+                        k: first.get(k) for k in ("status", "error") if k in first
+                    }
                 if self._gpr_line_record is not None:
                     self._gpr_line_record["export"] = export
         if self.gpr_measurement_active:
@@ -3263,18 +3339,18 @@ class ScanWall(State):
             self._begin_hyperspectral_segment(ctx, seg_start, seg_end)
 
             # Wheel is pressed against the wall. GPR: start the line now (the
-            # measurement was opened before the press, in ft_zero_wait).
+            # measurement was opened before the press, in ft_zero_wait), and only
+            # once the app has confirmed it does anything move laterally.
             #
-            # NOT in arm-sweep mode. The plate is at the partition start by now
-            # (the lead_in phase put it there), but the executor still has to
-            # preempt whatever holds the arm and settle it before the sweep leg
-            # begins, and a line started here would record that dead time as scan
-            # data. It starts instead on the executor's "sweep" feedback phase, in
-            # sweep_wait.
-            if not self._use_arm_sweep(ctx):
-                self._gpr_start_line(ctx)
-                if ctx.get("error_triggered"):
-                    return
+            # In arm-sweep mode too: the executor preempts and settles the arm
+            # for a second or two before its scan leg, and the plate stands still
+            # for that -- the distance triggers clock no traces while it does.
+            # Starting the line on the executor's "sweep" feedback instead (the
+            # old way) left the first tick of every sweep unrecorded and, worse,
+            # let the arm move before the line was known to be running.
+            self._gpr_start_line(ctx)
+            if ctx.get("error_triggered"):
+                return
 
             self.set_activity(
                 ctx,
@@ -3336,24 +3412,18 @@ class ScanWall(State):
             arm_sweep = self._use_arm_sweep(ctx)
             reason = ""      # only set on the arm-sweep path; read by the backoff
             if arm_sweep:
-                # The lead-in is done and the plate is now crossing the wall: this
-                # is the moment the GPR line has to start (see press_settle) and,
-                # for the same reason, the moment to start clocking it. Arming any
-                # earlier would trigger through the lead-in traverse and the
-                # executor's settle, recording plate travel that is not scan data;
-                # this feedback is also why none of the three no-sweep paths into
-                # sweep_wait (column failure, lead-in dispatch, lead-in failure)
-                # can arm the sampler.
-                # Armed once per sweep, not once per tick: neither the probe
-                # (off in sim, so gpr_line_active never latches there) nor the
-                # trigger timer (absent when gpr_trigger_enabled is off) can
-                # stand in for "already armed", so the flag is explicit. Set
-                # before the probe call so a failed start cannot re-arm either.
+                # The plate is now crossing the wall (the GPR line itself has
+                # been running since press_settle): this is the moment to start
+                # clocking it. Arming any earlier would trigger through the
+                # executor's settle, recording plate travel that is not scan
+                # data; this feedback is also why none of the three no-sweep
+                # paths into sweep_wait (column failure, lead-in dispatch,
+                # lead-in failure) can arm the sampler.
+                # Armed once per sweep, not once per tick: the trigger timer
+                # (absent when gpr_trigger_enabled is off) cannot stand in for
+                # "already armed", so the flag is explicit.
                 if self._sweep_scanning and not self._sweep_samplers_armed:
                     self._sweep_samplers_armed = True
-                    self._gpr_start_line(ctx)
-                    if ctx.get("error_triggered"):
-                        return
                     self._start_gpr_triggers(ctx, seg_start, seg_end)
                     self._start_hyperspectral(ctx, seg_start, seg_end)
                 # The executor owns the sweep's own watchdogs and reports one

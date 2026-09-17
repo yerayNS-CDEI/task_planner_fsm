@@ -93,7 +93,7 @@ def main(argv=None):
     print("\n== Data folders ==")
     for label, path in (("data dir", paths.data_dir(ctx)),
                         ("raw hyperspectral", paths.raw_hyperspectral_root(ctx)),
-                        ("GPR incoming", paths.gpr_incoming_dir(ctx)),
+                        ("GPR shared inbox", paths.gpr_incoming_dir(ctx)),
                         ("processed", paths.data_dir(ctx) / "processed")):
         line(path.is_dir(), f"{label} {path}")
 

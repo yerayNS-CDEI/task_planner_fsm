@@ -142,7 +142,7 @@ def main(argv=None):
         try:
             t0 = time.monotonic()
             result = gpr.process_incoming(
-                paths.gpr_incoming_dir(ctx), paths.gpr_manifest_path(ctx),
+                paths.gpr_incoming_dirs(ctx), paths.gpr_manifest_path(ctx),
                 paths.gpr_results_dir(ctx), paths.gpr_weights_path(ctx), logger=log,
                 run_hyperbolae=paths.gpr_weights_path(ctx).is_file())
             log.info(f"gpr: {result['n_new']} new scan(s) in {time.monotonic() - t0:.0f} s, "

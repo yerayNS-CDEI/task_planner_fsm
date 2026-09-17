@@ -3,11 +3,12 @@
 The probe keeps its traces. ScanWall starts and stops each line over HTTP and,
 after the line stop, pulls ``POST /measurement/export/raw`` -- a zip holding
 ``<name>_<stamp>/<name>.sgy`` plus the ``.csv`` sidecar (and a ``.json``) --
-and unpacks it flat into ``data/raw/gpr/incoming/`` with the line key as a
-prefix (``unpack_export``). Files can also be dropped there by hand, so this
+and unpacks it flat into the session's own ``incoming/`` with the line key as
+a prefix (``unpack_export``). The shared ``data/raw/gpr/incoming/`` is only
+for files dropped there by hand, and is read after the session's folder. This
 module keeps the fewest assumptions it can:
 
-* any ``.sgy`` with a sidecar in the incoming folder is a scan;
+* any ``.sgy`` with a sidecar in an incoming folder is a scan;
 * a scan is tied to a line from ScanWall's manifest by name if the file name
   contains the line key or the measurement name, else by time (the most recent
   line started before the file was written);
@@ -85,22 +86,33 @@ def unpack_export(zip_path, incoming_dir, key):
 # ----------------------------------------------------------------------
 # Finding and matching scans
 # ----------------------------------------------------------------------
-def find_scan_files(incoming_dir):
-    """``[{sgy, csv, stem, mtime}]`` for every SEGY with a sidecar, oldest first."""
-    incoming_dir = Path(os.path.expanduser(str(incoming_dir)))
-    if not incoming_dir.is_dir():
-        return []
+def _as_dirs(incoming):
+    """One folder or a list of them, expanded; a missing folder is skipped."""
+    items = incoming if isinstance(incoming, (list, tuple)) else [incoming]
+    dirs = []
+    for item in items:
+        d = Path(os.path.expanduser(str(item)))
+        if d.is_dir() and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def find_scan_files(incoming):
+    """``[{sgy, csv, stem, mtime}]`` for every SEGY with a sidecar, oldest
+    first. ``incoming`` is one folder or several (the session's own, then the
+    shared inbox)."""
     found = []
-    for sgy in list(incoming_dir.glob("*.sgy")) + list(incoming_dir.glob("*.segy")):
-        csv = sgy.with_suffix(".csv")
-        if not csv.is_file():
-            continue            # the pipelines need the sidecar; wait for it
-        found.append({
-            "sgy": str(sgy),
-            "csv": str(csv),
-            "stem": sgy.stem,
-            "mtime": os.path.getmtime(sgy),
-        })
+    for incoming_dir in _as_dirs(incoming):
+        for sgy in list(incoming_dir.glob("*.sgy")) + list(incoming_dir.glob("*.segy")):
+            csv = sgy.with_suffix(".csv")
+            if not csv.is_file():
+                continue            # the pipelines need the sidecar; wait for it
+            found.append({
+                "sgy": str(sgy),
+                "csv": str(csv),
+                "stem": sgy.stem,
+                "mtime": os.path.getmtime(sgy),
+            })
     return sorted(found, key=lambda f: f["mtime"])
 
 
@@ -304,16 +316,16 @@ def load_summary(out_dir):
     return summary if isinstance(summary, dict) and summary.get("entries") else None
 
 
-def pending_files(incoming_dir, out_dir):
-    """Scans in the incoming folder not yet processed into ``out_dir``. Cheap:
-    a directory listing and a small JSON, safe to call every FSM tick."""
+def pending_files(incoming, out_dir):
+    """Scans in the incoming folder(s) not yet processed into ``out_dir``.
+    Cheap: directory listings and a small JSON, safe to call every FSM tick."""
     registry = _load_registry(Path(out_dir) / REGISTRY_FILENAME)
-    return [f for f in find_scan_files(incoming_dir) if _registry_key(f) not in registry]
+    return [f for f in find_scan_files(incoming) if _registry_key(f) not in registry]
 
 
-def process_incoming(incoming_dir, manifest_path, out_dir, weights_path,
+def process_incoming(incoming, manifest_path, out_dir, weights_path,
                      logger=None, run_hyperbolae=True, run_lines=True):
-    """Process every new scan in the incoming folder. Blocking.
+    """Process every new scan in the incoming folder(s). Blocking.
 
     Returns::
 
@@ -339,7 +351,7 @@ def process_incoming(incoming_dir, manifest_path, out_dir, weights_path,
     registry_path = out_dir / REGISTRY_FILENAME
     registry = _load_registry(registry_path)
 
-    files = find_scan_files(incoming_dir)
+    files = find_scan_files(incoming)
     new_files = [f for f in files if _registry_key(f) not in registry]
     lines = read_gpr_lines(manifest_path)
     # Lines already tied to a processed file are not offered again.

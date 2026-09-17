@@ -113,13 +113,32 @@ def latest_raw_session_dir(ctx=None):
 
 
 def gpr_incoming_dir(ctx=None) -> Path:
-    """Where the GP8800 exports (``.sgy`` + ``.csv``) land (``gpr_incoming_dir``)."""
+    """The shared inbox for hand-copied GP8800 exports (``.sgy`` + ``.csv``)
+    (``gpr_incoming_dir``). Anything here is offered to EVERY session's
+    processing; the exports ScanWall pulls itself go to the session's own
+    folder instead (``gpr_session_incoming_dir``)."""
     return _expand(_get(ctx, "gpr_incoming_dir", data_dir(ctx) / "raw" / "gpr" / "incoming"))
+
+
+def gpr_session_dir(ctx=None) -> Path:
+    """This mission's GPR folder: manifest, export zips, unpacked scans."""
+    return data_dir(ctx) / "raw" / "gpr" / f"session_{session_id(ctx)}"
+
+
+def gpr_session_incoming_dir(ctx=None) -> Path:
+    """Where ScanWall unpacks this mission's own exports. Per session, so a
+    ``w00_l00_s00`` from yesterday can never be mistaken for today's."""
+    return gpr_session_dir(ctx) / "incoming"
+
+
+def gpr_incoming_dirs(ctx=None):
+    """The folders SensorDataProcessing reads scans from, own session first."""
+    return [gpr_session_incoming_dir(ctx), gpr_incoming_dir(ctx)]
 
 
 def gpr_manifest_path(ctx=None) -> Path:
     """The per-mission record of GPR lines written by ScanWall."""
-    return data_dir(ctx) / "raw" / "gpr" / f"session_{session_id(ctx)}" / GPR_MANIFEST_FILENAME
+    return gpr_session_dir(ctx) / GPR_MANIFEST_FILENAME
 
 
 # ----------------------------------------------------------------------

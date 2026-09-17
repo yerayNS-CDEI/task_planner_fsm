@@ -25,6 +25,10 @@ def test_session_id_is_adopted_from_the_hyperspectral_session(tmp_path):
     assert paths.gpr_manifest_path(ctx) == (
         tmp_path / "raw" / "gpr" / "session_20260914_153000" / "gpr_lines.jsonl")
     assert paths.gpr_incoming_dir(ctx) == tmp_path / "raw" / "gpr" / "incoming"
+    assert paths.gpr_session_incoming_dir(ctx) == (
+        tmp_path / "raw" / "gpr" / "session_20260914_153000" / "incoming")
+    assert paths.gpr_incoming_dirs(ctx) == [
+        paths.gpr_session_incoming_dir(ctx), paths.gpr_incoming_dir(ctx)]
 
 
 def test_session_id_is_minted_once_and_cached(tmp_path):
@@ -79,6 +83,16 @@ def test_only_scans_with_a_sidecar_are_found_oldest_first(tmp_path):
     found = gpr.find_scan_files(tmp_path)
     assert [f["stem"] for f in found] == ["a", "b"]
     assert gpr.find_scan_files(tmp_path / "missing") == []
+
+
+def test_scans_are_found_across_the_session_folder_and_the_shared_inbox(tmp_path):
+    own, shared = tmp_path / "session" / "incoming", tmp_path / "incoming"
+    own.mkdir(parents=True); shared.mkdir()
+    _touch_scan(shared, "old", 100)
+    _touch_scan(own, "mine", 200)
+    found = gpr.find_scan_files([own, shared, tmp_path / "missing", own])
+    assert [f["stem"] for f in found] == ["old", "mine"]          # oldest first, no duplicates
+    assert gpr.find_scan_files(own) == [found[1]]                 # a single folder still works
 
 
 def test_export_zip_is_unpacked_flat_under_the_line_key(tmp_path):

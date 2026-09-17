@@ -1268,24 +1268,29 @@ prescribes, spread over the segment so each step is visible on the app:
 |------|------|------|
 | connect | `ft_zero_wait`, before force mode presses the plate | `POST /probe/connect` `{serialNumber, ip}` (406 = already connected) |
 | open the measurement | same moment | `POST /measurement/start` `{type: LINE_SCAN, name}` |
-| start the line | plate on the wall and about to move (`press_settle` for a base sweep, the executor's `sweep` feedback for an arm sweep) | `POST /measurement/line/start` |
-| stop the line | plate stopped, before the press is released | `POST /measurement/line/stop` |
-| export | right after the line stop | `POST /measurement/export/raw` → zip, unpacked into `data/raw/gpr/incoming/` |
+| start the line | `press_settle`: plate on the wall, before the sweep goal / crawl is sent, so nothing moves laterally until the app has confirmed the line | `POST /measurement/line/start` |
+| stop the line | plate stopped, before the press is released | `POST /measurement/line/stop`, then `GET /measurement/line` until `finished` (scans + length go into the manifest) |
+| export | `gpr_export_delay_s` after the line is confirmed stopped; one retry on failure (a 403 re-connects first) | `POST /measurement/export/raw` → zip, unpacked into `data/raw/gpr/incoming/` |
 | close the measurement | last | `POST /measurement/stop` |
 
 Every response is status-checked. A failed connect, measurement start or line
 start aborts the scan (a sweep without GPR data is pointless), and the line is
 never started unless the two calls before it succeeded. The stop/export/stop
-tail is best-effort: failures are logged, the export outcome is written into
-the line's manifest row (`export: {ok, status, zip, files}`), and an
+tail is best-effort: failures are logged, the line status and export outcome
+are written into the line's manifest row (`probe_line: {started, finished,
+scans, length}`, `export: {ok, status, zip, files}`), and an
 unreachable app skips the remaining calls instead of waiting out each timeout.
 
 The export answers with a zip (`<name>_<stamp>/<name>.sgy` + `.csv` sidecar +
 `.json`). ScanWall keeps it as `data/raw/gpr/session_<stamp>/exports/<key>_<stamp>.zip`
-and unpacks the members flat into `data/raw/gpr/incoming/` as
-`<key>_<original name>` — the line key prefix (`w02_l01_s00`) is what
-SensorDataProcessing matches the scan to its manifest row by. The sidecar is
-written before the `.sgy`, so a listing never sees a half-delivered scan.
+and unpacks the members flat into the session's own
+`data/raw/gpr/session_<stamp>/incoming/` as `<key>_<original name>` — the line
+key prefix (`w02_l01_s00`) is what SensorDataProcessing matches the scan to its
+manifest row by. Per session on purpose: the shared `data/raw/gpr/incoming/`
+is read by every mission (after the session's folder) and is only for exports
+copied there by hand — a `w00_l00_s00` left there from an earlier day would
+otherwise be matched to today's segment 1. The sidecar is written before the
+`.sgy`, so a listing never sees a half-delivered scan.
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
@@ -1293,9 +1298,12 @@ written before the `.sgy`, so a listing never sees a half-delivered scan.
 | `gpr_serial` | `GP88-007-0081` | Probe serial sent to `/probe/connect` |
 | `gpr_ip` | `192.168.1.99` | Probe static IP sent to `/probe/connect`; without it the app waits for a manual accept |
 | `gpr_timeout` | `30.0` | Per-request timeout (s) |
+| `gpr_line_finish_timeout_s` | `5.0` | How long to poll `GET /measurement/line` for `finished` after the stop |
+| `gpr_export_delay_s` | `1.0` | Pause between the confirmed line stop and the export |
+| `gpr_export_retry_delay_s` | `2.0` | Pause before the single export retry |
 | `gpr_export_enabled` | `true` | Export the line between line stop and measurement stop |
 | `gpr_export_path` | `/measurement/export/raw` | Export endpoint (no body; the response is the zip) |
-| `gpr_incoming_dir` | `data/raw/gpr/incoming` | Where the unpacked `.sgy` + `.csv` land (shared with SensorDataProcessing) |
+| `gpr_incoming_dir` | `data/raw/gpr/incoming` | Shared inbox for hand-copied scans; ScanWall's own exports go to `session_<stamp>/incoming/` |
 
 ### Sensor Processing (HSI + GPR + POKEYE)
 

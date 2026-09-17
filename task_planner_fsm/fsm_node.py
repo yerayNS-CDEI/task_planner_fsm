@@ -1115,7 +1115,8 @@ class RobotFSMNode(Node):
                 self.get_logger().warn(
                     f"[FSM Bootstrap] No recorded hyperspectral session under "
                     f"{sensor_paths.raw_hyperspectral_root(self.ctx)}; only GPR exports "
-                    f"in {sensor_paths.gpr_incoming_dir(self.ctx)} will be processed."
+                    f"in the shared inbox {sensor_paths.gpr_incoming_dir(self.ctx)} will "
+                    f"be processed."
                 )
             else:
                 session = str(latest)

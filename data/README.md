@@ -14,13 +14,16 @@ raw/
   hyperspectral/mti_log.json, Dataset_Entrenament_Nou.csv
                                    (the four above: arm_control's inspection_manager;
                                    override with --output-dir or $HYPERSPECTRAL_DATA_DIR)
-  gpr/incoming/                    GP8800 scans: <name>.sgy + <name>.csv (+ .json).
-                                   ScanWall unpacks each line's export here as
-                                   <key>_<name>.*; hand-copied exports work too
+  gpr/incoming/                    shared inbox for HAND-COPIED GP8800 scans
+                                   (<name>.sgy + <name>.csv); read by every session,
+                                   after the session's own folder
   gpr/session_<stamp>/gpr_lines.jsonl
                                    one row per GPR line scanned (segment geometry,
-                                   timestamps, export outcome) written by ScanWall
+                                   timestamps, line status, export outcome) written
+                                   by ScanWall
   gpr/session_<stamp>/exports/     the raw export zips, one per line (<key>_<stamp>.zip)
+  gpr/session_<stamp>/incoming/    the zips unpacked: <key>_<name>.sgy/.csv/.json --
+                                   what SensorDataProcessing runs on for this mission
 processed/session_<stamp>/
   hsi/       input.csv, hsi_result.json, classification_results.csv, samples.csv
   gpr/       gpr_summary.json, processed_files.json (+ NO_DRILL constraints per scan)

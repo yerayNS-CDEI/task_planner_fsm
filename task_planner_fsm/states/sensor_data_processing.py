@@ -336,11 +336,12 @@ class SensorDataProcessing(State):
         """Run the hyperbola and line pipelines over new GP8800 exports.
 
         The traces never enter ROS: ScanWall starts and stops the line, pulls
-        the export off the app and unpacks it into ``data/raw/gpr/incoming``
-        (see ``ScanWall._gpr_export``). Exports can also be copied there by
-        hand, so this phase waits at most ``gpr_wait_timeout_s`` (default 0:
-        process what is already there) and never blocks the mission on a file
-        that may not come.
+        the export off the app and unpacks it into the session's own
+        ``incoming/`` (see ``ScanWall._gpr_export``). Exports can also be
+        copied by hand into the shared ``data/raw/gpr/incoming``, which is read
+        after the session's folder; so this phase waits at most
+        ``gpr_wait_timeout_s`` (default 0: process what is already there) and
+        never blocks the mission on a file that may not come.
 
         Per v2 policy GPR still does not vote on whether POKEYE is needed.
         What it does produce is a veto: each hyperbola becomes a NO_DRILL
@@ -354,7 +355,7 @@ class SensorDataProcessing(State):
             return
 
         if self._job is None:
-            incoming = paths.gpr_incoming_dir(ctx)
+            incoming = paths.gpr_incoming_dirs(ctx)   # own session first, then the shared inbox
             out_dir = paths.gpr_results_dir(ctx)
             pending = gpr.pending_files(incoming, out_dir)
             if not pending:
@@ -364,10 +365,11 @@ class SensorDataProcessing(State):
                 waited = time.monotonic() - self._gpr_wait_started
                 if waited < timeout:
                     self.set_activity(
-                        ctx, f"Waiting for GPR exports in {incoming} ({waited:.0f}/{timeout:.0f} s)")
+                        ctx, f"Waiting for GPR exports in {incoming[0]} ({waited:.0f}/{timeout:.0f} s)")
                     return
                 node.get_logger().info(
-                    f"[{self.name}] no new GPR exports in {incoming}; skipping GPR processing.")
+                    f"[{self.name}] no new GPR exports in {incoming[0]} or {incoming[1]}; "
+                    f"skipping GPR processing.")
                 self._advance(ctx, "decision")
                 return
 
@@ -379,7 +381,9 @@ class SensorDataProcessing(State):
                     f"line pipeline only (see models/README.md).")
                 run_hyp = False
             node.get_logger().info(
-                f"[{self.name}] processing {len(pending)} GPR export(s) from {incoming}")
+                f"[{self.name}] processing {len(pending)} GPR export(s) "
+                f"({sum(f['sgy'].startswith(str(incoming[0])) for f in pending)} from this "
+                f"session, the rest from the shared inbox {incoming[1]})")
             self._job = BackgroundJob(
                 gpr.process_incoming,
                 incoming,
