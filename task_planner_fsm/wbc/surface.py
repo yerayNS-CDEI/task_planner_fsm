@@ -37,7 +37,21 @@ SENSOR_XY = np.array([
     [0.152,  0.170],    # S2 ToF, top-right
     [0.000, -0.172],    # S3 ToF, bottom-mid
 ])
-SENSOR_SIGMA = np.array([0.010, 0.010, 0.010, 0.010, 0.010, 0.010])
+# Per-sensor sigma, metres: the residual scatter of each sensor against the
+# arm's FK, measured 2026-09-17 (test/fixtures/plate_ranges_2026_09_17.json).
+# The ultrasonics report in whole centimetres, so they scatter 4-6 mm; the ToF
+# report in millimetres and scatter 1.4-1.7 mm. Weighting them equally let a
+# single ultrasonic count tilt the fitted plane by ~1 deg, which is what the
+# alignment task was chasing on 2026-09-15.
+#
+# The ranges arrive already CORRECTED for each sensor's constant offset — the
+# reader (arm_control sensors/arduino_sensors.py, sensors/plate_calibration.py)
+# subtracts the FK-fitted offsets before publishing, so nothing here carries a
+# copy. Those offsets are not small (U2 -4.4 cm, S2 +3.6 cm) and their pattern
+# cancels real tilt in the fit: uncorrected, the plate read 1 deg off while it
+# was 7.7 deg off. test_wbc_surface.py replays the calibration poses through this
+# fit and checks it tracks the FK.
+SENSOR_SIGMA = np.array([0.006, 0.006, 0.006, 0.002, 0.002, 0.002])
 # Validity window per sensor. Mind the ToF ceiling: beyond 0.258 m only the
 # ultrasonics report, so a fit taken far from the wall rests on three points.
 VALID_LO = np.array([0.02, 0.02, 0.02, 0.011, 0.011, 0.011])

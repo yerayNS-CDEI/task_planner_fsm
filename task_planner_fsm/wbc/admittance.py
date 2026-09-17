@@ -283,12 +283,14 @@ class AdmittancePress:
         self.tare_seconds = float(tare_seconds)
         self.tare_min_distance = float(tare_min_distance)
         # --- the approach schedule ---------------------------------------
-        # Where the plate STOPS: the range reading when the wheel and the four
-        # caster bars are all riding the wall. The plate cannot physically get
-        # closer, so this — not zero — is what the approach is closing on and
-        # what the gap is measured from. 0.1375 m is the reading the plate
-        # bottomed out at on 2026-09-14 (first load at 14.4 cm, 3 N at 14.15);
-        # the 0.13 it was came from a comment rather than a run.
+        # Where the plate STOPS: the range reading when the GPR face and wheel
+        # are on the wall. The plate cannot physically get closer, so this —
+        # not zero — is what the approach is closing on and what the gap is
+        # measured from. The GPR contact point is 15.0 cm in front of the
+        # sensor plane (the pendant TCP, confirmed against FK on 2026-09-17),
+        # so calibrated ranges read 0.150 there. The node passes that in; the
+        # 0.1375 default is what the same stop read through the uncalibrated
+        # sensors on 2026-09-14, kept so the existing tests stay meaningful.
         self.contact_distance = float(contact_distance)
         # How far beyond the stop the ranges may read while a force is still
         # believed to be contact. The wheel first loads about 7 mm outside the

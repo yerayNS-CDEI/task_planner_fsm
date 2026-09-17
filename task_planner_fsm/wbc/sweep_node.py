@@ -185,12 +185,11 @@ class WholeBodySweepNode(Node):
         # because a different sensor is what stops it.
         #
         # Sized off the HARDWARE STANDOFF, not off zero. The six range sensors
-        # sit on the plate face, but the GPR body has length along the wall
-        # normal and four bars with caster wheels stand off each corner, so when
-        # the wheel and the casters are all riding the wall the plate is still
-        # ~0.1375 m off it and that is what the ranges read. The plate BOTTOMS
-        # OUT there — measured on hardware 2026-09-14, it cannot physically get
-        # closer.
+        # sit on the plate face, but the GPR body stands 15 cm proud of it, so
+        # when its face and wheel are on the wall the plate is still 0.150 m
+        # off it and that is what the (calibrated) ranges read. The plate
+        # BOTTOMS OUT there; it cannot physically get closer. The casters are
+        # shorter than the GPR and do not reach the wall.
         #
         # So an envelope near zero can never be crossed and protects nothing,
         # which is exactly what the old 0.005 did. What it must catch is the
@@ -198,23 +197,24 @@ class WholeBodySweepNode(Node):
         # a bad force reading kept SEEK pushing. That means sitting just below
         # the stop, with enough room for sensor noise.
         #
-        # Mind that room, because the ranges are noisy. The per-sensor sigma is
-        # 0.010 m and the plane fit over six of them measures out at 4.2 mm
-        # sigma on the fitted distance, so with the plate resting quietly at its
-        # stop the envelope still trips on its own:
+        # Mind that room, because the ranges are noisy. With the sensors at an
+        # equal 0.010 m sigma the plane fit measured out at 4.2 mm sigma on the
+        # fitted distance, and with the plate resting quietly at its stop the
+        # envelope tripped on its own at less than 2 cm of margin:
         #
-        #     0.125 -> 12.4% of cycles      0.115 -> 0.02%
-        #     0.120 ->  1.0% of cycles      0.110 -> never
+        #     stop-1.25cm -> 12.4% of cycles      stop-2.25cm -> 0.02%
+        #     stop-1.75cm ->  1.0% of cycles      stop-2.75cm -> never
         #
-        # 0.115 is the value that buys a real guard without crying wolf. It sits
-        # over 2 cm inside the stop, which is far more travel than the bars have
-        # in them, and over 5 sigma clear of the noise.
+        # 2 cm inside the stop is the margin that buys a real guard without
+        # crying wolf: far more travel than the bars have in them, and over 5
+        # sigma clear of the noise (the 2026-09-17 sigmas, ToF-weighted, make
+        # the fitted distance quieter still). Re-datumed with the stop.
         #
         # A trip is cheap either way: it clamps the approach to zero for that
         # one cycle, and the stall counter resets on any untripped cycle, so
         # noise alone can never reach the 100 in a row that would fail the
         # sweep. What a too-tight envelope costs is a press that sits light.
-        self.declare_parameter("press_min_distance", 0.115)  # m
+        self.declare_parameter("press_min_distance", 0.130)  # m
         # --- the approach schedule ---------------------------------------
         # Closing on the wall at a constant speed makes the peak contact force a
         # function of the loop rate, because the wheel keeps approaching until
@@ -226,13 +226,21 @@ class WholeBodySweepNode(Node):
         # — measured flat at ~5 N from 50 Hz down to 8. See wbc/admittance.py for
         # the numbers and for why the gap estimate has to be pessimistic.
         #
-        # Where the plate STOPS: the range reading with the wheel and all four
-        # caster bars riding the wall. Same measurement press_min_distance is
-        # sized off, and the gap the schedule closes is measured from it.
-        # MEASURED 2026-09-14: the plate bottomed out at 13.75 cm, with the
-        # wheel first loading at 14.4 and 3 N by 14.15. The 0.13 before it was
-        # a comment, not a run.
-        self.declare_parameter("press_contact_distance", 0.1375)   # m
+        # Where the plate STOPS: the range reading with the GPR face and wheel
+        # on the wall. Same measurement press_min_distance is sized off, and
+        # the gap the schedule closes is measured from it.
+        #
+        # The contact point is the pendant TCP 'Sensor_plate', (-80, 0, +320) mm
+        # in tool0: 15.0 cm in front of the sensor plane, 8 cm off its centre.
+        # So with the plate parallel the ranges read 0.150 at contact — the
+        # arm's FK put the sensor plane at 15.0 cm in the 2026-09-17
+        # calibration, with the corrected plane fit agreeing to 1.5 mm. The
+        # 0.1375 measured on 2026-09-14 was the same geometry read through
+        # uncalibrated sensors (ultrasonics ~2 cm short, ToF ~1 cm long,
+        # averaging out), and only holds for ranges the reader has not yet
+        # corrected. The GPR face touches nearer than this when the plate is
+        # tilted (14.1 cm at 6 deg), which press_contact_window covers.
+        self.declare_parameter("press_contact_distance", 0.150)   # m
         # How far outside that stop the ranges may read while a force is still
         # believed to be contact. The dwell above is sized against sensor
         # noise; a transient from the arm's own motion is not noise, and one
