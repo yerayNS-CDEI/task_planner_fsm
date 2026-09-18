@@ -1491,6 +1491,57 @@ def test_a_plate_arriving_off_square_is_squared_without_overloading_the_wheel():
         f"base yaw reached {max(yaw_commands):.4f} rad/s against a {yaw_max} cap")
 
 
+def _heading_error(robot, t_hat=np.array([0.0, -1.0])):
+    """Angle from the turret's forward axis to the sweep tangent, radians."""
+    c, s_ = np.cos(robot.yaw), np.sin(robot.yaw)
+    t_base = np.array([[c, s_], [-s_, c]]) @ t_hat
+    return float(np.arctan2(t_base[1], t_base[0]))
+
+
+def test_the_base_turns_toward_the_sweep_tangent_and_holds_still_once_loaded():
+    """The 2026-09-18 15:59 run, as a regression. The heading rule then chased
+    shoulder_pan's start value with an inverted sign: the base yawed at the
+    cap for 22 s, carrying the squared plate 0.4 m along the wall on the
+    turret and into it sideways when the wheel touched. Now the rule turns
+    the turret toward the sweep tangent — the direction the travel pin drives
+    it in — and stops turning the moment the wheel is loaded.
+    """
+    node = _press_node()
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.03, tilt=0.0)
+    robot.yaw += np.radians(5.0)                 # turret 5 deg off the tangent
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    cap = float(node.get_parameter("w_heading_max").value)
+
+    errors, yaws, loaded_yaws = [], [], []
+
+    def on_cycle(cycle):
+        errors.append(abs(_heading_error(robot)))
+        if node.u_qp_prev is not None:
+            yaws.append(float(node.u_qp_prev[2]))
+            if node.press is not None and node.press.loaded:
+                loaded_yaws.append(abs(float(node.u_qp_prev[2])))
+
+    forces, _ = _press_run(node, robot, cycles=600, on_cycle=on_cycle)
+
+    assert node.pending_status is None, f"the sweep ended early: {node.pending_status}"
+    # Free space first: the yaw has the sign that closes the error, under the cap.
+    early = np.array(yaws[10:40])
+    assert np.all(early < 0.0), "a turret left of the tangent must yaw right"
+    assert np.all(np.abs(early) <= cap + 1e-9)
+    assert errors[200] < 0.5 * errors[0], (
+        f"heading error did not close: {np.degrees(errors[0]):.1f} -> "
+        f"{np.degrees(errors[200]):.1f} deg")
+    # The plate stayed square to the wall while the base turned under it.
+    tilt = np.degrees(np.arccos(np.clip(robot.tip()[0, 2], -1.0, 1.0)))
+    assert tilt < 1.5, f"plate {tilt:.2f} deg off square"
+    # And once the wheel is on the wall the base does not yaw at all.
+    assert node.press.in_contact, "it should have reached the wall"
+    assert loaded_yaws and max(loaded_yaws[5:]) < 1e-6, (
+        f"base yawed {max(loaded_yaws[5:]):.4f} rad/s with the wheel loaded")
+    assert forces.max() < 0.5 * node.press.force_limit
+
+
 def test_a_press_that_never_reaches_the_wall_fails_instead_of_recording_air():
     """The first hardware run reported 'Sweep succeeded' having swept a segment
     it may never have pressed. A false success means nobody knows to rescan."""

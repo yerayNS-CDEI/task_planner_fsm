@@ -604,13 +604,28 @@ class WholeBodySweepNode(Node):
         # the true rows kept, whatever yaw the pin asks for, the arm
         # counter-rotates inside the same solve and the plate does not move.
         #
-        # What the pin asks for is the yaw that follows the arm, slowly: over
-        # a long segment the base heading drifts against the wall and the arm
-        # winds up absorbing it, so this turns the base until shoulder_pan is
-        # back where the sweep started. Its input is a joint angle, not a
-        # range, so no sensor noise reaches the turret through it. Zero the
-        # cap and the yaw is simply held.
-        self.declare_parameter("k_heading", 0.2)          # 1/s on shoulder_pan's posture error
+        # What the pin asks for is the yaw that puts the turret's forward axis
+        # along the SWEEP TANGENT — the direction the travel pin drives it in,
+        # so a turret that is off it drives the base off the wall or into it
+        # and leaves the arm making up the difference. The error is the angle
+        # between that axis and the tangent (nearest of the two ways round, so
+        # a sweep run in reverse is not a 180 deg turn), its sign is fixed by
+        # geometry, and its input is the base's own yaw, not a range: no
+        # sensor noise reaches the turret through it.
+        #
+        # It was, for one run (2026-09-18 15:59), the yaw that returned
+        # shoulder_pan to where the sweep started. Wrong twice over: the
+        # plate had arrived 10.5 deg off and squaring it moved the pan
+        # legitimately, so the rule was undoing the alignment; and the sign
+        # was inverted for this mount, so it saturated at the cap for 22 s
+        # and carried the arm 0.4 m along the wall on the turret — into the
+        # wall sideways at 20 mm/s when the wheel finally touched. 30 N.
+        #
+        # ZERO while the wheel is loaded. A base yaw with the wheel on the
+        # wall drags the contact along it by the lever, whatever the reason
+        # for the yaw; the heading is corrected on the way in, in free space,
+        # or not at all.
+        self.declare_parameter("k_heading", 0.2)          # 1/s on the turret-vs-tangent angle
         self.declare_parameter("w_heading_max", 0.02)     # rad/s cap on the base yaw it asks for
         # Low-pass on the sensed surface normal, seconds, applied once per range
         # frame in the WORLD frame — see SurfaceEstimator for why both of
@@ -2278,8 +2293,13 @@ class WholeBodySweepNode(Node):
         # --- Pin the base's yaw, so the turret never squares the plate -------
         # See k_heading. Clipped into the acceleration box like the travel pin,
         # so a change of heading demand is a ramp, never a step.
-        w_heading = _clamp(float(p("k_heading").value) * (self.q_posture[0] - q_arm[0]),
-                           float(p("w_heading_max").value))
+        t_base = rotation.T @ t_hat[:2]          # sweep direction, turret frame
+        heading_error = math.atan2(float(t_base[1]), float(t_base[0]))
+        if abs(heading_error) > math.pi / 2.0:   # travelling turret-backward: align that axis
+            heading_error -= math.copysign(math.pi, heading_error)
+        loaded = self.press is not None and (self.press.loaded or side_loaded)
+        w_heading = 0.0 if loaded else _clamp(
+            float(p("k_heading").value) * heading_error, float(p("w_heading_max").value))
         base_lo[2] = base_hi[2] = float(np.clip(w_heading, base_lo[2], base_hi[2]))
 
         self.base_travel_pinned = False
@@ -2288,7 +2308,6 @@ class WholeBodySweepNode(Node):
             # Sweep direction expressed in the turret frame, where the twist is
             # commanded. During a wall scan this is ~[±1, 0]: the turret faces
             # along the wall, so its forward axis IS the travel axis.
-            t_base = rotation.T @ t_hat[:2]
             if abs(float(t_base[0])) < self.base_travel_min_alignment:
                 # The forward axis is not the travel axis. Pinning it would hold
                 # the base at some fraction of the sweep speed along the wrong
