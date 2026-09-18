@@ -1270,7 +1270,10 @@ def test_a_wall_that_recedes_mid_sweep_slows_the_base_instead_of_scanning_air():
     base slows itself without anything having to notice the event at all.
     """
     global WALL_X
-    node = _press_node()
+    # The decay is measured against the 1.5 s constant the numbers below were
+    # sized for; the shipped default is slower (4 s, so a newly loaded contact
+    # is not pulled on before it has seated), which is a different question.
+    node = _press_node(press_travel_tau=1.5)
     # Start 3 cm off contact: this test is about what happens AFTER the wheel
     # arrives, and _press_node already shortens the crawl in front of it.
     robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.03)
@@ -1540,6 +1543,62 @@ def test_the_base_turns_toward_the_sweep_tangent_and_holds_still_once_loaded():
     assert loaded_yaws and max(loaded_yaws[5:]) < 1e-6, (
         f"base yawed {max(loaded_yaws[5:]):.4f} rad/s with the wheel loaded")
     assert forces.max() < 0.5 * node.press.force_limit
+
+
+def test_a_dragging_plate_throttles_the_base_before_the_side_load_halts_it():
+    """The 2026-09-18 17:57 overload: the base set off 0.1 s after the latch
+    with an edge of the GPR face on the wall, and the force went 5 -> 30 N in
+    lockstep with the base speed while the side load climbed 2 -> 6 N. The
+    normal barrier could not see it; the side load could. Travel now throttles
+    linearly from press_drag_free_fraction of press_side_force_limit to zero
+    at the limit, on the raw side load, without waiting for the filter."""
+    node = _press_node()
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.03, tilt=0.0)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    limit = float(node.get_parameter("press_side_force_limit").value)
+    free = float(node.get_parameter("press_drag_free_fraction").value) * limit
+    side = {"value": 0.0}
+
+    def on_cycle(cycle):
+        node.side_force = side["value"]
+        if cycle == 750:
+            side["value"] = 0.5 * (free + limit)     # halfway up the throttle
+        if cycle == 850:
+            side["value"] = limit + 1.0              # over it: halted outright
+
+    _, travel = _press_run(node, robot, cycles=950, on_cycle=on_cycle)
+
+    assert node.press.in_contact, "it should have reached the wall"
+    rolling = travel[700:750].mean()
+    assert rolling > 0.5 * node.sweep_speed, "sweeping while the plate rolls"
+    dragging = travel[800:850].mean()
+    assert 0.3 * rolling < dragging < 0.7 * rolling, (
+        f"halfway up the drag band the travel should be about halved: "
+        f"{dragging:.4f} vs {rolling:.4f}")
+    assert travel[900:].max() < 0.05 * rolling, "over the limit the base stops"
+
+
+def test_the_retreat_stops_when_the_elbow_folds_past_its_limit():
+    """A pull along the normal knows nothing about the arm folding into
+    itself; on 2026-09-18 it took the elbow to 164 deg before the e-stop. Past
+    retreat_fold_limit the retreat ends where it is and the return takes over."""
+    length = 0.3
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, length, 0.0), retreat_standoff=0.40)
+    robot = _start_state(node.chain)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    _run(node, robot, cycles=200)
+    # A limit just under where the elbow already is: the first retreat cycle
+    # must trip it.
+    node.set_parameters([rclpy.parameter.Parameter(
+        "retreat_fold_limit", value=abs(float(robot.q[2])) - 0.01)])
+    gap_before = WALL_X - robot.tip()[0, 3]
+    _run(node, robot, cycles=4000)
+
+    assert node.status == "succeeded"
+    assert WALL_X - robot.tip()[0, 3] < gap_before + 0.05, (
+        "the retreat should have stopped almost where it started")
 
 
 def test_a_press_that_never_reaches_the_wall_fails_instead_of_recording_air():

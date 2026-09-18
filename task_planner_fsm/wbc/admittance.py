@@ -429,7 +429,7 @@ class AdmittancePress:
         return max(self.approach_min_speed, self.approach_gain * max(0.0, gap))
 
     # ------------------------------------------------------------------
-    def update(self, raw_force, distance, dt):
+    def update(self, raw_force, distance, dt, quiet=True):
         """One cycle. Returns the normal-axis velocity, positive = toward the wall.
 
         ``raw_force`` is the measured press force in newtons, already flipped so
@@ -471,6 +471,15 @@ class AdmittancePress:
                     f"cannot tare the force sensor: the plate is {distance * 100:.1f} cm "
                     f"from the surface, inside the {self.tare_min_distance * 100:.0f} cm "
                     f"free-space margin the tare needs (is it already touching?)")
+                return 0.0
+            # Only a QUIET arm is worth taring against. The F/T sensor carries
+            # the GPR's mass, and an arm that is moving — the sweep's opening
+            # alignment can swing the plate 15 deg at 0.5 rad/s — puts inertial
+            # load on it that is not bias. On 2026-09-18 the tare landed in
+            # exactly that swing and read +4.2 N; every force of the run was
+            # then 4 N low, contact latch and 30 N limit included. The caller
+            # says when the arm is still; until then the window does not run.
+            if not quiet:
                 return 0.0
             self._tare_samples.append(float(raw_force))
             self._tare_elapsed += dt

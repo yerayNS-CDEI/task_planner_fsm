@@ -96,9 +96,19 @@ class WholeBodySweepNode(Node):
         # Where to leave the plate when the sweep ends, so the base can transit
         # with the arm clear of the wall. Match the FSM's
         # scan_wall_transit_plate_offset. 0 disables the retreat.
-        self.declare_parameter("retreat_standoff", 0.40)
+        # 0.30, not the FSM's 0.40: this retreat is a straight pull along the
+        # normal with no collision model, and the FSM's transit_clear retracts
+        # to its own offset afterwards THROUGH the planner. Getting the plate
+        # off the wall is this node's job; getting it to 0.40 is not.
+        self.declare_parameter("retreat_standoff", 0.30)
         self.declare_parameter("retreat_speed", 0.05)     # m/s along the normal
         self.declare_parameter("retreat_timeout", 20.0)   # s on the node clock
+        # The retreat folds the arm, and a pull along the normal knows nothing
+        # about the arm folding into itself: on 2026-09-18 it took the elbow
+        # from 147 to 164 deg in six seconds before the e-stop. Past this
+        # elbow angle (radians, magnitude, joint index 2) the retreat stops
+        # where it is and hands over to the return, which is joint-space.
+        self.declare_parameter("retreat_fold_limit", math.radians(160.0))
         # Arm configuration to finish in, normally the unfolded pose the FSM's
         # planner last placed the arm in. Retreating along the normal alone
         # cannot leave the arm somewhere the planner will accept: too little and
@@ -186,6 +196,13 @@ class WholeBodySweepNode(Node):
         # still under the limit for most of the rise. Tared over the press's
         # own TARE window, since the F/T's lateral idle sits around 3-5 N.
         self.declare_parameter("press_side_force_limit", 10.0)
+        # Below this fraction of press_side_force_limit the plate is rolling
+        # and the base may sweep at full speed; from there to the limit the
+        # travel is throttled linearly to zero. A wheel that is rolling on
+        # concrete drags 1-2 N; a plate being dragged edge-first reads 5-6 N
+        # on the way to an overload (2026-09-18) and 20 N once it is one
+        # (09-14). The throttle acts before the halt does.
+        self.declare_parameter("press_drag_free_fraction", 0.3)
         # The distance sensors stop being the setpoint and become the envelope:
         # no approach closer than this to the sensed plane, whatever the force
         # says. A wrong force reading then cannot walk the arm into the wall,
@@ -393,7 +410,11 @@ class WholeBodySweepNode(Node):
         #
         # 0 disables the filter and restores the binary gate the paragraph above
         # argues against. It is there for a bench test, not for the robot.
-        self.declare_parameter("press_travel_tau", 1.5)            # s
+        # 4 s, up from 1.5 (2026-09-18): at 1.5 s the base was at 23 mm/s two
+        # seconds after the latch, with the contact still an edge, and the
+        # force went 5 -> 30 N in lockstep with the base speed. See the
+        # seating conditions on `health` below for what else now has to hold.
+        self.declare_parameter("press_travel_tau", 4.0)            # s
         # Whether the press gates the base's travel at all.
         #
         # True is what 9974b97 and 8e55536 argue for: the base holds until the
@@ -1705,8 +1726,15 @@ class WholeBodySweepNode(Node):
                 f"the wall.")
             self._begin_return()
             return
-
         p = self.get_parameter
+        fold = abs(float(q_arm[2])) if len(q_arm) > 2 else 0.0
+        if fold > float(p("retreat_fold_limit").value):
+            self.get_logger().warn(
+                f"Retreat stopped at {self.surface.distance:.2f} m: the elbow is at "
+                f"{math.degrees(fold):.0f} deg and folding further; returning from here.")
+            self._begin_return()
+            return
+
         speed = min(float(p("retreat_speed").value), remaining)
         n_arm = self.chain.n_joints
         w_hold = rotation_error(R_plate, self.retreat_R_hold) * float(p("k_align").value)
@@ -1909,6 +1937,25 @@ class WholeBodySweepNode(Node):
             self._strike("scan direction is normal to the sensed surface")
             return
         distance = self.surface.distance
+        p = self.get_parameter
+        # The orientation error, here rather than with the angular task below,
+        # because the press needs it first: it decides whether the arm is
+        # quiet enough to tare against and whether the contact is seated
+        # enough for the base to sweep on.
+        R_target = plate_orientation_target(m_hat)
+        if R_target is None:
+            self._strike("sensed surface normal is vertical")
+            return
+        align_error = rotation_error(R_plate, R_target)
+        align_deadband = float(p("align_deadband").value)
+        # Twice the band, not the band: the soft deadband drives the error
+        # TOWARD its edge and stops, so the plate settles just outside it and
+        # a test at the edge itself never passes. Inside two bands the plate is
+        # as square as the ranges can make it; a gross error (the 15 deg it
+        # arrived with on 2026-09-18) is what this is meant to exclude.
+        aligned = float(np.linalg.norm(align_error)) <= 2.0 * align_deadband
+        arm_quiet = (self.u_qp_prev is None
+                     or float(np.max(np.abs(self.u_qp_prev[3:]))) < 0.02)
         if self.press is not None:
             # Pressing: the plate sits where the wall puts it, so a standoff
             # target is not a thing to hold and not a thing to police. The
@@ -1931,7 +1978,6 @@ class WholeBodySweepNode(Node):
             self.standoff_strikes = 0
 
         # --- Task twist ------------------------------------------------------
-        p = self.get_parameter
         if self.press is not None:
             # Force replaces distance on this axis, and only on this axis. The
             # press has its own clamp (press_v_max), sized for contact rather
@@ -1946,7 +1992,8 @@ class WholeBodySweepNode(Node):
             press_dt = (now - self.press_stamp) if self.press_stamp else nominal_dt
             press_dt = float(min(max(press_dt, 0.2 * nominal_dt), 1.0))
             self.press_stamp = now
-            v_normal = self.press.update(self.press_force, distance, press_dt)
+            v_normal = self.press.update(self.press_force, distance, press_dt,
+                                         quiet=arm_quiet and aligned)
             # Learn how stiff this surface is, from the travel the LAST solve
             # asked for and the force that came back. Regressed on the commanded
             # rate rather than on the sensed distance, which has 4.2 mm of
@@ -2055,14 +2102,30 @@ class WholeBodySweepNode(Node):
             # far better noise defence than a dwell. So the question here is the
             # simpler one the release threshold already answers: is the wheel
             # loaded right now?
-            health = 1.0 if self.press.force >= self.press.release_force else 0.0
+            #
+            # Loaded is necessary, not sufficient. The contact also has to be
+            # SEATED before the base pulls on it: the plate inside its
+            # alignment deadband, so the face is on the wall and not a corner,
+            # and the side load low, so what is on the wall is rolling and not
+            # being dragged. On 2026-09-18 the base set off 0.1 s after the
+            # latch with the plate 1.5 deg off and an edge touching; the force
+            # went 5 -> 30 N in two seconds, one for one with the base speed.
+            side = self.side_force - self.side_bias
+            side_limit = float(p("press_side_force_limit").value)
+            free = float(p("press_drag_free_fraction").value) * side_limit
+            seated = aligned and side < free
+            health = 1.0 if (self.press.force >= self.press.release_force and seated) else 0.0
             tau = float(p("press_travel_tau").value)
             # Against the press's own MEASURED period, so the time constant is
             # 1.5 s of wall clock whatever rate the loop achieves — the same
             # reason every constant inside AdmittancePress is in seconds.
             alpha = (1.0 - math.exp(-press_dt / tau)) if tau > 0.0 else 1.0
             self.travel_authority += alpha * (health - self.travel_authority)
-            speed *= self.travel_authority
+            # And throttle on the drag itself, immediately rather than through
+            # the filter: a side load climbing toward the limit is the edge
+            # digging in, and the base is what is driving it.
+            drag = _clamp((side_limit - side) / max(side_limit - free, 1e-6), 1.0)
+            speed *= self.travel_authority * max(0.0, drag)
             if not health and self.travel_authority < 0.5:
                 # Say it out loud. A base crawling along a wall for no visible
                 # reason is the kind of thing that gets diagnosed as a stuck
@@ -2080,12 +2143,7 @@ class WholeBodySweepNode(Node):
                     throttle_duration_sec=2.0)
         v_ref = speed * t_hat + v_normal * m_hat + v_height * np.array([0.0, 0.0, 1.0])
 
-        R_target = plate_orientation_target(m_hat)
-        if R_target is None:
-            self._strike("sensed surface normal is vertical")
-            return
-        w_ref = soft_deadband(rotation_error(R_plate, R_target),
-                              float(p("align_deadband").value)) * float(p("k_align").value)
+        w_ref = soft_deadband(align_error, align_deadband) * float(p("k_align").value)
         w_max = float(p("w_align_max").value)
         if np.linalg.norm(w_ref) > w_max:
             w_ref = w_ref * (w_max / np.linalg.norm(w_ref))

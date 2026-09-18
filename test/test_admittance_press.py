@@ -15,7 +15,7 @@ plate face does. The range noise is the 4.2 mm sigma the plane fit measures.
 import numpy as np
 import pytest
 
-from task_planner_fsm.wbc.admittance import SEEK, AdmittancePress
+from task_planner_fsm.wbc.admittance import TARE, SEEK, AdmittancePress
 
 K_E = 2.0e4          # N/m, stiffness of the wall as seen through the wheel
 # MEASURED on 2026-09-07, not assumed. The force first appears at d = 14.0 cm
@@ -189,6 +189,25 @@ def test_tare_takes_the_same_time_at_every_rate(rate):
     assert press.state == SEEK
     assert 0.5 <= elapsed <= 0.5 + 2 * dt, f"tare took {elapsed:.2f}s at {rate} Hz"
     assert press.bias == pytest.approx(6.6, abs=1e-6)
+
+
+def test_tare_waits_for_a_quiet_arm():
+    """The sensor carries the GPR's mass, so an arm that is moving loads it
+    inertially and that is not bias. On 2026-09-18 the sweep's opening 15 deg
+    alignment swing landed inside the tare window: +4.2 N of bias, every force
+    of the run 4 N low. Cycles the caller flags as not quiet must neither count
+    toward the window nor contribute a sample."""
+    press = AdmittancePress(tare_seconds=0.5)
+    for _ in range(50):                                  # 1 s of swinging arm
+        assert press.update(9.0, 0.20, 0.02, quiet=False) == 0.0
+    assert press.state == TARE
+    assert press._tare_elapsed == 0.0
+    elapsed = 0.0
+    while press.state != SEEK and elapsed < 2.0:
+        press.update(1.0, 0.20, 0.02, quiet=True)
+        elapsed += 0.02
+    assert press.state == SEEK
+    assert press.bias == pytest.approx(1.0, abs=1e-6), "the swing's 9 N never entered the tare"
 
 
 def test_approach_is_capped_by_seek_speed_far_from_the_wall():
