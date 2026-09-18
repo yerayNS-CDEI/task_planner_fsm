@@ -234,6 +234,39 @@ def test_process_incoming_needs_the_segy_reader(tmp_path):
                              tmp_path / "w.pt")
 
 
+def test_the_summary_is_written_per_scan_like_the_registry(tmp_path, monkeypatch):
+    """A run killed between two scans (or a state left mid-job) must not leave
+    a scan in the registry -- never offered again -- but out of the summary the
+    NO_DRILL constraints are read from."""
+    monkeypatch.setattr(gpr, "require", lambda *names: None)
+    calls = []
+
+    def fake_process_scan(scan, line, out_dir, weights, logger=None, **kw):
+        calls.append(scan["stem"])
+        if len(calls) == 2:
+            raise KeyboardInterrupt          # the second scan is cut short
+        return {"key": scan["stem"], "sgy": scan["sgy"], "line": line, "associated": False,
+                "out_dir": str(out_dir), "hyperbolae": None, "no_drill": None,
+                "lines": None, "errors": {}}
+
+    monkeypatch.setattr(gpr, "process_scan", fake_process_scan)
+    _touch_scan(tmp_path / "in", "a", 1_000)
+    _touch_scan(tmp_path / "in", "b", 2_000)
+    with pytest.raises(KeyboardInterrupt):
+        gpr.process_incoming(tmp_path / "in", tmp_path / "m.jsonl", tmp_path / "out",
+                             tmp_path / "w.pt", run_hyperbolae=False)
+    registry = json.load(open(tmp_path / "out" / gpr.REGISTRY_FILENAME))
+    assert [v["key"] for v in registry.values()] == ["a"]
+    assert [e["key"] for e in gpr.load_summary(tmp_path / "out")["entries"]] == ["a"]
+
+    # The next pass picks up only b and appends it to the same summary.
+    calls.clear()
+    result = gpr.process_incoming(tmp_path / "in", tmp_path / "m.jsonl", tmp_path / "out",
+                                  tmp_path / "w.pt", run_hyperbolae=False)
+    assert calls == ["b"] and result["n_new"] == 1
+    assert [e["key"] for e in gpr.load_summary(tmp_path / "out")["entries"]] == ["a", "b"]
+
+
 # ----------------------------------------------------------------------
 # ScanWall writes the manifest
 # ----------------------------------------------------------------------

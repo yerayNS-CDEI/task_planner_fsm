@@ -350,6 +350,10 @@ def process_incoming(incoming, manifest_path, out_dir, weights_path,
     out_dir.mkdir(parents=True, exist_ok=True)
     registry_path = out_dir / REGISTRY_FILENAME
     registry = _load_registry(registry_path)
+    # Cumulative summary: this pass appends to whatever earlier walls produced.
+    summary_path = out_dir / SUMMARY_FILENAME
+    previous = _load_registry(summary_path)
+    all_entries = previous.get("entries", []) if isinstance(previous, dict) else []
 
     files = find_scan_files(incoming)
     new_files = [f for f in files if _registry_key(f) not in registry]
@@ -370,6 +374,13 @@ def process_incoming(incoming, manifest_path, out_dir, weights_path,
             "key": entry["key"], "associated": entry["associated"],
             "out_dir": entry["out_dir"], "errors": entry["errors"],
         }
+        # Registry and summary are written together, per scan: a run that is
+        # killed (or a state left) between two scans must not leave a scan
+        # marked processed, and so never offered again, yet missing from the
+        # summary the NO_DRILL constraints are read from.
+        all_entries.append(entry)
+        with open(summary_path, "w") as handle:
+            json.dump({"entries": all_entries}, handle, indent=2)
         with open(registry_path, "w") as handle:
             json.dump(registry, handle, indent=2)
 
@@ -386,13 +397,11 @@ def process_incoming(incoming, manifest_path, out_dir, weights_path,
         "n_failed": sum(1 for e in entries if e["errors"]),
         "hyperbolae_skipped": hyperbolae_skipped,
         "entries": entries,
-        "summary_json": str(out_dir / SUMMARY_FILENAME),
+        "summary_json": str(summary_path),
     }
-    # Cumulative summary: append this pass to whatever earlier walls produced.
-    previous = _load_registry(out_dir / SUMMARY_FILENAME)
-    all_entries = (previous.get("entries", []) if isinstance(previous, dict) else []) + entries
-    with open(out_dir / SUMMARY_FILENAME, "w") as handle:
-        json.dump({"entries": all_entries}, handle, indent=2)
+    if not entries and not summary_path.is_file():
+        with open(summary_path, "w") as handle:
+            json.dump({"entries": all_entries}, handle, indent=2)
     return result
 
 
