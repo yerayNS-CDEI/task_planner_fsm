@@ -124,7 +124,7 @@ from scipy.signal import savgol_filter
 
 # Columnas que, si existen en el CSV, se consideran metadatos (no features).
 # Se ignoran automáticamente a la hora de predecir.
-COLUMNAS_METADATO_CANDIDATAS = {"Date", "Time", "Label", "Class", "Counter"}
+COLUMNAS_METADATO_CANDIDATAS = {"Measure Type", "Date", "Time", "Counter", "Label", "Class"}
 
 # Mapeo de clase -> índice usado por este modelo (confirmado por el usuario).
 # Se usa como valor por defecto cuando el modelo solo predice índices
@@ -541,10 +541,10 @@ def obtener_features_desde_wl_guardado(wl_guardado, columnas_csv, tolerancia=1e-
 
     if faltantes:
         print(
-            "AVISO: el CSV no contiene todas las longitudes de onda "
-            f"guardadas en el modelo; faltan {len(faltantes)} bandas, por "
-            f"ejemplo: {[round(f, 2) for f in faltantes[:5]]}. Se ignora el "
-            "wl guardado y se recalculan las features por nombre de columna.",
+            "AVISO: el CSV no está en la misma rejilla de bandas que el "
+            f"entrenamiento ({len(faltantes)} de {len(wl_guardado)} bandas no "
+            "coinciden exactamente). Se usarán las bandas nativas del CSV y "
+            "se reproyectarán después a la rejilla del modelo.",
             file=sys.stderr,
         )
         return None, None
@@ -693,6 +693,55 @@ def obtener_nombres_clases(modelo, label_encoder, mapeo_clases, n_clases):
 # PIPELINE PRINCIPAL: filtro de calidad + predicción
 # ─────────────────────────────────────────────────────────────────────────
 
+def remuestrear_a_grid_entrenamiento(X, wl_origen, wl_destino):
+    """
+    Reproyecta los espectros de la rejilla de longitudes de onda del CSV
+    (wl_origen) a la rejilla EXACTA con la que se entrenó el modelo
+    (wl_destino), mediante interpolación lineal.
+
+    Esto hace falta porque distintos equipos/calibraciones del mismo sensor
+    no entregan exactamente las mismas bandas: p.ej. el CSV puede muestrear
+    el VIS en 401.32, 403.22, 405.11... mientras que el entrenamiento usó
+    400.43, 402.26, 404.09... Aunque ambos cubran 400-1650 nm, ni el número
+    de bandas ni sus posiciones coinciden, así que no se pueden emparejar
+    columna a columna: hay que interpolar.
+
+    La interpolación se hace POR SEGMENTO de sensor (VIS y SWIR por
+    separado), igual que el resto del preprocesado, para no interpolar
+    nunca a través del hueco entre sensores. Cualquier banda de destino que
+    caiga fuera del rango cubierto por su segmento de origen se rellena con
+    el valor del extremo más cercano de ese segmento (sin extrapolar).
+    """
+    X = np.asarray(X, dtype=float)
+    wl_origen = np.asarray(wl_origen, dtype=float)
+    wl_destino = np.asarray(wl_destino, dtype=float)
+
+    seg_origen = sensor_segments(wl_origen)
+    seg_destino = sensor_segments(wl_destino)
+
+    if len(seg_origen) != len(seg_destino):
+        sys.exit(
+            "ERROR: el CSV tiene "
+            f"{len(seg_origen)} segmento(s) de sensor y el modelo se entrenó "
+            f"con {len(seg_destino)}. No se puede reproyectar el espectro de "
+            "forma fiable. Revisa que el CSV cubra el mismo rango VIS+SWIR."
+        )
+
+    out = np.empty((X.shape[0], len(wl_destino)), dtype=float)
+    for (so, eo), (sd, ed) in zip(seg_origen, seg_destino):
+        wl_o = wl_origen[so:eo]
+        wl_d = wl_destino[sd:ed]
+        bloque = X[:, so:eo]
+        for k in range(X.shape[0]):
+            fila = bloque[k]
+            finitos = np.isfinite(fila)
+            if finitos.sum() < 2:
+                out[k, sd:ed] = np.nan
+                continue
+            out[k, sd:ed] = np.interp(wl_d, wl_o[finitos], fila[finitos])
+    return out
+
+
 def predecir(csv_path: str, model_path: str, confianza_minima: float,
              output_path: str = None, columnas_a_conservar=None,
              label_encoder_path: str = None, class_mapping_arg: str = None,
@@ -766,6 +815,27 @@ def predecir(csv_path: str, model_path: str, confianza_minima: float,
     idx_validas = np.where(valid_mask)[0]
     if len(idx_validas) > 0:
         X_validas = X[idx_validas]
+
+        # ── Reproyección a la rejilla de bandas del entrenamiento ────────────
+        # El filtro de calidad se aplica sobre la rejilla nativa del CSV (que
+        # es donde los huecos/dropouts del sensor tienen sentido). Pero el
+        # modelo espera exactamente las bandas de wl_guardado. Si el CSV
+        # viene en otra rejilla (otra calibración del equipo), se interpola
+        # aquí, por segmento, antes de calcular SNV+D1.
+        if wl_guardado is not None and wl is not None:
+            wl_modelo = np.asarray(wl_guardado, dtype=float)
+            if len(wl) != len(wl_modelo) or not np.allclose(wl, wl_modelo, atol=1e-6):
+                print(
+                    f"AVISO: el CSV tiene {len(wl)} bandas en 400-1650 nm y el "
+                    f"modelo se entrenó con {len(wl_modelo)}, o las posiciones "
+                    "no coinciden. Se reproyectan los espectros a la rejilla "
+                    "de entrenamiento por interpolación lineal (por segmento).",
+                    file=sys.stderr,
+                )
+                X_validas = remuestrear_a_grid_entrenamiento(
+                    X_validas, wl, wl_modelo
+                )
+                wl = wl_modelo
 
         # ── Transformación de features SNV+D1 (mismo pipeline del entrenamiento) ──
         if aplicar_transform and wl is not None:
@@ -858,10 +928,10 @@ def main():
                          help="Ruta donde guardar el CSV de resultados. "
                               "Si no se indica, solo se imprime por pantalla.")
     parser.add_argument("--keep-columns", nargs="*",
-                         default=["Date", "Time", "Label", "Class", "Counter"],
+                         default=["Measure Type", "Date", "Time", "Counter", "Label", "Class"],
                          help="Columnas originales del CSV a mantener en el "
                               "resultado como referencia, si existen "
-                              "(por defecto: Date Time Label Class).")
+                              "(por defecto: Measure Type, Date, Time, Counter, Label, Class).")
     parser.add_argument("--skip-quality-filter", action="store_true",
                          help="Desactiva el filtro de calidad espectral: "
                               "clasifica todas las filas del CSV tal cual, "
