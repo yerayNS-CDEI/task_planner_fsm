@@ -1090,11 +1090,16 @@ class RobotFSMNode(Node):
 
         The state reads everything from disk: the hyperspectral session
         (``hyperspectral_session_dir``), the GPR line manifest that shares its
-        stamp, and whatever GP8800 exports sit in ``data/raw/gpr/incoming``.
-        Unless a session is named explicitly (``-p hyperspectral_session_dir:=...``)
+        stamp with its own exports, and whatever GP8800 exports sit in the
+        shared ``data/raw/gpr/incoming``. Unless a session is named explicitly
+        (``-p hyperspectral_session_dir:=...`` or ``-p sensor_session_id:=...``)
         the most recent one under ``data/raw/hyperspectral`` is taken, which is
         what "process what we just recorded" means after a bench run or a
-        mission that was cut short. Results land in
+        mission that was cut short. With no hyperspectral record at all -- a
+        sweep with the camera off, so GPR only -- the most recent
+        ``data/raw/gpr/session_<stamp>/`` with a manifest is taken instead;
+        otherwise the fresh stamp minted for the run would point the GPR phase
+        at an empty folder. Results land in
         ``data/processed/session_<same stamp>/``.
 
         No robot: no stack is launched, and the run ends in Finished rather
@@ -1104,20 +1109,44 @@ class RobotFSMNode(Node):
         when re-processing).
         """
         explicit = self.ctx.get("hyperspectral_session_dir")
+        explicit_id = self.ctx.get("sensor_session_id")
         if explicit:
             session = os.path.expanduser(str(explicit))
             if not os.path.isdir(session):
                 self._abort_bootstrap(f"hyperspectral_session_dir '{session}' does not exist")
             self.get_logger().info(f"[FSM Bootstrap] Processing the session given: {session}")
+        elif explicit_id not in (None, ""):
+            # A GPR-only session named by its stamp (or its folder's name, for a
+            # record renamed by hand): the manifest and the exports live under it.
+            self.ctx["sensor_session_id"] = str(explicit_id)
+            gpr_dir = sensor_paths.gpr_session_dir(self.ctx)
+            if not gpr_dir.is_dir():
+                self._abort_bootstrap(f"sensor_session_id '{explicit_id}': {gpr_dir} does not exist")
+            self.get_logger().info(
+                f"[FSM Bootstrap] Processing the GPR session given: {gpr_dir} "
+                f"(no hyperspectral record; the GPR half only)")
         else:
             latest = sensor_paths.latest_raw_session_dir(self.ctx)
             if latest is None:
-                self.get_logger().warn(
-                    f"[FSM Bootstrap] No recorded hyperspectral session under "
-                    f"{sensor_paths.raw_hyperspectral_root(self.ctx)}; only GPR exports "
-                    f"in the shared inbox {sensor_paths.gpr_incoming_dir(self.ctx)} will "
-                    f"be processed."
-                )
+                latest_gpr = sensor_paths.latest_gpr_session_dir(self.ctx)
+                if latest_gpr is None:
+                    self.get_logger().warn(
+                        f"[FSM Bootstrap] No recorded session under "
+                        f"{sensor_paths.raw_hyperspectral_root(self.ctx)} or "
+                        f"{sensor_paths.raw_gpr_root(self.ctx)}; only GPR exports "
+                        f"in the shared inbox {sensor_paths.gpr_incoming_dir(self.ctx)} will "
+                        f"be processed."
+                    )
+                else:
+                    self.ctx["sensor_session_id"] = sensor_paths.session_stamp_of(latest_gpr)
+                    others = len(sensor_paths.gpr_session_dirs(self.ctx)) - 1
+                    self.get_logger().info(
+                        f"[FSM Bootstrap] No hyperspectral record; processing the latest "
+                        f"GPR session: {latest_gpr}"
+                        + (f" ({others} other GPR session(s) left alone; name one with "
+                           f"-p sensor_session_id:=<stamp> to process it instead)"
+                           if others else "")
+                    )
             else:
                 session = str(latest)
                 self.ctx["hyperspectral_session_dir"] = session

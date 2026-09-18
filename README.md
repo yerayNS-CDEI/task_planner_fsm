@@ -627,15 +627,27 @@ ros2 run task_planner_fsm fsm_node --initial-state SensorDataProcessing
 # a specific session instead of the latest one
 ros2 run task_planner_fsm fsm_node --initial-state SensorDataProcessing \
   --ros-args -p hyperspectral_session_dir:=data/raw/hyperspectral/session_20260915_142215
+# a GPR-only session (camera off), by its stamp or its folder name under data/raw/gpr
+ros2 run task_planner_fsm fsm_node --initial-state SensorDataProcessing \
+  --ros-args -p sensor_session_id:=20260917_121753
 ```
 
-Also available from the arm_control UI's *Initial State* combo. Starting at
+Also available from the arm_control UI's *Initial State* combo, whose
+*Session* selector beside it lists the recorded sessions (`hsi` and `gpr`) and
+passes the chosen one as the same parameter override; *latest (auto)* leaves
+the choice to fsm_node. Starting at
 `SensorDataProcessing` is an **offline run**: no robot stack is launched and
 nothing prompts for walls. The state processes the **most recent**
 `data/raw/hyperspectral/session_<stamp>/` (or the one named with
-`hyperspectral_session_dir`), the GPR line manifest sharing that stamp, and
-any GP8800 exports in `data/raw/gpr/incoming/`; results land in
-`data/processed/session_<stamp>/`. POKEYE targets are clustered for every wall
+`hyperspectral_session_dir`), the GPR line manifest and exports sharing that
+stamp under `data/raw/gpr/session_<stamp>/`, and any GP8800 exports in the
+shared `data/raw/gpr/incoming/`; results land in
+`data/processed/session_<stamp>/`. When there is **no hyperspectral record at
+all** (a sweep with the camera off, so GPR only) the most recent
+`data/raw/gpr/session_<stamp>/` with a manifest is taken instead — most recent
+by the manifest's modification time, so a session folder renamed by hand
+(`session_wheel`) still qualifies; `-p sensor_session_id:=<stamp>` names one
+explicitly. POKEYE targets are clustered for every wall
 in the record. The run then ends in `Finished` (`fsm_stop_after` defaults to
 `SensorDataProcessing` here; `--stop-after SendDataToPokeye` continues to the
 POKEYE hand-off instead), and the legacy simulation mock is disabled so a real
@@ -1366,7 +1378,9 @@ classifier bundle was pickled with numpy ≥ 2; on ROS Humble's numpy 1.24 the
 adapter aliases `numpy._core` so it still loads (`sensors/__init__.py`).
 
 **Offline**: `ros2 run task_planner_fsm process_sensor_session <stamp> --wall 2`
-runs the same chain on a recorded session (re-processing, Jetson timing);
+runs the same chain on a recorded session (re-processing, Jetson timing); the
+stamp is looked up under `data/raw/hyperspectral` first, then `data/raw/gpr`,
+and a GPR-only session skips the reflectance and classification steps;
 `--no-drill-tolerance`, `--scanned-line-tolerance`, `--block-on-unlocated`
 and `--no-gpr-coverage-required` set the drilling constraint policy there.
 

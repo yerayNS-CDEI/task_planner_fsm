@@ -20,7 +20,10 @@ raw/
   gpr/session_<stamp>/gpr_lines.jsonl
                                    one row per GPR line scanned (segment geometry,
                                    timestamps, line status, export outcome) written
-                                   by ScanWall
+                                   by ScanWall. With no hyperspectral session on
+                                   disk, the offline run picks the GPR session with
+                                   the newest manifest (-p sensor_session_id:=<stamp>
+                                   names one; the folder may be renamed by hand)
   gpr/session_<stamp>/exports/     the raw export zips, one per line (<key>_<stamp>.zip)
   gpr/session_<stamp>/incoming/    the zips unpacked: <key>_<name>.sgy/.csv/.json --
                                    what SensorDataProcessing runs on for this mission

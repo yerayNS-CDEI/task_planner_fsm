@@ -77,8 +77,7 @@ def session_id(ctx=None) -> str:
         return str(existing)
     hs_dir = ctx.get("hyperspectral_session_dir")
     if hs_dir:
-        name = Path(str(hs_dir)).name
-        stamp = name[len("session_"):] if name.startswith("session_") else name
+        stamp = session_stamp_of(hs_dir)
     else:
         stamp = new_session_stamp()
     ctx["sensor_session_id"] = stamp
@@ -110,6 +109,43 @@ def latest_raw_session_dir(ctx=None):
     """The most recent recorded session, or None when there is none yet."""
     sessions = raw_session_dirs(ctx)
     return sessions[-1] if sessions else None
+
+
+def raw_gpr_root(ctx=None) -> Path:
+    """Directory holding the ``session_<stamp>`` GPR records (and the shared inbox)."""
+    return data_dir(ctx) / "raw" / "gpr"
+
+
+def gpr_session_dirs(ctx=None):
+    """Every ``session_<stamp>`` under the raw GPR root, oldest first by name.
+
+    Like ``raw_session_dirs`` but for the record ScanWall writes on its own
+    (manifest, export zips, unpacked scans); the shared ``incoming/`` inbox is
+    not a session. A session may have been renamed by hand (``session_wheel``),
+    so a non-stamp name is still a session -- it just sorts by name.
+    """
+    root = raw_gpr_root(ctx)
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith("session_"))
+
+
+def latest_gpr_session_dir(ctx=None):
+    """The most recent GPR-only record (a sweep with the camera off), or None.
+
+    "Most recent" by manifest modification time rather than by name, because a
+    hand-renamed session no longer sorts chronologically.
+    """
+    with_manifest = [p for p in gpr_session_dirs(ctx) if (p / GPR_MANIFEST_FILENAME).is_file()]
+    if not with_manifest:
+        return None
+    return max(with_manifest, key=lambda p: (p / GPR_MANIFEST_FILENAME).stat().st_mtime)
+
+
+def session_stamp_of(session_dir) -> str:
+    """``session_<stamp>`` -> ``<stamp>`` (a name without the prefix is kept)."""
+    name = Path(str(session_dir)).name
+    return name[len("session_"):] if name.startswith("session_") else name
 
 
 def gpr_incoming_dir(ctx=None) -> Path:

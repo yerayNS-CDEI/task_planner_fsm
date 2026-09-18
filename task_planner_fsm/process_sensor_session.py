@@ -9,9 +9,13 @@ sensor stack on a machine without the robot, and for the Jetson timing work.
     ros2 run task_planner_fsm process_sensor_session 20260914_153000
     ros2 run task_planner_fsm process_sensor_session data/raw/hyperspectral/session_20260914_153000 --wall 2
     ros2 run task_planner_fsm process_sensor_session <session> --skip-gpr --radius 0.2
+    ros2 run task_planner_fsm process_sensor_session wheel      # GPR only: data/raw/gpr/session_wheel
 
-Results land in ``data/processed/session_<stamp>/`` exactly as they would
-during a mission (``--out`` overrides).
+A stamp is looked up under ``data/raw/hyperspectral`` first and then under
+``data/raw/gpr``; a GPR-only session (a sweep with the camera off) has no
+hyperspectral record, so the reflectance and classification steps are skipped
+and only the GPR half runs. Results land in ``data/processed/session_<stamp>/``
+exactly as they would during a mission (``--out`` overrides).
 """
 
 import argparse
@@ -46,15 +50,28 @@ class _Logger:
 
 
 def _resolve_session(arg, ctx):
-    """Accept a stamp, ``session_<stamp>`` or a path to the raw session dir."""
+    """Accept a stamp, ``session_<stamp>`` or a path to a raw session dir.
+
+    Returns ``(hyperspectral_dir | None, stamp)``. A stamp is looked up under
+    the hyperspectral root first, then the GPR root; a path under either root
+    is taken as given. A session found only under ``data/raw/gpr`` has no
+    hyperspectral record, so the first element is None and only the GPR half
+    runs (``paths.gpr_session_dir`` finds the manifest and exports by stamp).
+    """
     p = Path(os.path.expanduser(arg))
     if p.is_dir():
-        return p
+        stamp = paths.session_stamp_of(p)
+        is_gpr = p.resolve().parent == paths.raw_gpr_root(ctx).resolve()
+        return (None if is_gpr else p), stamp
     name = arg if arg.startswith("session_") else f"session_{arg}"
     candidate = paths.raw_hyperspectral_root(ctx) / name
     if candidate.is_dir():
-        return candidate
-    raise SystemExit(f"session not found: {arg} (looked in {paths.raw_hyperspectral_root(ctx)})")
+        return candidate, paths.session_stamp_of(candidate)
+    candidate = paths.raw_gpr_root(ctx) / name
+    if candidate.is_dir():
+        return None, paths.session_stamp_of(candidate)
+    raise SystemExit(f"session not found: {arg} (looked in {paths.raw_hyperspectral_root(ctx)} "
+                     f"and {paths.raw_gpr_root(ctx)})")
 
 
 def main(argv=None):
@@ -108,34 +125,49 @@ def main(argv=None):
         if value is not None:
             ctx[key] = value
 
-    session_dir = _resolve_session(args.session, ctx)
-    ctx["hyperspectral_session_dir"] = str(session_dir)
-    name = session_dir.name
-    ctx["sensor_session_id"] = name[len("session_"):] if name.startswith("session_") else name
-    log.info(f"session {session_dir} -> {paths.processed_dir(ctx)}")
+    session_dir, stamp = _resolve_session(args.session, ctx)
+    ctx["sensor_session_id"] = stamp
+    if session_dir is not None:
+        ctx["hyperspectral_session_dir"] = str(session_dir)
+        log.info(f"session {session_dir} -> {paths.processed_dir(ctx)}")
+    else:
+        log.info(f"session {paths.gpr_session_dir(ctx)} (GPR only, no hyperspectral record) "
+                 f"-> {paths.processed_dir(ctx)}")
 
     # 1) reflectance
-    if args.skip_reflectance and (session_dir / hp.REFLECTANCE_FILENAME).is_file():
+    if session_dir is None:
+        log.info("reflectance: skipped (no hyperspectral record)")
+    elif args.skip_reflectance and (session_dir / hp.REFLECTANCE_FILENAME).is_file():
         log.info("reflectance: reusing existing reflectance.csv")
     else:
         t0 = time.monotonic()
-        result = hp.process_session(str(session_dir), predict_fn=None, logger=log)
-        log.info(f"reflectance: {result['processed_samples']} samples in {time.monotonic() - t0:.1f} s")
+        try:
+            result = hp.process_session(str(session_dir), predict_fn=None, logger=log)
+        except FileNotFoundError as exc:
+            log.warn(f"reflectance: skipped ({exc})")
+        else:
+            log.info(f"reflectance: {result['processed_samples']} samples in "
+                     f"{time.monotonic() - t0:.1f} s")
 
     # 2) classification
     samples = []
     threshold = args.threshold
-    try:
-        t0 = time.monotonic()
-        result = hsi.classify_session(session_dir, paths.hsi_results_dir(ctx),
-                                      paths.hsi_model_path(ctx), threshold, logger=log,
-                                      device=args.hsi_device)
-        samples = result["samples"]
-        log.info(f"hsi: {result['n_classified']} spectra classified in {time.monotonic() - t0:.1f} s")
-        for wall, bucket in sorted(result["by_wall"].items(), key=lambda kv: (kv[0] is None, kv[0])):
-            log.info("  " + hsi.describe_wall(wall, bucket))
-    except (VendorUnavailable, FileNotFoundError) as exc:
-        log.warn(f"hsi: skipped ({exc})")
+    if session_dir is None:
+        log.info("hsi: skipped (no hyperspectral record)")
+    else:
+        try:
+            t0 = time.monotonic()
+            result = hsi.classify_session(session_dir, paths.hsi_results_dir(ctx),
+                                          paths.hsi_model_path(ctx), threshold, logger=log,
+                                          device=args.hsi_device)
+            samples = result["samples"]
+            log.info(f"hsi: {result['n_classified']} spectra classified in "
+                     f"{time.monotonic() - t0:.1f} s")
+            for wall, bucket in sorted(result["by_wall"].items(),
+                                       key=lambda kv: (kv[0] is None, kv[0])):
+                log.info("  " + hsi.describe_wall(wall, bucket))
+        except (VendorUnavailable, FileNotFoundError) as exc:
+            log.warn(f"hsi: skipped ({exc})")
 
     # 3) GPR
     if not args.skip_gpr:
