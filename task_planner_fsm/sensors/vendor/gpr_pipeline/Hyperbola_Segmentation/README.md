@@ -58,17 +58,16 @@ Tahzeeb's supplied `config.yaml` is preserved unchanged under `tahzeeb_original/
 Runtime copies override only file paths and scan-specific calibration such as scan length,
 actual rendered image dimensions, the corrected time window and εr=6.
 
-## Gains and consensus
+## Gain configuration
 
-Default gains are `0, 5, 10, ..., 45 dB`. Low gains are allowed to produce no detection.
-They do not veto a candidate. The initial acceptance rule is that the same physical
-hyperbola survives Tahzeeb's processing in at least **3 different gains**.
+The current demo configuration uses **one gain only: 40 dB**. Consequently
+`min_gain_support: 1`, so the retained cross-gain layer behaves as a passthrough after
+Tahzeeb's per-B-scan post-processing. The multi-gain architecture remains in the code so
+it can be re-enabled later without redesigning the pipeline.
 
-Initial association tolerances are ±6 cm horizontally and ±4 cm in depth. They are
-configurable and should be tuned on real demo data rather than treated as validated
-physical constants.
-
-`gain_support` is a **robustness-to-preprocessing indicator**, not statistical replication.
+If multiple gains are re-enabled, the existing association tolerances are ±6 cm
+horizontally and ±4 cm in depth. These are configurable integration parameters, not
+validated physical constants.
 
 ## Primary software interface
 
@@ -171,3 +170,36 @@ estimation is wanted, request that exact script rather than recreating it.
 In this combined DISCOVER package, GPRTools is not duplicated inside this folder. The hyperbola integration imports it from `../GPRTools`.
 
 The demo configuration is currently set to a single `40 dB` gain (`min_gain_support: 1`).
+
+## v4 recursive batch mode
+
+The CLI now accepts either one SEGY file or a directory:
+
+```bash
+python run_gpr_pipeline.py "path/to/scan.sgy"
+python run_gpr_pipeline.py "path/to/acquisitions" --output-dir "path/to/results"
+```
+
+For a directory, all `.sgy` / `.segy` files are found recursively. Each one must have its
+same-basename `.csv` sidecar. The relative input directory structure is preserved beneath
+the batch output root. Processing continues after a missing sidecar or per-scan failure.
+
+Batch-level files:
+
+```text
+batch_summary.csv
+batch_summary.json
+```
+
+Python API:
+
+```python
+from gpr_integration import run_gpr_batch
+summary = run_gpr_batch("path/to/acquisitions", output_root="path/to/results")
+```
+
+The original `run_gpr_pipeline()` single-scan API is unchanged.
+
+**Current v4 demo setting:** one gain only, `40 dB`, with `min_gain_support: 1`. Older
+multi-gain text above describes the retained scalable architecture, but no cross-gain vote
+is currently required in the demo configuration.

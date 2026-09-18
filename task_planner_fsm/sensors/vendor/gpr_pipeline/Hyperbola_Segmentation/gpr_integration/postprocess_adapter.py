@@ -13,6 +13,38 @@ _OBJECT_COLUMNS = [
     "depth_cm", "confidence", "arc_hw_m",
 ]
 
+_CONSOLIDATED_COLUMNS = [
+    "element", "source", "gx1", "gy1", "gx2", "gy2",
+    "confidence", "width_px",
+]
+
+
+def _empty_consolidated() -> pd.DataFrame:
+    """Return the schema expected from Tahzeeb step 01 for a valid no-detection scan."""
+    return pd.DataFrame(columns=_CONSOLIDATED_COLUMNS)
+
+
+def _consolidate_safely(step1: Any, runtime_cfg: dict[str, Any]) -> tuple[pd.DataFrame, str | None]:
+    """Run Tahzeeb step 01 while treating an empty candidate set as a valid result.
+
+    Tahzeeb's original ``01_consolidate.nms`` calls ``pd.concat`` on the list of
+    per-element detections. If the model produced no detections, or if all raw
+    detections were rejected by the configured filters, that list is empty and
+    pandas raises ``ValueError: No objects to concatenate``. For the robot pipeline
+    this is not an exceptional condition: it simply means that this scan contains
+    no valid hyperbola candidates.
+
+    The original Tahzeeb source is deliberately left unchanged. This integration
+    wrapper converts only that specific empty-set failure into an empty, correctly
+    shaped consolidated dataframe. Any other exception is re-raised.
+    """
+    try:
+        return step1.consolidate(runtime_cfg), None
+    except ValueError as exc:
+        if "No objects to concatenate" not in str(exc):
+            raise
+        return _empty_consolidated(), "NO_VALID_DETECTIONS_AFTER_CONSOLIDATION_FILTERS"
+
 
 def _runtime_config(
     base_cfg: dict[str, Any],
@@ -81,7 +113,7 @@ def run_postprocessing_one_gain(
     step2b = load_module_from_path("tahzeeb_02b_dedup", tahzeeb_dir / "02b_dedup.py", tahzeeb_dir)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    cons = step1.consolidate(runtime_cfg)
+    cons, empty_reason = _consolidate_safely(step1, runtime_cfg)
     cons.to_csv(output_dir / "consolidated.csv", index=False)
 
     if cons.empty:
@@ -109,6 +141,7 @@ def run_postprocessing_one_gain(
         "n_objects_before_dedup": int(len(objects)),
         "n_objects_after_dedup": int(len(kept)),
         "n_removed_by_dedup": int(len(removed)),
+        "empty_detection_reason": empty_reason,
         "calibration": {
             "scan_distance_m": float(scan_distance_m),
             "time_window_ns_after_time_zero": float(processed_time_window_ns),

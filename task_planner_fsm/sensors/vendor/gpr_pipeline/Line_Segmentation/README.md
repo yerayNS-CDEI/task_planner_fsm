@@ -62,7 +62,7 @@ Important interpretation:
 ## Shared folder layout
 
 ```text
-GPR_DISCOVER_robot_pipeline_v2_1/
+GPR_DISCOVER_PIPELINE_v4/
 ├── GPRTools/
 ├── Hyperbola_Segmentation/
 └── Line_Segmentation/
@@ -133,3 +133,32 @@ outputs/<scan>/
 ```
 
 `results_finales.csv` now exposes `posicion_lineas_relativa` in the **time-zero-rebased coordinate system**. Berta's original coordinate is kept separately as `posicion_lineas_relativa_original_berta`.
+
+## v4 recursive batch mode
+
+The CLI now accepts either one SEGY file or a directory:
+
+```bash
+python run_line_pipeline.py "path/to/scan.sgy"
+python run_line_pipeline.py "path/to/acquisitions" --output "path/to/results"
+```
+
+For directory input, all `.sgy` / `.segy` files are found recursively. Each scan needs its
+same-basename `.csv` sidecar. The folder hierarchy is preserved under the batch output
+root, and one failed/missing scan does not stop the rest.
+
+Batch-level files:
+
+```text
+batch_summary.csv
+batch_summary.json
+```
+
+Python API:
+
+```python
+from line_integration import run_line_batch
+summary = run_line_batch("path/to/acquisitions", output_root="path/to/results")
+```
+
+The original `run_line_pipeline()` single-scan API remains available.

@@ -425,7 +425,7 @@ def run_line_pipeline(
     _json_dump(result, output_dir / "line_result.json")
 
     manifest = {
-        "pipeline": "DISCOVER_GPR_Line_Segmentation_v2.1",
+        "pipeline": "DISCOVER_GPR_Line_Segmentation_v4",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "input": str(input_sgy),
         "output_dir": str(output_dir),

@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 # GPRTools is shared at the parent project level:
-# GPR_DISCOVER_robot_pipeline/GPRTools
+# GPR_DISCOVER_PIPELINE_v4/GPRTools
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))

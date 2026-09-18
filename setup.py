@@ -13,7 +13,7 @@ setup(
     # install; with --symlink-install the source tree is used in place.
     package_data={
         'task_planner_fsm.sensors': ['vendor/VERSIONS.md'],
-        'task_planner_fsm.sensors.vendor.gpr_pipeline': ['*.md'],
+        'task_planner_fsm.sensors.vendor.gpr_pipeline': ['*.md', '*.txt'],
         'task_planner_fsm.sensors.vendor.gpr_pipeline.GPRTools': ['*.md'],
         'task_planner_fsm.sensors.vendor.gpr_pipeline.Hyperbola_Segmentation': ['*.md', '*.txt'],
         'task_planner_fsm.sensors.vendor.gpr_pipeline.Hyperbola_Segmentation.gpr_integration': ['*.yaml'],
