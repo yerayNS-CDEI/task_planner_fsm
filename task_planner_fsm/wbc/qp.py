@@ -242,25 +242,37 @@ def _solve_osqp(A, b, lb, ub, A_ineq, ineq_lo, ineq_hi, ridge, settings):
         lower.append(np.atleast_1d(np.asarray(ineq_lo, dtype=float)))
         upper.append(np.atleast_1d(np.asarray(ineq_hi, dtype=float)))
 
-    problem = osqp.OSQP()
     # Only settings that exist in both the 0.6.x and 1.x OSQP APIs (the polish
     # flag was renamed, so it is left at whatever the installed version defaults
     # to rather than pinned here).
     defaults = {"verbose": False, "eps_abs": 1e-6, "eps_rel": 1e-6, "max_iter": 4000}
     defaults.update(settings or {})
-    try:
-        problem.setup(P=sp.csc_matrix(np.triu(P)), q=q,
-                      A=sp.csc_matrix(np.vstack(rows)),
-                      l=np.concatenate(lower), u=np.concatenate(upper),
-                      **defaults)
-        result = problem.solve()
-    except Exception:  # pragma: no cover - setup/solve blowups fall through
-        return None
-    status = str(result.info.status)
-    if result.x is None or not np.all(np.isfinite(result.x)):
-        return None
-    if "solved" not in status:   # covers "solved inaccurate"
-        return None
-    # OSQP satisfies the box only to solver tolerance; clip so a command can
-    # never leave the actuator envelope by a hair.
-    return np.clip(np.asarray(result.x, dtype=float), lb, ub), status
+    # Two attempts: as configured, then with OSQP's Ruiz equilibration OFF.
+    # The problem mixes weights from 1e-4 (damping) to 1e6 (a slack), and the
+    # equilibration usually earns its keep on that — but with the base's
+    # travel and yaw both pinned (equalities written as lb == ub) it can send
+    # the ADMM iteration the wrong way: measured on the obstacle-cap scenario,
+    # one problem in a hundred ran out its 4000 iterations scaled and solved
+    # in 425 unscaled, with identical counts on the other 98. A retry costs a
+    # fraction of a millisecond and only ever runs when the first attempt has
+    # already failed, which the caller would otherwise report as infeasible
+    # and stop the robot for.
+    for attempt in (defaults, {**defaults, "scaling": 0}):
+        try:
+            problem = osqp.OSQP()
+            problem.setup(P=sp.csc_matrix(np.triu(P)), q=q,
+                          A=sp.csc_matrix(np.vstack(rows)),
+                          l=np.concatenate(lower), u=np.concatenate(upper),
+                          **attempt)
+            result = problem.solve()
+        except Exception:  # pragma: no cover - setup/solve blowups fall through
+            continue
+        status = str(result.info.status)
+        if result.x is None or not np.all(np.isfinite(result.x)):
+            continue
+        if "solved" not in status:   # covers "solved inaccurate"
+            continue
+        # OSQP satisfies the box only to solver tolerance; clip so a command can
+        # never leave the actuator envelope by a hair.
+        return np.clip(np.asarray(result.x, dtype=float), lb, ub), status
+    return None

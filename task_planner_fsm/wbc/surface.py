@@ -26,6 +26,8 @@ Sensor array convention (matches ``arduino_sensors[_sim].py`` ``distance_sensors
     ToF:        S1(-.152, .17)  S2(.152, .17)  S3(0, -.172)
 """
 
+import math
+
 import numpy as np
 
 # Sensor (x, y) in the plate frame, metres, in publish order.
@@ -107,38 +109,88 @@ def fit_wall_plane(distances, huber_k=1.5, iterations=3):
 
 
 class SurfaceEstimator:
-    """Per-cycle surface estimate with an EMA low-pass on the normal.
+    """The sensed surface, low-passed on the normal, in the WORLD frame.
 
     Filtering the FIT (not the raw ranges) is what keeps the plate from chasing
-    ultrasonic noise; ``ema_alpha`` near 0 is smooth and laggy, near 1 is
-    responsive and twitchy.
+    ultrasonic noise. Two things about HOW it is filtered, both learned on
+    2026-09-15:
+
+    Once per range frame, with a time constant in seconds. The ranges arrive at
+    ~4 Hz and the control loop that reads them runs at 13-50 Hz; folding the
+    same frame in on every cycle made the filter's strength a function of the
+    loop rate — 66% of the way to each new frame at 13 Hz, 99% at the 50 Hz the
+    loop is built for, i.e. no filter at all. ``update`` now only folds a frame
+    with a NEW stamp, and weighs it by the time since the previous one.
+
+    In the world frame, not the plate's. The wall does not move; the plate
+    does, and it moves BECAUSE of this estimate. A normal filtered in plate
+    coordinates lags the plate's own rotation, so the alignment loop was
+    chasing a target that its last correction had shifted — delay inside the
+    feedback path. Rotating each fit into the world before filtering leaves
+    the delay only on the wall, where it costs nothing.
+
+    ``distance`` is the latest fit's perpendicular gap at the plate centre,
+    unfiltered: the press has its own distance filter and the approach
+    schedule wants the freshest number it can get.
     """
 
-    def __init__(self, ema_alpha=0.3):
-        self.ema_alpha = float(ema_alpha)
-        self.normal_plate = np.array([0.0, 0.0, 1.0])
+    def __init__(self, tau=0.5):
+        self.tau = float(tau)           # seconds
+        self.normal_world = None
         self.distance = None
         self.n_valid = 0
+        self._stamp = None
+        self._R_plate = np.eye(3)
 
     def reset(self):
-        self.normal_plate = np.array([0.0, 0.0, 1.0])
+        self.normal_world = None
         self.distance = None
         self.n_valid = 0
+        self._stamp = None
+        self._R_plate = np.eye(3)
 
-    def update(self, distances):
-        """Fold one ``/distance_sensors`` frame in. True when the estimate is usable."""
+    def update(self, distances, R_plate=None, stamp=None):
+        """Fold one ``/distance_sensors`` frame in. True when the estimate is usable.
+
+        ``R_plate`` is the plate's orientation in the world when the frame was
+        taken (identity if omitted, which makes the world the plate frame —
+        fine for a bench test, wrong for a moving plate). ``stamp`` is the
+        frame's time in seconds; a frame with the stamp already folded in is
+        NOT folded again, and the first frame is taken whole.
+        """
+        if stamp is not None and self._stamp is not None and stamp == self._stamp:
+            return self.normal_world is not None
         normal, distance, n_valid = fit_wall_plane(distances)
         self.n_valid = n_valid
         if normal is None:
             return False
-        filtered = self.ema_alpha * normal + (1.0 - self.ema_alpha) * self.normal_plate
-        self.normal_plate = filtered / np.linalg.norm(filtered)
+        R = np.eye(3) if R_plate is None else np.asarray(R_plate, dtype=float)
+        n_world = R @ normal
+        if self.normal_world is None or stamp is None or self._stamp is None or self.tau <= 0.0:
+            alpha = 1.0
+        else:
+            alpha = 1.0 - math.exp(-max(stamp - self._stamp, 0.0) / self.tau)
+        previous = n_world if self.normal_world is None else self.normal_world
+        filtered = alpha * n_world + (1.0 - alpha) * previous
+        self.normal_world = filtered / np.linalg.norm(filtered)
         self.distance = distance
+        self._stamp = stamp
+        self._R_plate = R
         return True
 
-    def tilt(self):
+    def normal_in(self, R_plate):
+        """The filtered surface normal seen from a plate with orientation ``R_plate``."""
+        return np.asarray(R_plate, dtype=float).T @ self.normal_world
+
+    @property
+    def normal_plate(self):
+        """The filtered normal in the plate frame of the LAST frame folded in."""
+        return self.normal_in(self._R_plate)
+
+    def tilt(self, R_plate=None):
         """Angle (rad) between the plate and the sensed surface. 0 = parallel."""
-        return float(np.arccos(np.clip(self.normal_plate[2], -1.0, 1.0)))
+        n = self.normal_plate if R_plate is None else self.normal_in(R_plate)
+        return float(np.arccos(np.clip(n[2], -1.0, 1.0)))
 
 
 def sweep_tangent(m_hat, sweep_dir):

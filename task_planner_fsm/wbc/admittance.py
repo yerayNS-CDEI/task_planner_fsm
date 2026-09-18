@@ -381,6 +381,15 @@ class AdmittancePress:
         return self.state == PRESS
 
     @property
+    def loaded(self):
+        """Over ``contact_force`` on the LAST update, plausible or not, latched
+        or not — the earliest sign there is of the wheel meeting something.
+        True throughout PRESS. The sweep uses it to stop rotating the plate
+        the moment it touches, without waiting for the dwell that arms the
+        base."""
+        return self.state == PRESS or self._loaded
+
+    @property
     def stalled(self):
         """Sat at the envelope in SEEK without ever feeling the wall.
 

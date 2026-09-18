@@ -81,21 +81,69 @@ def test_one_wild_reading_does_not_tip_the_plane():
 
 
 def test_the_estimator_filters_toward_the_truth():
-    estimator = SurfaceEstimator(ema_alpha=0.5)
+    estimator = SurfaceEstimator(tau=0.5)
     truth = np.array([0.2, 0.0, 1.0])
     truth /= np.linalg.norm(truth)
     ranges = synth_ranges(truth, 0.20)
-    for _ in range(20):
-        assert estimator.update(ranges)
+    for k in range(20):
+        assert estimator.update(ranges, stamp=0.25 * k)
     np.testing.assert_allclose(estimator.normal_plate, truth, atol=1e-6)
+    np.testing.assert_allclose(estimator.normal_world, truth, atol=1e-6)   # identity plate
     assert estimator.distance == pytest.approx(0.20, abs=1e-9)
     assert estimator.tilt() == pytest.approx(np.arccos(truth[2]), abs=1e-6)
 
 
 def test_the_estimator_refuses_an_unusable_frame():
     estimator = SurfaceEstimator()
-    assert not estimator.update([np.nan] * 6)
+    assert not estimator.update([np.nan] * 6, stamp=0.0)
     assert estimator.distance is None
+
+
+def test_the_first_frame_is_taken_whole_and_the_time_constant_is_in_seconds():
+    """Fold a frame at 0 s, then a different one at tau seconds later: the
+    estimate has moved 1 - 1/e of the way, whatever the loop rate."""
+    estimator = SurfaceEstimator(tau=0.5)
+    n0 = np.array([0.0, 0.0, 1.0])
+    n1 = np.array([0.1, 0.0, 1.0]) / np.linalg.norm([0.1, 0.0, 1.0])
+    assert estimator.update(synth_ranges(n0, 0.2), stamp=10.0)
+    np.testing.assert_allclose(estimator.normal_world, n0, atol=1e-9)
+    assert estimator.update(synth_ranges(n1, 0.2), stamp=10.5)
+    expected = (1 - np.exp(-1)) * n1 + np.exp(-1) * n0
+    expected /= np.linalg.norm(expected)
+    np.testing.assert_allclose(estimator.normal_world, expected, atol=1e-6)
+
+
+def test_a_frame_is_folded_in_once_however_often_the_loop_asks():
+    """The control loop runs many cycles per range frame. Re-presenting the
+    same stamp must not advance the filter — that is what made its strength a
+    function of the loop rate (99% transparent at 50 Hz on 4 Hz frames)."""
+    estimator = SurfaceEstimator(tau=0.5)
+    n0 = np.array([0.0, 0.0, 1.0])
+    n1 = np.array([0.1, 0.0, 1.0]) / np.linalg.norm([0.1, 0.0, 1.0])
+    estimator.update(synth_ranges(n0, 0.2), stamp=0.0)
+    for _ in range(12):
+        assert estimator.update(synth_ranges(n1, 0.2), stamp=0.25)
+    once = SurfaceEstimator(tau=0.5)
+    once.update(synth_ranges(n0, 0.2), stamp=0.0)
+    once.update(synth_ranges(n1, 0.2), stamp=0.25)
+    np.testing.assert_allclose(estimator.normal_world, once.normal_world, atol=1e-12)
+    assert np.dot(estimator.normal_world, n1) < 0.9999       # nowhere near fully converged
+
+
+def test_the_filter_lives_in_the_world_so_the_plate_can_turn_without_lag():
+    """Same wall, plate rotated between frames: the fit in plate coordinates
+    changes, the world normal does not, and the filter must report the same
+    world normal with no transient. A plate-frame filter would have blended
+    two plate-frame normals and produced a wall that is not there."""
+    wall = np.array([0.05, 0.0, 1.0]) / np.linalg.norm([0.05, 0.0, 1.0])
+    estimator = SurfaceEstimator(tau=1.0)
+    for k, angle in enumerate([0.0, 0.05, -0.05, 0.10]):
+        c, s_ = np.cos(angle), np.sin(angle)
+        R_plate = np.array([[c, 0, s_], [0, 1, 0], [-s_, 0, c]])   # plate yawed about y
+        n_plate = R_plate.T @ wall                                  # what the sensors see
+        assert estimator.update(synth_ranges(n_plate, 0.2), R_plate, stamp=0.25 * k)
+        np.testing.assert_allclose(estimator.normal_world, wall, atol=1e-9)
+        np.testing.assert_allclose(estimator.normal_in(R_plate), n_plate, atol=1e-9)
 
 
 def test_the_sweep_tangent_lies_in_the_sensed_surface():

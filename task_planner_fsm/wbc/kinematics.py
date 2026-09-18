@@ -90,6 +90,45 @@ def rotation_error(R_current, R_desired):
     return theta * axis / (2.0 * np.sin(theta))
 
 
+def soft_deadband(error, band):
+    """Shrink an error vector toward zero by ``band``; zero inside it.
+
+    Soft, not a cutoff: the norm is reduced by the band and the direction
+    kept, so the response rises continuously from nothing at the band's edge.
+    A hard ``if norm < band: 0`` passes an error just over the band at FULL
+    strength, and with a noisy sensor that is a kick every time the noise
+    crosses the line — which is the chatter a deadband is there to remove.
+
+    Used on the plate's orientation error: the calibrated plane fit jitters
+    ~1 deg p95 frame to frame on the real sensors, and below that the
+    alignment task is correcting noise, not wall.
+    """
+    e = np.asarray(error, dtype=float)
+    norm = float(np.linalg.norm(e))
+    if band <= 0.0 or norm <= band:
+        return np.zeros_like(e) if norm <= band else e
+    return e * ((norm - band) / norm)
+
+
+def shift_jacobian_point(J, r):
+    """Re-reference a 6xN twist Jacobian from its point to one displaced by ``r``.
+
+    ``J`` maps joint rates to the twist (v, w) of some point on a body; the
+    velocity of another point of the same body, offset by the WORLD vector
+    ``r``, is ``v + w x r``. Angular rows are unchanged. Used to evaluate the
+    press along the normal at the GPR's contact point rather than at the
+    plate's origin: a rotation of the plate moves the contact point along the
+    normal by ``|r| * w``, and a press that only watched the origin could not
+    see it.
+    """
+    J = np.asarray(J, dtype=float)
+    rx, ry, rz = np.asarray(r, dtype=float)
+    skew = np.array([[0.0, -rz, ry], [rz, 0.0, -rx], [-ry, rx, 0.0]])
+    out = J.copy()
+    out[:3, :] = J[:3, :] - skew @ J[3:6, :]
+    return out
+
+
 class Joint:
     """One URDF joint on the chain, in parent-link coordinates."""
 

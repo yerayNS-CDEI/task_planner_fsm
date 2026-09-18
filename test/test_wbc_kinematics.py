@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 
 from task_planner_fsm.wbc.kinematics import (
+    soft_deadband,
+    shift_jacobian_point,
     SerialChain,
     base_jacobian_block,
     rotation_error,
@@ -206,3 +208,28 @@ def test_rotation_error_is_the_axis_angle_of_the_correction():
 def test_unreachable_tip_link_is_reported():
     with pytest.raises(ValueError):
         SerialChain.from_urdf(URDF, "l2", "l1")
+
+
+def test_soft_deadband_is_zero_inside_and_continuous_at_the_edge():
+    band = np.radians(1.0)
+    assert np.all(soft_deadband([0.5 * band, 0.0, 0.0], band) == 0.0)
+    just_over = soft_deadband([1.01 * band, 0.0, 0.0], band)
+    assert 0.0 < just_over[0] < 0.02 * band          # not the full 1.01 deg
+    # direction is kept, norm reduced by exactly the band
+    e = np.array([0.0, 0.03, 0.04])
+    out = soft_deadband(e, band)
+    np.testing.assert_allclose(out / np.linalg.norm(out), e / np.linalg.norm(e))
+    assert np.linalg.norm(out) == pytest.approx(0.05 - band)
+    np.testing.assert_allclose(soft_deadband(e, 0.0), e)
+
+
+def test_shifting_the_jacobian_point_adds_the_lever_of_the_angular_rows():
+    """A yaw about z at a point 8 cm along +x moves that point along +y at
+    0.08 * w; the angular rows are untouched."""
+    J = np.zeros((6, 2))
+    J[5, 0] = 1.0            # column 0: rotate about z
+    J[0, 1] = 1.0            # column 1: translate along x
+    out = shift_jacobian_point(J, [0.08, 0.0, 0.0])
+    np.testing.assert_allclose(out[:3, 0], [0.0, 0.08, 0.0])
+    np.testing.assert_allclose(out[:3, 1], [1.0, 0.0, 0.0])
+    np.testing.assert_allclose(out[3:], J[3:])

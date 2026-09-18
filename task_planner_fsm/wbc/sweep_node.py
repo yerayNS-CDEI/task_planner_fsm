@@ -64,7 +64,7 @@ from .admittance import PRESS, SEEK, TARE, AdmittancePress
 from .avoidance import AvoidanceConfig, ObstacleField, avoidance_rows
 from .base_model import BaseLimits, box_bounds, constraint_rows, wheel_and_turret_rates
 from .hardware import HardwareMonitor
-from .kinematics import SerialChain, rotation_error, whole_body_jacobian
+from .kinematics import SerialChain, rotation_error, shift_jacobian_point, soft_deadband, whole_body_jacobian
 from .qp import SoftRows, Task, joint_limit_bounds, solve_velocity_qp
 from .stiffness import ContactStiffness, force_limit_rows
 from .streaming import DEFAULT_CONTROLLER, POSITION, ArmStream, slew_limit
@@ -179,6 +179,13 @@ class WholeBodySweepNode(Node):
         # no dwell every threshold tested latches spuriously within 45 s.
         self.declare_parameter("press_contact_dwell", 0.15)  # s
         self.declare_parameter("press_force_limit", 30.0)   # N, abort above this
+        # Lateral load on the plate, N, above which the plate is being TWISTED
+        # or DRAGGED rather than pressed: rotation stops, and in SEEK so does
+        # the approach. press_force_limit watches the normal only, and the
+        # 2026-09-15 overload put -25 N sideways on the plate with the normal
+        # still under the limit for most of the rise. Tared over the press's
+        # own TARE window, since the F/T's lateral idle sits around 3-5 N.
+        self.declare_parameter("press_side_force_limit", 10.0)
         # The distance sensors stop being the setpoint and become the envelope:
         # no approach closer than this to the sensed plane, whatever the force
         # says. A wrong force reading then cannot walk the arm into the wall,
@@ -241,6 +248,14 @@ class WholeBodySweepNode(Node):
         # corrected. The GPR face touches nearer than this when the plate is
         # tilted (14.1 cm at 6 deg), which press_contact_window covers.
         self.declare_parameter("press_contact_distance", 0.150)   # m
+        # Where the GPR actually touches, in the PLATE frame: the pendant TCP
+        # 'Sensor_plate', confirmed on the wall to 0.2 mm at two contacts on
+        # 2026-09-17. The press rows — the normal task, the force barrier and
+        # the stiffness regression — are evaluated HERE, not at the plate's
+        # origin, so a rotation of the plate shows up as the approach it really
+        # is at the contact (0.08 m of lever: 0.05 rad/s of alignment was
+        # 4 mm/s into the wall against a 0.8 mm/s schedule, and nothing saw it).
+        self.declare_parameter("contact_point", [-0.08, 0.0, 0.17])
         # How far outside that stop the ranges may read while a force is still
         # believed to be contact. The dwell above is sized against sensor
         # noise; a transient from the arm's own motion is not noise, and one
@@ -557,7 +572,54 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("k_align", 1.5)         # 1/s on the plate orientation error
         self.declare_parameter("v_normal_max", 0.05)   # m/s cap on the standoff correction
         self.declare_parameter("w_align_max", 0.30)    # rad/s cap on the orientation correction
-        self.declare_parameter("ema_alpha", 0.3)       # surface-normal low-pass
+        # Soft deadband on the orientation error, radians. The calibrated plane
+        # fit jitters ~1 deg p95 frame to frame (ultrasonics count in whole
+        # centimetres over a 0.3 m baseline); below that the task is chasing
+        # noise. Soft — the band is SUBTRACTED from the error, not used as a
+        # cutoff — so a 1.1 deg reading gets a 0.1 deg correction rather than
+        # the full 1.1 (see kinematics.soft_deadband). 1 deg over the 0.34 m
+        # plate is 6 mm corner to corner; the wheel's compliance covers that.
+        self.declare_parameter("align_deadband", math.radians(1.0))
+        # The orientation correction allowed while the wheel is ON the wall,
+        # rad/s. A pressed plate is already being oriented by the wall, and
+        # rotating it against that contact moves the contact point along the
+        # normal by the lever (0.08 m off the plate's centre, 0.17 proud): at
+        # 0.005 rad/s that is 0.4 mm/s, inside what the press row regulates,
+        # so the plate squares itself over a few seconds instead of in one
+        # twist. On the way in (SEEK) any load stops the rotation outright.
+        self.declare_parameter("w_align_contact_max", 0.005)
+        # The alignment belongs to the ARM. Six joints fully determine the
+        # plate's orientation, and the base's yaw adds nothing to it except a
+        # lever: the turret sits ~1 m behind the plate and the GPR's contact
+        # point 8 cm off the plate's centre, so a turret swing meant to square
+        # the plate also drives that point into or along the wall. On
+        # 2026-09-15 the turret was swinging +/-0.05 rad/s chasing sensor
+        # noise 1 mm off concrete, and that is how the corner got pushed in.
+        #
+        # So the base's yaw is PINNED, the way its travel is: an input to the
+        # solve, not something the solver apportions. (Dropping the base's
+        # columns from the angular rows instead was tried and is worse — a
+        # solver blind to what base yaw does to the plate finds it a free way
+        # to carry the plate along the wall when the travel is capped.) With
+        # the true rows kept, whatever yaw the pin asks for, the arm
+        # counter-rotates inside the same solve and the plate does not move.
+        #
+        # What the pin asks for is the yaw that follows the arm, slowly: over
+        # a long segment the base heading drifts against the wall and the arm
+        # winds up absorbing it, so this turns the base until shoulder_pan is
+        # back where the sweep started. Its input is a joint angle, not a
+        # range, so no sensor noise reaches the turret through it. Zero the
+        # cap and the yaw is simply held.
+        self.declare_parameter("k_heading", 0.2)          # 1/s on shoulder_pan's posture error
+        self.declare_parameter("w_heading_max", 0.02)     # rad/s cap on the base yaw it asks for
+        # Low-pass on the sensed surface normal, seconds, applied once per range
+        # frame in the WORLD frame — see SurfaceEstimator for why both of
+        # those matter. Frames arrive at ~4 Hz, so 0.5 s folds each one in at
+        # ~37% and roughly halves the per-frame tilt jitter (1.0 -> ~0.5 deg
+        # p95 on the calibrated ranges). The wall does not move, so the lag
+        # costs nothing; a wall that DOES change (the next segment, a reveal)
+        # is 1.5 cm of travel late at sweep speed.
+        self.declare_parameter("surface_tau", 0.5)
         self.declare_parameter("weight_linear", 1.0)
         self.declare_parameter("weight_angular", 0.5)
         # Per-DOF damping. The arm is damped ~10x harder than the base so the
@@ -820,6 +882,11 @@ class WholeBodySweepNode(Node):
         # wall. The UR reports the opposite sign on tool0 Z, and the flip happens
         # in _on_wrench so nothing downstream has to think about it.
         self.press_force = 0.0
+        self.side_force = 0.0
+        # The lateral idle of the F/T, learned over the press's TARE window and
+        # frozen; the side-load trip is measured above it.
+        self.side_bias = 0.0
+        self._side_tare = []
         self.wrench_stamp = None
         # When the sweep started waiting for the wheel to reach the wall. None
         # means it is not waiting — either it has touched, or it is not pressing.
@@ -844,7 +911,7 @@ class WholeBodySweepNode(Node):
         self.normal_rate_prev = 0.0
         # What the force row allowed this cycle, m/s, for the log line.
         self.force_cap = float("inf")
-        self.surface = SurfaceEstimator(ema_alpha=float(p("ema_alpha").value))
+        self.surface = SurfaceEstimator(tau=float(p("surface_tau").value))
         self.q_posture = None
         self.holding_since = None
         self.standoff_strikes = 0
@@ -897,6 +964,7 @@ class WholeBodySweepNode(Node):
         self.phase = "sweep"
         self.pending_status = None
         self.retreat_deadline = 0.0
+        self.retreat_R_hold = None
         self.return_deadline = 0.0
         # A typed-but-unset parameter RAISES on .value rather than returning
         # None, so an absent return target has to be caught, not defaulted.
@@ -1194,11 +1262,15 @@ class WholeBodySweepNode(Node):
         along. Pushing the wheel into the wall loads the sensor in -Z, so the
         sign flips here and the rest of the code only sees "how hard".
 
-        Only the Z component is taken. The lateral components are real — the
-        wheel drags along the wall as the sweep travels — but they are friction,
-        not press, and folding them in would read a fast sweep as a hard press.
+        Only the Z component is the PRESS. The lateral components are real —
+        the wheel drags along the wall as the sweep travels — but they are
+        friction, not press, and folding them in would read a fast sweep as a
+        hard press. They are kept separately as a side load, for the one thing
+        they do say: a plate being twisted into the wall loads the sensor
+        sideways before the normal reaches its limit.
         """
         self.press_force = -float(msg.wrench.force.z)
+        self.side_force = math.hypot(float(msg.wrench.force.x), float(msg.wrench.force.y))
         self.wrench_stamp = self._now()
 
     def _on_costmap(self, msg):
@@ -1479,6 +1551,11 @@ class WholeBodySweepNode(Node):
             return
         self.cmd_vel_pub.publish(Twist())        # the base is done moving
         self.phase = "retreat"
+        # The orientation the retreat holds is the one the plate has NOW —
+        # not a target from the ranges. Lifting a plate off a wall while
+        # re-squaring it is how a corner catches on the way out; the retreat
+        # is a translation and nothing else.
+        self.retreat_R_hold = None
         self.retreat_deadline = self._now() + float(
             self.get_parameter("retreat_timeout").value)
         self.get_logger().info(
@@ -1571,10 +1648,13 @@ class WholeBodySweepNode(Node):
         """Back the plate off along the sensed normal, arm only, base held still.
 
         Deliberately the same QP as the sweep with the base pinned to zero: the
-        arm's joint limits and the plate's orientation task still apply, so the
-        retreat cannot fling a joint into a stop or twist the plate on the way
-        out. Any input it cannot trust ends the retreat rather than guessing a
-        direction to move the arm in.
+        arm's joint limits apply, the plate's orientation is HELD at what it
+        was when the retreat began, and the posture task keeps the redundancy
+        from wandering — so the retreat cannot fling a joint into a stop or
+        twist the plate on the way out. (Until 2026-09-18 the angular rows had
+        zero weight and there was no posture task, and this docstring was
+        describing a retreat that did not exist.) Any input it cannot trust
+        ends the retreat rather than guessing a direction to move the arm in.
         """
         now = self._now()
         target = float(self.get_parameter("retreat_standoff").value)
@@ -1585,11 +1665,6 @@ class WholeBodySweepNode(Node):
                 f"{target:.2f} m); returning the arm from here.")
             self._begin_return()
             return
-        if self._stale_inputs(now) or not self.surface.update(self.distances):
-            self.get_logger().warn("Lost the plate ranges mid-retreat; stopping here.")
-            self._terminate()
-            return
-
         T_mount = self._mount_pose()
         base = self._base_pose()
         q_arm = self._arm_positions()
@@ -1599,7 +1674,14 @@ class WholeBodySweepNode(Node):
         yaw, p_base = base
         J, T_plate = whole_body_jacobian(self.chain, q_arm, T_mount, yaw, p_base)
         R_plate = T_plate[:3, :3]
-        m_hat = R_plate @ self.surface.normal_plate
+        if (self._stale_inputs(now)
+                or not self.surface.update(self.distances, R_plate, self.distance_stamp)):
+            self.get_logger().warn("Lost the plate ranges mid-retreat; stopping here.")
+            self._terminate()
+            return
+        m_hat = self.surface.normal_world
+        if self.retreat_R_hold is None:
+            self.retreat_R_hold = R_plate.copy()
 
         remaining = target - self.surface.distance
         if remaining <= 0.01:
@@ -1612,13 +1694,22 @@ class WholeBodySweepNode(Node):
         p = self.get_parameter
         speed = min(float(p("retreat_speed").value), remaining)
         n_arm = self.chain.n_joints
-        xdot = np.concatenate((-speed * m_hat, np.zeros(3)))
+        w_hold = rotation_error(R_plate, self.retreat_R_hold) * float(p("k_align").value)
+        w_max = float(p("w_align_max").value)
+        if np.linalg.norm(w_hold) > w_max:
+            w_hold = w_hold * (w_max / np.linalg.norm(w_hold))
+        xdot = np.concatenate((-speed * m_hat, w_hold))
         weights = np.concatenate((np.full(3, float(p("weight_linear").value)),
-                                  np.zeros(3)))
+                                  np.full(3, float(p("weight_angular").value))))
         damping = np.concatenate((np.array(p("damping_base").value, dtype=float),
                                   np.full(n_arm, float(p("damping_arm").value))))
+        posture = np.zeros(n_arm) if self.q_posture is None else _clamp_norm(
+            float(p("k_posture").value) * (self.q_posture - q_arm),
+            float(p("posture_rate_max").value))
         tasks = [Task(J, xdot, weights),
-                 Task(np.diag(damping), np.zeros(3 + n_arm), 1.0)]
+                 Task(np.diag(damping), np.zeros(3 + n_arm), 1.0),
+                 Task(np.hstack((np.zeros((n_arm, 3)), np.eye(n_arm))), posture,
+                      float(p("weight_posture").value))]
 
         lower_arm, upper_arm = self.chain.position_limits()
         arm_lo, arm_hi = joint_limit_bounds(
@@ -1727,9 +1818,6 @@ class WholeBodySweepNode(Node):
         if stale:
             self._strike(f"stale input: {stale}")
             return
-        if not self.surface.update(self.distances):
-            self._strike(f"only {self.surface.n_valid}/6 plate ranges valid — no plane fit")
-            return
 
         T_mount = self._mount_pose()
         base = self._base_pose()
@@ -1745,6 +1833,13 @@ class WholeBodySweepNode(Node):
 
         J, T_plate = whole_body_jacobian(self.chain, q_arm, T_mount, yaw, p_base)
         R_plate, p_plate = T_plate[:3, :3], T_plate[:3, 3]
+
+        # The plate's pose is what turns a frame of ranges into a wall in the
+        # world, so it has to be known first. The estimator folds a frame in
+        # once, on its own stamp, whatever this loop's rate is.
+        if not self.surface.update(self.distances, R_plate, self.distance_stamp):
+            self._strike(f"only {self.surface.n_valid}/6 plate ranges valid — no plane fit")
+            return
 
         # --- Where are we, along the sensed surface? -------------------------
         direction = self.seg_end[:2] - self.seg_start[:2]
@@ -1793,7 +1888,7 @@ class WholeBodySweepNode(Node):
                 return
 
         # --- The sensed surface frame ---------------------------------------
-        m_hat = R_plate @ self.surface.normal_plate      # plate -> wall, world axes
+        m_hat = self.surface.normal_world                # plate -> wall, world axes
         t_hat = sweep_tangent(m_hat, u_hat)
         if t_hat is None:
             self._strike("scan direction is normal to the sensed surface")
@@ -1974,10 +2069,44 @@ class WholeBodySweepNode(Node):
         if R_target is None:
             self._strike("sensed surface normal is vertical")
             return
-        w_ref = rotation_error(R_plate, R_target) * float(p("k_align").value)
+        w_ref = soft_deadband(rotation_error(R_plate, R_target),
+                              float(p("align_deadband").value)) * float(p("k_align").value)
         w_max = float(p("w_align_max").value)
         if np.linalg.norm(w_ref) > w_max:
             w_ref = w_ref * (w_max / np.linalg.norm(w_ref))
+        # A load on the way in stops the rotation. A plate that is touching the
+        # wall is already being oriented BY the wall, and rotating it against
+        # that contact is how a corner gets driven in; so on the first cycle
+        # the press sees a load — before the dwell, before the latch — the
+        # orientation task goes quiet and stays quiet while the load lasts.
+        # Once the press is ESTABLISHED the plate may square itself, slowly
+        # (w_align_contact_max), with the contact-point press row watching what
+        # that does to the approach. A side load says "twist" in any state
+        # and stops the rotation regardless.
+        side_loaded = False
+        if self.press is not None:
+            if self.press.state == TARE:
+                self._side_tare.append(self.side_force)
+            elif self._side_tare:
+                self.side_bias = float(np.mean(self._side_tare))
+                self._side_tare = []
+            side = self.side_force - self.side_bias
+            side_loaded = side > float(p("press_side_force_limit").value)
+            if side_loaded:
+                if self.press.state != PRESS:
+                    # Twisting on the way in: no closer until it clears.
+                    v_normal = min(v_normal, 0.0)
+                self.get_logger().warn(
+                    f"Side load {side:+.1f} N on the plate: holding the orientation"
+                    f"{' and the approach' if self.press.state != PRESS else ''} "
+                    f"until it clears.",
+                    throttle_duration_sec=1.0)
+            if side_loaded or (self.press.loaded and self.press.state != PRESS):
+                w_ref = np.zeros(3)
+            elif self.press.state == PRESS:
+                w_contact = float(p("w_align_contact_max").value)
+                if np.linalg.norm(w_ref) > w_contact:
+                    w_ref = w_ref * (w_contact / np.linalg.norm(w_ref))
         xdot = np.concatenate((v_ref, w_ref))
 
         # --- Resolve it across the 9 DOF -------------------------------------
@@ -2001,7 +2130,12 @@ class WholeBodySweepNode(Node):
         base_normal_row = np.zeros((1, 3 + n_arm))
         base_normal_row[0, :2] = m_hat[:2] @ rotation
 
-        J_task, xdot_task = J, xdot
+        J_task, xdot_task = J.copy(), xdot
+        # The press acts at the GPR's contact point, 8 cm off the plate's
+        # centre and 15 cm proud of it; the normal task, the force barrier and
+        # the stiffness regression all read the approach rate THERE.
+        r_contact = R_plate @ np.array(p("contact_point").value, dtype=float)
+        J_contact = shift_jacobian_point(J, r_contact)
         press_task = []
         if self.press is not None:
             # A press reference is TINY — tens of microns per second, three or
@@ -2024,10 +2158,9 @@ class WholeBodySweepNode(Node):
             # weight degrades instead, and the force loop's own clamps bound what
             # it can ask for anyway.
             projector = np.eye(3) - np.outer(m_hat, m_hat)
-            J_task = J.copy()
             J_task[:3, :] = projector @ J[:3, :]
             xdot_task = np.concatenate((projector @ v_ref, w_ref))
-            press_task = [Task(np.atleast_2d(m_hat @ J[:3, :]),
+            press_task = [Task(np.atleast_2d(m_hat @ J_contact[:3, :]),
                                np.array([v_normal]),
                                float(p("weight_press_normal").value))]
 
@@ -2122,7 +2255,7 @@ class WholeBodySweepNode(Node):
             # row takes over once the wheel is on the wall and the force is
             # the sensor that knows. (In TARE the bias is not yet measured
             # either, so that case was already excluded.)
-            normal_row = m_hat @ J[:3, :]
+            normal_row = m_hat @ J_contact[:3, :]
             rows, lower = force_limit_rows(
                 normal_row, self.press.force, self.press.force_limit,
                 force_alpha, self.stiffness)
@@ -2142,6 +2275,13 @@ class WholeBodySweepNode(Node):
         # Only ONE case hands the travel back to the solver outright, because
         # only one makes pinning actively wrong rather than merely inconvenient.
         # An obstacle narrows the bound instead of removing it — see below.
+        # --- Pin the base's yaw, so the turret never squares the plate -------
+        # See k_heading. Clipped into the acceleration box like the travel pin,
+        # so a change of heading demand is a ramp, never a step.
+        w_heading = _clamp(float(p("k_heading").value) * (self.q_posture[0] - q_arm[0]),
+                           float(p("w_heading_max").value))
+        base_lo[2] = base_hi[2] = float(np.clip(w_heading, base_lo[2], base_hi[2]))
+
         self.base_travel_pinned = False
         self.base_travel_capped = False
         if self.base_constant_travel:
@@ -2226,7 +2366,7 @@ class WholeBodySweepNode(Node):
         # What the solve actually asked for along the normal, which is the
         # travel the stiffness estimate regresses the next force against.
         if self.press is not None:
-            self.normal_rate_prev = float((m_hat @ J[:3, :]) @ solution.u)
+            self.normal_rate_prev = float((m_hat @ J_contact[:3, :]) @ solution.u)
         self.holding_since = None
         self._publish(solution.u, n_arm)
         self._log_cycle(solution, distance, remaining, phi)

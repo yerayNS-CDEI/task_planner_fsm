@@ -54,10 +54,18 @@ URDF = """<?xml version="1.0"?>
 ARM_JOINTS = ["j1", "j2", "j3", "j4", "j5", "j6"]
 WALL_X = 3.0           # the wall plane, x = WALL_X, its normal pointing -x
 STANDOFF = 0.20
-# Plate distance at which the GPR wheel and the four corner caster bars are all
-# riding the wall. The range sensors are on the plate face and everything that
-# touches stands off it, so this — not zero — is what "in contact" reads.
-PLATE_STANDOFF = 0.13
+# Plate distance at which the GPR's face and wheel are on the wall. The range
+# sensors are on the plate face and the GPR stands 15 cm proud of it, so this
+# — not zero — is what "in contact" reads. It is the node's default
+# press_contact_distance (0.150, the calibrated reading of 2026-09-17); the
+# simulated wall has to sit where the node expects it or the press walks into
+# the min_distance envelope before it ever feels anything.
+PLATE_STANDOFF = 0.150
+# Where the GPR touches, in the plate frame of this harness (sensors at z=0):
+# 8 cm off the plate's centre and PLATE_STANDOFF proud of it. The node's own
+# contact_point default is the same point in the URDF plate frame, whose
+# sensors sit at z=+0.02; _node passes this one so the two agree.
+CONTACT_POINT = np.array([-0.08, 0.0, PLATE_STANDOFF])
 # Where the FSM's arm_approach leaves the plate before a sweep begins.
 APPROACH_GAP = 0.20
 MOUNT_HEIGHT = 0.9     # column-set arm mount height above the turret footprint
@@ -109,20 +117,29 @@ class KinematicRobot:
             return float("inf")
         return float((WALL_X - T[0, 3]) / ray[0])
 
-    def press_force(self, standoff=PLATE_STANDOFF, stiffness=2.0e4):
+    def contact_gap(self):
+        """Distance from the GPR's contact point to the wall along the wall's
+        normal; negative once it is pressed in."""
+        T = self.tip()
+        return float(WALL_X - (T[:3, 3] + T[:3, :3] @ CONTACT_POINT)[0])
+
+    def press_force(self, stiffness=2.0e4):
         """Contact force through the plate, N, positive = pressing into the wall.
 
         Contact does NOT begin at zero plate distance. The GPR body has length
-        along the wall normal and four bars with caster wheels stand off the
-        plate's corners, so everything is riding the surface while the plate
-        itself is still ``standoff`` metres off it — and the plate's own range
-        sensors report that number, not zero.
+        along the wall normal, so its face and wheel are on the surface while
+        the plate itself is still PLATE_STANDOFF metres off it — and the
+        plate's own range sensors report that number, not zero. The force is
+        what the CONTACT POINT does, not the plate's centre: with the plate
+        square the two agree, but a rotation of the plate moves the contact
+        point along the normal by its lever, and the barrier the node builds
+        has to be tested against the same physics it is guarding.
 
-        Past the standoff the plate is loading four rigid bars, so ``stiffness``
-        is high: 5 N is a quarter of a millimetre of squeeze, which is why the
-        press gain has to be small.
+        Past the standoff the plate is loading the GPR's rigid body, so
+        ``stiffness`` is high: 5 N is a quarter of a millimetre of squeeze,
+        which is why the press gain has to be small.
         """
-        return max(0.0, stiffness * (standoff - self.plate_gap()))
+        return max(0.0, -stiffness * self.contact_gap())
 
     def ranges(self):
         """What the six sensors see of the wall plane x = WALL_X."""
@@ -146,6 +163,7 @@ def _node(seg_start, seg_end, **overrides):
         rclpy.parameter.Parameter("arm_joints", value=ARM_JOINTS),
         rclpy.parameter.Parameter("standoff", value=STANDOFF),
         rclpy.parameter.Parameter("control_rate", value=50.0),
+        rclpy.parameter.Parameter("contact_point", value=CONTACT_POINT.tolist()),
     ]
     params += [rclpy.parameter.Parameter(k, value=v) for k, v in overrides.items()]
     node = WholeBodySweepNode(parameter_overrides=params)
@@ -162,7 +180,10 @@ def _wire(node, robot):
     node.joint_positions["turret_joint"] = 0.0
     node.joint_stamp = 1e12                    # never stale
     node.distances = robot.ranges()
-    node.distance_stamp = 1e12
+    # A fresh frame every cycle: the estimator folds a frame in once per
+    # stamp, so the stamp has to move with the clock (and stay "never stale"
+    # against max_data_age, which it does as long as it is the clock itself).
+    node.distance_stamp = node._now() if isinstance(node._now, _Clock) else 1e12
     # Stands in for /force_torque_sensor_broadcaster/wrench, already sign-flipped
     # the way _on_wrench does it. Inert unless the node has a press configured.
     node.press_force = robot.press_force()
@@ -375,13 +396,6 @@ def test_the_plate_is_backed_off_the_wall_before_the_arm_is_handed_back():
     assert np.linalg.norm(robot.base_xy - base_at_sweep_end) < 0.15
 
 
-@pytest.mark.xfail(reason="NOT FIXED ON THIS BRANCH. _retreat_step still builds "
-                          "its angular target as np.zeros(3) with no weight on "
-                          "those rows, so the plate wanders ~10 deg off square "
-                          "on the way out (the assertion allows 6). The "
-                          "docstring below records the hardware consequence; "
-                          "this is a real open defect, not stale test code.",
-                   strict=True)
 def test_the_retreat_keeps_the_plate_square_on_the_way_out():
     """The retreat once weighted its angular rows ZERO — the docstring claimed
     otherwise, which is how it survived — so the plate was free to rotate as it
@@ -405,7 +419,6 @@ def test_the_retreat_keeps_the_plate_square_on_the_way_out():
         for _ in range(2000):
             _wire(node, robot)
             commands.clear()
-            node.surface.update(robot.ranges())
             node._retreat_step()
             if node.phase != "retreat":
                 break
@@ -424,11 +437,6 @@ def test_the_retreat_keeps_the_plate_square_on_the_way_out():
     assert held < 0.7 * free
 
 
-@pytest.mark.xfail(reason="NOT FIXED ON THIS BRANCH. _retreat_step runs no "
-                          "posture task, so weight_posture has no effect during "
-                          "the retreat and both arms of the comparison return "
-                          "the identical error. Open defect, not stale test.",
-                   strict=True)
 def test_the_retreat_aims_at_the_configuration_it_has_to_hand_back():
     """A 3-DOF pull-back with the base pinned leaves three DOF of redundancy, and
     damping alone spends them by folding the elbow toward the column. The posture
@@ -456,7 +464,6 @@ def test_the_retreat_aims_at_the_configuration_it_has_to_hand_back():
         for _ in range(2000):
             _wire(node, robot)
             commands.clear()
-            node.surface.update(robot.ranges())
             node._retreat_step()
             if node.phase != "retreat":
                 break
@@ -838,9 +845,10 @@ def test_a_late_stream_tick_advances_the_arm_setpoint_in_real_time():
     node = _sweep_along_wall()
     robot = _start_state_along_wall(node.chain)
 
-    # A tick displaced by a slow solve: 10 ms rather than the nominal 5.
-    # 0.1 rad/s for 0.01 s is 0.001 rad, not the 0.0005 the nominal would give.
-    assert _setpoint_step_over(node, robot, elapsed=0.01) == pytest.approx(0.001, abs=1e-9)
+    # A tick displaced by a slow solve: twice the nominal stream period.
+    # 0.1 rad/s over that is twice what the nominal would give.
+    nominal = 1.0 / node.stream_rate
+    assert _setpoint_step_over(node, robot, elapsed=2 * nominal) == pytest.approx(0.2 * nominal, abs=1e-9)
 
 
 def test_a_single_late_stream_tick_cannot_jump_the_setpoint():
@@ -868,7 +876,11 @@ def test_a_fast_stream_tick_does_not_under_integrate():
     node = _sweep_along_wall()
     robot = _start_state_along_wall(node.chain)
 
-    assert _setpoint_step_over(node, robot, elapsed=0.001) == pytest.approx(0.0005, abs=1e-9)
+    # The floor is one NOMINAL stream period, read from the node rather than
+    # written in: stream_rate has already moved once (200 -> 100 Hz, e55fe94)
+    # and a constant here failed for that reason alone.
+    nominal = 1.0 / node.stream_rate
+    assert _setpoint_step_over(node, robot, elapsed=0.001) == pytest.approx(0.1 * nominal, abs=1e-9)
 
 
 def test_a_dead_solve_holds_the_arm_instead_of_streaming_on():
@@ -1022,7 +1034,7 @@ def test_the_acceleration_bound_reaches_the_published_base_command():
 # geometry, and it is the one the travel pin is designed for.
 
 
-def _start_state_along_wall(chain, gap=0.35, y=1.2):
+def _start_state_along_wall(chain, gap=0.35, y=1.2, tilt=0.08):
     """The deployed ScanWall geometry, as a starting state.
 
     The base is yawed -90 deg, so the turret's +y (its LEFT) points at the wall
@@ -1030,8 +1042,14 @@ def _start_state_along_wall(chain, gap=0.35, y=1.2):
     The arm's first joint is turned +90 deg to cancel that, which leaves the tip
     and the plate in exactly the pose ``_start_state`` produces: reaching at the
     wall from ``gap`` metres. Only the body underneath is rotated.
+
+    ``tilt`` is j5, radians: 0.08 leaves the plate ~4.6 deg off square for the
+    alignment task to take out. A scenario that BEGINS pressed must pass 0:
+    the GPR touches 8 cm off the plate's centre, so 4.6 deg of yaw with the
+    centre at the standoff is the contact point 6 mm into the wall — 120 N,
+    which is the 2026-09-15 overload, not a 5 N start.
     """
-    q = np.array([np.pi / 2.0, -np.pi / 2.0, 0.9, -0.9, 0.08, np.pi / 2.0])
+    q = np.array([np.pi / 2.0, -np.pi / 2.0, 0.9, -0.9, tilt, np.pi / 2.0])
     tip_local = chain.fk(q)[:3, 3]
     reach = float(np.hypot(tip_local[0], tip_local[1]))
     return KinematicRobot(chain, base_xy=[WALL_X - reach - gap, y],
@@ -1304,7 +1322,7 @@ def test_a_brief_hollow_costs_speed_rather_than_stopping_the_base():
     # Already touching, so the sweep is in the state this test is about within a
     # few cycles rather than after a 25 s approach. No tare: the wheel is loaded
     # from cycle zero, and taring in contact is a fault by design.
-    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
     node.q_posture = robot.q.copy()
     node.row_z = float(robot.tip()[2, 3])
 
@@ -1338,7 +1356,7 @@ def _squeezed_press(force_alpha, weight_press_normal=1.0e4, cycles=400):
     """
     node = _press_node(press_force_alpha=force_alpha, press_tare_seconds=0.0,
                        weight_press_normal=weight_press_normal)
-    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
     node.q_posture = robot.q.copy()
     node.row_z = float(robot.tip()[2, 3])
 
@@ -1391,7 +1409,11 @@ def test_the_force_barrier_bounds_the_squash_when_the_press_task_cannot():
     with it the force is held AT the limit instead of sailing through it.
 
     Both still fail the sweep, and that is the honest result — the barrier
-    bounds the overload, it does not make the situation survivable.
+    bounds the overload, it does not make the situation survivable: held
+    exactly at the limit, the limit's own dwell eventually trips. Since the
+    barrier moved to the GPR's contact point (where the force acts, 8 cm off
+    the plate's centre) it holds the force at 30.0 rather than letting it
+    creep to 31.5, and the harness measures the force at that same point.
     """
     guarded, guarded_force = _squeezed_press(force_alpha=1.0, weight_press_normal=1.0)
     unguarded, unguarded_force = _squeezed_press(force_alpha=0.0, weight_press_normal=1.0)
@@ -1399,11 +1421,12 @@ def test_the_force_barrier_bounds_the_squash_when_the_press_task_cannot():
     assert unguarded_force.max() > 40.0, (
         f"unbounded, the squash runs well past the limit "
         f"(peak {unguarded_force.max():.1f} N)")
+    assert unguarded.pending_status, "and the sweep is lost"
     assert guarded_force.max() <= 30.5, (
         f"the barrier should hold it at the limit, not past it "
         f"(peak {guarded_force.max():.1f} N)")
     assert guarded_force.max() < 0.75 * unguarded_force.max()
-    assert guarded.pending_status and unguarded.pending_status, "both still fail"
+    assert guarded.pending_status, "held at the limit, the limit still trips"
 
 
 def test_the_force_barrier_does_not_slow_a_press_that_is_going_fine():
@@ -1420,6 +1443,52 @@ def test_the_force_barrier_does_not_slow_a_press_that_is_going_fine():
     assert node.press.in_contact, "it should have reached the wall"
     assert forces[-100:].mean() == pytest.approx(5.0, abs=1.5), "and be holding it"
     assert travel[-50:].mean() > 0.5 * node.sweep_speed, "and still be sweeping"
+
+
+def test_a_plate_arriving_off_square_is_squared_without_overloading_the_wheel():
+    """The 2026-09-15 overload, as a regression.
+
+    The plate reached the wall 7.7 deg off square (the uncalibrated ranges
+    read it at 1), so the GPR's corner — 8 cm off the plate's centre — touched
+    first, and the alignment task then rotated the plate ABOUT ITS CENTRE
+    against that contact: 0.05 rad/s of turret and wrist swing was 4 mm/s of
+    approach at the corner against a 0.8 mm/s schedule, and nothing watching
+    the plate's centre could see it. 31 N in 0.7 s.
+
+    Now the press's normal rows are evaluated at the contact point, the
+    orientation error is deadbanded, the base's yaw is pinned, and any load
+    stops the rotation. So a plate that arrives 4.6 deg off (the fixture's
+    tilt) must reach the wall, square itself, hold the target force, and do
+    it without the force ever nearing the limit — and without the turret
+    being asked to move.
+    """
+    node = _press_node()
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.03, tilt=0.08)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    assert np.degrees(np.arccos(robot.tip()[0, 2])) > 4.0, "the fixture starts off square"
+
+    yaw_commands, tilts = [], []
+
+    def on_cycle(cycle):
+        tilts.append(np.degrees(np.arccos(np.clip(robot.tip()[0, 2], -1.0, 1.0))))
+        if node.u_qp_prev is not None:
+            yaw_commands.append(abs(float(node.u_qp_prev[2])))
+
+    forces, travel = _press_run(node, robot, cycles=900, on_cycle=on_cycle)
+    yaw_max = float(node.get_parameter("w_heading_max").value)
+
+    assert node.pending_status is None, f"the sweep ended early: {node.pending_status}"
+    assert node.press.in_contact, "it should have reached the wall"
+    assert forces.max() < 0.5 * node.press.force_limit, (
+        f"peak {forces.max():.1f} N against a {node.press.force_limit:.0f} N limit")
+    assert forces[-100:].mean() == pytest.approx(5.0, abs=1.5), "holding the target"
+    assert tilts[-1] < 1.5, f"plate still {tilts[-1]:.2f} deg off square"
+    assert travel[-50:].mean() > 0.5 * node.sweep_speed, "and sweeping"
+    # The squaring was the arm's: the base's yaw never exceeded what the slow
+    # heading pin is allowed to ask for.
+    assert max(yaw_commands) <= yaw_max + 1e-9, (
+        f"base yaw reached {max(yaw_commands):.4f} rad/s against a {yaw_max} cap")
 
 
 def test_a_press_that_never_reaches_the_wall_fails_instead_of_recording_air():
@@ -1574,6 +1643,15 @@ def test_a_capped_barrier_can_still_stop_the_base_completely():
     It takes a few cycles to get there, because the acceleration bound only lets
     the command fall by ``base_accel_max * dt`` each time. That ramp is the point:
     the barrier gets the base all the way to a stop, and does it smoothly.
+
+    The slab sits just inside the safety margin of the footprint's FRONT
+    sample (0.45 m ahead, margin 0.15): the barrier then demands retreat,
+    which the cap floors at zero. It used to sit 0.2 m ahead — 25 cm inside
+    the front of the footprint — where the samples that would have seen it
+    are inside the obstacle, on a flat distance field, and are dropped; the
+    base then "stopped" only because the solver was free to carry the plate
+    along the wall by yawing instead. With the yaw pinned that accident is
+    gone, and the test has to put the obstacle where the barrier can see it.
     """
     node = _sweep_along_wall()
     robot = _start_state_along_wall(node.chain)
@@ -1583,10 +1661,12 @@ def test_a_capped_barrier_can_still_stop_the_base_completely():
 
     commands = {}
     _capture(node, commands)
-    # A slab right across the path, close enough that the barrier demands a stop.
+    # A slab right across the path, 10 cm off the front of the footprint: inside
+    # the 15 cm margin, so the barrier demands a stop.
     base_y = robot.base_xy[1]
-    node._on_costmap(_costmap([(robot.base_xy[0] - 1.5, base_y - 0.5,
-                                robot.base_xy[0] + 1.5, base_y - 0.2)]))
+    front = float(node.get_parameter("avoid_footprint_radius").value)
+    node._on_costmap(_costmap([(robot.base_xy[0] - 1.5, base_y - front - 0.40,
+                                robot.base_xy[0] + 1.5, base_y - front - 0.10)]))
 
     clock = _install_clock(node)
     travel = []
@@ -1661,7 +1741,7 @@ def test_the_smoothness_term_makes_consecutive_solutions_resemble_each_other():
     rough.row_z = float(robot.tip()[2, 3])
     rough_trace = _velocity_trace(rough, robot, 60)
 
-    smooth = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.2, 0.0), weight_smoothness=0.5)
+    smooth = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.2, 0.0), weight_smoothness=5.0)
     robot2 = _start_state(smooth.chain)
     smooth.q_posture = robot2.q.copy()
     smooth.row_z = float(robot2.tip()[2, 3])
@@ -1672,11 +1752,13 @@ def test_the_smoothness_term_makes_consecutive_solutions_resemble_each_other():
     # things and only one of them is the complaint: total travel is set by where
     # the arm has to get to and barely moves with this weight, while the peak
     # cycle-to-cycle change is exactly what is felt as a jolt. Measured across
-    # this fixture, worst step falls 0.021 -> 0.012 -> 0.003 rad/s at weights of
-    # 0, 0.5 and 5, while the standoff error stays at 0.048 m throughout.
+    # this fixture, worst step falls 0.0028 -> 0.0024 -> 0.0018 -> 0.0015 rad/s
+    # at weights of 0, 0.5, 2 and 5. (It was 0.021 -> 0.012 -> 0.003 before the
+    # base's yaw was pinned: the turret being recruited to square the plate,
+    # and the arm answering it, was most of the roughness there was to remove.)
     rough_step = np.abs(np.diff(rough_trace[:n, 3:], axis=0)).max()
     smooth_step = np.abs(np.diff(smooth_trace[:n, 3:], axis=0)).max()
-    assert smooth_step < 0.75 * rough_step, (
+    assert smooth_step < 0.6 * rough_step, (
         f"smoothness weight did not reduce the worst arm step: "
         f"{smooth_step:.5f} not meaningfully below {rough_step:.5f}")
 
