@@ -590,12 +590,15 @@ def test_the_velocity_clamp_bounds_a_gain_that_is_far_too_high():
     5 N target, instead of the 17 N excursion it reaches unclamped. Contact is
     never lost, so the GPR keeps its wheel on the wall the whole time.
     """
+    # Symmetric clamps here: the shipped retreat clamp is wider than the
+    # approach one (retreat_v_max, for the soft-limit reaction), and this test
+    # is about what ONE clamped step is worth, not about that asymmetry.
     wild = _run_against_wall(
-        _press(target_force=5.0, gain=1.0e-2, v_max=0.05,
-               filter_tau=NO_FILTER, force_limit=1e9))[-300:]
+        _press(target_force=5.0, gain=1.0e-2, v_max=0.05, retreat_v_max=0.05,
+               filter_tau=NO_FILTER, force_limit=1e9, soft_limit=1e9))[-300:]
     clamped = _run_against_wall(
-        _press(target_force=5.0, gain=1.0e-2, v_max=0.005,
-               filter_tau=NO_FILTER, force_limit=1e9))[-300:]
+        _press(target_force=5.0, gain=1.0e-2, v_max=0.005, retreat_v_max=0.005,
+               filter_tau=NO_FILTER, force_limit=1e9, soft_limit=1e9))[-300:]
 
     # One clamped step against this wall is v_max * dt * K_e = 2 N of swing.
     assert clamped.ptp() == pytest.approx(2.0, abs=0.2)
@@ -638,3 +641,107 @@ def test_the_press_recovers_when_the_wall_falls_away():
             recovered = True
             break
     assert recovered, "the press should find the surface again"
+
+
+def _kicked_off_the_wall(press, kick=0.012, stiffness=2.0e3, dt=0.1, cycles=600):
+    """After a settled press, the wall steps back ``kick`` metres — the base's
+    chassis yawing under the plate, as measured on 2026-09-21 — and the loop
+    runs on at ``dt`` against a ``stiffness`` wall. Returns (seconds to be
+    back in contact, peak force on the way back, force history)."""
+    gap, wheel = press.distance, 0.03
+    gap += kick
+    forces, back, released = [], None, False
+    for cycle in range(cycles):
+        force = max(0.0, stiffness * (wheel - gap))
+        gap -= press.update(force, gap, dt) * dt
+        forces.append(force)
+        # The state lags the force filter by a cycle or two, so wait for the
+        # release before looking for the re-contact.
+        released = released or not press.in_contact
+        if back is None and released and press.in_contact:
+            back = cycle * dt
+    return back, max(forces), np.array(forces)
+
+
+def test_a_wheel_kicked_off_a_known_wall_is_back_on_it_in_seconds_not_half_a_minute():
+    """The 12:50 run on 2026-09-21: 12 mm off, and the first-approach floor of
+    0.8 mm/s took 30 s to win it back. After a contact the wall's position is
+    known, so the re-contact closes on it at up to recontact_speed. At the
+    caster contact's ~2 kN/m and a 10 Hz loop the landing stays gentle."""
+    fast = _press(target_force=5.0, gain=5.0e-5, v_max=0.005, seek_speed=0.01,
+                  approach_min_speed=0.0008, filter_tau=0.1,
+                  recontact_speed=0.005, recontact_gain=2.0, recontact_memory=5.0)
+    _run_against_wall(fast, stiffness=2.0e3, dt=0.1, cycles=400)
+    assert fast.in_contact and fast.wall_distance is not None
+    back, peak, _ = _kicked_off_the_wall(fast)
+    assert back is not None and back < 4.0, f"re-contact took {back} s"
+    assert peak < 12.0, f"re-contact landed at {peak:.1f} N"
+    # Regaining the last newton of TARGET from there is the press law's job,
+    # and at 5e-5 m/s/N on a 2 kN/m contact that is the slow part (0.5 mm at
+    # 0.05 mm/s): the sweep node scales the gain to the measured stiffness
+    # for exactly that reason — see gain_scale and test_wbc_sweep_node.
+
+    slow = _press(target_force=5.0, gain=5.0e-5, v_max=0.005, seek_speed=0.01,
+                  approach_min_speed=0.0008, filter_tau=0.1,
+                  recontact_memory=0.0)          # the old behaviour: no memory
+    _run_against_wall(slow, stiffness=2.0e3, dt=0.1, cycles=400)
+    back_slow, _, _ = _kicked_off_the_wall(slow)
+    assert back_slow is None or back_slow > 3.0 * back, (
+        f"without the memory it should be the crawl: {back_slow} s vs {back} s")
+
+
+def test_the_remembered_wall_is_forgotten_after_the_memory_expires():
+    """A wall that has been gone for longer than recontact_memory may be a
+    different wall, and the pessimistic first-approach schedule is the right
+    one for a wall whose position is not known."""
+    press = _press(target_force=5.0, gain=5.0e-5, v_max=0.005, seek_speed=0.01,
+                   approach_min_speed=0.0008, recontact_speed=0.005,
+                   recontact_memory=1.0)
+    _run_against_wall(press, stiffness=2.0e3, dt=0.1, cycles=400)
+    # Off the wall, and held off: the surface has gone away for good.
+    gap = press.distance + 0.05
+    speeds = [press.update(0.0, gap, 0.1) for _ in range(30)]
+    assert press.recontacting is False
+    # During the memory the approach ran at the re-contact ceiling; after it,
+    # at whatever the first-approach schedule allows for a 5 cm gap (capped by
+    # seek_speed), which is a different number — the point is that it changed.
+    assert max(speeds[:8]) == pytest.approx(0.005, abs=1e-9)
+    assert speeds[-1] != pytest.approx(0.005, abs=1e-9)
+
+
+def test_over_the_soft_limit_the_press_backs_off_fast_and_does_not_fault():
+    """The reaction layer. A contact the base drives from 5 to 25 N is not a
+    fault any more: the retreat clamp opens to retreat_v_max and the force
+    comes down in a fraction of a second, with the wheel still on the wall."""
+    press = _press(target_force=5.0, gain=2.5e-4, v_max=0.005, retreat_v_max=0.02,
+                   filter_tau=0.1, soft_limit=15.0, force_limit=45.0)
+    _run_against_wall(press, stiffness=2.0e3, dt=0.1, cycles=400)
+    assert press.in_contact
+    # The wall lurches 15 mm toward the plate in one cycle: 30 N more — the
+    # 2026-09-21 16:58 overload, which was a fault at the 30 N limit.
+    gap, wheel = press.distance - 0.015, 0.03
+    forces, retreat = [], []
+    for _ in range(30):
+        force = max(0.0, 2.0e3 * (wheel - gap))
+        v = press.update(force, gap, 0.1)
+        gap -= v * 0.1
+        forces.append(force); retreat.append(-v)
+    assert max(forces) > 30.0
+    assert max(retreat) > 0.008, "the retreat should open well past the approach clamp"
+    assert press.fault is None
+    assert forces[-1] < 15.0 and press.in_contact, "relieved, and still touching"
+    assert max(forces[1:]) - min(forces[1:]) > 10.0
+
+
+def test_a_force_that_will_not_come_down_is_a_fault_after_the_soft_dwell():
+    """Backing off at 20 mm/s and the force not moving means something is
+    holding the plate in — a snagged caster, a base still pushing. The hard
+    limit is for a force still climbing; this is for one that is stuck."""
+    press = _press(target_force=5.0, filter_tau=0.0, soft_limit=15.0,
+                   soft_limit_seconds=0.95, force_limit=45.0)
+    _into_contact(press)
+    for _ in range(9):
+        press.update(20.0, 0.03, 0.1)
+    assert press.fault is None
+    press.update(20.0, 0.03, 0.1)
+    assert press.fault and "soft limit" in press.fault

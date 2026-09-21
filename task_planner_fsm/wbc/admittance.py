@@ -124,6 +124,23 @@ calibration is worth more here than any gain in this file.
 ``approach_min_speed`` is the floor that keeps a pessimistic estimate from
 stalling the approach short of the wall forever.
 
+**Re-contact is not a first approach.** The schedule above is pessimistic
+because on a first approach the wall's position is known only through a plane
+fit with 4 mm of sigma and a possible bias. After a contact, it is known far
+better: the plate was pressing on it a moment ago, and the ranges at that
+moment say where it was. A wheel that comes off — the base's chassis kicks
+when it starts (measured 0.7 deg of uncommanded yaw on 2026-09-21, ~12 mm at
+the plate), a hollow, a lip — is then a wheel a known distance from a known
+wall, and closing that at the first-approach floor is what turned a 12 mm
+excursion into a 30 s crawl on the 12:50 run. So for ``recontact_memory``
+seconds after a release the approach is scheduled on the gap to the
+REMEMBERED wall instead, with a higher ceiling (``recontact_speed``) and its
+own gain. The impact bound is the same arithmetic as before — latency times
+speed times stiffness — and the numbers below assume the caster contact this
+plate actually rides on, ~2 kN/m measured (see the stiffness floor in the
+sweep node): 5 mm/s over a 100 ms cycle is 1 N. The memory expires because a
+wall that is gone for longer than that may genuinely be a different wall.
+
 **Every time constant here is in SECONDS, not cycles.** The old code counted
 cycles — a 0.2 EMA coefficient, 25 tare cycles, 100 stall cycles — all sized at
 50 Hz. At the 10 Hz the robot actually achieved, the force filter's lag went
@@ -234,7 +251,9 @@ class AdmittancePress:
                  contact_distance=0.1375, approach_gain=0.3,
                  approach_margin=0.0126, approach_min_speed=0.0008,
                  distance_tau=0.15, force_limit_dwell=0.06,
-                 contact_window=0.03):
+                 contact_window=0.03, recontact_speed=0.005,
+                 recontact_gain=2.0, recontact_memory=5.0,
+                 soft_limit=15.0, retreat_v_max=0.02, soft_limit_seconds=3.0):
         self.target_force = float(target_force)
         self.gain = float(gain)
         self.v_max = float(v_max)
@@ -342,6 +361,41 @@ class AdmittancePress:
         # the field run hit, where the filter was lagging so far behind that the
         # wheel was at 40 N while the filtered force read 3.9 and never tripped.
         self.force_limit_dwell = float(force_limit_dwell)
+        # --- re-contact --------------------------------------------------
+        # Ceiling on the approach while closing on a wall the press was on a
+        # moment ago; 1/s gain on the gap to it; and how long that knowledge
+        # is trusted after the release. See the module docstring.
+        #
+        # The remembered distance is where the plate sat AT TARGET FORCE, so
+        # it includes the contact's compression, F_target / K_e. The wheel
+        # therefore meets the wall with that much gap still showing and lands
+        # at gain * F_target / K_e — and the force that builds over one cycle
+        # of latency is K_e times that times dt = gain * F_target * dt, the
+        # same on any surface. At 2/s and 10 Hz that is 1 N; at 5 Hz, 2 N.
+        self.recontact_speed = float(recontact_speed)
+        self.recontact_gain = float(recontact_gain)
+        self.recontact_memory = float(recontact_memory)
+        # Scales ``gain`` from outside, per cycle, without touching the tunable
+        # itself: the sweep node raises it when the measured contact is softer
+        # than the ~2e4 N/m the gain was sized against.
+        self.gain_scale = 1.0
+        # --- the soft limit ------------------------------------------------
+        # Between the target and the hard limit there used to be nothing: a
+        # contact the base drove from 5 N to 30 N in a second was a FAULT, and
+        # the sweep retreated, failed and the FSM retried — nine failures in
+        # ten on the real wall were this. Above ``soft_limit`` the loop now
+        # REACTS instead: the retreat clamp opens to ``retreat_v_max`` (only
+        # the approach has an impact hazard; backing off has none, and 30 N on
+        # a ~2 kN/m contact is 15 mm to unload — 3 s at the approach clamp,
+        # under a second at this one), and the caller stops the base and the
+        # plate's rotation the same cycle (``overloaded``). The hard limit is
+        # then for what the reaction cannot handle: a force still climbing
+        # through it, or one that sits above the soft limit for longer than
+        # ``soft_limit_seconds`` — something is holding the plate in, and
+        # backing off is not working.
+        self.soft_limit = float(soft_limit)
+        self.retreat_v_max = float(retreat_v_max)
+        self.soft_limit_seconds = float(soft_limit_seconds)
         self.reset()
 
     def reset(self):
@@ -355,11 +409,16 @@ class AdmittancePress:
         self._seeded = False
         self._stalled = 0.0     # seconds sat at the envelope in SEEK
         self._over_limit = 0.0  # seconds the raw force has been over the limit
+        self._over_soft = 0.0   # seconds the filtered force has been over the soft limit
         self._contact_held = 0.0    # seconds the force has been over contact_force
         self._contact_n = 0         # ...and how many readings in a row
         self._loaded = False        # over contact_force THIS cycle, plausible or not
         self._tare_samples = []
         self._tare_elapsed = 0.0
+        # Where the wall WAS: the filtered range while the press was on it, and
+        # how long ago the press came off. None until there has been a press.
+        self.wall_distance = None
+        self._since_release = None
         # Whether the wheel has EVER reached the wall in this segment. Latching,
         # and deliberately so: it is what ARMS the sweep's travel, and an arming
         # test must not follow the contact state back down. It carries the dwell
@@ -388,6 +447,19 @@ class AdmittancePress:
         the moment it touches, without waiting for the dwell that arms the
         base."""
         return self.state == PRESS or self._loaded
+
+    @property
+    def overloaded(self):
+        """Filtered force over ``soft_limit``: back off hard, and the caller
+        stops whatever is doing the loading."""
+        return self.force > self.soft_limit
+
+    @property
+    def recontacting(self):
+        """In SEEK, closing on a wall the press was on within ``recontact_memory``."""
+        return (self.state == SEEK and self._since_release is not None
+                and self._since_release < self.recontact_memory
+                and self.wall_distance is not None)
 
     @property
     def stalled(self):
@@ -425,6 +497,13 @@ class AdmittancePress:
         """
         if distance is None:
             return self.approach_min_speed
+        if self.recontacting:
+            # No margin: the wall position is the press's own filtered range
+            # from a moment ago, not a plane fit against unknown bias, and
+            # the same filter is on both sides of the subtraction.
+            gap = distance - self.wall_distance
+            return min(self.recontact_speed,
+                       max(self.approach_min_speed, self.recontact_gain * max(0.0, gap)))
         gap = (distance - self.approach_margin) - self.contact_distance
         return max(self.approach_min_speed, self.approach_gain * max(0.0, gap))
 
@@ -534,6 +613,17 @@ class AdmittancePress:
                     f"{self.force:.1f} N)")
         else:
             self._over_limit = 0.0
+        if self.force > self.soft_limit:
+            self._over_soft += dt
+            if (self.soft_limit_seconds > 0.0 and self._over_soft >= self.soft_limit_seconds
+                    and not self.fault):
+                self.fault = (
+                    f"press force {self.force:.1f} N has been over the "
+                    f"{self.soft_limit:.0f} N soft limit for {self._over_soft:.1f} s "
+                    f"and backing off at {self.retreat_v_max * 1000:.0f} mm/s is not "
+                    f"relieving it — something is holding the plate in")
+        else:
+            self._over_soft = 0.0
 
         if self.state == SEEK:
             # Held over the threshold, in TIME, and never on the seeding cycle.
@@ -564,25 +654,57 @@ class AdmittancePress:
             else:
                 self._contact_held = 0.0
                 self._contact_n = 0
+            if self._since_release is not None:
+                self._since_release += dt
             if (self._contact_held >= self.contact_dwell
                     and self._contact_n >= self.contact_samples):
                 self.state = PRESS
                 self.touched = True
                 self._stalled = 0.0
+                self._since_release = None
         elif self.state == PRESS and self.force < self.release_force:
             # Contact lost: a hollow, a gap, the wheel riding over a lip. Go
             # back to closing the distance rather than commanding the full force
-            # error, which out of contact is just "drive at the wall".
+            # error, which out of contact is just "drive at the wall" — but
+            # closing it on the wall the press was just on, which is known.
             self.state = SEEK
             self._contact_held = 0.0
             self._contact_n = 0
             self._loaded = False
+            self._since_release = 0.0
+        if self.state == PRESS and self.distance is not None and force >= self.contact_force:
+            # Remember where the wall is while it is UNDER LOAD — the raw force
+            # says so, not the state, because the state lags the force filter
+            # by a cycle or two and on the cycle the wheel is kicked off the
+            # range has already jumped while the state still says PRESS. A
+            # memory taken then is the excursion, not the wall. Blended over
+            # a few cycles for the same reason.
+            if self.wall_distance is None:
+                self.wall_distance = self.distance
+            else:
+                self.wall_distance += self._alpha(dt, 0.3) * (self.distance - self.wall_distance)
 
         if self.state == PRESS:
             # v_max bounds the FORCE loop only. It is sized for contact — a few
             # mm/s — and applying it to the approach as well would silently cap
             # seek_speed at it, so raising the seek speed would do nothing.
-            v = float(np.clip(self.gain * self.error(), -self.v_max, self.v_max))
+            # Asymmetric clamp: v_max bounds the APPROACH, which is where the
+            # impact hazard is; the retreat may go as fast as retreat_v_max.
+            v = float(np.clip(self.gain * self.gain_scale * self.error(),
+                              -self.retreat_v_max, self.v_max))
+            if self.force > self.soft_limit:
+                # The reaction: over the soft limit the retreat is at least
+                # the approach clamp, and grows with the EXCESS to reach
+                # retreat_v_max at the hard limit. Starting from v_max rather
+                # than from zero is what makes it fast where it matters — on
+                # a ~2 kN/m contact a 35 N shove is under the soft limit in
+                # ~1 s this way, ~2 s ramped from nothing — and the gain law
+                # alone (5 mm/s at 25 N, x5 on the soft contact) would take
+                # a second the base does not give it.
+                span = max(self.force_limit - self.soft_limit, 1.0)
+                excess = min(1.0, (self.force - self.soft_limit) / span)
+                reaction = self.v_max + excess * (self.retreat_v_max - self.v_max)
+                v = min(v, -min(reaction, self.retreat_v_max))
             self.approach_speed = 0.0
         else:
             if self._loaded:

@@ -30,6 +30,10 @@ import math
 
 import numpy as np
 
+# Where the six sensors sit along the plate frame's Z, metres: the ranges are
+# measured FROM this plane, not from the plate link's origin. Anything that
+# adds a range to a forward-kinematics position has to start from here.
+SENSOR_PLANE_Z = 0.02
 # Sensor (x, y) in the plate frame, metres, in publish order.
 SENSOR_XY = np.array([
     [0.000,  0.172],    # C/U1 ultrasonic, top-mid
@@ -48,11 +52,14 @@ SENSOR_XY = np.array([
 #
 # The ranges arrive already CORRECTED for each sensor's constant offset — the
 # reader (arm_control sensors/arduino_sensors.py, sensors/plate_calibration.py)
-# subtracts the FK-fitted offsets before publishing, so nothing here carries a
-# copy. Those offsets are not small (U2 -4.4 cm, S2 +3.6 cm) and their pattern
-# cancels real tilt in the fit: uncorrected, the plate read 1 deg off while it
-# was 7.7 deg off. test_wbc_surface.py replays the calibration poses through this
-# fit and checks it tracks the FK.
+# subtracts them before publishing, so nothing here carries a copy. The
+# offsets are measured with the plate square on a flat wall (2026-09-21), NOT
+# fitted against the arm: the 2026-09-17 FK fit solved for the wall's
+# orientation and the offsets together, which are not separable, and came out
+# 6.2 deg rotated — every sweep from then until 09-21 "squared" the plate to
+# that wall and put a corner into the real one. test_wbc_surface.py checks
+# the offsets against both: the parallel pose reads flat, and the FK poses
+# keep their relative geometry.
 SENSOR_SIGMA = np.array([0.006, 0.006, 0.006, 0.002, 0.002, 0.002])
 # Validity window per sensor. Mind the ToF ceiling: beyond 0.258 m only the
 # ultrasonics report, so a fit taken far from the wall rests on three points.

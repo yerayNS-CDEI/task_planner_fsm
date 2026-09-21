@@ -15,6 +15,12 @@
   <exec_depend>ur_dashboard_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
+  <!-- The whole-body sweep's QP solver (task_planner_fsm.wbc.qp). Required,
+       not optional: the base pins and the force barrier are constraints only
+       OSQP represents, and the node refuses to import without it. rosdep has
+       no rule for the Python binding (only the C++ osqp_vendor), so this key
+       will not resolve: install it with `pip install osqp`. -->
+  <exec_depend>python3-osqp-pip</exec_depend>
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>navi_wall</exec_depend>

@@ -175,21 +175,33 @@ def test_a_vertical_surface_normal_has_no_upright_solution():
 
 
 # ----------------------------------------------------------------------
-# Against the robot: the 2026-09-17 calibration bag, replayed
+# Against the robot: the calibration data, replayed
 # ----------------------------------------------------------------------
 #
 # test/fixtures/plate_ranges_2026_09_17.json holds, for 17 poses the arm
 # held still in front of a concrete wall, the mean of the six RAW published
-# ranges and the wall's true normal and distance in the plate frame from the
-# arm's forward kinematics (the pendant TCP is the GPR contact point, and it
-# was constrained to lie on the wall at the two contact poses). It also holds
-# the 104 raw range frames from the approach that ended in the 2026-09-15
-# 31 N overload.
+# ranges and the wall's normal and distance in the plate frame from the arm's
+# forward kinematics; the 104 raw range frames from the approach that ended
+# in the 2026-09-15 31 N overload; and, since 2026-09-21, ten raw frames with
+# the plate PARALLEL to a flat wall (all four GPR casters touching).
 #
-# The reader now subtracts a constant offset per sensor before publishing
-# (arm_control sensors/plate_calibration.py). These tests apply the same
-# offsets to the raw fixture and check that THIS fit, with THESE sigmas, then
-# recovers what the arm measured — and that without the offsets it does not.
+# The reader subtracts a constant offset per sensor before publishing
+# (arm_control sensors/plate_calibration.py); the fixture carries a copy and
+# these tests apply it to the raw data. What each part of the data can
+# validate is different, and the tests are careful about it:
+#
+#   * The parallel pose is a direct measurement: the six true ranges are
+#     equal, so corrected ranges must fit FLAT. This is the anchor.
+#   * The FK poses validate the RELATIVE geometry only. The 2026-09-17 fit
+#     solved for the wall plane's orientation together with the offsets, and
+#     the two are not separable — a wrong wall tilt and a diagonal offset
+#     pattern are the same thing to a plane fit. It settled 6.2 deg off, and
+#     the offsets it produced made every pose read 6.2 deg off the real
+#     wall (that is what put a corner into the wall first from 09-17 to
+#     09-21). So the FK normals in the fixture are all rotated by that
+#     constant, and the test checks angles BETWEEN poses, which the constant
+#     drops out of.
+#
 # If the offsets ever change, the fixture's copy must change with them.
 
 import json
@@ -210,40 +222,76 @@ def _angle_deg(a, b):
     return np.degrees(np.arccos(np.clip(np.dot(a, b) / np.linalg.norm(a) / np.linalg.norm(b), -1.0, 1.0)))
 
 
-def test_calibrated_ranges_fit_the_wall_the_arm_measured(field):
-    """Corrected ranges through the fit land on the FK plane, at every pose:
-    normal within 2 deg, sensor-plane distance within 8 mm."""
+def _reader_plane_ranges(frame):
+    """Six raw serial values -> metres from the sensor plane, as the reader does."""
+    u = [v / 100.0 for v in frame[:3]]
+    s = [v / 1000.0 + 0.083 for v in frame[3:]]
+    return np.array(u + s)
+
+
+def test_a_parallel_plate_reads_flat_through_the_calibration(field):
+    """The anchor: with all four casters on the wall the plate IS parallel,
+    so the corrected fit must say so — under half a degree, at the datum the
+    press is re-datumed to (press_contact_distance 0.140)."""
     offset = np.array(field["range_offset_m"])
-    for pose in field["poses"]:
-        normal, distance, n_valid = fit_wall_plane(np.array(pose["raw_mean"]) - offset)
-        assert n_valid == 6, pose["t_start"]
-        err = _angle_deg(normal, pose["fk_normal_plate"])
-        assert err < 2.0, f"pose {pose['t_start']}s: normal {err:.2f} deg off the FK"
-        assert abs(distance - pose["fk_sensor_plane_distance"]) < 0.008, (
-            f"pose {pose['t_start']}s: {distance:.4f} vs FK {pose['fk_sensor_plane_distance']:.4f}")
+    frames = np.array(field["parallel_pose_raw_2026_09_21"]["frames_raw_serial"], dtype=float)
+    mean = _reader_plane_ranges(frames.mean(axis=0))
+    normal, distance, n_valid = fit_wall_plane(mean - offset)
+    assert n_valid == 6
+    assert _tilt_deg(normal) < 0.5, f"parallel plate reads {_tilt_deg(normal):.2f} deg tilted"
+    assert abs(distance - 0.1395) < 0.004
+    # Frame by frame too, so the anchor is not an artefact of averaging the
+    # centimetre-quantised ultrasonics.
+    per_frame = [_tilt_deg(fit_wall_plane(_reader_plane_ranges(f) - offset)[0]) for f in frames]
+    assert max(per_frame) < 1.5
 
 
-def test_uncalibrated_ranges_fit_a_wall_that_is_not_there(field):
-    """Without the offsets the same fit is 3-5 deg wrong — the offset pattern
-    (U2 short, S2 long) cancels real tilt. This is the failure the reader's
-    calibration exists to remove; if it passes on raw ranges, the fixture no
-    longer describes the hardware."""
-    errors = [_angle_deg(fit_wall_plane(np.array(p["raw_mean"]))[0], p["fk_normal_plate"])
-              for p in field["poses"]]
-    assert max(errors) > 3.0
-    assert sum(e > 2.0 for e in errors) >= 6
+def test_the_old_fk_fit_offsets_tilt_a_parallel_plate(field):
+    """The 2026-09-17 offsets read the same parallel plate ~6 deg off — the
+    constant the FK fit absorbed into them. Kept so the failure mode stays
+    documented in a form that runs: if a future re-fit against the arm ever
+    reproduces this, it has made the same mistake."""
+    old = np.array(field["range_offset_m_2026_09_17_fk_fit"])
+    mean = _reader_plane_ranges(
+        np.array(field["parallel_pose_raw_2026_09_21"]["frames_raw_serial"], dtype=float).mean(axis=0))
+    assert _tilt_deg(fit_wall_plane(mean - old)[0]) > 5.0
 
 
-def test_the_approach_that_overloaded_was_seven_degrees_off(field):
-    """The 2026-09-15 31 N overload: the controller read the plate ~1 deg from
-    parallel on raw ranges while it was ~7-8 deg off. Corrected ranges show
-    the tilt that put one corner into the wall first."""
+def test_calibrated_ranges_keep_the_relative_geometry_the_arm_measured(field):
+    """Across the 17 FK poses the angle between any two fitted normals must
+    match the angle between the arm's two normals: the wall constant drops
+    out, what is left is whether the offsets distort the plate's rotations.
+    Corrected: under 1 deg for every pair. Raw: not."""
     offset = np.array(field["range_offset_m"])
+    poses = field["poses"]
+    fk = [np.array(p["fk_normal_plate"]) for p in poses]
+    fit = [fit_wall_plane(np.array(p["raw_mean"]) - offset)[0] for p in poses]
+    raw = [fit_wall_plane(np.array(p["raw_mean"]))[0] for p in poses]
+    pairs = [(i, j) for i in range(len(poses)) for j in range(i + 1, len(poses))]
+    corrected_err = [abs(_angle_deg(fk[i], fk[j]) - _angle_deg(fit[i], fit[j])) for i, j in pairs]
+    raw_err = [abs(_angle_deg(fk[i], fk[j]) - _angle_deg(raw[i], raw[j])) for i, j in pairs]
+    assert max(corrected_err) < 1.0, f"worst pair {max(corrected_err):.2f} deg"
+    assert np.mean(corrected_err) < 0.3
+    assert max(raw_err) > 3.0, "raw ranges keep the geometry — the offsets are doing nothing"
+    # And the constant itself, so the number in the docs stays tied to data:
+    # every FK normal sits the same ~6.2 deg from its corrected fit.
+    const = [_angle_deg(a, b) for a, b in zip(fk, fit)]
+    assert 5.5 < np.mean(const) < 7.0 and np.std(const) < 0.5
+
+
+def test_the_approach_that_overloaded_was_two_degrees_off_not_seven(field):
+    """The 2026-09-15 31 N overload, re-read. Through the 09-17 offsets it was
+    the '7.7 deg off' approach that motivated a week of alignment work; through
+    the parallel-pose offsets it was ~2 deg off, and the raw fit (what the
+    controller saw at the time) ~1.7. The overload was not a plate arriving
+    seven degrees off; it was the base driving a plate that was nearly square."""
+    offset = np.array(field["range_offset_m"])
+    old = np.array(field["range_offset_m_2026_09_17_fk_fit"])
     frames = np.array(field["failure_window_raw"])
-    raw = np.array([_tilt_deg(fit_wall_plane(f)[0]) for f in frames])
     corrected = np.array([_tilt_deg(fit_wall_plane(f - offset)[0]) for f in frames])
-    assert raw.mean() < 2.0
-    assert 6.0 < corrected.mean() < 9.5
+    through_old = np.array([_tilt_deg(fit_wall_plane(f - old)[0]) for f in frames])
+    assert 1.0 < corrected.mean() < 3.5
+    assert through_old.mean() > 6.0
 
 
 def test_corrected_tilt_jitter_fits_under_a_one_degree_deadband(field):

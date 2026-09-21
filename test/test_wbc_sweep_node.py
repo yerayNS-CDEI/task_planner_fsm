@@ -56,15 +56,17 @@ WALL_X = 3.0           # the wall plane, x = WALL_X, its normal pointing -x
 STANDOFF = 0.20
 # Plate distance at which the GPR's face and wheel are on the wall. The range
 # sensors are on the plate face and the GPR stands 15 cm proud of it, so this
-# — not zero — is what "in contact" reads. It is the node's default
-# press_contact_distance (0.150, the calibrated reading of 2026-09-17); the
-# simulated wall has to sit where the node expects it or the press walks into
-# the min_distance envelope before it ever feels anything.
+# — not zero — is what "in contact" reads. _node passes it to the node as
+# press_contact_distance (with press_min_distance 2 cm inside it), so the
+# simulated wall sits where the node expects it; the node's own defaults
+# follow the real plate's calibration (0.140 since 2026-09-21) and this
+# harness does not.
 PLATE_STANDOFF = 0.150
 # Where the GPR touches, in the plate frame of this harness (sensors at z=0):
 # 8 cm off the plate's centre and PLATE_STANDOFF proud of it. The node's own
 # contact_point default is the same point in the URDF plate frame, whose
-# sensors sit at z=+0.02; _node passes this one so the two agree.
+# sensors sit at z=+0.02; _node passes this one, and sensor_plane_z = 0, so
+# the two agree.
 CONTACT_POINT = np.array([-0.08, 0.0, PLATE_STANDOFF])
 # Where the FSM's arm_approach leaves the plate before a sweep begins.
 APPROACH_GAP = 0.20
@@ -164,6 +166,9 @@ def _node(seg_start, seg_end, **overrides):
         rclpy.parameter.Parameter("standoff", value=STANDOFF),
         rclpy.parameter.Parameter("control_rate", value=50.0),
         rclpy.parameter.Parameter("contact_point", value=CONTACT_POINT.tolist()),
+        rclpy.parameter.Parameter("sensor_plane_z", value=0.0),
+        rclpy.parameter.Parameter("press_contact_distance", value=PLATE_STANDOFF),
+        rclpy.parameter.Parameter("press_min_distance", value=PLATE_STANDOFF - 0.02),
     ]
     params += [rclpy.parameter.Parameter(k, value=v) for k, v in overrides.items()]
     node = WholeBodySweepNode(parameter_overrides=params)
@@ -866,8 +871,39 @@ def test_a_single_late_stream_tick_cannot_jump_the_setpoint():
     factor = float(node.get_parameter("stream_period_max_factor").value)
     nominal = 1.0 / node.stream_rate
     step = _setpoint_step_over(node, robot, elapsed=1.0)
-    assert step == pytest.approx(0.1 * factor * nominal, abs=1e-9)
+    # Two ceilings, whichever is lower: the factor, and the age at which the
+    # stream would stop trusting the velocity at all (here the solve is
+    # healthy at its nominal period, so that is the tighter one).
+    ceiling = min(factor * nominal, node._arm_command_max_age())
+    assert step == pytest.approx(0.1 * ceiling, abs=1e-9)
     assert step < 0.1 * 1.0, "a second-late tick must not advance a second of motion"
+
+
+def test_a_starved_stream_still_delivers_the_commanded_velocity():
+    """The 2026-09-21 16:58 bag: stream ticks 25-110 ms apart on a loaded
+    host, and a 40 ms cap on what one tick may integrate. The arm executed
+    10-40% of every velocity the solve published — a retreat asked for
+    84 mrad/s and got 8 — because everything past 40 ms of each late tick
+    was simply dropped. Within the horizon the stream trusts the velocity,
+    a late tick integrates the time that actually passed."""
+    node = _sweep_along_wall()
+    robot = _start_state_along_wall(node.chain)
+    # The solve itself is slow, 10 Hz, so its velocity stays trusted for
+    # 5 x 100 ms; a stream tick 110 ms late is well inside that.
+    _wire(node, robot)
+    node.arm_stream.reset(robot.q)
+    clock = _Clock(100.0)
+    node._now = clock
+    node.cycle_period = 0.1
+    node.stream_stamp = clock.t
+    clock.advance(0.11)
+    node.arm_qdot = np.full(len(node.arm_joints), 0.1)
+    node.arm_qdot_stamp = clock.t
+    before = node.arm_stream.command.copy()
+    node._stream_step()
+    step = float(np.max(node.arm_stream.command - before))
+    assert step == pytest.approx(0.1 * 0.11, abs=1e-9), (
+        f"a 110 ms tick advanced {step / 0.1 * 1e3:.0f} ms of motion")
 
 
 def test_a_fast_stream_tick_does_not_under_integrate():
@@ -1348,6 +1384,142 @@ def test_a_brief_hollow_costs_speed_rather_than_stopping_the_base():
     assert travel[-1] > 0.9 * before, "and the base should be back up to speed"
 
 
+def test_a_lost_wall_stops_the_base_at_once_and_is_budgeted_by_the_reseat_not_the_watchdog():
+    """The 2026-09-21 12:50 run, in the harness.
+
+    The wheel lifted as the base set off. The authority took 15 s to decay
+    through the filter and the base carried the plate 1.4 cm off the wall
+    meanwhile; the approach floor spent 30 s winning that back; and one second
+    after the re-seat the no_progress watchdog — which had been counting the
+    whole time — failed the sweep. Three things, each checked here: off the
+    wall for longer than a hollow, the base stops within the grace; while the
+    gate holds the base the watchdog does not run; and what ends a contact
+    that never comes back is reseat_timeout, with its own message.
+    """
+    global WALL_X
+    node = _press_node(press_travel_tau=1.5, press_release_grace=0.5,
+                       no_progress_timeout=3.0, reseat_timeout=6.0)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.03)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+
+    recede_at, was = 500, WALL_X
+    try:
+        def on_cycle(cycle):
+            global WALL_X
+            WALL_X = was + 0.06 if cycle >= recede_at else was
+        forces, travel = _press_run(node, robot, cycles=recede_at + 450,
+                                    on_cycle=on_cycle)
+    finally:
+        WALL_X = was
+
+    assert forces[recede_at - 1] > 1.0, "the wheel should be loaded before the wall moves"
+    swept = travel[recede_at - 50:recede_at].mean()
+    assert swept > 0.5 * node.sweep_speed
+    # The force filter (0.09 s) has to read the release, then the grace
+    # (0.5 s), then the acceleration bound ramps the command down over a few
+    # cycles: inside a second of the wheel lifting the base is STOPPED — not
+    # down to a quarter, as the filter alone would have it after four.
+    after_grace = travel[recede_at + 50:recede_at + 80]
+    assert max(after_grace) < 0.02 * swept, (
+        f"base still at {max(after_grace):.4f} m/s a second after the wheel lifted")
+    # The watchdog (3 s here) did not fire: the sweep outlived it by a margin
+    # and then ended on the re-seat budget (6 s), named as such.
+    assert len(travel) > recede_at + 300, f"ended early: {node.pending_status}"
+    assert len(travel) < recede_at + 400, "the re-seat budget should have ended it"
+    assert node.pending_status.startswith("failed"), node.pending_status
+    assert "did not re-seat" in node.pending_status, node.pending_status
+
+
+def test_a_wheel_the_base_kicks_off_the_wall_is_regained_without_stopping_the_base():
+    """The requirement, from the 2026-09-21 13:56 bag: the chassis yaws ~0.7 deg
+    when the base starts and shoves the plate ~12 mm normal to the wall. When
+    that takes the wheel OFF, the arm is to get it back — fast — and the base
+    is to keep sweeping through it, not stop and restart against a loaded
+    wheel. Modelled as the wall stepping 12 mm back for good, with the real
+    approach floor so the first-approach crawl is what it would be in the
+    field: the re-contact schedule closes at up to 5 mm/s on the wall it
+    remembers, and press_release_grace (3 s) keeps the base rolling."""
+    global WALL_X
+    node = _press_node(press_tare_seconds=0.0, press_approach_min_speed=0.0008)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+
+    kick_at, was = 400, WALL_X
+    try:
+        def on_cycle(cycle):
+            global WALL_X
+            WALL_X = was + 0.012 if cycle >= kick_at else was
+        forces, travel = _press_run(node, robot, cycles=kick_at + 400, on_cycle=on_cycle)
+    finally:
+        WALL_X = was
+
+    assert len(travel) == kick_at + 400, f"the sweep ended early: {node.pending_status}"
+    before = travel[kick_at - 50:kick_at].mean()
+    assert before > 0.5 * node.sweep_speed, "the base should be sweeping before the kick"
+    assert forces[kick_at + 5] == 0.0, "12 mm should take the wheel clean off"
+    # Back on the wall inside 3 s: the first cycle after the kick with real
+    # load again, and the press state to match.
+    regained = next((i for i in range(kick_at + 10, len(forces)) if forces[i] > 1.0), None)
+    assert regained is not None and (regained - kick_at) * 0.02 < 3.0, (
+        f"re-contact took {None if regained is None else (regained - kick_at) * 0.02} s")
+    assert node.press.in_contact
+    # And the base never stopped for it: through the loss and the re-contact
+    # the travel stayed above a third of what it was, and is back up after.
+    through = travel[kick_at:regained + 50]
+    assert through.min() > 0.3 * before, (
+        f"the base dropped to {through.min() / before:.0%} of its speed during the loss")
+    assert travel[-25:].mean() > 0.8 * before, "and it is back up to speed afterwards"
+    # The landing was gentle: the memory includes the compression, so the
+    # wheel meets the wall at gain * F_target / K_e whatever K_e is.
+    assert max(forces[regained:regained + 100]) < 12.0
+
+
+def test_a_base_driven_overload_is_relieved_and_swept_on_rather_than_failed():
+    """The 2026-09-21 16:58 and 13:56 overloads, in the harness: a seated
+    5 N contact that the base's start shoves 15 mm further into the wall in
+    one cycle — 30 N on the ~2 kN/m caster contact, which was a fault at the
+    old limit. Now: the base is cut to zero that cycle, the press backs off at
+    up to press_retreat_v_max, the force is under the soft limit within a
+    second, nothing fails, and the sweep goes on from there."""
+    global WALL_X
+    node = _press_node(press_tare_seconds=0.0)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
+    # The caster contact, not the harness's concrete.
+    robot.press_force = lambda: KinematicRobot.press_force(robot, stiffness=2.0e3)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+
+    shove_at, was = 400, WALL_X
+    try:
+        def on_cycle(cycle):
+            global WALL_X
+            WALL_X = was - 0.015 if cycle >= shove_at else was
+        forces, travel = _press_run(node, robot, cycles=shove_at + 500, on_cycle=on_cycle)
+    finally:
+        WALL_X = was
+
+    assert len(travel) == shove_at + 500, f"the sweep ended: {node.pending_status}"
+    before = travel[shove_at - 50:shove_at].mean()
+    assert before > 0.5 * node.sweep_speed, "sweeping before the shove"
+    soft = float(node.get_parameter("press_force_soft_limit").value)
+    hard = float(node.get_parameter("press_force_limit").value)
+    peak = max(forces[shove_at:shove_at + 20])
+    assert soft < peak < hard, f"the shove should land between the limits: {peak:.1f} N"
+    # Cut, not eased: the base is stopped within a few cycles of the shove.
+    assert max(travel[shove_at + 5:shove_at + 25]) < 0.1 * before, (
+        f"the base kept moving at {max(travel[shove_at + 5:shove_at + 25]) / before:.0%}")
+    # Relieved inside a second and a half, with the wheel still on the wall.
+    within = forces[shove_at:shove_at + 75]
+    assert min(within) < soft, f"still {min(within):.1f} N 1.5 s after the shove"
+    assert forces[shove_at + 75] > 0.5, "the reaction should not throw the wheel off the wall"
+    assert node.press.in_contact
+    assert node.pending_status is None
+    # And the base comes back on its own once the contact has re-seated.
+    assert travel[-25:].mean() > 0.5 * before, "the sweep should resume"
+
+
 def _squeezed_press(force_alpha, weight_press_normal=1.0e4, cycles=400):
     """A press with an obstacle BEHIND the base, so the barrier pushes it in.
 
@@ -1411,25 +1583,33 @@ def test_the_force_barrier_bounds_the_squash_when_the_press_task_cannot():
     without it the wheel runs 44% past the limit before anything notices,
     with it the force is held AT the limit instead of sailing through it.
 
-    Both still fail the sweep, and that is the honest result — the barrier
-    bounds the overload, it does not make the situation survivable: held
-    exactly at the limit, the limit's own dwell eventually trips. Since the
-    barrier moved to the GPR's contact point (where the force acts, 8 cm off
-    the plate's centre) it holds the force at 30.0 rather than letting it
-    creep to 31.5, and the harness measures the force at that same point.
+    Since 2026-09-21 there is a reaction layer under the hard limit: over
+    press_force_soft_limit the press backs off at up to press_retreat_v_max
+    and the base is cut. That changes what this scenario costs. Neither run
+    fails any more — the squash peaks in the high thirties against a 45 N
+    hard limit, is relieved, and the sweep goes on — and the barrier's own
+    contribution is the couple of newtons it shaves off the peak by bounding
+    the approach before the reaction has to undo it. Smaller than it was,
+    and still a bound where the reaction is a response.
     """
     guarded, guarded_force = _squeezed_press(force_alpha=1.0, weight_press_normal=1.0)
     unguarded, unguarded_force = _squeezed_press(force_alpha=0.0, weight_press_normal=1.0)
 
-    assert unguarded_force.max() > 40.0, (
-        f"unbounded, the squash runs well past the limit "
-        f"(peak {unguarded_force.max():.1f} N)")
-    assert unguarded.pending_status, "and the sweep is lost"
-    assert guarded_force.max() <= 30.5, (
-        f"the barrier should hold it at the limit, not past it "
-        f"(peak {guarded_force.max():.1f} N)")
-    assert guarded_force.max() < 0.75 * unguarded_force.max()
-    assert guarded.pending_status, "held at the limit, the limit still trips"
+    soft = float(guarded.get_parameter("press_force_soft_limit").value)
+    hard = float(guarded.get_parameter("press_force_limit").value)
+    assert unguarded_force.max() > 2.0 * soft, (
+        f"with the task unable to hold it, the squash should run well past the "
+        f"soft limit (peak {unguarded_force.max():.1f} N)")
+    assert unguarded_force.max() < hard and guarded_force.max() < hard
+    assert guarded_force.max() < unguarded_force.max(), "the barrier still lowers the peak"
+    assert unguarded.pending_status is None and guarded.pending_status is None, (
+        "relieved, not failed")
+    # With the obstacle STILL pushing the base in, the reaction and the push
+    # meet at the soft limit: the press backs off whenever the force is over
+    # it and stops when it is under. Bounded there, not relieved to target —
+    # that needs the push to end, which in this fixture it never does.
+    for forces in (guarded_force, unguarded_force):
+        assert forces[-50:].mean() < soft + 1.0, "held at the soft limit, not above it"
 
 
 def test_the_force_barrier_does_not_slow_a_press_that_is_going_fine():
@@ -1577,6 +1757,52 @@ def test_a_dragging_plate_throttles_the_base_before_the_side_load_halts_it():
         f"halfway up the drag band the travel should be about halved: "
         f"{dragging:.4f} vs {rolling:.4f}")
     assert travel[900:].max() < 0.05 * rolling, "over the limit the base stops"
+
+
+def test_an_overloaded_contact_is_not_swept_on_and_reseats_only_after_a_dwell():
+    """The 2026-09-18 19:26 run: the drag throttle relieved a 23 N contact,
+    the side load dropped under the free line, the gate reopened, the base
+    ramped, and the force went to 30 — a 4 s limit cycle. Two rules from it:
+    a normal force far over target is not a seated contact whatever the side
+    load says, and a contact that came unseated must hold every condition for
+    press_seat_dwell before the base is let back onto it."""
+    node = _press_node()
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.03, tilt=0.0)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    target = float(node.get_parameter("press_force").value)
+    factor = float(node.get_parameter("press_seated_force_factor").value)
+    dwell = float(node.get_parameter("press_seat_dwell").value)
+    dt = 1.0 / float(node.get_parameter("control_rate").value)
+    fake = {"force": None}
+
+    def on_cycle(cycle):
+        # From cycle 750 the sensor reports a force far over target for 2 s,
+        # with the plate not actually moving: the gate must close on that
+        # alone, and after it clears must wait out the dwell before reopening.
+        if 750 <= cycle < 850:
+            node.press_force = 1.5 * factor * target
+        fake["force"] = node.press_force
+
+    # 1450 rather than 1100 cycles: relieving a 15 N reading takes the wheel
+    # clean off the wall, and a wheel off the wall for longer than
+    # press_release_grace now stops the base outright, so the return is a
+    # full ramp from zero through the 4 s filter rather than from wherever
+    # the decay had got to. The rule is the same; the recovery takes longer.
+    _, travel = _press_run(node, robot, cycles=1450, on_cycle=on_cycle)
+
+    assert node.pending_status is None, f"the sweep ended early: {node.pending_status}"
+    rolling = travel[700:750].mean()
+    assert rolling > 0.5 * node.sweep_speed, "sweeping before the overload"
+    # Decaying through the 4 s filter: two seconds in, the travel is at
+    # ~exp(-2/4) = 60% and still falling.
+    assert travel[849] < 0.7 * rolling, "the base backs off an overloaded contact"
+    assert travel[849] < travel[800] < travel[760], "and keeps backing off while it lasts"
+    # After the overload clears, nothing reopens for the dwell: the authority
+    # can only keep decaying through it.
+    reseat = 850 + int(dwell / dt)
+    assert travel[850:reseat].max() <= travel[849] + 1e-6, "no ramp-up inside the dwell"
+    assert travel[-50:].mean() > 0.8 * rolling, "and it comes back afterwards"
 
 
 def test_the_retreat_stops_when_the_elbow_folds_past_its_limit():
@@ -1930,3 +2156,65 @@ def test_diagnostics_can_still_be_turned_off():
     node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.2, 0.0),
                  publish_diagnostics=False)
     assert node.diag_pub is None
+
+
+# The end of the real arm, as the URDF lays it out (arm_control ur_macro.xacro
+# and sensor_plate.urdf.xacro, defaults ee_cylinder_length 0.15 and
+# sensors_offset 0.15): the flange carries a cylinder adapter, the PLATE hangs
+# off the adapter's middle, and 'tool0' has been moved 0.15 m past the plate
+# toward the wall. Only the wrist joint is kept, so the chain has something
+# to actuate; the fixed offsets are what this test is about.
+WRIST_URDF = """<?xml version="1.0"?>
+<robot name="wrist">
+  <link name="arm_base_link"/><link name="arm_flange"/>
+  <link name="arm_ee_cylinder_link"/><link name="arm_plate_link"/><link name="arm_tool0"/>
+  <joint name="wrist" type="revolute"><parent link="arm_base_link"/><child link="arm_flange"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-3.1" upper="3.1" velocity="2"/></joint>
+  <joint name="flange-ee_cylinder" type="fixed"><parent link="arm_flange"/><child link="arm_ee_cylinder_link"/>
+    <origin xyz="0.075 0 0" rpy="0 1.5707963 0"/></joint>
+  <joint name="tool0_to_plate_joint" type="fixed"><parent link="arm_ee_cylinder_link"/><child link="arm_plate_link"/>
+    <origin xyz="0 0 0.075" rpy="0 0 1.5707963"/></joint>
+  <joint name="ee_cylinder-tool0" type="fixed"><parent link="arm_ee_cylinder_link"/><child link="arm_tool0"/>
+    <origin xyz="0 0 0.225" rpy="0 0 1.5707963"/></joint>
+</robot>
+"""
+
+
+def test_the_default_contact_point_lands_on_the_pendant_tcp():
+    """The node's tip link and contact point, together, must name the GPR.
+
+    The contact point is the pendant TCP 'Sensor_plate': 320 mm out along the
+    flange's tool axis and 80 mm off it, verified on the wall to 0.2 mm on
+    2026-09-17. The parameter stores it in the PLATE link's frame and the
+    node applies it in the TIP link's axes, so the two parameters only mean
+    the GPR when the tip IS the plate link. Until 2026-09-21 the tip was
+    'arm_tool0', which the URDF puts 0.15 m past the plate: the press rows
+    were evaluated 15 cm beyond the wall, and nothing in the harness could
+    see it because its tip link is its plate. This pins the pair against the
+    real layout.
+    """
+    node = WholeBodySweepNode(parameter_overrides=[
+        rclpy.parameter.Parameter("arm_joints", value=["wrist"])])
+    tip = str(node.get_parameter("arm_tip_link").value)
+    contact = np.array(node.get_parameter("contact_point").value, dtype=float)
+    chain = SerialChain.from_urdf(WRIST_URDF, "arm_base_link", tip)
+    flange = SerialChain.from_urdf(WRIST_URDF, "arm_base_link", "arm_flange")
+    T_tip, T_flange = chain.fk([0.0]), flange.fk([0.0])
+    contact_world = T_tip[:3, 3] + T_tip[:3, :3] @ contact
+    # The TCP is 320 mm from the flange along the tool axis and 80 mm off it.
+    # The tool axis is the plate's +Z (the flange's own frame has it along X,
+    # ur_description style, and which lateral axis carries the 80 mm depends
+    # on the fixed joints' yaws), so measure along that and take the radius.
+    axis = T_tip[:3, 2]
+    from_flange = contact_world - T_flange[:3, 3]
+    along = float(axis @ from_flange)
+    assert along == pytest.approx(0.32, abs=1e-6), \
+        f"contact is {along:.3f} m along the tool axis, the TCP is at 0.320"
+    assert np.linalg.norm(from_flange - along * axis) == pytest.approx(0.08, abs=1e-6)
+    # And the sensor plane the ranges are measured from sits where the
+    # calibration says: 0.15 m behind the contact, along the same axis.
+    sensor_plane = float(node.get_parameter("sensor_plane_z").value)
+    plane_world = T_tip[:3, 3] + T_tip[:3, :3] @ np.array([0.0, 0.0, sensor_plane])
+    assert float(axis @ (contact_world - plane_world)) == pytest.approx(0.15, abs=1e-6)
+    node.destroy_node()

@@ -16,23 +16,28 @@ That keeps one code path, degrades gracefully when the primary task is
 infeasible, and — unlike a pseudoinverse — lets hard limits be *constraints*
 instead of after-the-fact clipping.
 
-Solved with OSQP when available. The fallback is a box-constrained least squares
-(``scipy.optimize.lsq_linear``), which handles everything except the base
-actuator rows; the caller is told via ``QPSolution.solver`` so it can warn.
+Solved with OSQP, and only OSQP. There used to be a box-only fallback
+(``scipy.optimize.lsq_linear``) for hosts without it; it was removed because it
+could not stand in for this problem at all. It drops the actuator rows and the
+force barrier, and it rejects equal bounds outright — which is how the base
+travel pin and the retreat's pinned base are written — so on a host without
+OSQP every pinned cycle failed and the retreat exited without moving, with the
+wheel still loaded on the wall. A solver that cannot represent the constraints
+is not a fallback for a controller whose safety lives in the constraints.
+Missing OSQP is now an import error at startup, where it is cheap.
 """
 
 from dataclasses import dataclass
 
 import numpy as np
 
-try:  # optional: only needed for the constrained solve
+try:
     import osqp
     import scipy.sparse as sp
-    _HAVE_OSQP = True
-except ImportError:  # pragma: no cover - exercised only on hosts without osqp
-    _HAVE_OSQP = False
-
-from scipy.optimize import lsq_linear
+except ImportError as exc:  # pragma: no cover - exercised only on hosts without osqp
+    raise ImportError(
+        "task_planner_fsm.wbc needs the OSQP Python binding (pip install osqp); "
+        "there is no rosdep key for it, see package.xml") from exc
 
 
 @dataclass
@@ -203,29 +208,15 @@ def solve_velocity_qp(tasks, lb, ub, A_ineq=None, ineq_lo=None, ineq_hi=None,
         return QPSolution(u[:-n_soft] if n_soft else u, status, solver,
                           residual, slacks)
 
-    has_rows = A_ineq is not None and len(np.atleast_2d(A_ineq)) > 0
-    if _HAVE_OSQP:
-        solution = _solve_osqp(A, b, lb, ub, A_ineq, ineq_lo, ineq_hi, ridge, osqp_settings)
-        if solution is not None:
-            return _unpack(solution[0], solution[1], "osqp")
-        if has_rows:
-            # OSQP is installed and could not solve it, which for a problem with
-            # constraint rows almost always means they genuinely conflict. Do
-            # NOT fall through to the box-only solver here: it would drop the
-            # actuator limits and the obstacle barriers and hand back a
-            # healthy-looking command that honours neither. Report the failure
-            # and let the caller stop.
-            return QPSolution(None, "infeasible or solver failure", "osqp", float("inf"))
-
-    # Fallback: box-constrained least squares, used when OSQP is not installed
-    # at all. Exact for the box, blind to the rows — the caller must say so out
-    # loud, because a barrier that is not enforced is a barrier that is absent.
-    try:
-        result = lsq_linear(A, b, bounds=(lb, ub), max_iter=50)
-        solver = "lsq_linear" if A_ineq is None else "lsq_linear(box-only)"
-        return _unpack(np.asarray(result.x, dtype=float), "solved", solver)
-    except Exception as exc:  # pragma: no cover - numerical last resort
-        return QPSolution(None, f"failed: {exc}", "none", float("inf"))
+    solution = _solve_osqp(A, b, lb, ub, A_ineq, ineq_lo, ineq_hi, ridge, osqp_settings)
+    if solution is not None:
+        return _unpack(solution[0], solution[1], "osqp")
+    # OSQP could not solve it, which for a problem with constraint rows almost
+    # always means they genuinely conflict. There is deliberately nothing to
+    # fall through to: a solver that dropped the actuator limits and the
+    # barriers would hand back a healthy-looking command that honours neither.
+    # Report the failure and let the caller stop.
+    return QPSolution(None, "infeasible or solver failure", "osqp", float("inf"))
 
 
 def _solve_osqp(A, b, lb, ub, A_ineq, ineq_lo, ineq_hi, ridge, settings):

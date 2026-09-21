@@ -68,7 +68,7 @@ from .kinematics import SerialChain, rotation_error, shift_jacobian_point, soft_
 from .qp import SoftRows, Task, joint_limit_bounds, solve_velocity_qp
 from .stiffness import ContactStiffness, force_limit_rows
 from .streaming import DEFAULT_CONTROLLER, POSITION, ArmStream, slew_limit
-from .surface import SurfaceEstimator, plate_orientation_target, sweep_tangent
+from .surface import SENSOR_PLANE_Z, SurfaceEstimator, plate_orientation_target, sweep_tangent
 
 ARM_JOINTS = [
     "arm_shoulder_pan_joint", "arm_shoulder_lift_joint", "arm_elbow_joint",
@@ -137,12 +137,17 @@ class WholeBodySweepNode(Node):
         # it is 'arm_base_link' (the URDF link), NOT the FSM's 'arm_base' — the
         # UR description carries both, rotated pi about z from each other.
         self.declare_parameter("arm_root_link", "arm_base_link")
-        # The plate ranges are measured at 'arm_plate_link', which shares its
-        # orientation with 'arm_tool0' (both hang off arm_ee_cylinder_link with
-        # the same rpy) and sits 0.15 m further along the shared +Z. Using tool0
-        # as the tip therefore keeps the sensed normal valid, and the standoff
-        # keeps the same meaning it has everywhere else in the FSM.
-        self.declare_parameter("arm_tip_link", "arm_tool0")
+        # The tip is the PLATE link, because that is the frame everything
+        # else is written in: the six ranges are measured from its sensor
+        # plane (z = +0.02), the 2026-09-17 calibration is expressed in it,
+        # and contact_point below is in it. It is NOT 'arm_tool0'. That frame
+        # shares the plate's orientation but sits 0.15 m further along the
+        # shared +Z, toward the wall (URDF: plate at ee_cylinder + L/2, tool0
+        # at ee_cylinder + sensors_offset + L/2). Until 2026-09-21 the tip was
+        # tool0 with the plate-frame contact point applied in its axes, which
+        # put the press rows 15 cm past the wall and read the base 13 cm
+        # further from it than it was.
+        self.declare_parameter("arm_tip_link", "arm_plate_link")
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         # How the arm is commanded: "position" streams servoj setpoints through
         # forward_position_controller, "velocity" streams speedj through
@@ -174,8 +179,31 @@ class WholeBodySweepNode(Node):
         # stiff environment, so k * K_e sets the closed-loop bandwidth and must
         # stay well under the servo lag. See the module docstring for the sizing.
         self.declare_parameter("press_gain", 5.0e-5)
+        # The gain above was sized for ~2e4 N/m (concrete through a hard
+        # wheel). The plate rides on four corner casters on bars, and that
+        # contact measured ~2e3 N/m twice on 2026-09-21 (5 mm for 10 N; 12 mm
+        # for 27 N). On a contact that soft the same gain closes a 1 N error
+        # at 0.05 mm/s — 10 s for the last newton, and the base's start kicks
+        # the plate by more than that in one second. So the gain is scaled
+        # each cycle by press_gain_stiffness_ref / K_e (the estimator's value,
+        # which floors at press_stiffness_floor), and capped: at 5x the loop
+        # is still 20x under the ringing boundary if the contact turns out to
+        # be the 2e4 the gain was sized for (2 / (K_e dt) at 10 Hz).
+        self.declare_parameter("press_gain_stiffness_ref", 2.0e4)   # N/m
+        self.declare_parameter("press_gain_boost_max", 5.0)
         self.declare_parameter("press_v_max", 0.005)        # m/s
         self.declare_parameter("press_seek_speed", 0.01)    # m/s, closing on the wall
+        # Re-contact: after a contact the wall's position is known, so a wheel
+        # that comes off it — the chassis kicks when the base starts, a lip, a
+        # hollow — closes on the remembered range at up to this speed instead
+        # of the first-approach floor. 12 mm off took 30 s at 0.8 mm/s on
+        # 2026-09-21 12:50; at 5 mm/s it is under 3 s. The landing force per
+        # cycle of latency is gain * F_target * dt whatever the stiffness
+        # (the memory includes the compression): 1 N at 10 Hz. The memory
+        # expires after press_recontact_memory; see wbc/admittance.py.
+        self.declare_parameter("press_recontact_speed", 0.005)   # m/s
+        self.declare_parameter("press_recontact_gain", 2.0)      # 1/s
+        self.declare_parameter("press_recontact_memory", 5.0)    # s
         # SEEK -> PRESS, and the gate the base's travel is released by. 3.0 N
         # rather than the 1.0 it was: the de-biased force sensor measures sigma
         # 0.95 N with nothing touching, so 1.0 N was 1.1 sigma — inside the noise
@@ -188,7 +216,32 @@ class WholeBodySweepNode(Node):
         # because an approach gives the noise several hundred tries at it; with
         # no dwell every threshold tested latches spuriously within 45 s.
         self.declare_parameter("press_contact_dwell", 0.15)  # s
-        self.declare_parameter("press_force_limit", 30.0)   # N, abort above this
+        # The HARD limit: abort above this. 45 N, up from 30 (2026-09-21),
+        # now that there is a reaction layer underneath it. The sensor is a
+        # UR10e tool flange F/T, rated +/-100 N and +/-10 Nm; 30 N was never
+        # a hardware number, it was the only line there was, and nine field
+        # failures in ten were this line tripping on a load the BASE put on
+        # the plate faster than the arm could back off. The soft limit below
+        # is where the loop now reacts; this is for a force still climbing
+        # through the reaction, or (press_soft_limit_seconds) one that will
+        # not come down.
+        self.declare_parameter("press_force_limit", 45.0)   # N, abort above this
+        # The SOFT limit: over it the press retreats at up to
+        # press_retreat_v_max (sized on the excess, reaching that at the hard
+        # limit), the base's travel authority is cut to zero THIS cycle and
+        # the plate's rotation is frozen — the scan pauses for a second
+        # instead of the state failing. 15 N is three times target, well
+        # clear of the +/-5 N the sensor is rated to and of the 11-13 N the
+        # base start put on a seated contact before it snagged.
+        self.declare_parameter("press_force_soft_limit", 15.0)   # N
+        self.declare_parameter("press_retreat_v_max", 0.02)      # m/s, backing off
+        self.declare_parameter("press_soft_limit_seconds", 3.0)  # s over the soft limit -> fault
+        # Torque about the flange, Nm, the other half of the hard limit. The
+        # sensor's range is +/-10 Nm and the plate's casters sit 27 cm from
+        # its centre, so a single loaded corner reaches the range at ~37 N —
+        # under the force limit. Above this the reading itself is no longer
+        # to be trusted, whatever the force says.
+        self.declare_parameter("press_torque_limit", 8.0)        # Nm, |T_xy|
         # Lateral load on the plate, N, above which the plate is being TWISTED
         # or DRAGGED rather than pressed: rotation stops, and in SEEK so does
         # the approach. press_force_limit watches the normal only, and the
@@ -203,6 +256,18 @@ class WholeBodySweepNode(Node):
         # on the way to an overload (2026-09-18) and 20 N once it is one
         # (09-14). The throttle acts before the halt does.
         self.declare_parameter("press_drag_free_fraction", 0.3)
+        # A contact is not seated while the normal force is far over its
+        # target either, whatever the side load says: a plate at 23 N against
+        # 5 N is being levered on an edge, and the base pulling on it is what
+        # takes it to 30 (2026-09-18 19:26). Above this multiple of the target
+        # the base waits for the press loop to relieve it.
+        self.declare_parameter("press_seated_force_factor", 2.0)
+        # Once a contact has come unseated it has to hold every seating
+        # condition for this long before the base is let back onto it. Without
+        # it the 19:26 run cycled with a 4 s period: throttle, force falls,
+        # side load falls under the free line, gate reopens, base ramps, force
+        # climbs — three rounds up to 30 N.
+        self.declare_parameter("press_seat_dwell", 1.5)             # s
         # The distance sensors stop being the setpoint and become the envelope:
         # no approach closer than this to the sensed plane, whatever the force
         # says. A wrong force reading then cannot walk the arm into the wall,
@@ -238,7 +303,7 @@ class WholeBodySweepNode(Node):
         # one cycle, and the stall counter resets on any untripped cycle, so
         # noise alone can never reach the 100 in a row that would fail the
         # sweep. What a too-tight envelope costs is a press that sits light.
-        self.declare_parameter("press_min_distance", 0.130)  # m
+        self.declare_parameter("press_min_distance", 0.120)  # m
         # --- the approach schedule ---------------------------------------
         # Closing on the wall at a constant speed makes the peak contact force a
         # function of the loop rate, because the wheel keeps approaching until
@@ -255,24 +320,34 @@ class WholeBodySweepNode(Node):
         # the gap the schedule closes is measured from it.
         #
         # The contact point is the pendant TCP 'Sensor_plate', (-80, 0, +320) mm
-        # in tool0: 15.0 cm in front of the sensor plane, 8 cm off its centre.
-        # So with the plate parallel the ranges read 0.150 at contact — the
-        # arm's FK put the sensor plane at 15.0 cm in the 2026-09-17
-        # calibration, with the corrected plane fit agreeing to 1.5 mm. The
-        # 0.1375 measured on 2026-09-14 was the same geometry read through
-        # uncalibrated sensors (ultrasonics ~2 cm short, ToF ~1 cm long,
-        # averaging out), and only holds for ranges the reader has not yet
-        # corrected. The GPR face touches nearer than this when the plate is
-        # tilted (14.1 cm at 6 deg), which press_contact_window covers.
-        self.declare_parameter("press_contact_distance", 0.150)   # m
-        # Where the GPR actually touches, in the PLATE frame: the pendant TCP
-        # 'Sensor_plate', confirmed on the wall to 0.2 mm at two contacts on
-        # 2026-09-17. The press rows — the normal task, the force barrier and
+        # in the UR's tool0 (the flange), which is (-0.08, 0, +0.17) in the
+        # plate link: 15.0 cm in front of the sensor plane, 8 cm off its centre.
+        # What actually lands on the wall with the plate parallel is the GPR's
+        # four casters, and with all four touching the calibrated ranges read
+        # 0.1395 (measured 2026-09-21, ToF median; that pose IS the 09-21
+        # calibration's datum, so this number and the reader's offsets move
+        # together). The 0.150 it was came from the 2026-09-17 FK fit, whose
+        # wall plane was 6.2 deg mis-oriented — the 8 cm TCP offset times
+        # sin(6.2 deg) is the 0.9 cm. The 0.1375 of 2026-09-14 was raw
+        # ranges. A tilted plate touches a corner nearer than this, which
+        # press_contact_window covers.
+        self.declare_parameter("press_contact_distance", 0.140)   # m
+        # Where the GPR actually touches, in the PLATE frame (arm_tip_link,
+        # see above — this vector is applied in that link's axes, so the two
+        # must agree): the pendant TCP 'Sensor_plate', confirmed on the wall
+        # to 0.2 mm at two contacts on 2026-09-17. The press rows — the normal
+        # task, the force barrier and
         # the stiffness regression — are evaluated HERE, not at the plate's
         # origin, so a rotation of the plate shows up as the approach it really
         # is at the contact (0.08 m of lever: 0.05 rad/s of alignment was
         # 4 mm/s into the wall against a 0.8 mm/s schedule, and nothing saw it).
         self.declare_parameter("contact_point", [-0.08, 0.0, 0.17])
+        # Where the six range sensors sit along the plate's +Z, metres. The
+        # ranges are measured from THAT plane, not from the link origin, so a
+        # forward-kinematics position plus a range has to start here (see the
+        # base-to-wall floor). Same number as wbc/surface.py's SENSOR_PLANE_Z
+        # and the URDF's sensor mounts; the test harness sets it to 0.
+        self.declare_parameter("sensor_plane_z", SENSOR_PLANE_Z)
         # How far outside that stop the ranges may read while a force is still
         # believed to be contact. The dwell above is sized against sensor
         # noise; a transient from the arm's own motion is not noise, and one
@@ -348,17 +423,21 @@ class WholeBodySweepNode(Node):
         # HIGH: overestimating K_e tightens the bound and costs a slow press,
         # underestimating it loosens the bound and costs the plate.
         #
-        # 2e4, not the 2000 it was. On 2026-09-14 the fit never converged (the
-        # press was overloaded 0.6 s after it began) and the row ran on its
-        # floor throughout — which at 2000 N/m allowed 13 mm/s of approach with
-        # 3.6 N already on the wheel, against a wall that then made 26 N in a
-        # single 140 ms cycle. That is a floor for the caster bars flexing, not
-        # for the concrete they bottom out against, and the press's own gain
-        # is sized against 2e4 for exactly that surface. At 2e4 the row only
-        # makes sense while the wheel is LOADED — at 0 N it would cap the
-        # whole approach at 1.5 mm/s — so it is now built only in PRESS; the
-        # approach schedule bounds the closing speed on distance until then.
-        self.declare_parameter("press_stiffness_floor", 2.0e4)      # N/m
+        # 2e3 (2026-09-21), back from the 2e4 it was raised to on 09-14. The
+        # 09-14 argument — "the caster bars bottom out against concrete and
+        # made 26 N in one cycle" — was made with the plate calibrated 6 deg
+        # off, so what bottomed out was one corner driven in edge-first; see
+        # plate_calibration.py in arm_control. What the plate actually rides
+        # on is four corner casters on bars, and that contact measured ~2e3
+        # twice on 09-21 (5 mm for 10 N, 12 mm for 27 N). With the estimator
+        # able to say so, the press gain (press_gain_stiffness_ref) and the
+        # force barrier both size themselves to the wall that is there. The
+        # cost if a contact IS stiffer than the floor: the barrier allows
+        # 10x the approach for the same headroom — 3.75 mm/s at 25 N of
+        # headroom, which over a 100 ms cycle at 2e4 is 7.5 N. Inside the
+        # limit, and the estimator moves off the floor within a few cycles
+        # of loaded travel. Still built only in PRESS.
+        self.declare_parameter("press_stiffness_floor", 2.0e3)      # N/m
         self.declare_parameter("press_stiffness_ceiling", 5.0e4)    # N/m
         self.declare_parameter("press_stiffness_tau", 3.0)          # s
         # Every time constant below is in SECONDS, not cycles. They used to be
@@ -415,6 +494,31 @@ class WholeBodySweepNode(Node):
         # force went 5 -> 30 N in lockstep with the base speed. See the
         # seating conditions on `health` below for what else now has to hold.
         self.declare_parameter("press_travel_tau", 4.0)            # s
+        # How long the wheel may be OFF the wall before the base is stopped
+        # outright rather than eased down through the filter above. The filter
+        # is right for a hollow — a 0.3 s unload the wheel rides over costs a
+        # slice of speed and nothing restarts against a loaded wheel — and
+        # wrong for a real loss: on 2026-09-21 12:50 the wheel lifted as the
+        # base set off, the authority took 15 s to decay from 0.45 to zero,
+        # and the base carried the plate 1.4 cm off the wall in that time,
+        # which the 0.8 mm/s approach floor then spent 30 s winning back.
+        # 3 s, up from the 0.5 it shipped at for one run: with the re-contact
+        # schedule (press_recontact_speed) a wheel 12 mm off is back on the
+        # wall in under 3 s, and the user's call is that the base should keep
+        # sweeping through a loss the arm can regain — a few centimetres of
+        # air in the scan cost less than a stop and a restart against a
+        # loaded wheel. The filter still eases the base while the wheel is
+        # off; the hard stop is for a wall that does not come back. 0
+        # disables it.
+        self.declare_parameter("press_release_grace", 3.0)        # s
+        # How long a contact may stay unseated — wheel off, or on but not yet
+        # square/unloaded — before the sweep is failed. While the gate holds
+        # the base at zero the no_progress watchdog does not run (standing
+        # still because the controller said so is not a stall: the 12:50 run
+        # was killed by that watchdog one second into a successful re-seat),
+        # so this is the budget that bounds a re-seat instead. Sized for the
+        # crawl back at the approach floor: 1.4 cm at 0.8 mm/s was 30 s.
+        self.declare_parameter("reseat_timeout", 60.0)             # s
         # Whether the press gates the base's travel at all.
         #
         # True is what 9974b97 and 8e55536 argue for: the base holds until the
@@ -543,17 +647,27 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("control_period_max_factor", 4.0)
         # The same clamp, one rate down, on the STREAM tick — which is where the
         # setpoint integration now happens, so this is what bounds how far one
-        # tick may advance the arm. Both halves of the protection are the same
-        # as they were at the control rate: a burst of early ticks cannot
-        # integrate less than one nominal stream step, and one late tick cannot
-        # advance the whole gap it slept through.
+        # tick may advance the arm. A burst of early ticks cannot integrate
+        # less than one nominal stream step; a late tick is bounded here AND
+        # by the command's own age (the stream holds instead once the velocity
+        # is older than arm_command_max_age_factor achieved periods).
         #
-        # 4.0 at 200 Hz is 20 ms, so the worst a single tick can do is
-        # arm_qdot_max * 0.02 = 0.01 rad. ArmStream clamps the setpoint to
-        # within arm_stream_max_lead (0.2 rad) of the measured arm regardless,
-        # so the lead clamp remains the real backstop and this sits an order of
-        # magnitude inside it.
-        self.declare_parameter("stream_period_max_factor", 4.0)
+        # 50, not the 4 it was. At 4 the cap was 40 ms, and on the robot the
+        # stream ticks arrive 25-110 ms apart (the executor is starved; the
+        # tick itself is microseconds). Every tick later than 40 ms advanced
+        # the setpoint by 40 ms worth and DROPPED the rest, so the arm executed
+        # 10-40% of whatever velocity the solve published — measured on
+        # 2026-09-21 16:58: a retreat asked for 84 mrad/s at the elbow and the
+        # arm delivered 8, with the setpoint leading it by only 15 mrad, i.e.
+        # the setpoint itself was crawling. Every press retreat, every
+        # re-contact and every alignment since the stream was split off has
+        # been scaled by that fraction, and the stiffness fit (regressed on
+        # COMMANDED travel) has read high by its inverse. Time the arm should
+        # have been moving is not a gap to protect against; the velocity is
+        # still trusted or the stream would be holding. The backstops for a
+        # genuinely huge tick are unchanged: arm_stream_max_lead (0.2 rad) on
+        # the setpoint and the acceleration bound on the velocity behind it.
+        self.declare_parameter("stream_period_max_factor", 50.0)
         # When the stream stops believing the velocity it is integrating, as a
         # multiple of the control period actually being achieved.
         #
@@ -918,6 +1032,8 @@ class WholeBodySweepNode(Node):
         # wall. The UR reports the opposite sign on tool0 Z, and the flip happens
         # in _on_wrench so nothing downstream has to think about it.
         self.press_force = 0.0
+        # |T_xy| at the flange, Nm: the torque a corner load puts on the sensor.
+        self.plate_torque = 0.0
         self.side_force = 0.0
         # The lateral idle of the F/T, learned over the press's TARE window and
         # frozen; the side-load trip is measured above it.
@@ -939,6 +1055,9 @@ class WholeBodySweepNode(Node):
         # holds contact, and closes again on its own if the wall goes away. See
         # press_travel_tau.
         self.travel_authority = 0.0
+        self.seated_since = None
+        # When the contact last stopped being seated; None while it is.
+        self.unseated_since = None
         # How stiff the pressed surface has turned out to be, and the rate the
         # LAST solve actually asked for along the normal — which is the travel
         # the estimate regresses the force against. Both None/inert without a
@@ -1112,7 +1231,13 @@ class WholeBodySweepNode(Node):
                 approach_min_speed=float(p("press_approach_min_speed").value),
                 distance_tau=float(p("press_distance_tau").value),
                 force_limit_dwell=float(p("press_force_limit_dwell").value),
-                contact_window=float(p("press_contact_window").value))
+                contact_window=float(p("press_contact_window").value),
+                recontact_speed=float(p("press_recontact_speed").value),
+                recontact_gain=float(p("press_recontact_gain").value),
+                recontact_memory=float(p("press_recontact_memory").value),
+                soft_limit=float(p("press_force_soft_limit").value),
+                retreat_v_max=float(p("press_retreat_v_max").value),
+                soft_limit_seconds=float(p("press_soft_limit_seconds").value))
             self.stiffness = ContactStiffness(
                 floor=float(p("press_stiffness_floor").value),
                 ceiling=float(p("press_stiffness_ceiling").value),
@@ -1266,6 +1391,9 @@ class WholeBodySweepNode(Node):
         ("press_approach_gain", "approach_gain"),
         ("press_contact_distance", "contact_distance"),
         ("press_contact_window", "contact_window"),
+        ("press_recontact_speed", "recontact_speed"),
+        ("press_force_soft_limit", "soft_limit"),
+        ("press_retreat_v_max", "retreat_v_max"),
     )
 
     def _refresh_press_tuning(self):
@@ -1307,6 +1435,7 @@ class WholeBodySweepNode(Node):
         """
         self.press_force = -float(msg.wrench.force.z)
         self.side_force = math.hypot(float(msg.wrench.force.x), float(msg.wrench.force.y))
+        self.plate_torque = math.hypot(float(msg.wrench.torque.x), float(msg.wrench.torque.y))
         self.wrench_stamp = self._now()
 
     def _on_costmap(self, msg):
@@ -1912,10 +2041,11 @@ class WholeBodySweepNode(Node):
                 # Two different faults arrive here and they have different
                 # fixes, so name which one it is. A plate that is HELD has full
                 # travel authority and still is not moving. A plate that has
-                # LOST THE WALL closed its own authority and stopped itself —
-                # and that case deliberately has no timeout of its own: the
-                # authority decays, the base stops, and this watchdog is what
-                # eventually notices. One timeout, not two.
+                # LOST THE WALL closes its own authority and stops itself; once
+                # the authority reaches zero this watchdog is frozen (see the
+                # travel gate) and reseat_timeout takes over, so the second
+                # branch here only names a base still creeping under a partly
+                # decayed authority.
                 if (self.press is not None and self.travel_authority < 0.5
                         and self.press.force < self.press.release_force):
                     why = (f"the wheel came off the wall — {self.press.force:+.1f} N "
@@ -1992,6 +2122,11 @@ class WholeBodySweepNode(Node):
             press_dt = (now - self.press_stamp) if self.press_stamp else nominal_dt
             press_dt = float(min(max(press_dt, 0.2 * nominal_dt), 1.0))
             self.press_stamp = now
+            # See press_gain_stiffness_ref: the gain is sized for a stiff
+            # wall and raised, within a cap, for the softer one measured.
+            self.press.gain_scale = min(
+                max(float(p("press_gain_stiffness_ref").value) / max(self.stiffness.value, 1.0), 1.0),
+                float(p("press_gain_boost_max").value))
             v_normal = self.press.update(self.press_force, distance, press_dt,
                                          quiet=arm_quiet and aligned)
             # Learn how stiff this surface is, from the travel the LAST solve
@@ -2011,6 +2146,14 @@ class WholeBodySweepNode(Node):
                 self.stiffness.reset()
             if self.press.fault:
                 self.finish("failed", self.press.fault)
+                return
+            torque_limit = float(p("press_torque_limit").value)
+            if self.press.state != TARE and torque_limit > 0.0 and self.plate_torque > torque_limit:
+                self.finish(
+                    "failed",
+                    f"plate torque {self.plate_torque:.1f} Nm exceeded the {torque_limit:.0f} Nm "
+                    f"limit with {self.press.force:+.1f} N on the wheel: the load is on a "
+                    f"corner, not the face")
                 return
             if self.press.stalled:
                 self.finish(
@@ -2113,33 +2256,96 @@ class WholeBodySweepNode(Node):
             side = self.side_force - self.side_bias
             side_limit = float(p("press_side_force_limit").value)
             free = float(p("press_drag_free_fraction").value) * side_limit
-            seated = aligned and side < free
-            health = 1.0 if (self.press.force >= self.press.release_force and seated) else 0.0
+            over = self.press.force > float(p("press_seated_force_factor").value) * self.press.target_force
+            loaded_now = self.press.force >= self.press.release_force
+            seated_now = loaded_now and aligned and side < free and not over
+            # With a dwell: the conditions have to hold continuously before the
+            # contact counts as seated again, so a throttle that relieved the
+            # force does not hand the base straight back to what caused it.
+            if seated_now:
+                if self.seated_since is None:
+                    self.seated_since = now
+                health = 1.0 if now - self.seated_since >= float(p("press_seat_dwell").value) else 0.0
+            else:
+                self.seated_since = None
+                health = 0.0
+            if health:
+                self.unseated_since = None
+            elif self.unseated_since is None:
+                self.unseated_since = now
             tau = float(p("press_travel_tau").value)
             # Against the press's own MEASURED period, so the time constant is
             # 1.5 s of wall clock whatever rate the loop achieves — the same
             # reason every constant inside AdmittancePress is in seconds.
             alpha = (1.0 - math.exp(-press_dt / tau)) if tau > 0.0 else 1.0
-            self.travel_authority += alpha * (health - self.travel_authority)
+            grace = float(p("press_release_grace").value)
+            if self.press.overloaded:
+                # Over the soft limit the base is what is loading the plate —
+                # every overload traced on 2026-09-21 rose with the base's
+                # speed while the arm was already backing off. Stop it this
+                # cycle; the press unloads; the ramp resumes from zero once
+                # the contact re-seats.
+                self.travel_authority = 0.0
+            elif not loaded_now and grace > 0.0 and now - self.unseated_since >= grace:
+                # Off the wall for longer than a hollow: STOP, this cycle. The
+                # filter's slow decay is for a wheel that is about to be back
+                # on the wall; a wheel that has lifted is being carried further
+                # off by every millimetre the base still travels, and nothing
+                # is lost by stopping a base that is pulling on air. The ramp
+                # back up still goes through the filter, from zero.
+                self.travel_authority = 0.0
+            else:
+                self.travel_authority += alpha * (health - self.travel_authority)
+            if self.travel_authority < 0.05:
+                # The base is standing still because THIS gate is holding it,
+                # so it is not a stall and the no_progress watchdog must not
+                # count it — it killed the 12:50 run one second after a re-seat
+                # that had taken 30 s. What bounds the wait instead is the
+                # re-seat budget: unseated this long, the wall is not coming
+                # back and the sweep should end while the arm is still clear.
+                self.best_progress = self.progress
+                self.progress_stamp = now
+                budget = float(p("reseat_timeout").value)
+                if (budget > 0.0 and self.unseated_since is not None
+                        and now - self.unseated_since > budget):
+                    self.finish(
+                        "failed",
+                        f"the contact did not re-seat in {budget:.0f}s: "
+                        f"{self.press.force:+.1f} N against a "
+                        f"{self.press.target_force:.0f} N target at "
+                        f"{distance * 100:.1f} cm, travel authority "
+                        f"{self.travel_authority:.2f}")
+                    return
             # And throttle on the drag itself, immediately rather than through
             # the filter: a side load climbing toward the limit is the edge
             # digging in, and the base is what is driving it.
             drag = _clamp((side_limit - side) / max(side_limit - free, 1e-6), 1.0)
             speed *= self.travel_authority * max(0.0, drag)
             if not health and self.travel_authority < 0.5:
-                # Say it out loud. A base crawling along a wall for no visible
-                # reason is the kind of thing that gets diagnosed as a stuck
-                # solver; it is in fact the loop declining to scan air.
+                # Say it out loud, and say WHICH condition: a base crawling
+                # along a wall for no visible reason gets diagnosed as a stuck
+                # solver, and "off the wall" printed for a plate at 23 N sent
+                # the 19:26 analysis the wrong way.
                 #
                 # Both halves, or this fires on the way IN as well: the first
                 # rise from zero spends about a second under 0.5 with the wheel
-                # loaded and everything working, and "wheel is off the wall" is
-                # exactly the wrong thing to print there.
+                # loaded and everything working.
+                if not loaded_now:
+                    why = (f"wheel is off the wall ({self.press.force:+.1f} N against a "
+                           f"{self.press.target_force:.0f} N target)")
+                elif over:
+                    why = (f"force {self.press.force:+.1f} N is far over the "
+                           f"{self.press.target_force:.0f} N target, waiting for the press to relieve it")
+                elif not aligned:
+                    why = (f"plate {math.degrees(np.linalg.norm(align_error)):.1f} deg off square")
+                elif side >= free:
+                    why = f"side load {side:+.1f} N, the plate is dragging"
+                else:
+                    why = "contact re-seating"
                 self.get_logger().warn(
-                    f"Wheel is off the wall ({self.press.force:+.1f} N against a "
-                    f"{self.press.target_force:.0f} N target): base is down to "
-                    f"{self.travel_authority * 100:.0f}% of sweep speed while the arm "
-                    f"closes the gap. It stops itself if the wall does not come back.",
+                    f"Contact not seated — {why}: base at "
+                    f"{self.travel_authority * 100:.0f}% of sweep speed. It stops itself "
+                    f"if the contact does not seat.",
                     throttle_duration_sec=2.0)
         v_ref = speed * t_hat + v_normal * m_hat + v_height * np.array([0.0, 0.0, 1.0])
 
@@ -2174,7 +2380,7 @@ class WholeBodySweepNode(Node):
                     f"{' and the approach' if self.press.state != PRESS else ''} "
                     f"until it clears.",
                     throttle_duration_sec=1.0)
-            if side_loaded or (self.press.loaded and self.press.state != PRESS):
+            if side_loaded or self.press.overloaded or (self.press.loaded and self.press.state != PRESS):
                 w_ref = np.zeros(3)
             elif self.press.state == PRESS:
                 w_contact = float(p("w_align_contact_max").value)
@@ -2205,8 +2411,10 @@ class WholeBodySweepNode(Node):
 
         J_task, xdot_task = J.copy(), xdot
         # The press acts at the GPR's contact point, 8 cm off the plate's
-        # centre and 15 cm proud of it; the normal task, the force barrier and
-        # the stiffness regression all read the approach rate THERE.
+        # centre and 17 cm proud of its origin (15 cm proud of the sensor
+        # plane); the normal task, the force barrier and the stiffness
+        # regression all read the approach rate THERE. The vector is in the
+        # tip link's axes, which is why the tip has to be the plate link.
         r_contact = R_plate @ np.array(p("contact_point").value, dtype=float)
         J_contact = shift_jacobian_point(J, r_contact)
         press_task = []
@@ -2290,7 +2498,10 @@ class WholeBodySweepNode(Node):
         # is (plate standoff + how far the base sits behind the plate) along the
         # normal. Keep that above a floor, or the base ends up closer to the wall
         # than Nav2's own footprint allows and the next transit cannot plan.
-        base_gap = float(np.dot(p_plate[:2] - p_base[:2], m_hat[:2])) + distance
+        # The range is measured from the SENSOR PLANE, 2 cm along the plate's
+        # +Z from the link origin, so that is where the standoff is added on.
+        p_sensors = p_plate + R_plate[:, 2] * float(p("sensor_plane_z").value)
+        base_gap = float(np.dot(p_sensors[:2] - p_base[:2], m_hat[:2])) + distance
         floor = float(p("base_wall_min_gap").value)
         if floor > 0.0:
             A_avoid = np.vstack((A_avoid, -base_normal_row))
@@ -2433,12 +2644,6 @@ class WholeBodySweepNode(Node):
                 f"K_e={self.stiffness.value:.0f} N/m allowing only "
                 f"{self.force_cap * 1000:+.1f} mm/s of approach.",
                 throttle_duration_sec=2.0)
-        if solution.solver.endswith("(box-only)"):
-            self.get_logger().warn(
-                "OSQP unavailable: solving with a box-only fallback, so neither the "
-                "base's chassis/turret/wheel limits nor the force barrier are "
-                "enforced by the solver.",
-                throttle_duration_sec=10.0)
 
         # What the solve actually asked for along the normal, which is the
         # travel the stiffness estimate regresses the next force against.
@@ -2715,7 +2920,11 @@ class WholeBodySweepNode(Node):
         # what desynchronised the arm from the base on the first hardware run.
         nominal = 1.0 / self.stream_rate
         elapsed = (now - self.stream_stamp) if self.stream_stamp else nominal
-        dt = float(min(max(elapsed, nominal), self.stream_period_max_factor * nominal))
+        # Integrate the time that actually passed, as long as the velocity is
+        # one the stream still trusts: the age check above is the horizon, the
+        # factor is a ceiling inside it. See stream_period_max_factor.
+        dt = float(min(max(elapsed, nominal), self.stream_period_max_factor * nominal,
+                       self._arm_command_max_age()))
         self.stream_cycle_period = elapsed
         self.stream_stamp = now
         self.arm_stream.send(qdot, dt, self._arm_positions())
@@ -2818,8 +3027,9 @@ class WholeBodySweepNode(Node):
         if self.press is None:
             press = ""
         else:
-            approach = ("" if self.press.state == PRESS
-                        else f"app={self.press.approach_speed * 1000:.1f}mm/s ")
+            approach = (f"gain x{self.press.gain_scale:.1f} " if self.press.state == PRESS
+                        else f"app={self.press.approach_speed * 1000:.1f}mm/s"
+                             f"{'(re)' if self.press.recontacting else ''} ")
             press = (f"press={self.press.force:+.1f}N(raw{self.press.raw:+.1f})"
                      f"/{self.press.target_force:.0f} "
                      f"[{self.press.state.upper() if self.press.state != SEEK else 'seek'}] "
