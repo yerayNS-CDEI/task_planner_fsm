@@ -455,6 +455,11 @@ class AdmittancePress:
         return self.force > self.soft_limit
 
     @property
+    def over_soft_seconds(self):
+        """How long the filtered force has been over the soft limit, s."""
+        return self._over_soft
+
+    @property
     def recontacting(self):
         """In SEEK, closing on a wall the press was on within ``recontact_memory``."""
         return (self.state == SEEK and self._since_release is not None

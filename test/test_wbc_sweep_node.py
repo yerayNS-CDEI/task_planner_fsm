@@ -1507,9 +1507,11 @@ def test_a_base_driven_overload_is_relieved_and_swept_on_rather_than_failed():
     hard = float(node.get_parameter("press_force_limit").value)
     peak = max(forces[shove_at:shove_at + 20])
     assert soft < peak < hard, f"the shove should land between the limits: {peak:.1f} N"
-    # Cut, not eased: the base is stopped within a few cycles of the shove.
-    assert max(travel[shove_at + 5:shove_at + 25]) < 0.1 * before, (
-        f"the base kept moving at {max(travel[shove_at + 5:shove_at + 25]) / before:.0%}")
+    # This shove runs past the cut line (halfway from the soft limit to the
+    # hard one), so the base IS stopped — within half a second of the
+    # filtered force getting there, and cut rather than eased.
+    assert max(travel[shove_at + 15:shove_at + 35]) < 0.1 * before, (
+        f"the base kept moving at {max(travel[shove_at + 15:shove_at + 35]) / before:.0%}")
     # Relieved inside a second and a half, with the wheel still on the wall.
     within = forces[shove_at:shove_at + 75]
     assert min(within) < soft, f"still {min(within):.1f} N 1.5 s after the shove"
@@ -1518,6 +1520,64 @@ def test_a_base_driven_overload_is_relieved_and_swept_on_rather_than_failed():
     assert node.pending_status is None
     # And the base comes back on its own once the contact has re-seated.
     assert travel[-25:].mean() > 0.5 * before, "the sweep should resume"
+
+
+def test_a_transient_overload_is_relieved_without_stopping_the_base():
+    """The 17:54 run: 21 overloads to 16-25 N, each relieved by the press in
+    under a second — and each one stopped the base, which then restarted
+    through the 1-9 mm/s band where the chassis kicks. Under the cut line
+    the authority is frozen, not zeroed: the arm relieves it, the base rolls
+    on, and there is no restart to kick."""
+    global WALL_X
+    node = _press_node(press_tare_seconds=0.0)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
+    robot.press_force = lambda: KinematicRobot.press_force(robot, stiffness=2.0e3)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+
+    shove_at, was = 400, WALL_X
+    try:
+        def on_cycle(cycle):
+            global WALL_X
+            WALL_X = was - 0.008 if cycle >= shove_at else was   # ~16 N more
+        forces, travel = _press_run(node, robot, cycles=shove_at + 200, on_cycle=on_cycle)
+    finally:
+        WALL_X = was
+
+    assert len(travel) == shove_at + 200, f"the sweep ended: {node.pending_status}"
+    before = travel[shove_at - 50:shove_at].mean()
+    soft = float(node.get_parameter("press_force_soft_limit").value)
+    peak = max(forces[shove_at:shove_at + 20])
+    assert soft < peak < 30.0, f"a transient between the soft limit and the cut line: {peak:.1f} N"
+    assert min(travel[shove_at:shove_at + 100]) > 0.3 * before, (
+        f"the base should roll on through a transient, not stop: "
+        f"{min(travel[shove_at:shove_at + 100]) / before:.0%}")
+    assert min(forces[shove_at:shove_at + 75]) < soft, "and the press relieves it"
+    assert node.pending_status is None
+
+
+def test_the_base_moves_or_stops_but_never_crawls():
+    """The start band. Every spike in the 17:54 bag came at 1-9 mm/s of
+    commanded base speed; none at 15-30. So once the authority says move,
+    the base moves at base_min_moving_speed or more, and below a small
+    authority it is stopped rather than crept."""
+    node = _press_node(press_tare_seconds=0.0)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    _, travel = _press_run(node, robot, cycles=400)
+    floor = float(node.get_parameter("base_min_moving_speed").value)
+    moving = np.flatnonzero(travel > 1e-6)
+    assert len(moving) > 100, "the base should have set off"
+    # The acceleration bound (0.3 m/s^2, 6 mm/s per 20 ms cycle) is allowed
+    # its two cycles to reach the floor; after that, nothing under it.
+    settled = travel[moving[2:]]
+    assert settled.min() >= 0.95 * floor, (
+        f"the base crawled at {settled.min() * 1e3:.1f} mm/s, under the {floor * 1e3:.0f} mm/s floor")
+    # And it still ramps ABOVE the floor rather than stepping to full speed.
+    first = np.flatnonzero(travel > 1e-6)[0]
+    assert travel[first] < 0.6 * node.sweep_speed
+    assert travel[-1] > travel[first]
 
 
 def _squeezed_press(force_alpha, weight_press_normal=1.0e4, cycles=400):
@@ -1794,10 +1854,17 @@ def test_an_overloaded_contact_is_not_swept_on_and_reseats_only_after_a_dwell():
     assert node.pending_status is None, f"the sweep ended early: {node.pending_status}"
     rolling = travel[700:750].mean()
     assert rolling > 0.5 * node.sweep_speed, "sweeping before the overload"
-    # Decaying through the 4 s filter: two seconds in, the travel is at
-    # ~exp(-2/4) = 60% and still falling.
+    # Over the soft limit but under the cut line, the authority is FROZEN
+    # for press_overload_cut_seconds — the base neither ramps nor stops
+    # while the press is given its chance to relieve it — and then, the
+    # force having sat there too long, the base is cut.
+    cut_after = float(node.get_parameter("press_overload_cut_seconds").value)
+    frozen = travel[760:750 + int(0.9 * cut_after / dt)]
+    assert frozen.max() - frozen.min() < 1e-6, "frozen, not ramping and not decaying"
+    assert frozen.mean() == pytest.approx(rolling, rel=0.05), "at the speed it had"
+    assert travel[750 + int(1.3 * cut_after / dt):849].max() < 1e-6, (
+        "and cut once the force has sat over the soft limit for the whole dwell")
     assert travel[849] < 0.7 * rolling, "the base backs off an overloaded contact"
-    assert travel[849] < travel[800] < travel[760], "and keeps backing off while it lasts"
     # After the overload clears, nothing reopens for the dwell: the authority
     # can only keep decaying through it.
     reseat = 850 + int(dwell / dt)

@@ -260,8 +260,12 @@ class WholeBodySweepNode(Node):
         # target either, whatever the side load says: a plate at 23 N against
         # 5 N is being levered on an edge, and the base pulling on it is what
         # takes it to 30 (2026-09-18 19:26). Above this multiple of the target
-        # the base waits for the press loop to relieve it.
-        self.declare_parameter("press_seated_force_factor", 2.0)
+        # the base waits for the press loop to relieve it. 3.0, not 2.0
+        # (2026-09-21 17:54): at sweep speed the force ripples to 10-14 N on
+        # a wall that is not flat, and 2x target called every ripple
+        # unseated, decayed the base, and sent it back through the start
+        # band below. 3x is the soft limit, where the press itself reacts.
+        self.declare_parameter("press_seated_force_factor", 3.0)
         # Once a contact has come unseated it has to hold every seating
         # condition for this long before the base is let back onto it. Without
         # it the 19:26 run cycled with a 4 s period: throttle, force falls,
@@ -511,6 +515,31 @@ class WholeBodySweepNode(Node):
         # off; the hard stop is for a wall that does not come back. 0
         # disables it.
         self.declare_parameter("press_release_grace", 3.0)        # s
+        # The base's START band. On the 17:54 run (bag wbc_2026_09_21-17_54)
+        # every force spike — eight of them in 30 s, 16-34 N — came with the
+        # base commanded at 1-9 mm/s, and none at 15-30 mm/s: commanded that
+        # slowly the chassis does not move, then breaks free with a yaw kick
+        # of a few tenths of a degree that shoves the plate a centimetre. The
+        # authority ramp from zero was dragging the base through that band on
+        # every restart, so once the base is to move at all it moves at least
+        # this fast. The ramp still shapes everything above it.
+        self.declare_parameter("base_min_moving_speed", 0.010)      # m/s
+        # ...and below this authority the base is stopped rather than crept:
+        # the filter decays toward zero and never reaches it.
+        self.declare_parameter("base_min_moving_authority", 0.05)
+        # A transient over the soft limit no longer STOPS the base — the arm
+        # relieves a 20 N shove in under a second (17:54: 21 releases, peak
+        # 33.7 N, no abort) and a stopped base has to restart through the
+        # band above. The authority is frozen while overloaded; the base is
+        # cut only when the force is this far from the soft limit toward the
+        # hard one, or has sat over the soft limit this long.
+        self.declare_parameter("press_overload_cut_fraction", 0.5)
+        self.declare_parameter("press_overload_cut_seconds", 1.0)   # s
+        # Pre-roll: drive the base forward at sweep speed for this long at
+        # the start of the segment, with the plate still at its standoff, so
+        # the chassis casters swing into trail and the drive breaks out of
+        # rest with nothing on the wall. 0 disables it.
+        self.declare_parameter("base_preroll_seconds", 2.0)         # s
         # How long a contact may stay unseated — wheel off, or on but not yet
         # square/unloaded — before the sweep is failed. While the gate holds
         # the base at zero the no_progress watchdog does not run (standing
@@ -2179,7 +2208,17 @@ class WholeBodySweepNode(Node):
             heading - yaw, heading - (yaw - phi)) * float(p("sweep_speed_margin").value)
         speed = min(self.sweep_speed, remaining, reachable)
         gate = bool(p("press_gate_travel").value)
-        if self.press is not None and gate and not self.press.touched:
+        preroll = float(p("base_preroll_seconds").value)
+        prerolling = (self.press is not None and gate and not self.press.touched
+                      and self.start_stamp is not None and now - self.start_stamp < preroll)
+        if prerolling:
+            # See base_preroll_seconds: the base's first start happens now,
+            # with the plate 20 cm off the wall, not at the moment the wheel
+            # has just landed. The arm's own loops keep the standoff.
+            speed = self.sweep_speed
+            self.best_progress = self.progress
+            self.progress_stamp = now
+        elif self.press is not None and gate and not self.press.touched:
             # No travel until the wheel has reached the wall. Otherwise the base
             # sets off at sweep_speed while the arm is still closing the standoff
             # at press_seek_speed, and the first stretch of the segment is
@@ -2280,12 +2319,17 @@ class WholeBodySweepNode(Node):
             alpha = (1.0 - math.exp(-press_dt / tau)) if tau > 0.0 else 1.0
             grace = float(p("press_release_grace").value)
             if self.press.overloaded:
-                # Over the soft limit the base is what is loading the plate —
-                # every overload traced on 2026-09-21 rose with the base's
-                # speed while the arm was already backing off. Stop it this
-                # cycle; the press unloads; the ramp resumes from zero once
-                # the contact re-seats.
-                self.travel_authority = 0.0
+                # Over the soft limit: FREEZE the authority — no further ramp
+                # while the press relieves it — and cut only if the force is
+                # running toward the hard limit or will not come down. The
+                # 17:54 bag has 21 overloads relieved in under a second each;
+                # stopping the base for every one of them restarted it
+                # through the band base_min_moving_speed exists to avoid.
+                span = self.press.force_limit - self.press.soft_limit
+                cut_at = self.press.soft_limit + float(p("press_overload_cut_fraction").value) * span
+                if (self.press.force > cut_at
+                        or self.press.over_soft_seconds > float(p("press_overload_cut_seconds").value)):
+                    self.travel_authority = 0.0
             elif not loaded_now and grace > 0.0 and now - self.unseated_since >= grace:
                 # Off the wall for longer than a hollow: STOP, this cycle. The
                 # filter's slow decay is for a wheel that is about to be back
@@ -2320,7 +2364,12 @@ class WholeBodySweepNode(Node):
             # the filter: a side load climbing toward the limit is the edge
             # digging in, and the base is what is driving it.
             drag = _clamp((side_limit - side) / max(side_limit - free, 1e-6), 1.0)
-            speed *= self.travel_authority * max(0.0, drag)
+            # Moving or stopped, never crawling: see base_min_moving_speed.
+            if self.travel_authority >= float(p("base_min_moving_authority").value):
+                floor = min(1.0, float(p("base_min_moving_speed").value) / max(speed, 1e-6))
+                speed *= max(self.travel_authority, floor) * max(0.0, drag)
+            else:
+                speed = 0.0
             if not health and self.travel_authority < 0.5:
                 # Say it out loud, and say WHICH condition: a base crawling
                 # along a wall for no visible reason gets diagnosed as a stuck
