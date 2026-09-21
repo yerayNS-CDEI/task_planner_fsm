@@ -203,7 +203,12 @@ class WholeBodySweepNode(Node):
         # expires after press_recontact_memory; see wbc/admittance.py.
         self.declare_parameter("press_recontact_speed", 0.005)   # m/s
         self.declare_parameter("press_recontact_gain", 2.0)      # 1/s
-        self.declare_parameter("press_recontact_memory", 5.0)    # s
+        self.declare_parameter("press_recontact_memory", 8.0)    # s
+        # Inside this much of the remembered wall the re-contact creeps at
+        # press_approach_min_speed: the memory is a filtered range, good to
+        # its noise, and 18:39 landed at 5 mm/s on a ~25 kN/m corner 89
+        # times. 3 mm is ~1.5 sigma of the ToF fit.
+        self.declare_parameter("press_recontact_margin", 0.003)  # m
         # SEEK -> PRESS, and the gate the base's travel is released by. 3.0 N
         # rather than the 1.0 it was: the de-biased force sensor measures sigma
         # 0.95 N with nothing touching, so 1.0 N was 1.1 sigma — inside the noise
@@ -1264,6 +1269,8 @@ class WholeBodySweepNode(Node):
                 recontact_speed=float(p("press_recontact_speed").value),
                 recontact_gain=float(p("press_recontact_gain").value),
                 recontact_memory=float(p("press_recontact_memory").value),
+                recontact_margin=float(p("press_recontact_margin").value),
+                stiffness_hint=float(p("press_gain_stiffness_ref").value),
                 soft_limit=float(p("press_force_soft_limit").value),
                 retreat_v_max=float(p("press_retreat_v_max").value),
                 soft_limit_seconds=float(p("press_soft_limit_seconds").value))
@@ -2152,10 +2159,16 @@ class WholeBodySweepNode(Node):
             press_dt = float(min(max(press_dt, 0.2 * nominal_dt), 1.0))
             self.press_stamp = now
             # See press_gain_stiffness_ref: the gain is sized for a stiff
-            # wall and raised, within a cap, for the softer one measured.
-            self.press.gain_scale = min(
-                max(float(p("press_gain_stiffness_ref").value) / max(self.stiffness.value, 1.0), 1.0),
-                float(p("press_gain_boost_max").value))
+            # wall and raised, within a cap, for a softer one — once one has
+            # been MEASURED. Until the fit has converged the contact is
+            # assumed stiff: on 2026-09-21 18:39 a corner that turned out to
+            # be ~25 kN/m was pressed at the soft-contact gain because the
+            # estimator was still on its 2 kN/m floor, and the loop bounced.
+            k_ref = float(p("press_gain_stiffness_ref").value)
+            k_believed = self.stiffness.value if self.stiffness.fitted else max(self.stiffness.value, k_ref)
+            self.press.stiffness_hint = k_believed
+            self.press.gain_scale = min(max(k_ref / max(k_believed, 1.0), 1.0),
+                                        float(p("press_gain_boost_max").value))
             v_normal = self.press.update(self.press_force, distance, press_dt,
                                          quiet=arm_quiet and aligned)
             # Learn how stiff this surface is, from the travel the LAST solve
@@ -2330,7 +2343,13 @@ class WholeBodySweepNode(Node):
                 if (self.press.force > cut_at
                         or self.press.over_soft_seconds > float(p("press_overload_cut_seconds").value)):
                     self.travel_authority = 0.0
-            elif not loaded_now and grace > 0.0 and now - self.unseated_since >= grace:
+            elif (not loaded_now and grace > 0.0 and now - self.unseated_since >= grace
+                    and not self.press.recontacting):
+                # ...unless the press is still closing on a wall it remembers
+                # (press_recontact_memory bounds that), in which case the
+                # base rolls on and the min-moving floor keeps it out of the
+                # start band: a re-contact on a soft contact takes ~6 s with
+                # the last millimetres at the approach floor.
                 # Off the wall for longer than a hollow: STOP, this cycle. The
                 # filter's slow decay is for a wheel that is about to be back
                 # on the wall; a wheel that has lifted is being carried further

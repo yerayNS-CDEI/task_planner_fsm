@@ -252,8 +252,9 @@ class AdmittancePress:
                  approach_margin=0.0126, approach_min_speed=0.0008,
                  distance_tau=0.15, force_limit_dwell=0.06,
                  contact_window=0.03, recontact_speed=0.005,
-                 recontact_gain=2.0, recontact_memory=5.0,
-                 soft_limit=15.0, retreat_v_max=0.02, soft_limit_seconds=3.0):
+                 recontact_gain=2.0, recontact_memory=8.0,
+                 soft_limit=15.0, retreat_v_max=0.02, soft_limit_seconds=3.0,
+                 recontact_margin=0.003, stiffness_hint=2.0e4):
         self.target_force = float(target_force)
         self.gain = float(gain)
         self.v_max = float(v_max)
@@ -379,6 +380,20 @@ class AdmittancePress:
         # itself: the sweep node raises it when the measured contact is softer
         # than the ~2e4 N/m the gain was sized against.
         self.gain_scale = 1.0
+        # Inside this much of the remembered wall the re-contact creeps at
+        # the first-approach floor instead of closing at recontact_speed. The
+        # remembered distance is a filtered range with millimetres of noise,
+        # and a landing at 5 mm/s on a stiff contact with a slow loop is a
+        # slam: on 2026-09-21 18:39 the arm met a ~25 kN/m corner at 5 mm/s
+        # with 0.2 s of latency and made 39 N, 89 times in four minutes.
+        self.recontact_margin = float(recontact_margin)
+        # What the caller currently believes the contact stiffness is, N/m,
+        # for bounding the RETREAT so it cannot unload past target in one
+        # cycle: the fitted value when there is one, else the STIFF reference
+        # — assuming soft when it is not known is what threw the wheel off
+        # the wall on 18:39 (20 mm/s of retreat on a 25 kN/m contact is
+        # several newtons of compression gone per cycle).
+        self.stiffness_hint = float(stiffness_hint)
         # --- the soft limit ------------------------------------------------
         # Between the target and the hard limit there used to be nothing: a
         # contact the base drove from 5 N to 30 N in a second was a FAULT, and
@@ -503,10 +518,12 @@ class AdmittancePress:
         if distance is None:
             return self.approach_min_speed
         if self.recontacting:
-            # No margin: the wall position is the press's own filtered range
-            # from a moment ago, not a plane fit against unknown bias, and
-            # the same filter is on both sides of the subtraction.
-            gap = distance - self.wall_distance
+            # The wall position is the press's own filtered range from a
+            # moment ago, so the gap is good to the range noise — and no
+            # better. Close fast down to recontact_margin from it, and creep
+            # the rest at the first-approach floor, which is the speed sized
+            # for meeting a stiff wall with a slow loop.
+            gap = (distance - self.wall_distance) - self.recontact_margin
             return min(self.recontact_speed,
                        max(self.approach_min_speed, self.recontact_gain * max(0.0, gap)))
         gap = (distance - self.approach_margin) - self.contact_distance
@@ -697,6 +714,12 @@ class AdmittancePress:
             # impact hazard is; the retreat may go as fast as retreat_v_max.
             v = float(np.clip(self.gain * self.gain_scale * self.error(),
                               -self.retreat_v_max, self.v_max))
+            # A retreat may not unload MORE than the excess over target in
+            # one cycle at the stiffness the caller believes in: past that
+            # the wheel leaves the wall and the next cycle is a re-contact.
+            # ``dt`` is the measured period, so a slow loop retreats slower.
+            unload = max(0.0, self.force - self.target_force) / max(self.stiffness_hint, 1.0)
+            retreat_cap = max(self.approach_min_speed, unload / max(dt, 1e-3))
             if self.force > self.soft_limit:
                 # The reaction: over the soft limit the retreat is at least
                 # the approach clamp, and grows with the EXCESS to reach
@@ -710,6 +733,7 @@ class AdmittancePress:
                 excess = min(1.0, (self.force - self.soft_limit) / span)
                 reaction = self.v_max + excess * (self.retreat_v_max - self.v_max)
                 v = min(v, -min(reaction, self.retreat_v_max))
+            v = max(v, -retreat_cap)
             self.approach_speed = 0.0
         else:
             if self._loaded:

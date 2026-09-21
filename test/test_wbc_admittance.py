@@ -540,6 +540,11 @@ def test_the_scheduled_approach_does_not_slam_whatever_the_loop_rate():
     assert max(peaks.values()) < 15.0, f"peak force by rate: {peaks}"
 
 
+# The three demonstrations below run a deliberately wild gain against the
+# wall to SHOW ringing. The press now caps its retreat at the compression it
+# believes is there to unload (stiffness_hint), which is a deadbeat step for
+# a wall at exactly that stiffness and would hide the ringing they exist to
+# show — so they pass a hint of 1 N/m, which never binds.
 def test_a_gain_that_is_too_high_for_the_wall_is_visibly_unstable():
     """The guard rail for anyone tempted to turn the gain up on hardware.
 
@@ -552,9 +557,9 @@ def test_a_gain_that_is_too_high_for_the_wall_is_visibly_unstable():
     model has no servo lag in it, so the real boundary is LOWER than the one
     measured here, not higher.
     """
-    tame = _press(target_force=5.0, gain=5.0e-5, v_max=0.05,
+    tame = _press(stiffness_hint=1.0, target_force=5.0, gain=5.0e-5, v_max=0.05,
                   filter_tau=NO_FILTER, force_limit=1e9)
-    wild = _press(target_force=5.0, gain=1.0e-2, v_max=0.05,
+    wild = _press(stiffness_hint=1.0, target_force=5.0, gain=1.0e-2, v_max=0.05,
                   filter_tau=NO_FILTER, force_limit=1e9)
 
     tame_force = _run_against_wall(tame)[-300:]
@@ -571,10 +576,10 @@ def test_the_force_filter_is_part_of_what_keeps_the_loop_stable():
     before anyone shortens filter_tau to make the press feel more responsive.
     """
     unfiltered = _run_against_wall(
-        _press(target_force=5.0, gain=1.0e-2, v_max=0.05,
+        _press(stiffness_hint=1.0, target_force=5.0, gain=1.0e-2, v_max=0.05,
                filter_tau=NO_FILTER, force_limit=1e9))[-300:]
     filtered = _run_against_wall(
-        _press(target_force=5.0, gain=1.0e-2, v_max=0.05,
+        _press(stiffness_hint=1.0, target_force=5.0, gain=1.0e-2, v_max=0.05,
                filter_tau=FAST_FILTER, force_limit=1e9))[-300:]
 
     assert unfiltered.ptp() > 10.0
@@ -594,10 +599,10 @@ def test_the_velocity_clamp_bounds_a_gain_that_is_far_too_high():
     # approach one (retreat_v_max, for the soft-limit reaction), and this test
     # is about what ONE clamped step is worth, not about that asymmetry.
     wild = _run_against_wall(
-        _press(target_force=5.0, gain=1.0e-2, v_max=0.05, retreat_v_max=0.05,
+        _press(stiffness_hint=1.0, target_force=5.0, gain=1.0e-2, v_max=0.05, retreat_v_max=0.05,
                filter_tau=NO_FILTER, force_limit=1e9, soft_limit=1e9))[-300:]
     clamped = _run_against_wall(
-        _press(target_force=5.0, gain=1.0e-2, v_max=0.005, retreat_v_max=0.005,
+        _press(stiffness_hint=1.0, target_force=5.0, gain=1.0e-2, v_max=0.005, retreat_v_max=0.005,
                filter_tau=NO_FILTER, force_limit=1e9, soft_limit=1e9))[-300:]
 
     # One clamped step against this wall is v_max * dt * K_e = 2 N of swing.
@@ -674,7 +679,9 @@ def test_a_wheel_kicked_off_a_known_wall_is_back_on_it_in_seconds_not_half_a_min
     _run_against_wall(fast, stiffness=2.0e3, dt=0.1, cycles=400)
     assert fast.in_contact and fast.wall_distance is not None
     back, peak, _ = _kicked_off_the_wall(fast)
-    assert back is not None and back < 4.0, f"re-contact took {back} s"
+    # Fast down to recontact_margin from the remembered wall, then the
+    # approach floor for the last few millimetres: ~6 s, against 30.
+    assert back is not None and back < 7.0, f"re-contact took {back} s"
     assert peak < 12.0, f"re-contact landed at {peak:.1f} N"
     # Regaining the last newton of TARGET from there is the press law's job,
     # and at 5e-5 m/s/N on a 2 kN/m contact that is the slow part (0.5 mm at
@@ -686,7 +693,7 @@ def test_a_wheel_kicked_off_a_known_wall_is_back_on_it_in_seconds_not_half_a_min
                   recontact_memory=0.0)          # the old behaviour: no memory
     _run_against_wall(slow, stiffness=2.0e3, dt=0.1, cycles=400)
     back_slow, _, _ = _kicked_off_the_wall(slow)
-    assert back_slow is None or back_slow > 3.0 * back, (
+    assert back_slow is None or back_slow > 1.5 * back, (
         f"without the memory it should be the crawl: {back_slow} s vs {back} s")
 
 
@@ -745,3 +752,26 @@ def test_a_force_that_will_not_come_down_is_a_fault_after_the_soft_dwell():
     assert press.fault is None
     press.update(20.0, 0.03, 0.1)
     assert press.fault and "soft limit" in press.fault
+
+
+def test_re_contact_on_a_stiff_corner_with_a_slow_loop_does_not_slam():
+    """The 2026-09-21 18:39 bounce: a corner at ~25 kN/m (a caster bottomed
+    out — not the 2 kN/m of a caster on its bar), the loop at 5 Hz, and the
+    re-contact landing at 5 mm/s made 39 N, 89 times. The last millimetres
+    to the remembered wall are now taken at the approach floor, and the
+    retreat cannot unload past target in one cycle at the believed
+    stiffness, so the wheel is neither slammed nor thrown off."""
+    press = _press(target_force=5.0, gain=5.0e-5, v_max=0.005, seek_speed=0.01,
+                   approach_min_speed=0.0008, filter_tau=0.1,
+                   recontact_speed=0.005, recontact_gain=2.0, recontact_memory=10.0,
+                   recontact_margin=0.003, stiffness_hint=2.0e4,
+                   soft_limit=15.0, force_limit=45.0)
+    _run_against_wall(press, stiffness=2.5e4, dt=0.2, cycles=300)
+    assert press.in_contact
+    back, peak, forces = _kicked_off_the_wall(press, kick=0.012, stiffness=2.5e4, dt=0.2, cycles=200)
+    assert back is not None, "it should find the wall again"
+    assert peak < 15.0, f"landed at {peak:.1f} N on the stiff corner"
+    # And having landed, it STAYS: no bounce back off the wall.
+    after = forces[int(back / 0.2) + 5:]
+    assert min(after) > 1.5, "the wheel came off again after landing"
+    assert press.fault is None

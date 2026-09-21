@@ -1336,10 +1336,16 @@ def test_a_wall_that_recedes_mid_sweep_slows_the_base_instead_of_scanning_air():
     swept = travel[recede_at - 50:recede_at].mean()
     assert swept > 0.5 * node.sweep_speed, "and the base should be sweeping"
     assert forces[-1] == 0.0, "the wheel should be off the wall at the end"
-    # Four seconds later, at tau = 1.5 s, the authority is down to single figures.
-    assert travel[-1] < 0.25 * swept, (
+    # Four seconds later, at tau = 1.5 s, the authority is down to single
+    # figures — and the base is at base_min_moving_speed, not below it: the
+    # press is still closing on the wall it remembers (press_recontact_memory),
+    # and until that expires the base rolls on at the floor rather than
+    # stopping and restarting through the start band.
+    floor = float(node.get_parameter("base_min_moving_speed").value)
+    assert travel[-1] < swept and travel[-1] <= floor + 1e-6, (
         f"the base was still travelling at {travel[-1]:.4f} m/s against {swept:.4f} "
         f"with the wheel off the wall (authority {node.travel_authority:.2f})")
+    assert node.travel_authority < 0.1
     assert node.press.touched, "the latch still latches — it is only the ARMING now"
 
 
@@ -1397,7 +1403,10 @@ def test_a_lost_wall_stops_the_base_at_once_and_is_budgeted_by_the_reseat_not_th
     that never comes back is reseat_timeout, with its own message.
     """
     global WALL_X
+    # A short re-contact memory: this test is about the cut and the budgets,
+    # and while the press still remembers a wall the base is kept rolling.
     node = _press_node(press_travel_tau=1.5, press_release_grace=0.5,
+                       press_recontact_memory=0.8,
                        no_progress_timeout=3.0, reseat_timeout=6.0)
     robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.03)
     node.q_posture = robot.q.copy()
@@ -1416,11 +1425,12 @@ def test_a_lost_wall_stops_the_base_at_once_and_is_budgeted_by_the_reseat_not_th
     assert forces[recede_at - 1] > 1.0, "the wheel should be loaded before the wall moves"
     swept = travel[recede_at - 50:recede_at].mean()
     assert swept > 0.5 * node.sweep_speed
-    # The force filter (0.09 s) has to read the release, then the grace
-    # (0.5 s), then the acceleration bound ramps the command down over a few
-    # cycles: inside a second of the wheel lifting the base is STOPPED — not
-    # down to a quarter, as the filter alone would have it after four.
-    after_grace = travel[recede_at + 50:recede_at + 80]
+    # The force filter (0.09 s) has to read the release, then the grace and
+    # the re-contact memory (0.5 / 0.8 s here), then the acceleration bound
+    # ramps the command down over a few cycles: inside ~1.5 s of the wheel
+    # lifting the base is STOPPED — not down to a quarter, as the filter
+    # alone would have it after four.
+    after_grace = travel[recede_at + 65:recede_at + 95]
     assert max(after_grace) < 0.02 * swept, (
         f"base still at {max(after_grace):.4f} m/s a second after the wheel lifted")
     # The watchdog (3 s here) did not fire: the sweep outlived it by a margin
@@ -1451,18 +1461,19 @@ def test_a_wheel_the_base_kicks_off_the_wall_is_regained_without_stopping_the_ba
         def on_cycle(cycle):
             global WALL_X
             WALL_X = was + 0.012 if cycle >= kick_at else was
-        forces, travel = _press_run(node, robot, cycles=kick_at + 400, on_cycle=on_cycle)
+        forces, travel = _press_run(node, robot, cycles=kick_at + 700, on_cycle=on_cycle)
     finally:
         WALL_X = was
 
-    assert len(travel) == kick_at + 400, f"the sweep ended early: {node.pending_status}"
+    assert len(travel) == kick_at + 700, f"the sweep ended early: {node.pending_status}"
     before = travel[kick_at - 50:kick_at].mean()
     assert before > 0.5 * node.sweep_speed, "the base should be sweeping before the kick"
     assert forces[kick_at + 5] == 0.0, "12 mm should take the wheel clean off"
-    # Back on the wall inside 3 s: the first cycle after the kick with real
-    # load again, and the press state to match.
+    # Back on the wall inside 7 s: fast to recontact_margin from the wall it
+    # remembers, then the approach floor for the last millimetres (a stiff
+    # contact met at 5 mm/s by a slow loop is a slam — 18:39). Against 30 s.
     regained = next((i for i in range(kick_at + 10, len(forces)) if forces[i] > 1.0), None)
-    assert regained is not None and (regained - kick_at) * 0.02 < 3.0, (
+    assert regained is not None and (regained - kick_at) * 0.02 < 7.0, (
         f"re-contact took {None if regained is None else (regained - kick_at) * 0.02} s")
     assert node.press.in_contact
     # And the base never stopped for it: through the loss and the re-contact
