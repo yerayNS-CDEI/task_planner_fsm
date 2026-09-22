@@ -2531,7 +2531,9 @@ class ScanWall(State):
             cmd += ["-p", "return_joints:=[" +
                     ", ".join(f"{q:.4f}" for q in self._unfolded_joints) + "]"]
         cmd += [
-            "-p", f"sweep_speed:={float(ctx.get('wbc_sweep_speed', 0.03))}",
+            # The fallback has to track wbc/sweep_node's own default, or the
+            # node's is dead code: this is always passed.
+            "-p", f"sweep_speed:={float(ctx.get('wbc_sweep_speed', 0.045))}",
             "-p", f"status_topic:={ctx.get('wbc_status_topic', self.WBC_STATUS_TOPIC)}",
             # Everything in the loop — control period, data ages, the sweep
             # deadline — ticks on the node's clock. Gazebo runs well below

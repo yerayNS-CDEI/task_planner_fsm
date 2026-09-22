@@ -89,7 +89,16 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("seg_start", [0.0, 0.0, 0.0])
         self.declare_parameter("seg_end", [0.0, 0.0, 0.0])
         self.declare_parameter("row_z", float("nan"))     # NaN -> hold the height we start at
-        self.declare_parameter("sweep_speed", 0.03)       # m/s along the wall
+        # 0.045 m/s (2026-09-22). 0.03 was where the base could be trusted
+        # to hold contact; the 15:58 segment then ran at 23.6 mm/s mean with
+        # the travel authority pinned at 1.00, zero releases and the force
+        # inside +/-1 N of its 10 N target — i.e. the reference had become
+        # the ceiling rather than the constraint. What to watch as this goes
+        # up is the force RIPPLE, which is the wall's texture read at the
+        # speed the casters cross it: there were ~5 N of headroom to the soft
+        # limit at 24 mm/s, and when that closes, the speed has found its
+        # limit rather than the gate having.
+        self.declare_parameter("sweep_speed", 0.045)      # m/s along the wall
         self.declare_parameter("standoff", 0.20)          # m, plate to wall
         self.declare_parameter("arrive_tolerance", 0.03)  # m of arc length
         # The sweep's overall clock. It used to be length / speed + a 30 s

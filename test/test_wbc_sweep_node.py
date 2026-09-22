@@ -1479,9 +1479,15 @@ def test_a_wheel_the_base_kicks_off_the_wall_is_regained_without_stopping_the_ba
     assert node.press.in_contact
     # And the base never stopped for it: through the loss and the re-contact
     # the travel stayed above a third of what it was, and is back up after.
+    # Against the FLOOR, not a fraction of the sweep speed: what must not
+    # happen is the base stopping and having to restart through the band
+    # where the chassis kicks, and the floor is exactly the speed that
+    # avoids it. (As a fraction it moves whenever sweep_speed does.)
     through = travel[kick_at:regained + 50]
-    assert through.min() > 0.3 * before, (
-        f"the base dropped to {through.min() / before:.0%} of its speed during the loss")
+    floor = float(node.get_parameter("base_min_moving_speed").value)
+    assert through.min() >= 0.95 * floor, (
+        f"the base dropped to {through.min() * 1e3:.1f} mm/s during the loss, "
+        f"under its {floor * 1e3:.0f} mm/s floor")
     assert travel[-25:].mean() > 0.8 * before, "and it is back up to speed afterwards"
     # The landing was gentle: the memory includes the compression, so the
     # wheel meets the wall at gain * F_target / K_e whatever K_e is.
