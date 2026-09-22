@@ -1519,15 +1519,19 @@ def test_a_base_driven_overload_is_relieved_and_swept_on_rather_than_failed():
     hard = float(node.get_parameter("press_force_limit").value)
     peak = max(forces[shove_at:shove_at + 20])
     assert soft < peak < hard, f"the shove should land between the limits: {peak:.1f} N"
-    # This shove runs past the cut line (halfway from the soft limit to the
-    # hard one), so the base IS stopped — within half a second of the
-    # filtered force getting there, and cut rather than eased.
-    assert max(travel[shove_at + 15:shove_at + 35]) < 0.1 * before, (
-        f"the base kept moving at {max(travel[shove_at + 15:shove_at + 35]) / before:.0%}")
+    # The base is NOT stopped for it, and since 2026-09-22 it does not need
+    # to be: at the gain the contact's measured stiffness allows, the arm
+    # backs a 34 N shove down to the soft limit inside a second and to
+    # target inside two, so the force never sits over the cut line long
+    # enough to be worth interrupting the sweep for. A shove that does
+    # persist is a different test (…reseats_only_after_a_dwell).
+    assert min(travel[shove_at:shove_at + 50]) > 0.8 * before, (
+        "the sweep should carry on through a shove the arm can absorb")
     # Relieved inside a second and a half, with the wheel still on the wall.
     within = forces[shove_at:shove_at + 75]
     assert min(within) < soft, f"still {min(within):.1f} N 1.5 s after the shove"
-    assert forces[shove_at + 75] > 0.5, "the reaction should not throw the wheel off the wall"
+    assert forces[shove_at + 100] > 0.5, "the reaction should not throw the wheel off the wall"
+    assert forces[shove_at + 100] < soft, "and it should be back near target"
     assert node.press.in_contact
     assert node.pending_status is None
     # And the base comes back on its own once the contact has re-seated.
@@ -2371,3 +2375,26 @@ def test_an_implausible_force_step_does_not_move_the_drift_estimate():
     node.press.force = 5.0 + 1.0e4 * (3.0 * cap) * 0.1    # a step, 3x the cap
     node._update_wall_drift(0.1)
     assert node.wall_drift == pytest.approx(0.001), "the step should be dropped"
+
+
+def test_the_stiffness_estimate_survives_a_brief_loss_of_contact():
+    """It needs about eight loaded cycles of travel to converge, and on
+    2026-09-22 15:02 the wheel came off 53 times in one segment — so it
+    converged on 5 % of them and the gain, the retreat cap and the force
+    barrier all ran on the floor. Either side of a hollow it is the same
+    wall and the same casters, so a loss the press still remembers the wall
+    through keeps the estimate; one it does not, resets it."""
+    node = _press_node(press_tare_seconds=0.0)
+    node.stiffness.value, node.stiffness.fitted = 1.2e4, True
+
+    node.press.state = SEEK
+    node.press.wall_distance = 0.15          # …and still remembers the wall
+    node.press._since_release = 0.0
+    assert node.press.recontacting
+    node._stiffness_step()
+    assert node.stiffness.fitted and node.stiffness.value == 1.2e4, "a brief loss keeps it"
+
+    node.press._since_release = node.press.recontact_memory + 1.0
+    assert not node.press.recontacting
+    node._stiffness_step()
+    assert not node.stiffness.fitted, "a loss past the memory resets it"

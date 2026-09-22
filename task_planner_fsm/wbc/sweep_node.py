@@ -198,7 +198,19 @@ class WholeBodySweepNode(Node):
         # m/s per N. Small on purpose: the loop is a velocity source against a
         # stiff environment, so k * K_e sets the closed-loop bandwidth and must
         # stay well under the servo lag. See the module docstring for the sizing.
-        self.declare_parameter("press_gain", 5.0e-5)
+        # 5e-4 at press_gain_stiffness_ref (6 kN/m, the contact measured),
+        # scaled by 1/K_e from there. The 5e-5 it was is what the module
+        # docstring sized against a 2e4 wall with no measurement of one, and
+        # it left the press unable to REBUILD force: on 2026-09-22 15:02,
+        # 3.5 N of error commanded 0.18 mm/s, so after every dip the loop
+        # took seconds to climb back and the force held 6.5 N against a 10 N
+        # target. Measured against the wall's own texture and a 4 mm knock
+        # every 20 s, at 10 Hz with 0.3 s of servo lag: 5e-5 holds a mean of
+        # 7.5 N and spends 15 % of cycles under the release threshold, 5e-4
+        # holds 8.1 N and 7.8 %, and neither rings on a smooth wall at any
+        # stiffness from 6 to 50 kN/m once the scaling is applied. The
+        # boundary the docstring derives, 2 / (K_e dt), is 3.3e-3 here.
+        self.declare_parameter("press_gain", 5.0e-4)
         # The gain above was sized for ~2e4 N/m (concrete through a hard
         # wheel). The plate rides on four corner casters on bars, and that
         # contact measured ~2e3 N/m twice on 2026-09-21 (5 mm for 10 N; 12 mm
@@ -209,8 +221,14 @@ class WholeBodySweepNode(Node):
         # which floors at press_stiffness_floor), and capped: at 5x the loop
         # is still 20x under the ringing boundary if the contact turns out to
         # be the 2e4 the gain was sized for (2 / (K_e dt) at 10 Hz).
-        self.declare_parameter("press_gain_stiffness_ref", 2.0e4)   # N/m
-        self.declare_parameter("press_gain_boost_max", 5.0)
+        # The stiffness press_gain is the right gain AT. 6e3, the contact
+        # this plate actually rides on (see press_stiffness_floor); the
+        # scaling above then slows the loop on anything stiffer and speeds
+        # it on anything softer, keeping k * K_e — the loop gain that
+        # decides stability — roughly where it was tuned.
+        self.declare_parameter("press_gain_stiffness_ref", 6.0e3)   # N/m
+        self.declare_parameter("press_gain_boost_max", 3.0)
+        self.declare_parameter("press_gain_scale_min", 0.2)
         self.declare_parameter("press_v_max", 0.005)        # m/s
         self.declare_parameter("press_seek_speed", 0.01)    # m/s, closing on the wall
         # Re-contact: after a contact the wall's position is known, so a wheel
@@ -2221,35 +2239,30 @@ class WholeBodySweepNode(Node):
             press_dt = (now - self.press_stamp) if self.press_stamp else nominal_dt
             press_dt = float(min(max(press_dt, 0.2 * nominal_dt), 1.0))
             self.press_stamp = now
-            # See press_gain_stiffness_ref: the gain is sized for a stiff
-            # wall and raised, within a cap, for a softer one — once one has
-            # been MEASURED. Until the fit has converged the contact is
-            # assumed stiff: on 2026-09-21 18:39 a corner that turned out to
-            # be ~25 kN/m was pressed at the soft-contact gain because the
-            # estimator was still on its 2 kN/m floor, and the loop bounced.
+            # The loop gain that matters is k * K_e — a velocity source
+            # against a spring — so k should track 1/K_e and press_gain is
+            # the value at press_gain_stiffness_ref. Scaled BOTH ways since
+            # 2026-09-22: a stiff contact wants a slower loop (the 09-21
+            # 18:39 bounce was a 25 kN/m corner pressed at a soft-contact
+            # gain) and a soft one a faster (15:02 held 6.5 N against a 10 N
+            # target because 3.5 N of error commanded 0.18 mm/s).
+            #
+            # Until the fit converges the contact is assumed STIFF, which
+            # through this scaling means a slow gain — the conservative
+            # direction on a wall whose stiffness is not yet known.
             k_ref = float(p("press_gain_stiffness_ref").value)
-            k_believed = self.stiffness.value if self.stiffness.fitted else max(self.stiffness.value, k_ref)
+            k_believed = self.stiffness.value if self.stiffness.fitted else max(self.stiffness.value, 2.0e4)
             self.press.stiffness_hint = k_believed
-            self.press.gain_scale = min(max(k_ref / max(k_believed, 1.0), 1.0),
-                                        float(p("press_gain_boost_max").value))
+            self.press.gain_scale = float(np.clip(
+                k_ref / max(k_believed, 1.0),
+                float(p("press_gain_scale_min").value),
+                float(p("press_gain_boost_max").value)))
             self._update_wall_drift(press_dt)
             v_normal = self.press.update(self.press_force, distance, press_dt,
                                          quiet=arm_quiet and aligned)
-            # Learn how stiff this surface is, from the travel the LAST solve
-            # asked for and the force that came back. Regressed on the commanded
-            # rate rather than on the sensed distance, which has 4.2 mm of
-            # plane-fit sigma against a penetration of a fraction of a
-            # millimetre — see wbc/stiffness.py. Only while the force means
-            # something: during TARE it is an untared reading, and out of
-            # contact the slope being fitted is of nothing at all.
-            if self.press.state == PRESS:
-                self.stiffness.update(self.normal_rate_prev, self.press.force,
-                                      press_dt)
-            elif self.press.state == SEEK:
-                # Contact lost. The next one may be a different surface — a
-                # reveal, the far side of a lip — and carrying the old slope
-                # into it would size the force row for a wall that is not there.
-                self.stiffness.reset()
+            # Learn how stiff this surface is, from the travel the last solve
+            # asked for and the force that came back.
+            self._stiffness_step(press_dt)
             if self.press.fault:
                 self.finish("failed", self.press.fault)
                 return
@@ -2798,6 +2811,35 @@ class WholeBodySweepNode(Node):
         self.holding_since = None
         self._publish(solution.u, n_arm)
         self._log_cycle(solution, distance, remaining, phi)
+
+    def _stiffness_step(self, dt=0.0):
+        """Fold one cycle into the contact-stiffness estimate, or forget it.
+
+        Regressed on the rate the LAST solve asked for rather than on the
+        sensed distance, which has 4.2 mm of plane-fit sigma against a
+        penetration of a fraction of a millimetre — see wbc/stiffness.py.
+        Only while the force means something: during TARE it is an untared
+        reading, and out of contact the slope being fitted is of nothing.
+        """
+        if self.press is None:
+            return
+        if self.press.state == PRESS:
+            self.stiffness.update(self.normal_rate_prev, self.press.force, dt)
+        elif self.press.state == SEEK and not self.press.recontacting:
+            # Contact lost for longer than the press remembers the wall
+            # (press_recontact_memory). The next one may be a different
+            # surface — a reveal, the far side of a lip — and carrying the
+            # old slope into it would size the force row for a wall that is
+            # not there.
+            #
+            # A BRIEF loss keeps it, which is the common case and used to
+            # throw the estimate away: on 2026-09-22 15:02 the wheel came
+            # off 53 times in one segment, the fit needs ~8 loaded cycles of
+            # travel to converge, and it managed it on 5 % of them. An
+            # estimate that never converges is one the gain and the retreat
+            # cap cannot use — and it is the same wall either side of a
+            # hollow.
+            self.stiffness.reset()
 
     def _update_wall_drift(self, dt):
         """How fast the wall is going away from the plate, m/s.
