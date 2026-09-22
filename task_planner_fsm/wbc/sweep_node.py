@@ -265,11 +265,17 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("press_side_force_limit", 10.0)
         # Below this fraction of press_side_force_limit the plate is rolling
         # and the base may sweep at full speed; from there to the limit the
-        # travel is throttled linearly to zero. A wheel that is rolling on
-        # concrete drags 1-2 N; a plate being dragged edge-first reads 5-6 N
-        # on the way to an overload (2026-09-18) and 20 N once it is one
-        # (09-14). The throttle acts before the halt does.
-        self.declare_parameter("press_drag_free_fraction", 0.3)
+        # travel is throttled linearly to zero. A plate being dragged
+        # edge-first reads 5-6 N on the way to an overload (2026-09-18) and
+        # 20 N once it is one (09-14). The throttle acts before the halt does.
+        #
+        # 0.6, not 0.3 (2026-09-22): four casters ROLLING on a real wall
+        # measured p50 2.2 N, p90 5.5 N of side load (bag 10:38), so a free
+        # line at 3 N called the contact unseated ~40 % of the time from
+        # nothing but rolling drag, restarted the seat dwell each time, and
+        # the base never climbed off its floor. 6 N clears the rolling load;
+        # the throttle still acts from there to the 10 N limit.
+        self.declare_parameter("press_drag_free_fraction", 0.6)
         # A contact is not seated while the normal force is far over its
         # target either, whatever the side load says: a plate at 23 N against
         # 5 N is being levered on an edge, and the base pulling on it is what
@@ -285,7 +291,10 @@ class WholeBodySweepNode(Node):
         # it the 19:26 run cycled with a 4 s period: throttle, force falls,
         # side load falls under the free line, gate reopens, base ramps, force
         # climbs — three rounds up to 30 N.
-        self.declare_parameter("press_seat_dwell", 1.5)             # s
+        # 0.5 s, from 1.5 (2026-09-22): with the free line above where it
+        # belongs the dwell no longer has to absorb rolling-drag flicker, and
+        # every restart of it was 1.5 s the base spent at its floor.
+        self.declare_parameter("press_seat_dwell", 0.5)             # s
         # The distance sensors stop being the setpoint and become the envelope:
         # no approach closer than this to the sensed plane, whatever the force
         # says. A wrong force reading then cannot walk the arm into the wall,
@@ -511,7 +520,10 @@ class WholeBodySweepNode(Node):
         # seconds after the latch, with the contact still an edge, and the
         # force went 5 -> 30 N in lockstep with the base speed. See the
         # seating conditions on `health` below for what else now has to hold.
-        self.declare_parameter("press_travel_tau", 4.0)            # s
+        # 2 s (2026-09-22), back from the 4 the 09-18 edge contacts asked
+        # for: the seating conditions now do that job, and at 4 s every
+        # interruption cost the base ~8 s to get back to speed.
+        self.declare_parameter("press_travel_tau", 2.0)            # s
         # How long the wheel may be OFF the wall before the base is stopped
         # outright rather than eased down through the filter above. The filter
         # is right for a hollow — a 0.3 s unload the wheel rides over costs a
@@ -2369,6 +2381,13 @@ class WholeBodySweepNode(Node):
                 self.travel_authority = 0.0
             else:
                 self.travel_authority += alpha * (health - self.travel_authority)
+                if self.press.recontacting or (loaded_now and self.seated_since is not None):
+                    # Closing on a wall it remembers, or back on it and
+                    # waiting out the seat dwell: the base keeps at least the
+                    # moving floor, so a 6 s re-contact does not end with the
+                    # base stopped and restarting through the start band.
+                    self.travel_authority = max(
+                        self.travel_authority, float(p("base_min_moving_authority").value))
             if self.travel_authority < 0.05:
                 # The base is standing still because THIS gate is holding it,
                 # so it is not a stall and the no_progress watchdog must not
