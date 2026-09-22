@@ -832,3 +832,42 @@ def test_the_drift_feedforward_is_bounded_however_wrong_it_is():
     assert forces.max() > 15.0, "an absurd drift should press in"
     assert press.fault is None or "limit" in press.fault
     assert forces[-1] < 1.5e4 * 0.004 * 0.1 * 60 * 1.1, "but only at the capped rate"
+
+
+def test_the_target_clears_the_ripple_a_rolling_caster_makes():
+    """Why press_force is 10 N and not 5. A caster rolling on a real wall
+    rides its texture, and the loop does NOT follow that — it is a tenth of
+    a millimetre per cycle against a force law that moves the plate a
+    quarter of that — so the force simply swings about whatever is being
+    held. In the 2026-09-22 14:16 segment the swing was p10 2.6 to p90
+    10.8 N about a 5 N target: every trough crossed the 1.5 N release, the
+    wheel "came off the wall" 78 times, the travel authority sat under 0.3
+    for 40 % of the run, and the sweep averaged 14 mm/s where the same
+    controller does 27 with the authority up. Holding further from the
+    threshold is the whole fix; chasing the texture with more gain is not
+    (measured: at 0.3 s of servo lag a 4x gain loses contact MORE).
+
+    Beyond about a millimetre of texture the target stops being enough on
+    its own — the loop cannot follow the slow component either, and both
+    targets lose the wall. That is the next thing, not this one.
+    """
+    def run(target, amp=0.0008, period=2.0, K=6.0e3, dt=0.1, lag=0.3):
+        press = _press(target_force=target, gain=5.0e-5, v_max=0.005,
+                       filter_tau=0.1, stiffness_hint=K,
+                       soft_limit=max(15.0, 1.5 * target), force_limit=45.0)
+        gap, wheel = 0.03, 0.03
+        queue, forces = [0.0] * max(1, int(round(lag / dt))), []
+        for cycle in range(600):
+            texture = amp * math.sin(2 * math.pi * cycle * dt / period)
+            force = max(0.0, K * (wheel - gap + texture))
+            queue.append(press.update(force, gap, dt))
+            gap -= queue.pop(0) * dt
+            forces.append(force)
+        forces = np.array(forces[250:])
+        return (forces < press.release_force).mean(), forces
+
+    lost_at_5, _ = run(5.0)
+    lost_at_10, held = run(10.0)
+    assert lost_at_5 > 0.05, f"a 5 N target should keep losing it: {lost_at_5:.0%}"
+    assert lost_at_10 == 0.0, f"a 10 N target should not: {lost_at_10:.0%}"
+    assert held.min() > 3.0, f"and the trough stays clear of the threshold: {held.min():.1f} N"

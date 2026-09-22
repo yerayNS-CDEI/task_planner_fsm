@@ -183,7 +183,18 @@ class WholeBodySweepNode(Node):
         # contact force that can never arrive would just stall.
         self.declare_parameter("press_enabled", False)
         self.declare_parameter("wrench_topic", "/force_torque_sensor_broadcaster/wrench")
-        self.declare_parameter("press_force", 5.0)          # N, matches the old force_mode
+        # 10 N, not the 5 that matched the old force_mode (2026-09-22). The
+        # target has to clear the RIPPLE, not just the sensor: a caster
+        # rolling on a real wall at 15-25 mm/s rides half a millimetre of
+        # texture, which at the measured 6 kN/m is +/-4 N. Around a 5 N
+        # target that put the trough under press_release_force on 32 % of
+        # cycles — the wheel "came off the wall" 78 times in one segment,
+        # the travel authority sat below 0.3 for 40 % of the time, and the
+        # sweep averaged 14 mm/s where the same controller does 27 with the
+        # authority up. At 10 N the trough is ~6 N and contact simply holds.
+        # The casters take it four ways, the soft limit is still 50 % above
+        # it, and the hard limit and the barrier are where they were.
+        self.declare_parameter("press_force", 10.0)         # N
         # m/s per N. Small on purpose: the loop is a velocity source against a
         # stiff environment, so k * K_e sets the closed-loop bandwidth and must
         # stay well under the servo lag. See the module docstring for the sizing.
@@ -2361,7 +2372,14 @@ class WholeBodySweepNode(Node):
             side = self.side_force - self.side_bias
             side_limit = float(p("press_side_force_limit").value)
             free = float(p("press_drag_free_fraction").value) * side_limit
-            over = self.press.force > float(p("press_seated_force_factor").value) * self.press.target_force
+            # Never above the soft limit: past that the press is already
+            # reacting (retreat opened, base cut), and a seated test that
+            # only fires higher would be asleep exactly when it matters. It
+            # used to be 3x the target, which the 10 N target would have put
+            # at 30 N — twice the soft limit.
+            over = self.press.force > min(
+                float(p("press_seated_force_factor").value) * self.press.target_force,
+                float(p("press_force_soft_limit").value))
             loaded_now = self.press.force >= self.press.release_force
             seated_now = loaded_now and aligned and side < free and not over
             # With a dwell: the conditions have to hold continuously before the
