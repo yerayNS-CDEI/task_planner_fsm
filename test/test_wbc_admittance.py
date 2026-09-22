@@ -775,3 +775,60 @@ def test_re_contact_on_a_stiff_corner_with_a_slow_loop_does_not_slam():
     after = forces[int(back / 0.2) + 5:]
     assert min(after) > 1.5, "the wheel came off again after landing"
     assert press.fault is None
+
+
+def _against_a_receding_wall(press, recede, K=1.5e4, dt=0.1, cycles=400, lag=0.2):
+    """The 2026-09-22 geometry: the base carries the plate along a wall its
+    heading is a couple of degrees off, so the wall goes away at ``recede``
+    m/s while the press tries to hold 5 N on it. ``lag`` is the servo delay
+    between the command and the arm."""
+    gap, wheel, queue, forces = 0.03, 0.03, [0.0] * max(1, int(round(lag / dt))), []
+    for _ in range(cycles):
+        force = max(0.0, K * (wheel - gap))
+        queue.append(press.update(force, gap, dt))
+        gap += recede * dt - queue.pop(0) * dt
+        forces.append(force)
+    return np.array(forces)
+
+
+def test_a_receding_wall_makes_the_press_hover_until_it_is_fed_forward():
+    """The 2026-09-22 12:46 run's remaining fault. The turret was aligned by
+    eye to ~2 deg, which at 20 mm/s of sweep is 0.7 mm/s of wall going away.
+    The force law has no term for that: it caught up in bursts to 10 N, then
+    held while the receding wall ate the contact back under the release
+    threshold — 80 releases in one segment, the plate never more than a
+    millimetre from where it belonged. Given the drift, the same loop holds
+    the same wall."""
+    def run(drift):
+        press = _press(target_force=5.0, gain=5.0e-5, v_max=0.005,
+                       filter_tau=0.1, stiffness_hint=6.0e3, soft_limit=15.0)
+        press.gain_scale = 3.3
+        press.drift = drift
+        return press, _against_a_receding_wall(press, recede=0.0007)
+
+    blind, blind_f = run(0.0)
+    fed, fed_f = run(0.0007)
+    settled = slice(150, None)
+    assert (blind_f[settled] < blind.release_force).mean() > 0.15, (
+        "blind to the drift the press should keep losing the wall: "
+        f"{(blind_f[settled] < blind.release_force).mean():.0%} of cycles under release")
+    assert (fed_f[settled] < fed.release_force).mean() < 0.02, (
+        f"fed the drift it should hold: {(fed_f[settled] < fed.release_force).mean():.0%} under release")
+    assert abs(fed_f[settled].mean() - 5.0) < 2.0, (
+        f"and hold near target, not merely on the wall: {fed_f[settled].mean():.1f} N")
+    assert fed_f[settled].ptp() < blind_f[settled].ptp()
+
+
+def test_the_drift_feedforward_is_bounded_however_wrong_it_is():
+    """It is an estimate, and an estimate that says 'the wall is running
+    away' drives the plate at the wall. drift_max is what that may cost."""
+    press = _press(target_force=5.0, gain=5.0e-5, v_max=0.005, filter_tau=0.1,
+                   stiffness_hint=6.0e3, drift_max=0.004, soft_limit=15.0,
+                   force_limit=45.0)
+    _run_against_wall(press, stiffness=1.5e4, dt=0.1, cycles=200)
+    press.drift = 1.0                      # absurd: a metre a second
+    forces = _against_a_receding_wall(press, recede=0.0, cycles=60)
+    # It presses in at the cap, no faster, and the limits underneath catch it.
+    assert forces.max() > 15.0, "an absurd drift should press in"
+    assert press.fault is None or "limit" in press.fault
+    assert forces[-1] < 1.5e4 * 0.004 * 0.1 * 60 * 1.1, "but only at the capped rate"

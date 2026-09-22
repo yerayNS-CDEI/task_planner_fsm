@@ -62,17 +62,17 @@ class ContactStiffness:
     returns the current estimate in N/m, which is also available as ``value``.
     """
 
-    def __init__(self, floor=2.0e3, ceiling=5.0e4, tau=3.0,
+    def __init__(self, floor=6.0e3, ceiling=5.0e4, tau=3.0,
                  min_travel_sigma=2.0e-5, min_samples=8.0):
         # What the row assumes before it has learned anything, and the value a
         # fit is never allowed to go below. The four corner casters on their
-        # bars, which is what this plate rides on: ~2e3 N/m, measured twice
-        # on 2026-09-21. It was raised to 2e4 on 09-14 on the argument that
-        # the bars "bottom out against concrete" — a corner driven in
-        # edge-first, as it turned out, by a plate calibrated 6 deg off. The
-        # sweep node's press_stiffness_floor comment has the cost of being
-        # wrong in either direction; the node passes its value in, this
-        # default only has to agree with it.
+        # bars, which is what this plate rides on: the fit over two complete
+        # 2026-09-22 runs gives p10 2.5-6 kN/m, median 7-16 kN/m. Since the
+        # value is CLIPPED to the floor, this also bounds how wrong a noisy
+        # fit can be on the low side, which is what the press's retreat cap
+        # and gain are sized against. The sweep node's press_stiffness_floor
+        # comment has the history and the cost of being wrong either way;
+        # the node passes its value in, this default only has to agree.
         self.floor = float(floor)
         # Only to stop a fit driven by noise from clamping the press to a stop.
         # Above concrete's own ~2e4, so it never binds on a real surface.

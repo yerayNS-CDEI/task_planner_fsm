@@ -218,6 +218,26 @@ class WholeBodySweepNode(Node):
         # its noise, and 18:39 landed at 5 mm/s on a ~25 kN/m corner 89
         # times. 3 mm is ~1.5 sigma of the ToF fit.
         self.declare_parameter("press_recontact_margin", 0.003)  # m
+        # --- following a wall that is going away ---------------------------
+        # A base whose heading is a couple of degrees off the wall carries the
+        # plate away from it at travel * sin(error) — 0.7 mm/s at 20 mm/s and
+        # 2 deg, measured on 2026-09-22 12:46, where it made the plate hover:
+        # the press caught up in bursts to 10 N, then held while the receding
+        # wall ate the contact back under the release threshold, 80 times in
+        # one segment. The drift is estimated from what the loop already has
+        # (see _update_wall_drift) and fed forward into the press.
+        #
+        # The cap is what a wrong estimate may do: 4 mm/s is 12 deg of
+        # heading error at sweep speed, well past anything a sane setup has,
+        # and at the measured 6 kN/m it is 24 N/s of authority — the soft
+        # limit and the force barrier are still underneath it.
+        self.declare_parameter("press_drift_max", 0.004)          # m/s
+        # Seconds of averaging on the estimate. Long against the 1 Hz hover
+        # it is there to cancel, short against a segment.
+        self.declare_parameter("press_drift_tau", 2.0)            # s
+        # Below this force the estimate is not updated: dF/dt divided by the
+        # stiffness only means travel while the wheel is actually loaded.
+        self.declare_parameter("press_drift_min_force", 2.0)      # N
         # SEEK -> PRESS, and the gate the base's travel is released by. 3.0 N
         # rather than the 1.0 it was: the de-biased force sensor measures sigma
         # 0.95 N with nothing touching, so 1.0 N was 1.1 sigma — inside the noise
@@ -450,21 +470,26 @@ class WholeBodySweepNode(Node):
         # HIGH: overestimating K_e tightens the bound and costs a slow press,
         # underestimating it loosens the bound and costs the plate.
         #
-        # 2e3 (2026-09-21), back from the 2e4 it was raised to on 09-14. The
-        # 09-14 argument — "the caster bars bottom out against concrete and
-        # made 26 N in one cycle" — was made with the plate calibrated 6 deg
-        # off, so what bottomed out was one corner driven in edge-first; see
-        # plate_calibration.py in arm_control. What the plate actually rides
-        # on is four corner casters on bars, and that contact measured ~2e3
-        # twice on 09-21 (5 mm for 10 N, 12 mm for 27 N). With the estimator
-        # able to say so, the press gain (press_gain_stiffness_ref) and the
-        # force barrier both size themselves to the wall that is there. The
-        # cost if a contact IS stiffer than the floor: the barrier allows
-        # 10x the approach for the same headroom — 3.75 mm/s at 25 N of
-        # headroom, which over a 100 ms cycle at 2e4 is 7.5 N. Inside the
-        # limit, and the estimator moves off the floor within a few cycles
-        # of loaded travel. Still built only in PRESS.
-        self.declare_parameter("press_stiffness_floor", 2.0e3)      # N/m
+        # 6e3 (2026-09-22). The history is worth keeping because both
+        # earlier values were fitted to a plate that was not contacting the
+        # way it does now: 2e3 came from the 09-21 bags (a caster on its
+        # bar, measured while the arm was executing a fraction of what it
+        # was told), 2e4 from 09-14 (a corner driven in edge-first by a
+        # plate calibrated 6 deg off). With the plate square and the arm
+        # honest, the fit over two complete runs gives p10 2.5-6 kN/m,
+        # median 7-16 kN/m: four casters on a real wall.
+        #
+        # The floor is what the fit is CLIPPED to, so it also bounds how
+        # wrong a noisy fit can be on the low side — and that is what the
+        # 12:46 run made expensive. Wherever the fit settled near 2.5 kN/m
+        # the press believed the contact ten times softer than it is: the
+        # retreat cap (excess compression per cycle at the believed
+        # stiffness) was ten times too generous, the loop unloaded past
+        # target, the wheel crossed the release threshold, and the plate
+        # hovered — 80 releases and 1.6 -> 9 -> 1.6 N at about 1 Hz for a
+        # whole segment. Believing the contact too STIFF costs a slower
+        # press; believing it too soft costs the contact.
+        self.declare_parameter("press_stiffness_floor", 6.0e3)      # N/m
         self.declare_parameter("press_stiffness_ceiling", 5.0e4)    # N/m
         self.declare_parameter("press_stiffness_tau", 3.0)          # s
         # Every time constant below is in SECONDS, not cycles. They used to be
@@ -1120,6 +1145,10 @@ class WholeBodySweepNode(Node):
         # press. See wbc/stiffness.py.
         self.stiffness = None
         self.normal_rate_prev = 0.0
+        # Estimated rate at which the WALL is receding from the plate, m/s,
+        # positive = going away. See _update_wall_drift.
+        self.wall_drift = 0.0
+        self._drift_force_prev = None
         # What the force row allowed this cycle, m/s, for the log line.
         self.force_cap = float("inf")
         self.surface = SurfaceEstimator(tau=float(p("surface_tau").value))
@@ -1292,6 +1321,7 @@ class WholeBodySweepNode(Node):
                 recontact_gain=float(p("press_recontact_gain").value),
                 recontact_memory=float(p("press_recontact_memory").value),
                 recontact_margin=float(p("press_recontact_margin").value),
+                drift_max=float(p("press_drift_max").value),
                 stiffness_hint=float(p("press_gain_stiffness_ref").value),
                 soft_limit=float(p("press_force_soft_limit").value),
                 retreat_v_max=float(p("press_retreat_v_max").value),
@@ -2191,6 +2221,7 @@ class WholeBodySweepNode(Node):
             self.press.stiffness_hint = k_believed
             self.press.gain_scale = min(max(k_ref / max(k_believed, 1.0), 1.0),
                                         float(p("press_gain_boost_max").value))
+            self._update_wall_drift(press_dt)
             v_normal = self.press.update(self.press_force, distance, press_dt,
                                          quiet=arm_quiet and aligned)
             # Learn how stiff this surface is, from the travel the LAST solve
@@ -2750,6 +2781,54 @@ class WholeBodySweepNode(Node):
         self._publish(solution.u, n_arm)
         self._log_cycle(solution, distance, remaining, phi)
 
+    def _update_wall_drift(self, dt):
+        """How fast the wall is going away from the plate, m/s.
+
+        While the wheel is loaded the contact is a spring: the force it makes
+        is the stiffness times the overlap, so
+
+            dF/dt = K_e * (what the plate did - what the wall did)
+
+        and the plate's part is known — it is the whole-body normal rate the
+        last solve asked for, which the arm now executes (see
+        stream_period_max_factor). Rearranged, the wall's part falls out:
+
+            drift = v_normal - (dF/dt) / K_e        (positive = receding)
+
+        This needs no extra sensor and, unlike the ranges, it resolves the
+        fraction of a millimetre that matters here: on 2026-09-22 the plate's
+        range sat at 15.2 cm to the last digit while the force swung 1.6 to
+        10 N, because the whole excursion was half a millimetre of caster
+        compression. The force sees it; the plane fit cannot.
+
+        Updated only under load, and only from the FILTERED force, whose lag
+        is short against the averaging below. Out of contact the last
+        estimate is kept: the base goes on crabbing while the wheel is off
+        the wall, and that is exactly when the approach needs it.
+        """
+        if self.press is None:
+            return
+        force = self.press.force
+        prev, self._drift_force_prev = self._drift_force_prev, force
+        p = self.get_parameter
+        if (prev is None or dt <= 0.0 or self.press.state != PRESS
+                or force < float(p("press_drift_min_force").value)):
+            return
+        k = max(self.stiffness.value, 1.0)
+        sample = self.normal_rate_prev - (force - prev) / dt / k
+        cap = float(p("press_drift_max").value)
+        if abs(sample) > 2.0 * cap:
+            # Implausible: a wall does not move at twice what the cap allows
+            # for. An impact, a sensor step or a stiffness estimate that has
+            # jumped will all produce one, and a clipped sample would fold
+            # that into the average as a bias. Drop it instead — the estimate
+            # is only worth having when it is measuring what it claims to.
+            return
+        tau = float(p("press_drift_tau").value)
+        alpha = (1.0 - math.exp(-dt / tau)) if tau > 0.0 else 1.0
+        self.wall_drift += alpha * (sample - self.wall_drift)
+        self.press.drift = self.wall_drift
+
     def _accel_bounds(self, lo, hi, now):
         """Narrow the QP's box bounds to what the acceleration limit allows.
 
@@ -3124,7 +3203,8 @@ class WholeBodySweepNode(Node):
         if self.press is None:
             press = ""
         else:
-            approach = (f"gain x{self.press.gain_scale:.1f} " if self.press.state == PRESS
+            approach = (f"gain x{self.press.gain_scale:.1f} drift={self.wall_drift * 1000:+.1f}mm/s "
+                        if self.press.state == PRESS
                         else f"app={self.press.approach_speed * 1000:.1f}mm/s"
                              f"{'(re)' if self.press.recontacting else ''} ")
             press = (f"press={self.press.force:+.1f}N(raw{self.press.raw:+.1f})"

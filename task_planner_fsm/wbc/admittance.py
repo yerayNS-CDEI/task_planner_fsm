@@ -141,6 +141,18 @@ plate actually rides on, ~2 kN/m measured (see the stiffness floor in the
 sweep node): 5 mm/s over a 100 ms cycle is 1 N. The memory expires because a
 wall that is gone for longer than that may genuinely be a different wall.
 
+**A wall that is going away.** The plate is carried by a base, and a base
+that is not travelling exactly parallel to the wall takes the plate away
+from it (or into it) at ``travel * sin(heading error)`` — 0.7 mm/s at
+20 mm/s and 2 deg, which is what the 2026-09-22 12:46 run had left after
+the turret was aligned by eye. Nothing in the force law follows that: the
+loop pressed in bursts, overshot to 10 N, then held still while the
+receding wall ate the contact back to 1.6 N, and crossed the release
+threshold about once a second — 80 releases in one segment, with the plate
+never more than a millimetre from where it should be. So the caller
+measures the drift and hands it in (``drift``), and the loop adds it to
+whatever it asks for. The force law then sees a stationary wall.
+
 **Every time constant here is in SECONDS, not cycles.** The old code counted
 cycles — a 0.2 EMA coefficient, 25 tare cycles, 100 stall cycles — all sized at
 50 Hz. At the 10 Hz the robot actually achieved, the force filter's lag went
@@ -254,7 +266,8 @@ class AdmittancePress:
                  contact_window=0.03, recontact_speed=0.005,
                  recontact_gain=2.0, recontact_memory=8.0,
                  soft_limit=15.0, retreat_v_max=0.02, soft_limit_seconds=3.0,
-                 recontact_margin=0.003, stiffness_hint=2.0e4):
+                 recontact_margin=0.003, stiffness_hint=2.0e4,
+                 drift_max=0.004):
         self.target_force = float(target_force)
         self.gain = float(gain)
         self.v_max = float(v_max)
@@ -394,6 +407,13 @@ class AdmittancePress:
         # the wall on 18:39 (20 mm/s of retreat on a 25 kN/m contact is
         # several newtons of compression gone per cycle).
         self.stiffness_hint = float(stiffness_hint)
+        # Feedforward, m/s, positive when the WALL is receding from the plate:
+        # the caller measures it (see the sweep node) and the loop adds it to
+        # whatever the force law asks for, so the press regulates force
+        # instead of chasing a moving wall. Bounded, because a wrong estimate
+        # drives the plate at the wall as surely as a right one holds it.
+        self.drift = 0.0
+        self.drift_max = float(drift_max)
         # --- the soft limit ------------------------------------------------
         # Between the target and the hard limit there used to be nothing: a
         # contact the base drove from 5 N to 30 N in a second was a FAULT, and
@@ -734,6 +754,11 @@ class AdmittancePress:
                 reaction = self.v_max + excess * (self.retreat_v_max - self.v_max)
                 v = min(v, -min(reaction, self.retreat_v_max))
             v = max(v, -retreat_cap)
+            # ...and follow the wall. Added AFTER the clamps because it is not
+            # the loop's own demand: v_max bounds how hard the press pushes,
+            # and a wall receding at 1 mm/s needs 1 mm/s of following before
+            # any of that budget is spent.
+            v += float(np.clip(self.drift, -self.drift_max, self.drift_max))
             self.approach_speed = 0.0
         else:
             if self._loaded:
@@ -759,7 +784,7 @@ class AdmittancePress:
                 # matters.
                 self.approach_speed = min(self.seek_speed,
                                           self._approach_cap(self.distance))
-            v = self.approach_speed
+            v = self.approach_speed + float(np.clip(self.drift, 0.0, self.drift_max))
 
         # The envelope. Approach is refused inside min_distance whatever the
         # force says; retreat is always allowed, so a press that has gone too

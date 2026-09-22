@@ -18,6 +18,7 @@ rclpy = pytest.importorskip("rclpy")
 
 from std_msgs.msg import Float64  # noqa: E402
 
+from task_planner_fsm.wbc.admittance import PRESS, SEEK                 # noqa: E402
 from task_planner_fsm.wbc.kinematics import SerialChain, rpy_to_matrix  # noqa: E402
 from task_planner_fsm.wbc.streaming import POSITION, VELOCITY           # noqa: E402
 from task_planner_fsm.wbc.surface import SENSOR_XY                      # noqa: E402
@@ -1591,6 +1592,55 @@ def test_the_base_moves_or_stops_but_never_crawls():
     assert travel[-1] > travel[first]
 
 
+def test_the_node_measures_a_receding_wall_from_force_and_commanded_travel():
+    """The estimator behind the press's drift feedforward. The plate's range
+    cannot see this — on 2026-09-22 it read 15.2 cm to the last digit while
+    the force swung 1.6 to 10 N, the whole excursion being half a millimetre
+    of caster compression — so the wall's motion is recovered from the force
+    it makes instead: dF/dt = K_e * (plate - wall), and the plate's part is
+    the rate the last solve asked for."""
+    node = _press_node(press_tare_seconds=0.0, press_drift_tau=0.5)
+    node.stiffness.value, node.stiffness.fitted = 1.0e4, True
+    node.press.state = PRESS
+    node.press.force = 5.0
+    node._drift_force_prev = None
+    # The arm advances at 2 mm/s; the force rises as if the wall were
+    # standing still minus 1 mm/s of recession, i.e. only 1 mm/s of closing.
+    dt, advance, recede = 0.1, 0.002, 0.001
+    for _ in range(40):
+        node._update_wall_drift(dt)
+        node.normal_rate_prev = advance
+        node.press.force += node.stiffness.value * (advance - recede) * dt
+    assert node.wall_drift == pytest.approx(recede, abs=2e-4), (
+        f"measured {node.wall_drift * 1000:.2f} mm/s of drift, wall was doing "
+        f"{recede * 1000:.1f}")
+    assert node.press.drift == node.wall_drift, "and it reaches the press"
+
+    # A wall that is not moving reads as no drift, whatever the arm does.
+    node.wall_drift, node._drift_force_prev = 0.0, None
+    for _ in range(40):
+        node._update_wall_drift(dt)
+        node.normal_rate_prev = advance
+        node.press.force += node.stiffness.value * advance * dt
+    assert abs(node.wall_drift) < 2e-4, f"{node.wall_drift * 1000:.2f} mm/s on a still wall"
+
+
+def test_the_drift_estimate_is_not_updated_off_the_wall():
+    """dF/dt over the stiffness only means travel while the wheel is loaded;
+    out of contact the last estimate is KEPT, because the base goes on
+    crabbing while the wheel is off and that is when the approach needs it."""
+    node = _press_node(press_tare_seconds=0.0)
+    node.stiffness.value, node.stiffness.fitted = 1.0e4, True
+    node.wall_drift = 0.001
+    node.press.state = SEEK
+    node.press.force = 0.2
+    node._drift_force_prev = 0.2
+    node.normal_rate_prev = 0.005
+    for _ in range(20):
+        node._update_wall_drift(0.1)
+    assert node.wall_drift == pytest.approx(0.001), "the estimate should be held, not moved"
+
+
 def _squeezed_press(force_alpha, weight_press_normal=1.0e4, cycles=400):
     """A press with an obstacle BEHIND the base, so the barrier pushes it in.
 
@@ -2305,3 +2355,19 @@ def test_the_default_contact_point_lands_on_the_pendant_tcp():
     plane_world = T_tip[:3, 3] + T_tip[:3, :3] @ np.array([0.0, 0.0, sensor_plane])
     assert float(axis @ (contact_world - plane_world)) == pytest.approx(0.15, abs=1e-6)
     node.destroy_node()
+
+
+def test_an_implausible_force_step_does_not_move_the_drift_estimate():
+    """A force that jumps faster than any wall could move is a disturbance —
+    an impact, a sensor step, a stiffness estimate that has just jumped — and
+    folding it in as a clipped sample would bias the average. It is dropped."""
+    node = _press_node(press_tare_seconds=0.0)
+    node.stiffness.value, node.stiffness.fitted = 1.0e4, True
+    node.press.state = PRESS
+    node.press.force = 5.0
+    node.wall_drift, node._drift_force_prev = 0.001, 5.0
+    node.normal_rate_prev = 0.0
+    cap = float(node.get_parameter("press_drift_max").value)
+    node.press.force = 5.0 + 1.0e4 * (3.0 * cap) * 0.1    # a step, 3x the cap
+    node._update_wall_drift(0.1)
+    assert node.wall_drift == pytest.approx(0.001), "the step should be dropped"
