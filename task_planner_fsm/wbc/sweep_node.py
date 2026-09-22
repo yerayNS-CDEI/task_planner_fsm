@@ -92,7 +92,16 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("sweep_speed", 0.03)       # m/s along the wall
         self.declare_parameter("standoff", 0.20)          # m, plate to wall
         self.declare_parameter("arrive_tolerance", 0.03)  # m of arc length
-        self.declare_parameter("timeout_pad", 30.0)       # s beyond length/speed
+        # The sweep's overall clock. It used to be length / speed + a 30 s
+        # pad, which assumes the base holds sweep_speed for the whole segment
+        # and ended every 2026-09-21/22 field run at ~2 m while the sweep
+        # was still progressing, slowly, in contact. A sweep that is not
+        # progressing is already caught by no_progress_timeout (25 s without
+        # 2 cm, frozen while the gate itself holds the base) and by
+        # reseat_timeout; this is only a cap on one that is, so the FSM is
+        # never left waiting for ever. length / speed times this factor.
+        self.declare_parameter("timeout_factor", 5.0)
+        self.declare_parameter("timeout_pad", 30.0)       # s on top of that
         # Where to leave the plate when the sweep ends, so the base can transit
         # with the arm clear of the wall. Match the FSM's
         # scan_wall_transit_plate_offset. 0 disables the retreat.
@@ -1049,7 +1058,8 @@ class WholeBodySweepNode(Node):
         # When the sweep began commanding, so the diagnostics carry a clock
         # that starts at the segment rather than at the epoch.
         self.start_stamp = None
-        self.timeout = segment_length / max(self.sweep_speed, 1e-3) + float(p("timeout_pad").value)
+        self.timeout = (float(p("timeout_factor").value) * segment_length / max(self.sweep_speed, 1e-3)
+                        + float(p("timeout_pad").value))
 
         # --- State -----------------------------------------------------------
         self.chain = None
