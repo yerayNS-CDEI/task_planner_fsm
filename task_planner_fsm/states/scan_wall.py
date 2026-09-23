@@ -1,5 +1,6 @@
 from ..state import State
 from ..utils.column_control import ColumnController
+from ..utils.gpr_sweep import GprSweep
 from ..utils.costmap_utils import (
     COSTMAP_WAIT_TIMEOUT_S,
     base_standoff_goal,
@@ -34,7 +35,6 @@ import subprocess, os, signal
 import math
 from math import atan2, sin, cos
 import time
-import requests
 
 # Validity window (m) for each of the six plate ranges, in the publish order of
 # arm_control's arduino_sensors(_sim): [C/U1, A/U2, B/U3] ultrasonic then
@@ -226,14 +226,11 @@ class ScanWall(State):
         self.ft_topic = "/force_torque_sensor_broadcaster/wrench"
         self._press_settle_start = None
 
-        # GPR (GP Proceq8800) HTTP API: connect + run a LINE_SCAN measurement
-        # while the wheel is pressed against the wall. Real robot only (mirrors
-        # force_mode gating); ctx overrides allow bench testing. See gpr_api memory.
-        self.gpr_base_url = "http://192.168.42.33:9000"
-        self.gpr_serial = "GP88-007-0081"
-        self.gpr_timeout = 30.0
-        self.gpr_measurement_active = False
-        self.gpr_line_active = False
+        # GPR (GP8800): the line is opened on the probe before the plate
+        # travels, clocked by plate-travel triggers while it sweeps, then
+        # exported and recorded for SensorDataProcessing. See utils/gpr_sweep.py.
+        # On for the real robot, off in sim; ctx["gpr_enabled"] overrides.
+        self._gpr = GprSweep(name, self)
 
     def on_enter(self, ctx):
         node = ctx["node"]
@@ -289,8 +286,7 @@ class ScanWall(State):
         self._restore_sweep_speed(ctx)   # clear any stale slow-sweep limit from a re-entry
         self.force_mode_active = False
         self._press_settle_start = None
-        self.gpr_measurement_active = False
-        self.gpr_line_active = False
+        self._gpr.abort(ctx)          # close anything a previous entry left open
         ctx["error_triggered"] = False
 
         self.column.reset()
@@ -957,115 +953,6 @@ class ScanWall(State):
             )
             return True
         return False
-
-    # ------------------------------------------------------------------
-    # GPR (GP Proceq8800) HTTP API — real robot only
-    # ------------------------------------------------------------------
-    def _gpr_enabled(self, ctx):
-        """GPR is DISABLED for now: the probe is not yet on the real robot's
-        network topology, so scans run without it. Re-enable by setting the
-        ``gpr_enabled`` ctx flag True (bench testing or once the probe is wired
-        in). Previously defaulted to on for the real robot (``not sim``)."""
-        return bool(ctx.get("gpr_enabled", False))
-
-    def _gpr_request(self, ctx, method, path, json_body=None):
-        """Issue one GPR HTTP request (blocking). Returns the response, or None on
-        a connection/timeout error. Any 2xx is success (starts return 200, stops
-        return 204); errors carry a ``{"error":{"code","message"}}`` body."""
-        node = ctx["node"]
-        base_url = ctx.get("gpr_base_url", self.gpr_base_url).rstrip("/")
-        url = f"{base_url}{path}"
-        try:
-            resp = requests.request(
-                method, url, json=json_body,
-                timeout=ctx.get("gpr_timeout", self.gpr_timeout),
-            )
-        except requests.exceptions.RequestException as e:
-            node.get_logger().error(f"[{self.name}] GPR {method} {path} failed: {e}")
-            return None
-        if resp.status_code >= 400:
-            node.get_logger().error(
-                f"[{self.name}] GPR {method} {path} -> HTTP {resp.status_code}: "
-                f"{resp.text.strip()[:200]}"
-            )
-        else:
-            node.get_logger().info(
-                f"[{self.name}] GPR {method} {path} -> HTTP {resp.status_code}"
-            )
-        return resp
-
-    def _gpr_connect(self, ctx):
-        """Connect to the probe. 200 = connected, 406 = already connected (both OK).
-        Measurement calls 403 unless connected first, so a failure here aborts the
-        scan (a sweep with no GPR data is pointless).
-
-        TODO (auto-connect): /probe/connect also accepts an optional ``ip`` field.
-        Without it, the connection request must be **accepted manually on the GP
-        App (iPad)** before this returns — so the scan is not fully autonomous yet.
-        Once the probe is assigned a static IP, pass ``ip`` here (e.g. from
-        ``ctx.get("gpr_ip")``) so the connection completes without operator input.
-        """
-        node = ctx["node"]
-        serial = ctx.get("gpr_serial", self.gpr_serial)
-        body = {"serialNumber": serial}
-        # gpr_ip is intentionally unset for now (no static IP assigned to the probe).
-        gpr_ip = ctx.get("gpr_ip")
-        if gpr_ip:
-            body["ip"] = gpr_ip
-        node.get_logger().info(f"[{self.name}] GPR: connecting to probe {serial}.")
-        self.set_activity(ctx, "Connecting to the GPR probe", publish=True)
-        resp = self._gpr_request(ctx, "POST", "/probe/connect", body)
-        if resp is not None and (resp.status_code < 400 or resp.status_code == 406):
-            node.get_logger().info(f"[{self.name}] GPR probe connected.")
-            return True
-        node.get_logger().error(f"[{self.name}] GPR probe connection failed; aborting scan.")
-        self.fail(ctx, "GPR probe connection failed")
-        return False
-
-    def _gpr_start_measurement_and_line(self, ctx):
-        """Connect, create a LINE_SCAN measurement, then start the line. Called
-        once per line right after the GPR wheel is pressed against the wall. Any
-        start-path failure aborts the scan via ``error_triggered``."""
-        if not self._gpr_enabled(ctx):
-            return
-        node = ctx["node"]
-        if not self._gpr_connect(ctx):
-            return
-        line_no = ctx.get("current_line_idx", 0) + 1
-        seg_no = self._seg_idx + 1
-        body = {"type": "LINE_SCAN", "name": f"scan_wall line {line_no} seg {seg_no}"}
-        self.set_activity(ctx, "Starting the GPR line-scan measurement", publish=True)
-        resp = self._gpr_request(ctx, "POST", "/measurement/start", body)
-        if resp is None or resp.status_code >= 400:
-            node.get_logger().error(f"[{self.name}] GPR start measurement failed; aborting scan.")
-            self.fail(ctx, "GPR failed to start the measurement")
-            return
-        self.gpr_measurement_active = True
-        self.set_activity(ctx, "Starting the GPR scan line", publish=True)
-        resp = self._gpr_request(ctx, "POST", "/measurement/line/start")
-        if resp is None or resp.status_code >= 400:
-            node.get_logger().error(f"[{self.name}] GPR start line failed; aborting scan.")
-            self.fail(ctx, "GPR failed to start the scan line")
-            return
-        self.gpr_line_active = True
-        node.get_logger().info(f"[{self.name}] GPR measurement + line started.")
-
-    def _gpr_stop_line_and_measurement(self, ctx):
-        """Stop the line then the measurement. Best-effort: logs failures but does
-        not abort (the sweep is already done). Guarded by flags so it is a safe
-        no-op if the line/measurement was never started."""
-        if not self._gpr_enabled(ctx):
-            return
-        node = ctx["node"]
-        if self.gpr_line_active or self.gpr_measurement_active:
-            self.set_activity(ctx, "Stopping the GPR line and measurement", publish=True)
-        if self.gpr_line_active:
-            self._gpr_request(ctx, "POST", "/measurement/line/stop")
-            self.gpr_line_active = False
-        if self.gpr_measurement_active:
-            self._gpr_request(ctx, "POST", "/measurement/stop")
-            self.gpr_measurement_active = False
-            node.get_logger().info(f"[{self.name}] GPR line + measurement stopped.")
 
     # ------------------------------------------------------------------
     # Column height from the map-frame line z
@@ -2002,10 +1889,17 @@ class ScanWall(State):
             if not self._wall_contact_ready(ctx):
                 return
 
-            # Wheel is pressed against the wall. GPR: connect, create the LINE_SCAN
-            # measurement and start the line now (real robot only).
-            self._gpr_start_measurement_and_line(ctx)
-            if ctx.get("error_triggered"):
+            # GPR: connect, open the LINE_SCAN measurement and start the line
+            # now, before anything travels. An open line with no triggers records
+            # nothing; the traces start with the triggers (_arm_gpr_triggers).
+            err = self._gpr.begin_segment(
+                ctx, ctx.get("current_wall_index"), ctx.get("current_line_idx", 0),
+                self._seg_idx, seg_start, seg_end, "map",
+                sweep="wbc" if self._wbc_enabled(ctx) else (
+                    "crawl" if bool(ctx.get("sweep_use_crawl", False)) else "nav2"))
+            if err:
+                node.get_logger().error(f"[{self.name}] {err}; aborting scan.")
+                self.fail(ctx, err)
                 return
 
             self.set_activity(
@@ -2020,6 +1914,8 @@ class ScanWall(State):
             # opposite the segment end, speed already capped in sweep_setup.
             # Alternative (ctx["sweep_use_crawl"]): a /cmd_vel drag.
             if self._wbc_enabled(ctx):
+                # The press is inside the sweep node: the triggers arm on its
+                # first "running: seated" (_on_wbc_status), not here.
                 if not self._start_wbc_sweep(ctx, seg_start, seg_end):
                     return
                 self._seg_phase = "sweep_wait"
@@ -2033,6 +1929,8 @@ class ScanWall(State):
                 self._start_sweep_crawl(ctx, goal_xy)
             elif not self._send_base_goal(ctx, goal_xy):
                 return
+            # Force mode has the wheel on the wall already (_wall_contact_ready).
+            self._arm_gpr_triggers(ctx, seg_start, seg_end)
             self._seg_phase = "sweep_wait"
             return
 
@@ -2063,7 +1961,7 @@ class ScanWall(State):
                 f"[{self.name}] Segment sweep finished (status={status}). Stopping GPR, "
                 f"force mode + arm processes..."
             )
-            self._gpr_stop_line_and_measurement(ctx)   # stop line + measurement before releasing the press
+            self._gpr.end_segment(ctx)      # stop line, export, stop measurement, before releasing the press
             self._stop_force_mode(ctx)      # release the press before the arm retracts
             # Keep the reader running: the next segment's transit_clear needs the
             # plate distance to retract the arm before the base moves. Only the
@@ -2501,7 +2399,7 @@ class ScanWall(State):
         if self._wbc_status_sub is None:
             self._wbc_status_sub = node.create_subscription(
                 String, str(ctx.get("wbc_status_topic", self.WBC_STATUS_TOPIC)),
-                self._on_wbc_status, 10)
+                lambda msg: self._on_wbc_status(msg, ctx), 10)
         self._nav_status = None
         self._wbc_started_at = time.time()
 
@@ -2607,14 +2505,36 @@ class ScanWall(State):
         self._wbc_ever_started = True
         return self._start_arm_procs(ctx, [("wbc_sweep_proc", cmd, "wbc_sweep_controller")])
 
-    def _on_wbc_status(self, msg):
-        """Map the sweep node's status onto the Nav2 goal status sweep_wait reads."""
+    def _on_wbc_status(self, msg, ctx):
+        """Map the sweep node's status onto the Nav2 goal status sweep_wait reads,
+        and clock the GPR off its contact report: the first "running: seated" is
+        the line's d = 0, later seated/unseated flips go on the line record.
+        Here rather than in the 1 Hz tick, which would put d = 0 up to 4.5 cm
+        late at sweep speed."""
         status = str(msg.data)
+        if status.startswith("running: "):
+            seated = status == "running: seated"
+            if seated and not self._gpr.armed and self._seg_phase == "sweep_wait":
+                seg_start, seg_end = self._segments[self._seg_idx][:2]
+                self._arm_gpr_triggers(ctx, seg_start, seg_end)
+            if status != "running: approach":
+                self._gpr.note_contact(ctx, seated)
+            return
         if status.startswith("succeeded"):
             self._nav_status = GoalStatus.STATUS_SUCCEEDED
         elif status.startswith("failed"):
             self._wbc_failure = status
             self._nav_status = -1
+
+    def _arm_gpr_triggers(self, ctx, seg_start, seg_end):
+        """Plate on the wall and about to travel: start the GPR's clock."""
+        if self._wbc_enabled(ctx):
+            speed = float(ctx.get("wbc_sweep_speed", 0.045))
+        elif bool(ctx.get("sweep_use_crawl", False)):
+            speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
+        else:
+            speed = float(ctx.get("sweep_speed_limit", self.SWEEP_SPEED_LIMIT_MS))
+        self._gpr.arm_triggers(ctx, "map", seg_start, seg_end, speed)
 
     def _wbc_sweep_tick(self, ctx):
         """Per-tick watchdog for a sweep whose node stopped talking.
@@ -2860,7 +2780,7 @@ class ScanWall(State):
         self._stop_sweep_crawl(ctx, publish_stop=True)
         self._stop_wbc_sweep(ctx)
         self._restore_sweep_speed(ctx)
-        self._gpr_stop_line_and_measurement(ctx)
+        self._gpr.abort(ctx)
         self._stop_force_mode(ctx)
         self._stop_arm_processes(ctx)
 

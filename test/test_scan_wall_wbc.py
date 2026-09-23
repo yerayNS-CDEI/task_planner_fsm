@@ -69,15 +69,15 @@ def test_force_mode_is_not_attempted_when_the_sweep_is_whole_body(state, node):
 
 def test_node_status_maps_onto_the_goal_status_sweep_wait_reads(state):
     assert state._nav_status is None
-    state._on_wbc_status(String(data="running"))
+    state._on_wbc_status(String(data="running"), {})
     assert state._nav_status is None               # still in flight
 
-    state._on_wbc_status(String(data="succeeded"))
+    state._on_wbc_status(String(data="succeeded"), {})
     assert state._nav_status == GoalStatus.STATUS_SUCCEEDED
 
 
 def test_a_failure_is_recorded_with_its_reason(state):
-    state._on_wbc_status(String(data="failed: standoff 0.55 m is 0.35 m off the target"))
+    state._on_wbc_status(String(data="failed: standoff 0.55 m is 0.35 m off the target"), {})
     assert state._nav_status == -1
     assert "standoff" in state._wbc_failure
 

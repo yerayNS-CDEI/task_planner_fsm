@@ -24,5 +24,6 @@ setup(
         'scripts/mock_server',
         'scripts/goal_status_listener',
         'scripts/wbc_sweep_controller',
+        'scripts/gpr_trigger_bridge',
     ],
 )

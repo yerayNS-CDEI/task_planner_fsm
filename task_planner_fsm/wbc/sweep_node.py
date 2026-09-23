@@ -1333,7 +1333,15 @@ class WholeBodySweepNode(Node):
             robot_mode_topic=str(p("robot_mode_topic").value),
             safety_mode_topic=str(p("safety_mode_topic").value))
         self.press = None
+        # What the contact is doing, reported to the FSM as a suffix on the
+        # running status ("running: seated") so it can clock the GPR off the
+        # plate only while the wheel is on the wall: "approach" until the
+        # contact first seats, then "seated" / "unseated". The first "seated"
+        # is the GPR line's d = 0. A sweep with no press holds the standoff
+        # from the start, so it is "seated" throughout. See _set_contact.
+        self.contact = "seated"
         if bool(p("press_enabled").value):
+            self.contact = "approach"
             self.press = AdmittancePress(
                 target_force=float(p("press_force").value),
                 gain=float(p("press_gain").value),
@@ -1862,7 +1870,25 @@ class WholeBodySweepNode(Node):
         self._publish_status()
 
     def _publish_status(self):
-        self.status_pub.publish(String(data=self.status))
+        status = self.status
+        if status == "running":
+            status = f"running: {self.contact}"
+        self.status_pub.publish(String(data=status))
+
+    def _set_contact(self, seated):
+        """Record whether the contact is seated, publishing on a change rather
+        than waiting for the 0.5 s republish: at sweep speed that half second
+        is 2 cm of wall the GPR's first trace would land late by. Before the
+        first seat a lost dwell is still the approach, not an unseat."""
+        if seated:
+            contact = "seated"
+        elif self.contact == "approach":
+            contact = "approach"
+        else:
+            contact = "unseated"
+        if contact != self.contact:
+            self.contact = contact
+            self._publish_status()
 
     # ------------------------------------------------------------------
     # State readers
@@ -2365,6 +2391,7 @@ class WholeBodySweepNode(Node):
             # off the wall — so the base stopped itself" is never the right
             # answer: the base did not stop, nothing here would have stopped it.
             self.travel_authority = 1.0
+            self._set_contact(self.press.state == PRESS)
         elif self.press is not None:
             # Armed. From here the travel is SCALED by a continuous authority
             # rather than released outright: the live contact state is filtered
@@ -2414,6 +2441,7 @@ class WholeBodySweepNode(Node):
             else:
                 self.seated_since = None
                 health = 0.0
+            self._set_contact(bool(health))
             if health:
                 self.unseated_since = None
             elif self.unseated_since is None:
