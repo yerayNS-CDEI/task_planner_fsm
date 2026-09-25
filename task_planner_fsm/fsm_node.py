@@ -13,14 +13,18 @@ from geometry_msgs.msg import Point, Pose, Quaternion, WrenchStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry, OccupancyGrid
 from rclpy.action import ActionClient
+from rclpy.client import Client
 from rclpy.node import Node
+from rclpy.publisher import Publisher
+from rclpy.subscription import Subscription
+from rclpy.timer import Timer
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 import tf2_ros
 from rclpy.duration import Duration
 from std_msgs.msg import Bool, Float32MultiArray, String
 
-from task_planner_fsm.machine import StateMachine, seed_wall_detection_ctx
+from task_planner_fsm.machine import TERMINAL_STATES, StateMachine, seed_wall_detection_ctx
 from task_planner_fsm.sensors import paths as sensor_paths
 from task_planner_fsm.states import (
     ArmFolding,
@@ -178,6 +182,62 @@ NAV_SIM_REQUIRED_START_STATES = {
     if s not in {"Finished", "Error"} | OFFLINE_INITIAL_STATES
 }
 
+# States a restart (/fsm/restart, from Error or Finished only) may start a new
+# run at. Everything from ObjectID on reuses the robot stack that is already up.
+# Initialization and CreateMap are refused: CreateMap kills the running stack
+# (kill_stale_stack) and brings up its own mapping stack, i.e. a full restart.
+RESTART_TARGET_STATES = [
+    s
+    for s in FSM_STATE_ORDER[FSM_STATE_ORDER.index("ObjectID") :]
+    if s not in TERMINAL_STATES
+]
+
+# Targets that run the wall detector again: their run gets a fresh
+# fsm_start_wall_time, so GeometryReconstruction only trusts walls detected in
+# it. Later targets keep the original one and reuse the detected_walls.yaml
+# already on disk (that is the point of restarting at GeometryReconstruction).
+RESTART_REDETECT_STATES = set(
+    FSM_STATE_ORDER[: FSM_STATE_ORDER.index("ObjectID") + 1]
+)
+
+# States that leave the arm or column away from its folded pose when they fail.
+# A restart after an Error in one of them warns (see _perform_restart).
+RESTART_ARM_STATES = {"ArmUnfolding", "ScanWall", "ArmFolding", "ScanFloor", "ScanCeiling"}
+
+# ctx written by the subscriptions, not by a run. Kept over a restart: the
+# values are live, and the costmap is latched and would not be sent again.
+RESTART_KEPT_CTX_KEYS = {
+    "base_position",
+    "base_orientation",
+    "odom_received",
+    "global_costmap",
+    "column_current_height",
+    "ft_wrench",
+    "plate_distances",
+    "plate_distances_stamp",
+    "gpr_trigger_bridge_status",
+    "gpr_trigger_bridge_status_stamp",
+    "parking_active",
+    # Process bookkeeping: the robot stack stays up across runs.
+    "_procs",
+    "_cleanup_installed",
+    "_cleanup_done",
+    "_readiness_clients",
+}
+
+# ctx values kept over a restart whatever their key: ROS handles the states
+# created on the node (nav_client, _cmd_vel_pub, ...) and processes they
+# launched. Dropping them would leak the handle, and a state would create a
+# duplicate publisher/client next time.
+RESTART_KEPT_HANDLE_TYPES = (
+    Publisher,
+    Subscription,
+    Client,
+    ActionClient,
+    Timer,
+    subprocess.Popen,
+)
+
 
 # Fallback walls, only used when navi_wall's detected_walls.yaml cannot be
 # loaded during bootstrap. The default wall source is the YAML (see
@@ -252,6 +312,13 @@ class RobotFSMNode(Node):
         # copy on top of it.
         self.launch_stack = bool(launch_stack)
         self._stack_ensured = False
+        # Restart (/fsm/restart) bookkeeping. The wall source given on the
+        # command line is the default for every run; a request may override it
+        # for its own run only.
+        self._default_wall_source = self.wall_source
+        self._pending_restart: Optional[Dict] = None
+        self._restarting = False
+        self._run_index = 1
 
         # NOTE: Do NOT set use_sim_time=True here!
         # The FSM timer must run on wall time even in simulation mode,
@@ -325,6 +392,11 @@ class RobotFSMNode(Node):
         # be in ctx. StateMachine seeds these too, but it is constructed after
         # the bootstrap runs.
         seed_wall_detection_ctx(self.ctx)
+        self.ctx["fsm_run_index"] = self._run_index
+
+        # What a restart resets ctx to: the node hooks, the -p overrides and the
+        # wall-detection defaults -- everything that is not the run itself.
+        self._ctx_baseline = dict(self.ctx)
 
         # Build test context for non-default initial state.
         self._bootstrap_context_for_initial_state(initial_state, scan_phase)
@@ -362,6 +434,10 @@ class RobotFSMNode(Node):
 
         # Subscriptions
         self.create_subscription(Bool, "/start_flag", self.start_callback, 10)
+        # Start a new run from Error/Finished without restarting the node or
+        # the robot stack. JSON in a String, like the /fsm/* telemetry; see
+        # restart_callback.
+        self.create_subscription(String, "/fsm/restart", self.restart_callback, 10)
         self.create_subscription(Odometry, "/rtabmap/odom", self.odometry_callback, 10)
         self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
         self.create_subscription(Bool, "/execution_status", self.execution_status_callback, 10)
@@ -428,7 +504,7 @@ class RobotFSMNode(Node):
         )
 
         # Timer
-        self.timer = self.create_timer(1.0, self.machine.step)
+        self.timer = self.create_timer(1.0, self._tick)
         self.get_logger().info(f"[FSM] Simulation mode: {self.ctx['sim']}")
         self.get_logger().info(f"[FSM] Planner backend: {self.ctx['planner_backend']}")
         self.get_logger().info(
@@ -861,7 +937,13 @@ class RobotFSMNode(Node):
         deadline = time.time() + float(timeout_s)
         announced = False
         while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.2)
+            if getattr(self, "_restarting", False):
+                # Inside the FSM timer: the executor is already spinning this
+                # node and cannot be re-entered. The stack has been up all along,
+                # so the buffer already holds recent TF.
+                time.sleep(0.2)
+            else:
+                rclpy.spin_once(self, timeout_sec=0.2)
             for frame in frames:
                 try:
                     if not self.tf_buffer.can_transform(world, frame, rclpy.time.Time()):
@@ -1173,7 +1255,14 @@ class RobotFSMNode(Node):
         )
 
     def _abort_bootstrap(self, reason: str):
-        """Stop whatever the bootstrap launched and refuse to start the machine."""
+        """Stop whatever the bootstrap launched and refuse to start the machine.
+
+        On a restart nothing is stopped: the robot stack belongs to the session,
+        not to the run, and the restart is only refused (see _perform_restart).
+        """
+        if getattr(self, "_restarting", False):
+            self.get_logger().error(f"[FSM Bootstrap] {reason}; not restarting the FSM.")
+            raise BootstrapError(reason)
         self.get_logger().error(f"[FSM Bootstrap] {reason}; not starting the FSM.")
         try:
             stop_all(self.ctx)
@@ -1302,6 +1391,182 @@ class RobotFSMNode(Node):
             self._ensure_nav_sim_running()
         if initial_state in NAV_CLIENT_BOOTSTRAP_STATES:
             self._ensure_nav_client()
+
+    # ------------------------------------------------------------------
+    # Restart from Error / Finished (/fsm/restart)
+    # ------------------------------------------------------------------
+    RESTART_FIELDS = ("state", "scan_phase", "wall_source", "stop_after")
+
+    def _parse_restart_request(self, data: str) -> Dict:
+        """``/fsm/restart`` payload -> request dict. Raises ValueError with the reason.
+
+        Either a bare state name (``data: GeometryReconstruction``) or a JSON
+        object with ``state`` and, optionally, ``scan_phase`` (1/2),
+        ``wall_source`` (see WALL_SOURCES) and ``stop_after`` (a state, or null
+        to run to the end even if --stop-after was given on the command line).
+        """
+        text = (data or "").strip()
+        try:
+            request = json.loads(text)
+        except ValueError:
+            request = text
+        if isinstance(request, str):
+            request = {"state": request}
+        if not isinstance(request, dict):
+            raise ValueError("expected a state name or a JSON object")
+        unknown = sorted(set(request) - set(self.RESTART_FIELDS))
+        if unknown:
+            raise ValueError(
+                f"unknown field(s) {unknown}; valid: {', '.join(self.RESTART_FIELDS)}"
+            )
+        state = request.get("state")
+        if state not in RESTART_TARGET_STATES:
+            raise ValueError(
+                f"cannot restart at '{state}'; valid: {', '.join(RESTART_TARGET_STATES)}"
+            )
+        if request.get("scan_phase") not in (None, 1, 2):
+            raise ValueError(f"scan_phase must be 1 or 2, not {request['scan_phase']!r}")
+        if request.get("wall_source") not in (None,) + WALL_SOURCES:
+            raise ValueError(
+                f"wall_source must be one of {', '.join(WALL_SOURCES)}, "
+                f"not {request['wall_source']!r}"
+            )
+        if request.get("stop_after") not in (None,) + tuple(FSM_STATE_ORDER):
+            raise ValueError(f"unknown stop_after state {request['stop_after']!r}")
+        return request
+
+    def restart_callback(self, msg: String):
+        """Queue a restart; the next FSM tick runs it (see _tick).
+
+        Only validated and stored here: the restart re-runs the bootstrap, which
+        may prompt on stdin and wait for the stack, and belongs on the FSM's own
+        tick like every other blocking state step.
+        """
+        try:
+            request = self._parse_restart_request(msg.data)
+        except ValueError as exc:
+            self._reject_restart(str(exc))
+            return
+        current = self.machine.current_state.name
+        if current not in TERMINAL_STATES:
+            self._reject_restart(
+                f"the FSM is running ({current}); a restart is only accepted from "
+                f"{' or '.join(sorted(TERMINAL_STATES))}"
+            )
+            return
+        if self._pending_restart is not None:
+            self._reject_restart(
+                f"a restart at {self._pending_restart['state']} is already pending"
+            )
+            return
+        self._pending_restart = request
+        self.get_logger().info(
+            f"[FSM] Restart at {request['state']} requested from {current}; "
+            f"starting on the next tick."
+        )
+
+    def _reject_restart(self, reason: str, *, level: str = "warn"):
+        log = self.get_logger().error if level == "error" else self.get_logger().warn
+        log(f"[FSM] Restart refused: {reason}")
+        self.publish_fsm_event(
+            "restart_rejected",
+            summary=f"Restart refused: {reason}",
+            details={"reason": reason},
+            level=level,
+        )
+
+    def _tick(self):
+        """FSM timer: run a pending restart, then step the machine."""
+        request, self._pending_restart = self._pending_restart, None
+        if request is not None:
+            self._perform_restart(request)
+        self.machine.step()
+
+    def _reset_ctx_for_restart(self, target_state: str):
+        """Put ctx back to how the node started, minus the run.
+
+        In place: the subscriptions, the states and the atexit cleanup all hold
+        this very dict. What survives is the baseline (node hooks, -p overrides,
+        wall-detection defaults), the live subscription data and the ROS/process
+        handles (RESTART_KEPT_CTX_KEYS / RESTART_KEPT_HANDLE_TYPES). Everything
+        the previous run produced -- walls, targets, progress, sensor session,
+        error flags -- is dropped.
+        """
+        kept = {
+            key: value
+            for key, value in self.ctx.items()
+            if key not in self._ctx_baseline
+            and (key in RESTART_KEPT_CTX_KEYS or isinstance(value, RESTART_KEPT_HANDLE_TYPES))
+        }
+        dropped = sorted(set(self.ctx) - set(self._ctx_baseline) - set(kept))
+        self.ctx.clear()
+        self.ctx.update(self._ctx_baseline)
+        self.ctx.update(kept)
+        self.ctx["_fsm_status"] = {}
+        self.ctx["fsm_run_index"] = self._run_index
+        if target_state in RESTART_REDETECT_STATES:
+            self.ctx["fsm_start_wall_time"] = time.time()
+        self.get_logger().info(
+            f"[FSM] Run context reset: dropped {len(dropped)} key(s), kept "
+            f"{len(kept)} live/handle key(s)."
+        )
+
+    def _perform_restart(self, request: Dict):
+        """Reset the run, bootstrap ``request['state']`` and move the machine there.
+
+        The robot stack is left alone: the bootstrap reuses nav_sim when it is
+        alive and only relaunches it if it died. If the bootstrap fails the
+        machine stays where it was (Error/Finished) and the failure is shown
+        there, so another restart can be sent right away.
+        """
+        target = request["state"]
+        current = self.machine.current_state.name
+        if current not in TERMINAL_STATES:
+            self._reject_restart(f"the FSM left {current} before the restart ran")
+            return
+
+        self._run_index += 1
+        self.get_logger().info(
+            f"[FSM] Restarting: {current} -> {target} (run #{self._run_index})."
+        )
+        failed_in = self.ctx.get("last_state")
+        if current == "Error" and failed_in in RESTART_ARM_STATES:
+            # Nothing parks the arm on a restart: on_exit made the state safe
+            # (crawl stopped, force mode released), but the arm and column are
+            # wherever the failure left them.
+            self.get_logger().warn(
+                f"[FSM] The previous run failed in {failed_in}: the arm/column may "
+                f"still be out. Make sure they are clear before {target} moves the base."
+            )
+        self._reset_ctx_for_restart(target)
+        if "stop_after" in request:
+            if request["stop_after"]:
+                self.ctx["fsm_stop_after"] = request["stop_after"]
+            else:
+                self.ctx.pop("fsm_stop_after", None)
+        self.wall_source = request.get("wall_source") or self._default_wall_source
+        self._stack_ensured = False
+
+        self._restarting = True
+        try:
+            self._bootstrap_context_for_initial_state(target, request.get("scan_phase"))
+            if self.ctx.get("error_triggered"):
+                raise BootstrapError("the robot stack is not ready")
+        except Exception as exc:   # noqa: BLE001 - a failed restart must not kill the node
+            reason = str(exc) or type(exc).__name__
+            summary = f"Restart at {target} failed: {reason}"
+            self.ctx["error_triggered"] = False
+            self.ctx["fsm_error_summary"] = summary
+            self.set_fsm_status(current, phase="failed", summary=summary, level="error")
+            self.publish_fsm_status(dict(self.ctx["_fsm_status"]))
+            self._reject_restart(f"bootstrap for {target} failed: {reason}", level="error")
+            return
+        finally:
+            self._restarting = False
+
+        self.initial_state = target
+        self.machine.restart(target, reason=f"restart_run_{self._run_index}")
+        self.publish_fsm_graph()
 
     def publish_fsm_current(self, state_name: str):
         msg = String()

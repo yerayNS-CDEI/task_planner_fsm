@@ -20,6 +20,7 @@ class Error(State):
     def run(self, ctx):
         prev = ctx.get("last_state", "unknown")
         summary = ctx.get("fsm_error_summary") or f"{prev} failed; robot stopped"
+        summary += " -- send /fsm/restart to start again"
         self.set_activity(ctx, summary, level="error")
 
     def check_transition(self, ctx):

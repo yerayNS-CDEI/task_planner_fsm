@@ -4358,6 +4358,12 @@ class ScanWall(State):
         self._stop_force_mode(ctx)
         self._stop_arm_processes(ctx)
 
+    def reset_run(self, ctx):
+        # The sampler keeps its session for the whole mission (configure() is
+        # idempotent); a restarted run is a new mission with its own session.
+        self._hs.new_mission()
+        self._transit_retries = 0
+
     def check_transition(self, ctx):
         if self.finished and self.more_lines:
             return "ScanWall"        # same wall, next height (base stays put)

@@ -22,6 +22,13 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
         ctx["error_triggered"] = False
         ctx.setdefault("completed_base_indices", [])
 
+    def reset_run(self, ctx):
+        # Indices into the previous run's walls_data: a restarted run picks its
+        # walls afresh, so none of them has been scanned yet.
+        self.current_position = None
+        self.scanned_walls_idx = []
+        self.scanned_panels_idx = []
+
     #     node.create_subscription(Odometry, "/rtabmap/odom", self.odometry_callback, 10)
     
     # def odometry_callback(self, msg: Odometry):

@@ -18,6 +18,10 @@ from task_planner_fsm.states.proc_utils import install_global_cleanup
 # from the robot (or vice versa).
 WALL_RUN_DIR = "/tmp/navi_wall_run"
 
+# States the machine never leaves on its own; the only way out is a restart
+# (StateMachine.restart, requested on /fsm/restart).
+TERMINAL_STATES = frozenset({"Error", "Finished"})
+
 
 def wall_file_path(sim: bool) -> str:
     """Absolute path to this run's detected_walls.yaml (see WALL_RUN_DIR)."""
@@ -86,12 +90,21 @@ class StateMachine:
         # bootstrap; this covers callers that construct a machine directly.
         seed_wall_detection_ctx(self.ctx)
         install_global_cleanup(self.ctx)
+        self._enter_current_state()
+
+    def _enter_current_state(self, details=None):
+        """Run ``on_enter`` of ``current_state`` and announce it.
+
+        Shared by the first entry, every transition and a restart, so the three
+        publish the same status/event sequence.
+        """
         self.current_state.on_enter(self.ctx)
         self.ctx["is_initial_entry"] = False
         self._set_state_status(
             self.current_state.name,
             phase="entered",
             summary=f"Entered {self.current_state.name}",
+            data=details,
         )
         self._publish_current_state(self.current_state.name)
         self._publish_state_status(self.current_state.name)
@@ -99,6 +112,7 @@ class StateMachine:
             "entered",
             state_name=self.current_state.name,
             summary=f"Entered {self.current_state.name}",
+            details=details,
         )
 
     def _publish_current_state(self, state_name: str):
@@ -262,21 +276,63 @@ class StateMachine:
             self.ctx.get("_fsm_status", {}).pop("progress", None)
         self.ctx["is_initial_entry"] = False
         self._state_enter_time_monotonic = time.monotonic()
-        self.current_state.on_enter(self.ctx)
-        self._set_state_status(
-            self.current_state.name,
-            phase="entered",
-            summary=f"Entered {self.current_state.name}",
-            data={"from": previous_state, "reason": reason},
-        )
-        self._publish_current_state(self.current_state.name)
-        self._publish_state_status(self.current_state.name)
+        self._enter_current_state({"from": previous_state, "reason": reason})
+
+    def restart(self, target_state: str, reason: str = "restart"):
+        """Leave a terminal state and start a new run at ``target_state``.
+
+        Unlike a transition this is a fresh start: the retry budget is reset
+        and the target is entered as the run's initial state. The caller
+        (RobotFSMNode) has already reset ctx and re-run the bootstrap for the
+        target; this only moves the machine.
+        """
+        previous_state = self.current_state.name
+        if previous_state not in TERMINAL_STATES:
+            raise RuntimeError(
+                f"restart is only allowed from {sorted(TERMINAL_STATES)}, not '{previous_state}'"
+            )
+        if target_state not in self.states:
+            raise ValueError(f"Unknown state '{target_state}'")
+
+        self.current_state.on_exit(self.ctx)
+        for state in self.states.values():
+            state.reset_run(self.ctx)
+        self._publish_transition(previous_state, target_state, reason)
         self._publish_event(
-            "entered",
-            state_name=self.current_state.name,
-            summary=f"Entered {self.current_state.name}",
-            details={"from": previous_state, "reason": reason},
+            "restarted",
+            state_name=previous_state,
+            summary=f"Restart: {previous_state} -> {target_state}",
+            details={"to": target_state, "reason": reason},
         )
+        self.current_state = self.states[target_state]
+        self._retried_current_state = False
+        self.ctx["fsm_initial_state"] = target_state
+        self.ctx["last_state"] = None
+        self.ctx["is_initial_entry"] = True
+        self._state_enter_time_monotonic = time.monotonic()
+        try:
+            self._enter_current_state({"from": previous_state, "reason": reason})
+        except Exception:
+            self._handle_unhandled_exception()
+
+    def _handle_unhandled_exception(self):
+        """Report the exception being handled and take the retry/Error path."""
+        node = self.ctx["node"]
+        node.get_logger().error(
+            f"[FSM] Unhandled exception in state '{self.current_state.name}':\n"
+            + traceback.format_exc()
+        )
+        self._publish_event(
+            "exception",
+            state_name=self.current_state.name,
+            summary=f"Unhandled exception in {self.current_state.name}",
+            details={"traceback": traceback.format_exc()},
+            level="error",
+        )
+        self.ctx["error_triggered"] = True
+        next_state, transition_reason = self._resolve_error_transition("Unhandled exception")
+        if next_state and next_state in self.states:
+            self._apply_transition(next_state, transition_reason)
 
     def step(self):
         node = self.ctx["node"]
@@ -318,18 +374,4 @@ class StateMachine:
             if next_state and next_state in self.states:
                 self._apply_transition(next_state, transition_reason)
         except Exception:
-            node.get_logger().error(
-                f"[FSM] Unhandled exception in state '{self.current_state.name}':\n"
-                + traceback.format_exc()
-            )
-            self._publish_event(
-                "exception",
-                state_name=self.current_state.name,
-                summary=f"Unhandled exception in {self.current_state.name}",
-                details={"traceback": traceback.format_exc()},
-                level="error",
-            )
-            self.ctx["error_triggered"] = True
-            next_state, transition_reason = self._resolve_error_transition("Unhandled exception")
-            if next_state and next_state in self.states:
-                self._apply_transition(next_state, transition_reason)
+            self._handle_unhandled_exception()

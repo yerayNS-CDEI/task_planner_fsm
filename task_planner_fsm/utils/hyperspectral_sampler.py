@@ -450,6 +450,23 @@ class HyperspectralSampler:
             self._recorder.close()
             self._recorder = None
 
+    def new_mission(self):
+        """Detach from the current session so the next configure() opens a new one.
+
+        For an FSM restart: the next run is a new mission with its own session
+        directory, metrics and calibration. The service client is kept. Call it
+        after abort() (ScanWall.on_exit), so the record is already flushed.
+        """
+        if self._recorder is not None:
+            self._recorder.close()
+            self._recorder = None
+        self._session_dir = None
+        self.metrics = hp.SweepMetrics()
+        self._calibration_ready = False
+        self._calibration_future = None
+        self._calibration_stage = None
+        self._calibration = {}
+
     def save_metrics(self, ctx):
         """Persist the metrics file, if a session is open."""
         if not self._session_dir:
