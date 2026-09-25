@@ -1,4 +1,5 @@
 from ..state import State
+from ..utils.chassis_parking import ChassisParker
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 
@@ -10,7 +11,13 @@ class HomePosition(State):
         self.future = None
         self.verbose = False
         self.waiting = False
-        
+        # Park once home: Nav2 steers the turret, so the chassis arrives at
+        # whatever angle the drive left it (up to ~180 deg). Ending aligned means
+        # the next run -- a /fsm/restart included -- starts like a fresh one; the
+        # controller follows commands poorly once that angle passes ~90 deg.
+        # Knobs home_position_park_base / _park_grace_s / _park_timeout_s.
+        self._parker = ChassisParker(name, "home_position")
+
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering home state.")
@@ -20,6 +27,7 @@ class HomePosition(State):
         self.navigation_done = False
         self.future = None
         self.waiting = False
+        self._parker.reset()
 
         if ctx.get("nav_client") is None:
             node.get_logger().info(f"[{self.name}] Navigation client missing. Creating one for home navigation.")
@@ -30,6 +38,10 @@ class HomePosition(State):
 
     def run(self, ctx):
         node = ctx["node"]
+        if self.navigation_done:
+            self.set_activity(ctx, "Home: parking the chassis in line with the turret")
+            self._parker.step(ctx)
+            return
         self.set_activity(ctx, "Returning the robot to the home position")
         nav_client = ctx.get("nav_client")
         if nav_client is None:
@@ -92,7 +104,7 @@ class HomePosition(State):
         return
 
     def check_transition(self, ctx):
-        if self.navigation_done:
+        if self.navigation_done and self._parker.done:
             return "Finished"
         if ctx.get("error_triggered"):
             return "Error"

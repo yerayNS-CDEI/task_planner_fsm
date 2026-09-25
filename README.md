@@ -410,7 +410,7 @@ The FSM consists of **17 states** that execute sequentially with conditional tra
 | **WallDiscretization** | Cell grid generation | Call `/compute_wall_discretization` for each wall, generate panels & cells | All walls discretized |
 | **BasePlacement** | Optimal positioning | Call `/compute_optimal_base` for each panel, store positions by column | All bases computed |
 | **ExhaustiveScan** | Full coverage scan | Navigate to each base, scan all cells with column height control (0.0-0.9m) | All panels complete |
-| **HomePosition** | Return home | Navigate to (0, 0, 0) origin via Nav2 | Navigation complete |
+| **HomePosition** | Return home | Navigate to (0, 0, 0) origin via Nav2, then park the chassis in line with the turret | Navigation and parking complete |
 | **Finished** | Mission end | Log completion, set finished flag | Terminal state |
 | **Error** | Error handling | Log error details, retry failed state once | Terminal state |
 
@@ -545,7 +545,9 @@ ros2 topic pub /start_flag std_msgs/Bool "data: true" --once
 
 12. **HomePosition** (1-2 minutes)
    - Navigate to origin (0, 0, 0)
-   - Status: "Returning home..."
+   - Park the chassis in line with the turret (`/sim_controller/park_now`),
+     so the next run starts aligned like a fresh one
+   - Status: "Returning home..." then "Home: parking the chassis..."
 
 13. **Finished** (terminal)
    - Status: "Mission complete!"
@@ -653,6 +655,21 @@ If the bootstrap fails (e.g. the stack is not ready), the FSM stays in
 
 The robot is **not** moved to a safe pose first. After an `Error` in an arm
 state, check the arm/column before restarting at a state that drives the base.
+
+The chassis/turret angle matters too. HomePosition parks the chassis in line
+with the turret before `Finished` (knobs `home_position_park_base`, `_park_grace_s`,
+`_park_timeout_s`, same as ScanWall's `scan_wall_park_*`), so a restart after
+`Finished` starts aligned. After an `Error` nothing parks: if the chassis was
+left more than ~90 deg off the turret, sim_controller follows Nav2's commands
+poorly (the chassis has to drive in reverse and its pull compensation takes over;
+the robot can even back away from the goal). Park it by hand first:
+
+```bash
+ros2 param set /sim_controller enable_park_service true
+ros2 service call /sim_controller/park_now std_srvs/srv/Trigger
+# wait for /sim_controller/parking_active to go back to false, then
+ros2 param set /sim_controller enable_park_service false
+```
 
 ### Offline: process a recorded session
 
