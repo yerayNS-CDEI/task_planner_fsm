@@ -1,4 +1,5 @@
 from ..state import State
+from ..utils.chassis_parking import ChassisParker
 from ..utils.column_control import ColumnController
 from ..utils.gpr_sweep import GprSweep
 from ..utils.costmap_utils import (
@@ -115,21 +116,15 @@ class ScanWall(State):
         # is already in the unfolded_fsm pose by then; the turret joint compensates to
         # hold the arm world-stationary while the chassis rotates.
         # park_now is live-gated by the controller's enable_park_service parameter
-        # (kept false by default): this state flips it true via /set_parameters just
-        # for the maneuver, then false again. Driven by _park_phase through
-        # enable -> request -> settle -> disable. See _run_parking.
-        self.park_client = None            # ~/park_now Trigger client (created once)
-        self.park_enable_client = None     # /set_parameters client (created once)
+        # (kept false by default): the parker flips it true via /set_parameters just
+        # for the maneuver, then false again, carrying park_target_phi for the
+        # segment about to be swept (_park_target_for_segment). See
+        # utils/chassis_parking.py; knobs scan_wall_park_base / _park_grace_s /
+        # _park_timeout_s.
+        self._parker = ChassisParker(name, "scan_wall", target=self._park_target_for_segment)
         # Named poses wait for a trajectory controller to be active; see
         # _send_named_pose.
         self._controller_gate = TrajectoryControllerGate()
-        self.park_done = False
-        self._park_phase = "enable"
-        self._park_target = 0.0  # 0 or pi: see park_target_phi()
-        self.park_future = None
-        self.park_param_future = None
-        self._park_saw_active = False
-        self._park_wait_start = None
 
         # Pre-approach (base fixed): column to line height + unfolded_fsm pose.
         self.column = ColumnController(self.name)
@@ -266,13 +261,7 @@ class ScanWall(State):
         self.goal_sent = False
         self.waiting = False
         self.more_lines = False
-        self.park_done = False
-        self._park_phase = "enable"
-        self._park_target = 0.0
-        self.park_future = None
-        self.park_param_future = None
-        self._park_saw_active = False
-        self._park_wait_start = None
+        self._parker.reset()
         self.pose_sent = False
         self.pose_reached = False
         self.column_commanded = False
@@ -1096,39 +1085,6 @@ class ScanWall(State):
     # ------------------------------------------------------------------
     # Base parking (Phase 0): align the chassis with the wall-facing turret
     # ------------------------------------------------------------------
-    def _send_park_enabled(self, ctx, value, target=None):
-        """Flip the controller's enable_park_service parameter via /set_parameters.
-
-        park_now is live-gated by that parameter (always created but only acts while
-        it is true), so ScanWall sets it true just for the maneuver and false again
-        afterwards. ``target``, when given, goes in the same request as
-        park_target_phi (see park_target_phi()); it is second, so a sim_controller
-        built before that parameter existed rejects only it and still parks, to 0.
-        Returns the call future, or None if the parameter service is unavailable.
-        """
-        node = ctx["node"]
-        set_param_srv = ctx.get("park_set_param_service", "/sim_controller/set_parameters")
-        if self.park_enable_client is None:
-            self.park_enable_client = node.create_client(SetParameters, set_param_srv)
-        if not self.park_enable_client.wait_for_service(timeout_sec=2.0):
-            node.get_logger().warn(
-                f"[{self.name}] Parameter service '{set_param_srv}' unavailable; "
-                f"cannot toggle enable_park_service."
-            )
-            return None
-        req = SetParameters.Request()
-        pmsg = ParameterMsg()
-        pmsg.name = "enable_park_service"
-        pmsg.value = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=bool(value))
-        req.parameters = [pmsg]
-        if target is not None:
-            tmsg = ParameterMsg()
-            tmsg.name = "park_target_phi"
-            tmsg.value = ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
-                                        double_value=float(target))
-            req.parameters.append(tmsg)
-        return self.park_enable_client.call_async(req)
-
     def _park_target_for_segment(self, ctx):
         """park_target_phi() for the segment about to be swept, or 0 if unknown.
 
@@ -1148,53 +1104,6 @@ class ScanWall(State):
             return 0.0
         return park_target_phi(seg_start, seg_end, pose[2])
 
-    def _check_park_target_set(self, ctx, future):
-        """Warn if park_target_phi was rejected: the park then goes to 0."""
-        if not self._park_target:
-            return
-        try:
-            results = future.result().results
-        except Exception:
-            return
-        if len(results) > 1 and not results[1].successful:
-            ctx["node"].get_logger().warn(
-                f"[{self.name}] sim_controller rejected park_target_phi "
-                f"({results[1].reason}); parking square instead, so this reverse line "
-                f"will PULL the chassis. Rebuild sim_controller.")
-            self._park_target = 0.0
-
-    def _param_set_ok(self, ctx, future, label, only_first=False):
-        """True if a /set_parameters future succeeded; logs and returns False on an
-        exception or a rejected result. ``only_first`` judges enable_park_service
-        alone, so an unsupported park_target_phi behind it does not skip the park."""
-        node = ctx["node"]
-        try:
-            results = future.result().results
-        except Exception as e:
-            node.get_logger().warn(
-                f"[{self.name}] set enable_park_service ({label}) call failed: {e}"
-            )
-            return False
-        judged = results[:1] if only_first else results
-        ok = bool(judged) and all(r.successful for r in judged)
-        if not ok:
-            reason = results[0].reason if results else "no result"
-            node.get_logger().warn(
-                f"[{self.name}] set enable_park_service ({label}) rejected: {reason}"
-            )
-        return ok
-
-    def _reset_park_state(self):
-        """Reset the per-maneuver parking sub-state so _run_parking starts a fresh
-        enable->request->settle->disable cycle for the next segment."""
-        self.park_done = False
-        self._park_phase = "enable"
-        self._park_target = 0.0
-        self.park_future = None
-        self.park_param_future = None
-        self._park_saw_active = False
-        self._park_wait_start = None
-
     def _begin_park_phase(self, ctx):
         """Enter the park — folding first unless the arm is known to be folded.
 
@@ -1208,7 +1117,7 @@ class ScanWall(State):
         the pre-approach leaving the arm folded: the sweep, with a folded arm,
         would drag the plate nowhere near the wall.
         """
-        self._reset_park_state()
+        self._parker.reset()
         if not bool(ctx.get("scan_wall_park_base", True)):
             # Nothing rotates, so there is nothing to fold for.
             self._after_park_phase()
@@ -1218,160 +1127,6 @@ class ScanWall(State):
     def _after_park_phase(self):
         """Unfold for the sweep unless the arm is already out."""
         self._seg_phase = "sweep_setup" if self._arm_unfolded else "unfold"
-
-    def _run_parking(self, ctx):
-        """Align the diff-drive chassis with the turret before the sweep.
-
-        After NavigateToTarget the Nav2-driven turret faces the wall, but the
-        chassis wheels sit at an arbitrary heading (and each sweep strafes by
-        rotating the chassis further). sim_controller's /sim_controller/park_now
-        service rotates the chassis to the turret's current world heading while the
-        turret joint compensates to hold the turret (and the mounted arm)
-        world-stationary, so the whole robot ends up squared to the wall before the
-        arm extends.
-
-        park_now is live-gated by the controller's enable_park_service parameter
-        (kept false by default), so the maneuver runs as a small sequence:
-        ``enable`` (set the parameter true) -> ``request`` (call park_now) ->
-        ``settle`` (wait on the latched /sim_controller/parking_active flag:
-        active->inactive = aligned, or a short grace if it never goes active) ->
-        ``disable`` (set the parameter false again). Best-effort at every step: a
-        missing service or a failed/rejected call skips gracefully so the scan still
-        runs. Sets self.park_done when finished or skipped.
-        """
-        node = ctx["node"]
-
-        # Opt-out hook (e.g. benches without the base controller).
-        if not bool(ctx.get("scan_wall_park_base", True)):
-            self.park_done = True
-            return
-
-        # --- Phase 0a: enable the live-gated park service for this maneuver. ---
-        if self._park_phase == "enable":
-            self._park_target = self._park_target_for_segment(ctx)
-            self.park_param_future = self._send_park_enabled(ctx, True, self._park_target)
-            if self.park_param_future is None:
-                self.park_done = True  # no param service -> skip (parameter stays false)
-                return
-            node.get_logger().info(
-                f"[{self.name}] Parking: enabling park service before aligning the base."
-            )
-            self._park_phase = "enable_wait"
-            return
-
-        if self._park_phase == "enable_wait":
-            if not self.park_param_future.done():
-                return
-            self._check_park_target_set(ctx, self.park_param_future)
-            if not self._param_set_ok(ctx, self.park_param_future, "enable", only_first=True):
-                # Couldn't enable -> park_now would refuse; skip. The parameter is
-                # unchanged (still false), so no revert is needed.
-                self.park_done = True
-                self.park_param_future = None
-                return
-            self.park_param_future = None
-            self._park_phase = "request"
-            return
-
-        # --- Phase 0b: request the maneuver. ---
-        if self._park_phase == "request":
-            park_service = ctx.get("park_service", "/sim_controller/park_now")
-            if self.park_client is None:
-                self.park_client = node.create_client(Trigger, park_service)
-            if not self.park_client.wait_for_service(timeout_sec=2.0):
-                node.get_logger().warn(
-                    f"[{self.name}] Park service '{park_service}' unavailable; skipping "
-                    f"base alignment (scan proceeds)."
-                )
-                self._park_phase = "disable"  # revert the parameter we just enabled
-                return
-            node.get_logger().info(
-                f"[{self.name}] Parking: aligning the chassis to the turret (wall) heading"
-                + (" turned ROUND (180 deg), so this reverse line pushes the chassis "
-                   "instead of pulling it." if self._park_target else ".")
-            )
-            self.park_future = self.park_client.call_async(Trigger.Request())
-            self._park_saw_active = False
-            self._park_wait_start = time.time()
-            self._park_phase = "accept_wait"
-            return
-
-        if self._park_phase == "accept_wait":
-            if not self.park_future.done():
-                return
-            try:
-                resp = self.park_future.result()
-                if not resp.success:
-                    node.get_logger().warn(
-                        f"[{self.name}] Park request not accepted ({resp.message}); "
-                        f"proceeding without base alignment."
-                    )
-                    self._park_phase = "disable"
-                    self.park_future = None
-                    return
-                node.get_logger().info(f"[{self.name}] Park started: {resp.message}")
-            except Exception as e:
-                node.get_logger().warn(
-                    f"[{self.name}] Park service call failed ({e}); proceeding without "
-                    f"base alignment."
-                )
-                self._park_phase = "disable"
-                self.park_future = None
-                return
-            self.park_future = None
-            self._park_phase = "settle"
-            return
-
-        # --- Phase 0c: wait for the maneuver to finish (latched parking_active). ---
-        if self._park_phase == "settle":
-            grace_s = float(ctx.get("scan_wall_park_grace_s", 5.0))
-            timeout_s = float(ctx.get("scan_wall_park_timeout_s", 120.0))
-            active = ctx.get("parking_active")
-            elapsed = time.time() - self._park_wait_start
-
-            if elapsed > timeout_s:
-                node.get_logger().warn(
-                    f"[{self.name}] Parking did not confirm after {timeout_s:.0f}s; "
-                    f"proceeding with the sweep anyway."
-                )
-                self._park_phase = "disable"
-                return
-            if active:
-                self._park_saw_active = True
-                return
-            # active is False or None here.
-            if self._park_saw_active:
-                node.get_logger().info(f"[{self.name}] Chassis aligned to the wall.")
-                self._park_phase = "disable"
-                return
-            if elapsed >= grace_s:
-                node.get_logger().info(
-                    f"[{self.name}] Chassis already aligned (parking never went active)."
-                )
-                self._park_phase = "disable"
-            return
-
-        # --- Phase 0d: disable the park service again, then finish. ---
-        if self._park_phase == "disable":
-            self.park_param_future = self._send_park_enabled(ctx, False, 0.0)
-            if self.park_param_future is None:
-                node.get_logger().warn(
-                    f"[{self.name}] Could not disable park service (param service gone); "
-                    f"leaving enable_park_service as-is."
-                )
-                self.park_done = True
-                return
-            self._park_phase = "disable_wait"
-            return
-
-        if self._park_phase == "disable_wait":
-            if not self.park_param_future.done():
-                return
-            self._param_set_ok(ctx, self.park_param_future, "disable", only_first=True)  # best-effort log
-            self.park_param_future = None
-            node.get_logger().info(f"[{self.name}] Parking done; park service disabled.")
-            self.park_done = True
-            return
 
     # ------------------------------------------------------------------
     # Pre-approach (base fixed)
@@ -1818,7 +1573,7 @@ class ScanWall(State):
             # segment start (transit done/skipped). Parking is the LAST base motion before
             # the sweep — nothing navigates the base back to the segment start afterwards —
             # so the alignment is preserved. The arm is folded (see _begin_park_phase) and
-            # unfolds only once the chassis has stopped. Driven by _run_parking's
+            # unfolds only once the chassis has stopped. Driven by the parker's
             # enable->request->settle->disable sequence.
             self.set_activity(
                 ctx,
@@ -1826,8 +1581,7 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            self._run_parking(ctx)
-            if self.park_done:
+            if self._parker.step(ctx):
                 self._after_park_phase()
             return
 

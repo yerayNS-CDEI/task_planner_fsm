@@ -94,13 +94,13 @@ def test_no_fold_when_parking_is_disabled(state, node):
 
 
 def test_park_resets_the_parking_cycle_it_is_about_to_run(state, node):
-    """Guard against the fold detour skipping _reset_park_state: a stale
-    park_done from the previous segment would skip chassis alignment entirely."""
+    """Guard against the fold detour skipping the parker reset: a stale done
+    from the previous segment would skip chassis alignment entirely."""
     state._arm_folded = False
-    state.park_done = True
-    state._park_phase = "settle"
+    state._parker.done = True
+    state._parker._phase = "settle"
     state._begin_park_phase(ctx_for(node))
-    assert not state.park_done and state._park_phase == "enable"
+    assert not state._parker.done and state._parker._phase == "enable"
 
 
 # ------------------------------------------------------- swept-segment memory

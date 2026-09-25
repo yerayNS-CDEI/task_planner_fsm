@@ -90,17 +90,31 @@ class _Client:
 
 
 def test_the_target_travels_with_the_enable_and_is_reset_with_the_disable(node, state):
-    state.park_enable_client = _Client()
+    parker = state._parker
+    parker.park_enable_client = _Client()
     ctx = {"node": node}
-    state._send_park_enabled(ctx, True, math.pi)
-    state._send_park_enabled(ctx, False, 0.0)
-    enable, disable = state.park_enable_client.requests
+    parker._send_park_enabled(ctx, True, math.pi)
+    parker._send_park_enabled(ctx, False, 0.0)
+    enable, disable = parker.park_enable_client.requests
     # enable_park_service FIRST, so an old sim_controller rejects only the target.
     assert [p.name for p in enable.parameters] == ["enable_park_service", "park_target_phi"]
     assert enable.parameters[0].value.bool_value is True
     assert enable.parameters[1].value.double_value == pytest.approx(math.pi)
     assert disable.parameters[0].value.bool_value is False
     assert disable.parameters[1].value.double_value == 0.0
+
+
+def test_the_parker_asks_the_state_for_the_segment_target(node, state):
+    """ScanWall's parker takes its target from _park_target_for_segment when the
+    enable is sent, so each segment's park follows that segment's direction."""
+    state._base_xy_yaw_map = lambda ctx: (0.0, 0.0, TURRET_YAW)
+    state._segments, state._seg_idx = [LINE_1, LINE_2], 1
+    state._parker.park_enable_client = _Client()
+    ctx = {"node": node}
+    state._parker.step(ctx)
+    assert state._parker.target == pytest.approx(math.pi)
+    enable, = state._parker.park_enable_client.requests
+    assert enable.parameters[1].value.double_value == pytest.approx(math.pi)
 
 
 def _future(*ok):
@@ -111,11 +125,12 @@ def _future(*ok):
 
 def test_an_old_sim_controller_still_parks_square_rather_than_skipping(node, state):
     """A controller built before park_target_phi rejects it; the enable must
-    still count, and the state must know the park now goes to 0."""
+    still count, and the parker must know the park now goes to 0."""
     ctx = {"node": node}
     future = _future(True, False)
-    state._park_target = math.pi
-    state._check_park_target_set(ctx, future)
-    assert state._park_target == 0.0
-    assert state._param_set_ok(ctx, future, "enable", only_first=True)
-    assert not state._param_set_ok(ctx, future, "enable")
+    parker = state._parker
+    parker.target = math.pi
+    parker._check_target_set(ctx, future)
+    assert parker.target == 0.0
+    assert parker._param_set_ok(ctx, future, "enable")
+    assert not parker._param_set_ok(ctx, _future(False, True), "enable")
