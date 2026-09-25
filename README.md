@@ -600,6 +600,44 @@ ros2 run task_planner_fsm fsm_node --sim true \
 
 ---
 
+### Restart from Error / Finished (no stack restart)
+
+Once the FSM sits in `Error` or `Finished`, a new run can be started without
+killing fsm_node or the robot stack:
+
+```bash
+# pick/enter the walls again (ComputeWallPoints prompts on the FSM's stdin)
+ros2 topic pub --once /fsm/restart std_msgs/String "data: GeometryReconstruction"
+# JSON to pick the scan phase (1/2) as well
+ros2 topic pub --once /fsm/restart std_msgs/String \
+  '{data: "{\"state\": \"NavigateToTarget\", \"scan_phase\": 2}"}'
+```
+
+The target goes through the same bootstrap as `--initial-state` (same prompts),
+but the robot stack is reused: nav_sim is only relaunched if it died. Valid
+targets are `ObjectID` and every state after it, up to `HomePosition`.
+`Initialization` and `CreateMap` are refused, since mapping replaces the
+running stack. A request sent while a run is in progress is refused as well.
+The outcome goes to `/fsm/event` (`restarted`, or `restart_rejected` with the
+reason; `ros2 topic echo --full-length` shows the whole message). The
+arm_control UI's FSM tab has the same as a *Restart at* combo and button, live
+only while the FSM it started is in `Error` or `Finished`.
+
+The run context is reset to what the node started with (the `-p` overrides and
+command-line flags), dropping walls, targets, progress, the sensor session and
+the error flags. Live subscription data (odometry, the latched costmap, F/T,
+plate distances) and the ROS/process handles are kept. A restart at
+`GeometryReconstruction` or later reuses this session's `detected_walls.yaml`.
+A restart at `ObjectID` runs the detector again and only trusts its new output
+(the previous walls are backed up first, as on a fresh start).
+If the bootstrap fails (e.g. the stack is not ready), the FSM stays in
+`Error`/`Finished` with the reason shown, and another restart can be sent.
+
+The robot is **not** moved to a safe pose first. After an `Error` in an arm
+state, check the arm/column before restarting at a state that drives the base.
+
+---
+
 ## Key Features
 
 ### Two-Phase Scanning Strategy

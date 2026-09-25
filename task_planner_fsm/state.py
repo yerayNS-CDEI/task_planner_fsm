@@ -15,6 +15,22 @@ class State:
     def on_exit(self, ctx):
         pass
 
+    def reset_run(self, ctx):
+        """Forget what this state kept from the previous run.
+
+        Called on every state when the FSM is restarted from Error/Finished
+        (StateMachine.restart), before the new run's first state is entered.
+        Only needed for bookkeeping that outlives on_enter/on_exit on purpose
+        -- e.g. which walls were already scanned -- and would otherwise leak
+        into the next run. Clients, publishers and config stay as they are.
+
+        TODO(hyperspectral): when the HyperspectralSampler is ported from
+        sensor_implementation, ScanWall needs a reset_run() calling
+        self._hs.new_mission() (see 0b9cb80 there), or a restarted run keeps
+        appending to the previous run's session.
+        """
+        pass
+
     # ------------------------------------------------------------------
     # Human-readable activity reporting (shown in the RViz FSM panel).
     # ------------------------------------------------------------------

@@ -8,7 +8,8 @@ class Finished(State):
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering END state.")
-        pass
+        # Reached once per run; a restart (/fsm/restart) can bring us back here.
+        self.verbose = False
 
     def run(self, ctx):
         if not self.verbose:
