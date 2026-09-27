@@ -59,6 +59,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray, Float64MultiArray, String
+from visualization_msgs.msg import Marker, MarkerArray
 
 from .admittance import PRESS, SEEK, TARE, AdmittancePress
 from .avoidance import AvoidanceConfig, ObstacleField, avoidance_rows
@@ -66,6 +67,7 @@ from .base_model import BaseLimits, box_bounds, constraint_rows, wheel_and_turre
 from .hardware import HardwareMonitor
 from .kinematics import SerialChain, rotation_error, shift_jacobian_point, soft_deadband, whole_body_jacobian
 from .qp import SoftRows, Task, joint_limit_bounds, solve_velocity_qp
+from .self_collision import SelfCollisionConfig, SelfCollisionModel
 from .stiffness import ContactStiffness, force_limit_rows
 from .streaming import DEFAULT_CONTROLLER, POSITION, ArmStream, slew_limit
 from .surface import SENSOR_PLANE_Z, SurfaceEstimator, plate_orientation_target, sweep_tangent
@@ -115,8 +117,9 @@ class WholeBodySweepNode(Node):
         # with the arm clear of the wall. Match the FSM's
         # scan_wall_transit_plate_offset. 0 disables the retreat.
         # 0.30, not the FSM's 0.40: this retreat is a straight pull along the
-        # normal with no collision model, and the FSM's transit_clear retracts
-        # to its own offset afterwards THROUGH the planner. Getting the plate
+        # normal that knows the robot (self_collision) but not the room, and
+        # the FSM's transit_clear retracts to its own offset afterwards THROUGH
+        # the planner, which knows both. Getting the plate
         # off the wall is this node's job; getting it to 0.40 is not.
         self.declare_parameter("retreat_standoff", 0.30)
         self.declare_parameter("retreat_speed", 0.05)     # m/s along the normal
@@ -141,8 +144,21 @@ class WholeBodySweepNode(Node):
             "return_joints", None,
             ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE_ARRAY))
         self.declare_parameter("return_gain", 1.0)        # 1/s toward the target
-        self.declare_parameter("return_tolerance", 0.05)  # rad, per joint
+        # The return decelerates into its target at this rate rather than
+        # arriving at whatever speed the gain leaves it with. Half of
+        # arm_accel_max, so the jerk bound has room to shape the stop.
+        self.declare_parameter("return_decel", 1.0)       # rad/s^2
+        # Tight, because the return now arrives slowly enough to reach it; the
+        # brake that follows only has to take out the last few mrad/s.
+        self.declare_parameter("return_tolerance", 0.02)  # rad, per joint
         self.declare_parameter("return_timeout", 25.0)    # s on the node clock
+        # After a clean finish (the return arrived, or there was nothing to
+        # return to) the arm is brought to rest under the acceleration and jerk
+        # bounds before the node lets go, instead of being snapped to the
+        # measured pose. The brake ends once every commanded rate is below
+        # brake_speed_tolerance, or after brake_timeout regardless.
+        self.declare_parameter("brake_speed_tolerance", 0.002)   # rad/s and m/s
+        self.declare_parameter("brake_timeout", 2.0)             # s on the node clock
         # Fail a sweep that has stopped advancing this long, instead of waiting
         # out the whole length/speed budget with the plate stuck on something.
         self.declare_parameter("no_progress_timeout", 25.0)
@@ -1017,6 +1033,30 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("avoid_mask_halfwidth", 0.7)
         self.declare_parameter("avoid_mask_extension", 3.0)
         self.declare_parameter("avoid_slack_weight", 1e3)
+
+        # --- Self-collision (see wbc/self_collision.py) ------------------------
+        # Barrier rows keeping the arm's links off each other, off the column it
+        # stands on and off the turret body, in every phase: the sweep, the
+        # retreat and the return. The model is built from /robot_description.
+        self.declare_parameter("self_collision", True)
+        # JSON overriding any of the default model's spheres/capsules, pairs or
+        # obstacles; empty keeps the UR10e + plate defaults.
+        self.declare_parameter("self_collision_model", "")
+        self.declare_parameter("self_collision_margin", 0.04)     # m between surfaces
+        self.declare_parameter("self_collision_influence", 0.20)  # m, rows beyond are dropped
+        self.declare_parameter("self_collision_alpha", 2.0)       # 1/s
+        self.declare_parameter("self_collision_max_rows", 8)
+        # A group of its own, never sharing a slack with the base's obstacle
+        # rows or the force row: an engaged obstacle must not buy the arm the
+        # right to fold into itself.
+        self.declare_parameter("self_collision_slack_weight", 1e3)
+        # The frame the model's "body" obstacles are fixed to. Looked up in TF
+        # against arm_root_link every cycle, so it carries the column height.
+        self.declare_parameter("self_collision_body_frame", "turret_link")
+        # Publish the sphere model as a MarkerArray, for checking it against
+        # the robot in RViz. Off by default; a few Hz when on.
+        self.declare_parameter("self_collision_markers", False)
+        self.declare_parameter("self_collision_markers_topic", "/wbc_sweep/self_collision")
         # A costmap that never arrives is a warning, not a failure: the sweep is
         # slow, deliberate motion over ground the FSM already vetted with
         # reachable_wall_segments, and refusing to scan because Nav2 is not
@@ -1038,6 +1078,14 @@ class WholeBodySweepNode(Node):
         # reference velocities are tenths of a unit — and only bite on steps.
         self.declare_parameter("base_accel_max", [0.3, 0.3, 0.6])   # m/s^2, m/s^2, rad/s^2
         self.declare_parameter("arm_accel_max", 2.0)                # rad/s^2
+        # How fast the ARM's acceleration may change, rad/s^3; 0 disables. The
+        # acceleration bound alone lets a joint go from coasting to the full
+        # 2 rad/s^2 in one 20 ms cycle, and with the plate out at arm's length
+        # that step is the jolt felt on every start, stop and change of mind in
+        # the air. At 10 the full acceleration takes 0.2 s to build, and a
+        # press-sized change of rate (a few mrad/s) still settles in ~40 ms.
+        # Arm only: the base's own controller already shapes its ramps.
+        self.declare_parameter("arm_jerk_max", 10.0)                # rad/s^3
         # The UR's execution speed (teach-pendant slider, safety reduced mode)
         # scales the ARM but not the base, which desynchronises a whole-body
         # command. Reading it lets the whole command be scaled together. Absent
@@ -1209,6 +1257,11 @@ class WholeBodySweepNode(Node):
         # speed nobody asked for.
         self.u_qp_prev = None
         self.qp_stamp = None
+        # The acceleration the solver's last answer implied, (u_qp - its
+        # predecessor) / dt. The jerk bound in _accel_bounds limits how far the
+        # next solve may move away from it. None, like u_qp_prev, means "no
+        # history"; a stop sets it to zero.
+        self.a_qp_prev = None
         self.cycle_period = 0.0
         # What the solve last asked of the ARM, and when it asked. The stream
         # timer integrates this; the control timer is its only writer, and they
@@ -1235,15 +1288,18 @@ class WholeBodySweepNode(Node):
         self.accel_max = np.concatenate((
             np.array(p("base_accel_max").value, dtype=float),
             np.full(len(self.arm_joints), float(p("arm_accel_max").value))))
+        self.arm_jerk_max = float(p("arm_jerk_max").value)
         self.min_speed_scaling = float(p("min_speed_scaling").value)
-        # "sweep" -> "retreat" (backing the plate off the wall) -> "done". The
-        # terminal status is withheld until "done", because the FSM kills this
-        # process as soon as it sees one.
+        # "sweep" -> "retreat" (backing the plate off the wall) -> "return"
+        # (joint space, to the planner's pose) -> "brake" (to rest under the
+        # jerk bound) -> "done". The terminal status is withheld until "done",
+        # because the FSM kills this process as soon as it sees one.
         self.phase = "sweep"
         self.pending_status = None
         self.retreat_deadline = 0.0
         self.retreat_R_hold = None
         self.return_deadline = 0.0
+        self.brake_deadline = 0.0
         # A typed-but-unset parameter RAISES on .value rather than returning
         # None, so an absent return target has to be caught, not defaulted.
         try:
@@ -1277,6 +1333,12 @@ class WholeBodySweepNode(Node):
         self.obstacle_field = None
         self._field_from = None      # the message the cached field was built from
         self.closest_obstacle = float("inf")
+        # Built with the chain, from /robot_description. None when disabled or
+        # when the model could not be built — which is logged, loudly, there.
+        self.self_collision = None
+        self.self_collision_closest = float("inf")
+        self.self_collision_pair = ""
+        self._markers_stamp = None
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -1320,6 +1382,10 @@ class WholeBodySweepNode(Node):
             self.create_publisher(
                 Float64MultiArray, str(p("diagnostics_topic").value), 10)
             if bool(p("publish_diagnostics").value) else None)
+        self.markers_pub = (
+            self.create_publisher(
+                MarkerArray, str(p("self_collision_markers_topic").value), 1)
+            if bool(p("self_collision_markers").value) else None)
         self.arm_stream = ArmStream(
             self, self.arm_joints,
             mode=str(p("arm_stream_interface").value),
@@ -1458,6 +1524,9 @@ class WholeBodySweepNode(Node):
         self.arm_stream.set_position_limits(
             [by_name[name][0] for name in self.arm_joints],
             [by_name[name][1] for name in self.arm_joints])
+        # Before the chain is published, for the same reason as the limits: a
+        # control cycle must never see a chain without the model beside it.
+        self.self_collision = self._build_self_collision(self.urdf, chain)
         self.chain = chain
         if list(chain.joint_names) != list(self.arm_joints):
             # Same joints, different order. Every path here reorders explicitly,
@@ -1470,6 +1539,40 @@ class WholeBodySweepNode(Node):
                 f"the controller. Align 'arm_joints' with the controller's joint "
                 f"list to remove the ambiguity."
             )
+
+    def _build_self_collision(self, urdf, chain):
+        """The arm's sphere model, or None — never an exception into the callback.
+
+        A model that cannot be built leaves the sweep without self-collision
+        rows, which is said at ERROR here and again, throttled, every cycle
+        that would have used them. Refusing the sweep instead would turn a typo
+        in the JSON override into a robot that cannot scan at all.
+        """
+        p = self.get_parameter
+        if not bool(p("self_collision").value):
+            return None
+        config = SelfCollisionConfig(
+            safety_margin=float(p("self_collision_margin").value),
+            influence=float(p("self_collision_influence").value),
+            alpha=float(p("self_collision_alpha").value),
+            max_rows=int(p("self_collision_max_rows").value))
+        try:
+            model = SelfCollisionModel.from_json(
+                str(p("self_collision_model").value), urdf, self.arm_root_link,
+                chain.joint_names, config=config)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Cannot build the self-collision model ({exc}); the arm will be "
+                f"streamed with NO self-collision protection.")
+            return None
+        if model.missing_links:
+            self.get_logger().warn(
+                f"Self-collision spheres on {model.missing_links} dropped: not below "
+                f"'{self.arm_root_link}' in this URDF.")
+        self.get_logger().info(
+            f"Self-collision model: {len(model.spheres)} spheres, {len(model.pairs)} "
+            f"sphere pairs, {len(model.obstacles)} fixed obstacles.")
+        return model
 
     def _on_joint_states(self, msg):
         # Built aside and REBOUND, never mutated in place. This callback now
@@ -1671,6 +1774,86 @@ class WholeBodySweepNode(Node):
         self.closest_obstacle = closest
         return A, lower
 
+    def _chain_positions(self):
+        """Arm joint values in the CHAIN's order — the order the QP solves in.
+
+        ``_arm_positions`` is in the controller's order, and the two need not
+        agree (see _on_robot_description); anything that feeds a chain-ordered
+        solve by column has to read it this way.
+        """
+        try:
+            return np.array([self.joint_positions[name] for name in self.chain.joint_names])
+        except KeyError:
+            return None
+
+    def _self_collision_group(self, n_arm):
+        """This cycle's self-collision rows as a soft group, or None.
+
+        Zero base columns: the base carries the arm and everything it could
+        hit alike, so base motion never changes a self-distance.
+        """
+        self.self_collision_closest = float("inf")
+        self.self_collision_pair = ""
+        if not bool(self.get_parameter("self_collision").value):
+            return None
+        if self.self_collision is None:
+            self.get_logger().error(
+                "No self-collision model: the arm is moving with NO self-collision "
+                "protection.", throttle_duration_sec=5.0)
+            return None
+        q = self._chain_positions()
+        if q is None:
+            return None
+        T_body = None
+        pose = self._lookup(str(self.get_parameter("self_collision_body_frame").value),
+                            source_frame=self.arm_root_link)
+        if pose is not None:
+            T_body = np.eye(4)
+            T_body[:3, :3] = _quat_to_matrix(pose[0])
+            T_body[:3, 3] = pose[1]
+        else:
+            self.get_logger().warn(
+                "No TF for the self-collision body frame: the arm is kept off itself "
+                "and the mast, but NOT off the turret body this cycle.",
+                throttle_duration_sec=5.0)
+        A, lower, closest, pair = self.self_collision.rows(q, T_body)
+        self.self_collision_closest, self.self_collision_pair = closest, pair
+        self._publish_self_collision_markers(q)
+        if closest < float(self.get_parameter("self_collision_margin").value):
+            self.get_logger().warn(
+                f"Self-collision margin breached: {pair} {closest * 100:.1f} cm apart.",
+                throttle_duration_sec=1.0)
+        if not A.shape[0]:
+            return None
+        return SoftRows(np.hstack((np.zeros((A.shape[0], 3)), A)), lower,
+                        float(self.get_parameter("self_collision_slack_weight").value),
+                        name="self_collision")
+
+    def _publish_self_collision_markers(self, q):
+        """The sphere model as RViz spheres in the arm's root frame, at ~5 Hz."""
+        if self.markers_pub is None:
+            return
+        now = self._now()
+        if self._markers_stamp is not None and now - self._markers_stamp < 0.2:
+            return
+        self._markers_stamp = now
+        msg = MarkerArray()
+        centres, _ = self.self_collision.sphere_states(q)
+        for i, (centre, (_, _, radius)) in enumerate(zip(centres, self.self_collision.spheres)):
+            marker = Marker()
+            marker.header.frame_id = self.arm_root_link
+            marker.ns = "wbc_self_collision"
+            marker.id = i
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = (
+                float(v) for v in centre)
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = marker.scale.y = marker.scale.z = 2.0 * radius
+            marker.color.r, marker.color.g, marker.color.b, marker.color.a = 1.0, 0.5, 0.0, 0.4
+            msg.markers.append(marker)
+        self.markers_pub.publish(msg)
+
     # ------------------------------------------------------------------
     # Startup / teardown
     # ------------------------------------------------------------------
@@ -1754,6 +1937,11 @@ class WholeBodySweepNode(Node):
         self.deadline = self._now() + self.timeout
         self.start_stamp = self._now()
         self.stream_stamp = None
+        # The robot is at rest, so rest IS the command history, exactly as after
+        # a hold (see _strike). Left as None, the acceleration and jerk bounds
+        # both stood aside for the first solve, and whatever it asked for went
+        # to the arm as a single step.
+        self._seed_at_rest(self.start_stamp)
         # Two timers, two groups, two threads: the solve decides what velocity
         # the arm should have, the stream decides how finely the setpoint says
         # it, and neither waits for the other. The stream tick does nothing at
@@ -1770,8 +1958,24 @@ class WholeBodySweepNode(Node):
             f"setpoint at {self.stream_rate:.0f} Hz (timeout {self.timeout:.0f}s)."
         )
 
-    def halt(self):
+    def _seed_at_rest(self, now):
+        """Record a stopped robot as the command history the bounds ramp from."""
+        rest = np.zeros_like(self.accel_max)
+        self.u_prev = rest.copy()
+        self.u_qp_prev = rest.copy()
+        self.a_qp_prev = rest.copy()
+        self.command_stamp = now
+        self.qp_stamp = now
+
+    def halt(self, settled=False):
         """Stop everything this node commands. Safe to call repeatedly.
+
+        ``settled`` says the arm has already been brought to rest under the
+        bounds (the brake phase), so it is held at its last SETPOINT. Otherwise
+        it is held at the measurement — right for a fault, where the setpoint
+        may be running ahead of an arm that stopped following, but a small
+        backwards step for an arm that is still moving, since the measurement
+        lags the setpoint by the servo's tracking error.
 
         The arm's stop is NOT a zero — in position mode that would be a
         full-speed run to the zero configuration. ``ArmStream.hold`` knows what
@@ -1788,14 +1992,15 @@ class WholeBodySweepNode(Node):
                 timer.cancel()
                 setattr(self, name, None)
         self.cmd_vel_pub.publish(Twist())
-        self._hold_arm()
+        self._hold_arm(at_measurement=not settled)
         self.u_prev = None
         self.command_stamp = None
         self.u_qp_prev = None
+        self.a_qp_prev = None
         self.qp_stamp = None
         self.holding_since = None
 
-    def _hold_arm(self):
+    def _hold_arm(self, at_measurement=True):
         """Stop the arm, and stop the stream that would move it on. Indivisible.
 
         Two things have to happen together. The stored velocity is forgotten,
@@ -1811,13 +2016,16 @@ class WholeBodySweepNode(Node):
         two steps, unprotected, a tick could read the velocity that is about to
         be forgotten and publish a setpoint past the pose we are stopping in.
         The lock is uncontended in every normal cycle and costs nothing there.
+
+        ``at_measurement=False`` holds the last setpoint instead, for an arm the
+        brake has already brought to rest — see :meth:`halt`.
         """
         with self._arm_lock:
             self.arm_qdot = None
             self.arm_qdot_stamp = None
             self.stream_stamp = None
             self.arm_command_stale = False
-            self.arm_stream.hold(self._arm_positions())
+            self.arm_stream.hold(self._arm_positions() if at_measurement else None)
 
     def finish(self, status, reason=""):
         """End the sweep — but back the plate off the wall before saying so.
@@ -1862,10 +2070,14 @@ class WholeBodySweepNode(Node):
             f"along the sensed normal before handing the arm back."
         )
 
-    def _terminate(self):
-        """Publish the withheld status and stop commanding anything."""
+    def _terminate(self, settled=False):
+        """Publish the withheld status and stop commanding anything.
+
+        ``settled`` only from the brake, whose arm is already at rest; every
+        other caller is ending on a fault or mid-motion. See :meth:`halt`.
+        """
         self.phase = "done"
-        self.halt()
+        self.halt(settled=settled)
         self.status = self.pending_status or "failed: ended without a status"
         self._publish_status()
 
@@ -2045,11 +2257,16 @@ class WholeBodySweepNode(Node):
         lo_all, hi_all = self._accel_bounds(
             np.concatenate((np.zeros(3), arm_lo)),      # base pinned: arm only
             np.concatenate((np.zeros(3), arm_hi)), now)
-        solution = solve_velocity_qp(tasks, lo_all, hi_all)
+        # The retreat is where the arm folds (the 2026-09-18 elbow), so it is
+        # where the self-collision rows matter most.
+        group = self._self_collision_group(n_arm)
+        solution = solve_velocity_qp(tasks, lo_all, hi_all,
+                                     soft=[group] if group is not None else None)
         if not solution.ok:
             self.get_logger().warn("Retreat QP did not solve; stopping here.")
             self._terminate()
             return
+        self._warn_self_collision_slack(solution, [group])
 
         self._publish(solution.u, n_arm)
         self.get_logger().info(
@@ -2057,9 +2274,10 @@ class WholeBodySweepNode(Node):
             throttle_duration_sec=1.0)
 
     def _begin_return(self):
-        """Move to the joint-space return, or stop if there is nothing to return to."""
+        """Move to the joint-space return, or bring the arm to rest if there is
+        nothing to return to."""
         if not self.return_joints or self.chain is None:
-            self._terminate()
+            self._begin_brake()
             return
         self.phase = "return"
         self.return_deadline = self._now() + float(
@@ -2074,6 +2292,14 @@ class WholeBodySweepNode(Node):
         actually reached, so it is reachable, clear of the mast cylinder and
         something A* can plan out of — none of which any particular Cartesian
         standoff can guarantee.
+
+        Through the QP, like the retreat, and no longer published raw: that is
+        what puts the joint limits, the acceleration and jerk bounds and the
+        self-collision rows under it. The reference is a straight line in joint
+        space whose speed is capped three ways — ``arm_qdot_max``, the gain on
+        the remaining error, and the speed from which ``return_decel`` can still
+        stop in the distance left — so it arrives slowly instead of being cut
+        off at the tolerance while still moving.
         """
         now = self._now()
         q_arm = self._arm_positions()
@@ -2082,32 +2308,93 @@ class WholeBodySweepNode(Node):
             self._terminate()
             return
 
+        p = self.get_parameter
         error = np.asarray(self.return_joints, dtype=float) - q_arm
         worst = float(np.max(np.abs(error)))
-        if worst <= float(self.get_parameter("return_tolerance").value):
+        if worst <= float(p("return_tolerance").value):
             self.get_logger().info(
                 f"Arm back at the unfolded configuration (worst joint error "
                 f"{worst:.3f} rad).")
-            self._terminate()
+            self._begin_brake()
             return
         if now > self.return_deadline:
             self.get_logger().warn(
                 f"Return timed out with {worst:.2f} rad still to go; handing the arm "
                 f"back as it is.")
-            self._terminate()
+            self._begin_brake()
             return
 
-        limit = float(self.get_parameter("arm_qdot_max").value)
-        qdot = np.clip(error * float(self.get_parameter("return_gain").value), -limit, limit)
+        speed = min(float(p("arm_qdot_max").value),
+                    float(p("return_gain").value) * worst,
+                    math.sqrt(2.0 * float(p("return_decel").value) * worst))
         # ``error`` is in the CONTROLLER's joint order (both operands came from
-        # arm_joints); _publish expects the chain's, so hand it over by name
+        # arm_joints); the solve is in the chain's, so hand it over by name
         # rather than by position.
-        by_name = dict(zip(self.arm_joints, qdot))
-        qdot_chain = np.array([by_name[name] for name in self.chain.joint_names])
+        by_name = dict(zip(self.arm_joints, error * (speed / worst)))
+        qdot_ref = np.array([by_name[name] for name in self.chain.joint_names])
+
+        n_arm = self.chain.n_joints
+        damping = np.concatenate((np.array(p("damping_base").value, dtype=float),
+                                  np.full(n_arm, float(p("damping_arm").value))))
+        tasks = [Task(np.hstack((np.zeros((n_arm, 3)), np.eye(n_arm))), qdot_ref, 1.0),
+                 Task(np.diag(damping), np.zeros(3 + n_arm), 1.0)]
+        lower_arm, upper_arm = self.chain.position_limits()
+        arm_lo, arm_hi = joint_limit_bounds(
+            self._chain_positions(), lower_arm, upper_arm, float(p("arm_qdot_max").value),
+            margin=float(p("joint_limit_margin").value))
+        lo_all, hi_all = self._accel_bounds(
+            np.concatenate((np.zeros(3), arm_lo)),      # base pinned: arm only
+            np.concatenate((np.zeros(3), arm_hi)), now)
+        group = self._self_collision_group(n_arm)
+        solution = solve_velocity_qp(tasks, lo_all, hi_all,
+                                     soft=[group] if group is not None else None)
+        if not solution.ok:
+            self.get_logger().warn("Return QP did not solve; stopping here.")
+            self._terminate()
+            return
+        self._warn_self_collision_slack(solution, [group])
         self.cmd_vel_pub.publish(Twist())
-        self._publish(np.concatenate((np.zeros(3), qdot_chain)), len(q_arm))
+        self._publish(solution.u, n_arm)
         self.get_logger().info(
             f"Returning: worst joint error {worst:.2f} rad", throttle_duration_sec=1.0)
+
+    def _begin_brake(self):
+        """Bring the arm to rest under the bounds, then finish."""
+        self.phase = "brake"
+        self.brake_deadline = self._now() + float(
+            self.get_parameter("brake_timeout").value)
+
+    def _brake_step(self):
+        """Ramp every commanded rate to zero, then hand the arm back at rest.
+
+        The target is simply zero, clipped into the box the acceleration and
+        jerk bounds allow around the last command — the fastest stop those
+        bounds permit, and no faster. There is nothing left to solve for: no
+        task, and the base is already still. It ends the moment the command is
+        at rest, and after ``brake_timeout`` regardless, since an arm that has
+        not stopped by then is not going to be stopped by waiting.
+        """
+        now = self._now()
+        tolerance = float(self.get_parameter("brake_speed_tolerance").value)
+        if (self.u_qp_prev is None or float(np.max(np.abs(self.u_qp_prev))) <= tolerance
+                or now > self.brake_deadline):
+            self._terminate(settled=self.u_qp_prev is None
+                            or float(np.max(np.abs(self.u_qp_prev))) <= tolerance)
+            return
+        wide = np.full(self.u_qp_prev.shape, np.inf)
+        lo, hi = self._accel_bounds(-wide, wide, now)
+        self.cmd_vel_pub.publish(Twist())
+        self._publish(np.clip(np.zeros_like(lo), lo, hi), self.chain.n_joints)
+
+    def _warn_self_collision_slack(self, solution, groups):
+        """Say so when a self-collision barrier could not be met this cycle."""
+        names = [g.name for g in groups if g is not None]
+        slack = dict(zip(names, solution.slacks if solution.slacks is not None else []))
+        if slack.get("self_collision", 0.0) > 1e-3:
+            self.get_logger().warn(
+                f"Self-collision barrier short by {slack['self_collision']:.3f} rad/s at "
+                f"{self.self_collision_pair} ({self.self_collision_closest * 100:.1f} cm).",
+                throttle_duration_sec=1.0)
 
     def _control_step(self):
         now = self._now()
@@ -2131,6 +2418,9 @@ class WholeBodySweepNode(Node):
             return
         if self.phase == "return":
             self._return_step()
+            return
+        if self.phase == "brake":
+            self._brake_step()
             return
         if self.status != "running":
             return
@@ -2654,9 +2944,9 @@ class WholeBodySweepNode(Node):
                  float(p("weight_posture").value)),
         ]
         # Carry on from last cycle unless the task gives a reason not to. See
-        # weight_smoothness. Only once there IS a last cycle: at the start of a
-        # sweep there is nothing to be continuous with, and seeding it with
-        # zeros would ask the first solve to stay stopped.
+        # weight_smoothness. start() seeds the history with zeros — the robot
+        # IS at rest then — so the first solve is pulled gently toward rest as
+        # well as bounded to a ramp out of it; at 0.05 the pull is a nudge.
         smoothness = float(p("weight_smoothness").value)
         if self.u_qp_prev is not None and smoothness > 0.0:
             tasks.append(Task(np.eye(3 + n_arm), self.u_qp_prev, smoothness))
@@ -2724,6 +3014,9 @@ class WholeBodySweepNode(Node):
             soft_groups.append(SoftRows(A_avoid, avoid_lo,
                                         float(p("avoid_slack_weight").value),
                                         name="obstacle"))
+        self_collision = self._self_collision_group(n_arm)
+        if self_collision is not None:
+            soft_groups.append(self_collision)
         force_alpha = float(p("press_force_alpha").value)
         self.force_cap = float("inf")
         if self.press is not None and force_alpha > 0.0 and self.press.state == PRESS:
@@ -2840,6 +3133,7 @@ class WholeBodySweepNode(Node):
                 f"K_e={self.stiffness.value:.0f} N/m allowing only "
                 f"{self.force_cap * 1000:+.1f} mm/s of approach.",
                 throttle_duration_sec=2.0)
+        self._warn_self_collision_slack(solution, soft_groups)
 
         # What the solve actually asked for along the normal, which is the
         # travel the stiffness estimate regresses the next force against.
@@ -2960,6 +3254,7 @@ class WholeBodySweepNode(Node):
         step = np.abs(self.accel_max) * dt
         lo_new = np.maximum(lo, self.u_qp_prev - step)
         hi_new = np.minimum(hi, self.u_qp_prev + step)
+        self._jerk_bounds(lo, hi, lo_new, hi_new, dt)
         # The two can cross, and an empty box is an infeasible solve — the robot
         # stopping dead, which is the one outcome worse than a step. It happens
         # whenever the previous solution is already outside the new box: the
@@ -2971,6 +3266,38 @@ class WholeBodySweepNode(Node):
             lo_new = np.where(crossed, lo, lo_new)
             hi_new = np.where(crossed, hi, hi_new)
         return lo_new, hi_new
+
+    def _jerk_bounds(self, lo, hi, lo_new, hi_new, dt):
+        """Narrow the ARM's rows of ``lo_new``/``hi_new`` in place by the jerk bound.
+
+        The acceleration may move at most ``arm_jerk_max * dt`` from the one
+        the last solve implied. Bounding only that, though, would let a joint
+        build up an acceleration it cannot take back before it reaches the edge
+        of its velocity box — ramping the acceleration down from ``a`` adds
+        ``a^2 / 2j`` of speed on the way — so the acceleration TOWARD an edge is
+        also capped at ``sqrt(2 j * room)``. Where the two disagree the edge
+        wins: a jerk spike is better than a joint overrunning its limit, and it
+        only happens when the box itself moves faster than the jerk allows
+        (a joint limit released, a pinned phase change).
+
+        ``lo``/``hi`` are the velocity box before the acceleration narrowing;
+        crossings are left for the caller's fallback like any other.
+        """
+        jerk = self.arm_jerk_max
+        if jerk <= 0.0 or self.a_qp_prev is None:
+            return
+        arm = slice(3, None)
+        u0 = self.u_qp_prev[arm]
+        a0 = self.a_qp_prev[arm]
+        a_max = np.abs(self.accel_max[arm])
+        a_lo = np.maximum(-a_max, a0 - jerk * dt)
+        a_hi = np.minimum(a_max, a0 + jerk * dt)
+        with np.errstate(invalid="ignore"):
+            a_hi = np.minimum(a_hi, np.sqrt(2.0 * jerk * np.maximum(hi[arm] - u0, 0.0)))
+            a_lo = np.maximum(a_lo, -np.sqrt(2.0 * jerk * np.maximum(u0 - lo[arm], 0.0)))
+        a_lo = np.minimum(a_lo, a_hi)
+        lo_new[arm] = np.maximum(lo_new[arm], u0 + a_lo * dt)
+        hi_new[arm] = np.minimum(hi_new[arm], u0 + a_hi * dt)
 
     def _stale_inputs(self, now):
         stale = []
@@ -3014,6 +3341,7 @@ class WholeBodySweepNode(Node):
         # Same reasoning for the solver's own reference: the robot has just been
         # stopped, so zero IS where the next solve has to accelerate from.
         self.u_qp_prev = np.zeros_like(self.accel_max)
+        self.a_qp_prev = np.zeros_like(self.accel_max)
         self.qp_stamp = now
         held = now - self.holding_since
         if held >= self.max_hold_seconds:
@@ -3118,6 +3446,13 @@ class WholeBodySweepNode(Node):
             self.arm_qdot_stamp = now
 
         self._publish_diagnostics(now, u_qp, u)
+        # The acceleration this answer implies, over the same clamped interval
+        # _accel_bounds measures against, for the jerk bound on the next solve.
+        if self.u_qp_prev is not None and self.qp_stamp is not None:
+            qp_dt = float(min(max(now - self.qp_stamp, nominal), 3.0 * nominal))
+            self.a_qp_prev = (u_qp - self.u_qp_prev) / qp_dt
+        else:
+            self.a_qp_prev = np.zeros_like(u_qp)
         self.u_qp_prev = u_qp
         self.qp_stamp = now
 

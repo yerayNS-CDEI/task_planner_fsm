@@ -2404,3 +2404,203 @@ def test_the_stiffness_estimate_survives_a_brief_loss_of_contact():
     assert not node.press.recontacting
     node._stiffness_step()
     assert not node.stiffness.fitted, "a loss past the memory resets it"
+
+
+# ----------------------------------------------------------------------------
+# Smooth motion in the air, and self-collision
+# ----------------------------------------------------------------------------
+from task_planner_fsm.wbc.self_collision import (  # noqa: E402
+    ROOT, SelfCollisionConfig, SelfCollisionModel)
+
+
+def _phase_trace(node, robot, cycles):
+    """Run the loop, keeping (phase, time, solver velocity) for every published cycle."""
+    trace = []
+    real_publish = node._publish
+
+    def spy(u, n_arm):
+        trace.append((node.phase, node._now(), np.asarray(u, dtype=float).copy()))
+        return real_publish(u, n_arm)
+
+    node._publish = spy
+    _run(node, robot, cycles)
+    return trace
+
+
+def _worst_arm_jerk(trace):
+    """Largest change of arm acceleration per second, on the solve's own clock.
+
+    On real time stamps rather than a fixed period: a phase change spends a
+    cycle without publishing, and the command after it is bounded over the
+    whole gap — which a fixed-period second difference would read as a spike.
+    """
+    t = np.array([stamp for _, stamp, _ in trace])
+    u = np.array([vel[3:] for _, _, vel in trace])
+    dt = np.diff(t)
+    a = np.diff(u, axis=0) / dt[:, None]
+    return float((np.abs(np.diff(a, axis=0)) / dt[1:, None]).max())
+
+
+def _return_trace(**overrides):
+    """A short sweep, the retreat, and a return to a pose off the unfolded one."""
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, 0.3, 0.0), retreat_standoff=0.40, **overrides)
+    robot = _start_state(node.chain)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    target = robot.q + np.array([0.05, 0.10, -0.15, 0.10, 0.05, -0.05])
+    node.return_joints = target.tolist()
+    return node, robot, target, _phase_trace(node, robot, 8000)
+
+
+def test_the_first_command_after_start_ramps_out_of_rest():
+    """start() used to leave the command history empty, and with no history
+    both the acceleration and the jerk bound stood aside: whatever the first
+    solve asked for went to the arm as one step. The robot is at rest when a
+    sweep starts, so rest is the history."""
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.2, 0.0))
+    robot = _start_state(node.chain)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    _install_clock(node)
+    _wire(node, robot)
+    node.start()
+    node.control_timer.cancel()
+    node.stream_timer.cancel()
+    assert node.u_qp_prev == pytest.approx(np.zeros(3 + node.chain.n_joints))
+
+    trace = _velocity_trace(node, robot, 3)
+    dt = 1.0 / node.control_rate
+    jerk = float(node.get_parameter("arm_jerk_max").value)
+    assert np.all(np.abs(trace[0][3:]) <= jerk * dt * dt * 1.01 + 1e-12), (
+        f"first arm command {np.abs(trace[0][3:]).max():.4f} rad/s is a step, not a ramp")
+    assert np.all(np.abs(trace[0][:3]) <= node.accel_max[:3] * dt * 1.01)
+
+
+def test_the_arm_acceleration_changes_no_faster_than_the_jerk_bound():
+    """The acceleration bound alone lets a joint go from coasting to the full
+    2 rad/s^2 in one cycle — the jolt felt with the plate at arm's length, and
+    felt most in the air, where the retreat and the return move the arm
+    furthest and fastest."""
+    *_, bounded = _return_trace(arm_jerk_max=10.0)
+    *_, free = _return_trace(arm_jerk_max=0.0)
+    in_air = ("retreat", "return", "brake")
+    bounded_jerk = _worst_arm_jerk([c for c in bounded if c[0] in in_air])
+    free_jerk = _worst_arm_jerk([c for c in free if c[0] in in_air])
+    assert bounded_jerk <= 10.0 * 1.05, f"arm jerk {bounded_jerk:.1f} rad/s^3 over the 10 bound"
+    assert free_jerk > 3.0 * bounded_jerk, "the fixture must actually exercise the bound"
+
+
+def test_a_settled_stop_holds_the_setpoint_and_a_fault_holds_the_measurement():
+    """Holding at the measurement is right for a fault — the setpoint may be
+    running ahead of an arm that stopped following — but steps the arm back
+    by its tracking lag when it is still moving. The brake stops it first,
+    then lets go at the setpoint."""
+    for settled, expect_offset in ((True, 0.01), (False, 0.0)):
+        node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.0, 0.0))
+        robot = _start_state(node.chain)
+        commands = {}
+        _capture(node, commands)
+        _wire(node, robot)
+        node.arm_stream.reset(robot.q)
+        node.arm_stream.command = robot.q + 0.01      # the setpoint leads the arm
+        node._terminate(settled=settled)
+        assert commands["arm"] == pytest.approx(list(robot.q + expect_offset))
+
+
+def test_the_return_decelerates_into_its_target_and_brakes_to_rest():
+    """The return was a P-law published raw: no joint limits, no acceleration
+    bound, and cut off at 0.05 rad while still moving 0.05 rad/s, with the arm
+    then snapped to its measurement. It now runs through the QP on a profile
+    that arrives slowly, and a brake takes the last of it out."""
+    node, robot, target, trace = _return_trace()
+
+    assert node.status == "succeeded"
+    phases = [phase for phase, _, _ in trace]
+    assert "return" in phases and "brake" in phases
+    assert float(np.max(np.abs(robot.q - target))) < 0.03
+    last = trace[-1][2][3:]
+    assert np.abs(last).max() <= float(node.get_parameter("brake_speed_tolerance").value)
+    in_air = [c for c in trace if c[0] in ("return", "brake")]
+    assert _worst_arm_jerk(in_air) <= 10.0 * 1.05
+    # Arriving, not cut off: the return's last command is already slow.
+    arrival = [vel[3:] for phase, _, vel in trace if phase == "return"][-1]
+    assert np.abs(arrival).max() < 0.03
+
+
+def test_the_return_is_kept_off_an_obstacle_its_straight_line_crosses():
+    """The joint-space return is exactly the motion nothing was watching: a
+    straight line between two good configurations can pass through the mast.
+    With the model, the rows hold the tip off the obstacle; without it, the
+    same return goes straight through."""
+    def clearance_over_return(enabled):
+        node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.0, 0.0),
+                     self_collision=enabled, return_timeout=6.0)
+        robot = _start_state(node.chain)
+        node.q_posture = robot.q.copy()
+        node.row_z = float(robot.tip()[2, 3])
+        start = robot.q.copy()
+        target = start + np.array([1.2, 0.0, 0.0, 0.0, 0.0, 0.0])
+        # A box on the tip's arc, halfway round: the straight line in joint
+        # space passes right through it.
+        mid = node.chain.fk(start + 0.5 * (target - start))[:3, 3]
+        obstacle = {"type": "box", "frame": ROOT, "center": mid.tolist(),
+                    "half_extents": [0.06, 0.06, 0.06]}
+        probe = SelfCollisionModel(
+            URDF, "arm_base_link", node.chain.joint_names,
+            spheres=[("l6", (0.0, 0.0, 0.0), 0.05)], pairs=[], obstacles=[obstacle],
+            config=SelfCollisionConfig(influence=10.0))
+        if enabled:
+            node.self_collision = SelfCollisionModel(
+                URDF, "arm_base_link", node.chain.joint_names,
+                spheres=[("l6", (0.0, 0.0, 0.0), 0.05)], pairs=[], obstacles=[obstacle],
+                config=SelfCollisionConfig(safety_margin=0.03, influence=0.25, alpha=3.0))
+        node.return_joints = target.tolist()
+        _install_clock(node)
+        node._begin_return()
+
+        worst = float("inf")
+        real_publish = node._publish
+
+        def spy(u, n_arm):
+            nonlocal worst
+            worst = min(worst, probe.rows(robot.q)[2])
+            return real_publish(u, n_arm)
+
+        node._publish = spy
+        _run(node, robot, 2000)
+        assert node.status != "running", "the return must end, blocked or not"
+        return worst
+
+    assert clearance_over_return(False) < 0.0, "the fixture must actually cross it"
+    guarded = clearance_over_return(True)
+    assert guarded > 0.0, f"tip went {-guarded * 100:.1f} cm into the obstacle"
+
+
+def test_the_self_collision_rows_reach_the_sweep_qp():
+    """Present in the sweep's soft groups under their own name, never pooled
+    with the base's obstacle rows."""
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.2, 0.0))
+    robot = _start_state(node.chain)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    tip = node.chain.fk(robot.q)[:3, 3]
+    node.self_collision = SelfCollisionModel(
+        URDF, "arm_base_link", node.chain.joint_names,
+        spheres=[("l6", (0.0, 0.0, 0.0), 0.05)], pairs=[],
+        obstacles=[{"type": "box", "frame": ROOT, "center": (tip - [0.0, 0.0, 0.2]).tolist(),
+                    "half_extents": [0.1, 0.1, 0.05]}])
+    seen = []
+    real_solve = __import__("task_planner_fsm.wbc.sweep_node", fromlist=["x"]).solve_velocity_qp
+
+    def spy(*args, soft=None, **kwargs):
+        seen.append([g.name for g in (soft or [])])
+        return real_solve(*args, soft=soft, **kwargs)
+
+    import task_planner_fsm.wbc.sweep_node as sweep_module
+    original = sweep_module.solve_velocity_qp
+    sweep_module.solve_velocity_qp = spy
+    try:
+        _run(node, robot, 5)
+    finally:
+        sweep_module.solve_velocity_qp = original
+    assert seen and all("self_collision" in names for names in seen)
