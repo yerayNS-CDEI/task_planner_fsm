@@ -1876,6 +1876,19 @@ class ScanWall(State):
             # through the Nav2 controller at all.
             if not bool(ctx.get("sweep_use_crawl", False)) and not self._wbc_enabled(ctx):
                 self._apply_sweep_speed(ctx)
+            # GPR: connect and open this segment's measurement NOW, before the arm
+            # approach; the line starts in press_settle. Keeping the two apart is
+            # what sensor_implementation did (measurement before the press, line
+            # on contact): a line started straight after the measurement came back
+            # 200 with clientStartTimestamp 0. A probe/app problem also surfaces
+            # here, before the arm reaches for the wall.
+            err = self._gpr.open_measurement(
+                ctx, ctx.get("current_wall_index"), ctx.get("current_line_idx", 0),
+                self._seg_idx)
+            if err:
+                node.get_logger().error(f"[{self.name}] {err}; aborting scan.")
+                self.fail(ctx, err)
+                return
             self._seg_phase = "arm_approach"
             return
 
@@ -1938,6 +1951,7 @@ class ScanWall(State):
                     f"Skipping segment {self._seg_idx + 1} instead of sweeping out of "
                     f"reach (is the base parked too far from the wall?)."
                 )
+                self._gpr.abort(ctx)    # close the measurement sweep_setup opened
                 self._seg_idx += 1
                 self._seg_phase = "transit_clear"
                 return
@@ -2013,12 +2027,11 @@ class ScanWall(State):
             if not self._wall_contact_ready(ctx):
                 return
 
-            # GPR: connect, open the LINE_SCAN measurement and start the line
-            # now, before anything travels. An open line with no triggers records
-            # nothing; the traces start with the triggers (_arm_gpr_triggers).
-            err = self._gpr.begin_segment(
-                ctx, ctx.get("current_wall_index"), ctx.get("current_line_idx", 0),
-                self._seg_idx, seg_start, seg_end, "map",
+            # GPR: start the line on the measurement sweep_setup opened, before
+            # anything travels. An open line with no triggers records nothing;
+            # the traces start with the triggers (_arm_gpr_triggers).
+            err = self._gpr.start_line(
+                ctx, seg_start, seg_end, "map",
                 sweep="wbc" if self._wbc_enabled(ctx) else (
                     "crawl" if bool(ctx.get("sweep_use_crawl", False)) else "nav2"))
             if err:

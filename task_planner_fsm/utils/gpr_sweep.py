@@ -2,9 +2,9 @@
 clock it from the sensor plate's travel, and record where each line lies.
 
 Shaped like HyperspectralSampler -- a plain object owned by ScanWall, driven
-through ``begin_segment`` / ``arm_triggers`` / ``note_contact`` /
-``end_segment`` / ``abort`` -- so the scan strategy only decides WHEN each of
-those happens. The API flow, the trigger sampler and the line manifest are the
+through ``open_measurement`` / ``start_line`` / ``arm_triggers`` /
+``note_contact`` / ``end_segment`` / ``abort`` -- so the scan strategy only
+decides WHEN each of those happens. The API flow, the trigger sampler and the line manifest are the
 ones sensor_implementation proved on the base-placement sweep; what differs per
 strategy is only the moment the plate is on the wall and about to travel.
 
@@ -12,12 +12,18 @@ THE THREE PIECES
 ----------------
 * **Probe (HTTP).** ``/probe/connect`` with the serial and the probe's static
   IP (so the connection completes without anyone accepting it on the GP App),
-  ``/measurement/start`` (LINE_SCAN), ``/measurement/line/start``; at the end
-  ``line/stop``, wait for ``GET /measurement/line`` to report it finished,
-  ``/measurement/export/raw`` (zip unpacked into the session's ``incoming/``),
-  ``/measurement/stop``. A failure to START aborts the scan (a sweep the GPR
-  did not record is a wasted wall); a failure to stop or export is logged and
-  recorded -- the traces stay on the app.
+  ``/measurement/start`` (LINE_SCAN) early in the segment, and
+  ``/measurement/line/start`` only when the plate is about to travel -- apart,
+  as sensor_implementation had them (measurement before the press, line on
+  contact), with at least ``LINE_START_DELAY_S`` between them; at the end ``line/stop``, wait for ``GET /measurement/line`` to report it
+  finished, ``/measurement/export/raw`` (zip unpacked into the session's
+  ``incoming/``), ``/measurement/stop``. Each step runs only once the one before
+  it is confirmed, not just answered 2xx: a line start is only a start when the
+  app got the probe's confirmation (``clientStartTimestamp`` non-zero) and
+  reports the line running. A failure to START is retried once from a clean
+  measurement, then aborts the scan (a sweep the GPR did not record is a wasted
+  wall); a failure to stop or export is logged and recorded -- the traces stay
+  on the app.
 
 * **Triggers.** The probe clocks a trace per encoder step, and the encoder is
   an ESP32 fake wheel (gpr_trigger_bridge). One ``/gpr/trigger`` message per
@@ -34,8 +40,9 @@ THE THREE PIECES
 
 UNDER THE WHOLE-BODY SWEEP
 --------------------------
-The press is inside wbc_sweep_controller, so ScanWall starts the line before it
-launches the node and arms the triggers on the node's first ``running: seated``:
+The press is inside wbc_sweep_controller, so ScanWall opens the measurement
+before the arm approach, starts the line just before it launches the node, and
+arms the triggers on the node's first ``running: seated``:
 the plate's pose at that moment is d = 0. Travel before it -- the base pre-roll
 with the plate 20 cm off the wall -- is never counted.
 
@@ -70,6 +77,20 @@ class GprSweep:
     PROBE_IP = "192.168.1.99"
     TIMEOUT_S = 30.0
     EXPORT_PATH = "/measurement/export/raw"
+    # The export is one blocking POST that returns the zip. It gets a budget of
+    # its own: a timeout here would stop the measurement under an export the
+    # app is still writing.
+    EXPORT_TIMEOUT_S = 120.0
+    # Least time between /measurement/start and /measurement/line/start. The
+    # start is documented to return once a line can be started, but lines
+    # started straight after it came back 200 with clientStartTimestamp 0
+    # (09-30). Normally the arm approach already spans it; only the remainder
+    # is waited out.
+    LINE_START_DELAY_S = 2.0
+    # After line/start: how long GET /measurement/line may take to report the
+    # line running, and how many full measurement+line attempts to make.
+    LINE_START_CONFIRM_S = 3.0
+    LINE_START_ATTEMPTS = 2
     # After line/stop: how long to wait for GET /measurement/line to report the
     # line finished, the pause before the export, and before its one retry.
     LINE_FINISH_TIMEOUT_S = 5.0
@@ -106,6 +127,7 @@ class GprSweep:
         self.measurement_active = False
         self.line_active = False
         self._measurement_name = None
+        self._measurement_t0 = None   # time.time() of the last /measurement/start
         self._segment = None          # (wall_index, line_idx, seg_idx)
         self._record = None           # open manifest row
         self._pub = None
@@ -162,28 +184,39 @@ class GprSweep:
     # ------------------------------------------------------------------
     # Segment lifecycle
     # ------------------------------------------------------------------
-    def begin_segment(self, ctx, wall_index, line_idx, seg_idx, seg_start, seg_end, frame,
-                      sweep="wbc"):
-        """Open the line record, connect, open the measurement and start the
-        line -- all before the plate travels. Returns None, or the reason the
-        scan must abort (the caller fails the state; ``abort`` cleans up)."""
+    def open_measurement(self, ctx, wall_index, line_idx, seg_idx):
+        """Connect and open this segment's LINE_SCAN measurement, early -- well
+        before the plate travels, so a probe/app problem surfaces before the arm
+        is on the wall and the line start later meets a settled measurement.
+        Returns None, or the reason the scan must abort (the caller fails the
+        state; ``abort`` cleans up)."""
         self._segment = (wall_index, int(line_idx), int(seg_idx))
         self._seated = None
+        ok, reason = self.bridge_ready(ctx)
+        if not ok:
+            return reason
+        if not self.enabled(ctx):
+            return None
+        if self.line_active or self.measurement_active:
+            self._log(ctx).warn(
+                f"[{self.name}] GPR: measurement '{self._measurement_name}' is still "
+                f"open; finishing it before starting a new one.")
+            self._finish_line(ctx)
+        return self._start_measurement(ctx)
+
+    def start_line(self, ctx, seg_start, seg_end, frame, sweep="wbc"):
+        """Open the line record and start the line, with the plate about to
+        travel. Refuses without the measurement ``open_measurement`` opened.
+        Returns None, or the reason the scan must abort."""
         ok, reason = self.bridge_ready(ctx)
         if not ok:
             return reason
         self._open_record(ctx, seg_start, seg_end, frame, sweep)
         if not self.enabled(ctx):
             return None
-        if self.measurement_active:
-            self._log(ctx).warn(
-                f"[{self.name}] GPR: measurement '{self._measurement_name}' is still "
-                f"open; finishing it before starting a new one.")
-            self._finish_line(ctx)
-        err = self._start_measurement(ctx)
-        if err:
-            return err
-        err = self._start_line(ctx)
+        if not self.measurement_active:
+            return "GPR line start requested without an open measurement"
+        err = self._open_line(ctx)
         if err:
             return err
         self._record["probe_active"] = True
@@ -268,16 +301,17 @@ class GprSweep:
     # ------------------------------------------------------------------
     # Probe: GP API over HTTP (blocking -- called from the FSM tick)
     # ------------------------------------------------------------------
-    def _request(self, ctx, method, path, json_body=None):
+    def _request(self, ctx, method, path, json_body=None, timeout=None):
         """One request; the response, or None on a transport error. Any 2xx is
         success (starts return 200, stops 204); errors carry
         ``{"error":{"code","message"}}``."""
         log = self._log(ctx)
         base_url = str(ctx.get("gpr_base_url", self.BASE_URL)).rstrip("/")
+        if timeout is None:
+            timeout = float(ctx.get("gpr_timeout", self.TIMEOUT_S))
         try:
             resp = requests.request(
-                method, f"{base_url}{path}", json=json_body,
-                timeout=float(ctx.get("gpr_timeout", self.TIMEOUT_S)))
+                method, f"{base_url}{path}", json=json_body, timeout=timeout)
         except requests.exceptions.RequestException as e:
             log.error(f"[{self.name}] GPR {method} {path} failed: {e}")
             return None
@@ -326,9 +360,73 @@ class GprSweep:
         _, line_idx, seg_idx = self._segment
         return f"scan_wall line {line_idx + 1} seg {seg_idx + 1}"
 
+    def _line_info(self, ctx):
+        """GET /measurement/line as {started, finished, scans, length, index},
+        or None if the app did not answer with one."""
+        data = self._data(self._request(ctx, "GET", "/measurement/line"))
+        if data is None:
+            return None
+        return {k: data.get(k) for k in ("started", "finished", "scans", "length", "index")}
+
+    def _close_stale_measurement(self, ctx):
+        """Close what an earlier attempt left open on the app.
+
+        The flags only know what THIS object opened. A state retry after the app
+        went unreachable, or an FSM restart, can leave a measurement -- even a
+        running line -- open on the app, and the next start then runs against
+        it. Ask the app instead: a started line is stopped (only if it is still
+        running), and its measurement closed. Best-effort: /measurement/start
+        still reports whatever this does not fix."""
+        info = self._line_info(ctx)
+        if not info or not info["started"]:
+            return
+        log = self._log(ctx)
+        log.warn(
+            f"[{self.name}] GPR app still has a measurement with a line open "
+            f"(last: {info}); closing it before starting a new one.")
+        if not info["finished"]:
+            self._request(ctx, "POST", "/measurement/line/stop")
+            self._wait_line_finished(ctx)
+        self._request(ctx, "POST", "/measurement/stop")
+
+    def _open_line(self, ctx):
+        """line/start on the open measurement, retried once from a clean one
+        (measurement/start -> settle -> line/start) if the line does not come
+        up. None, or why it failed."""
+        attempts = max(1, int(ctx.get("gpr_line_start_attempts", self.LINE_START_ATTEMPTS)))
+        err = None
+        for attempt in range(1, attempts + 1):
+            if self._record is not None:
+                self._record["line_start_attempts"] = attempt
+            err = None if self.measurement_active else self._start_measurement(ctx)
+            if not err:
+                self._settle_measurement(ctx)
+                err = self._start_line(ctx)
+                if not err:
+                    return None
+            # Nothing was recorded (no triggers yet): close it without an export.
+            self._log(ctx).warn(
+                f"[{self.name}] {err}; closing the measurement"
+                + (f" and starting over (attempt {attempt + 1}/{attempts})."
+                   if attempt < attempts else "."))
+            self._finish_line(ctx, export=False)
+        return err
+
+    def _settle_measurement(self, ctx):
+        """Wait out whatever is left of the least gap after measurement/start."""
+        delay = float(ctx.get("gpr_line_start_delay_s", self.LINE_START_DELAY_S))
+        if self._measurement_t0 is not None:
+            delay -= time.time() - self._measurement_t0
+        if delay > 0.0:
+            self._log(ctx).info(
+                f"[{self.name}] GPR: letting the measurement settle {delay:.1f} s "
+                f"before starting the line.")
+            time.sleep(delay)
+
     def _start_measurement(self, ctx):
         if not self._connect(ctx):
             return "GPR probe connection failed"
+        self._close_stale_measurement(ctx)
         name = self._measurement_name_for()
         self._activity(ctx, "Starting the GPR line-scan measurement")
         resp = self._request(ctx, "POST", "/measurement/start",
@@ -343,17 +441,45 @@ class GprSweep:
                 f"[{self.name}] GPR app named the measurement '{echoed}' "
                 f"(asked for '{name}'); recording the requested name.")
         self._measurement_name = name
+        self._measurement_t0 = time.time()
         self.measurement_active = True
         if self._record is not None:
             self._record["measurement_name"] = name
         return None
 
     def _start_line(self, ctx):
+        """line/start, confirmed twice: the app got the probe's own start
+        (``clientStartTimestamp`` non-zero -- a 200 with 0 is a start the probe
+        never acknowledged), and GET /measurement/line reports the line running.
+        ``line_active`` follows what the app reports, so a stop is only ever
+        sent for a line that did start."""
         self._activity(ctx, "Starting the GPR scan line")
+        # A fresh measurement has no line yet. One that does is not the
+        # measurement just started, and a line started on it is not ours.
+        before = self._line_info(ctx)
+        if before and before["started"]:
+            return f"GPR measurement already holds a line before line/start ({before})"
         resp = self._request(ctx, "POST", "/measurement/line/start")
         if not self._ok(resp):
             return "GPR failed to start the scan line"
-        self.line_active = True
+        stamp = (self._data(resp) or {}).get("clientStartTimestamp")
+        timeout = float(ctx.get("gpr_line_start_confirm_s", self.LINE_START_CONFIRM_S))
+        deadline = time.time() + timeout
+        while True:
+            info = self._line_info(ctx)
+            if info and info["started"] and not info["finished"]:
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(0.5)
+        self.line_active = bool(info and info["started"])
+        if self._record is not None:
+            self._record["client_start_timestamp_ms"] = stamp
+        if not stamp:
+            return (f"GPR line/start answered without the probe's confirmation "
+                    f"(clientStartTimestamp {stamp!r})")
+        if not (info and info["started"] and not info["finished"]):
+            return f"GPR app does not report the line running after line/start (last: {info})"
         self._log(ctx).info(
             f"[{self.name}] GPR line started; traces come with the triggers, once "
             f"the plate is seated on the wall.")
@@ -367,18 +493,16 @@ class GprSweep:
         deadline = time.time() + timeout
         info = None
         while True:
-            data = self._data(self._request(ctx, "GET", "/measurement/line"))
-            if data is not None:
-                info = {k: data.get(k) for k in ("started", "finished", "scans", "length", "index")}
-                if info["finished"] or not info["started"]:
-                    self._log(ctx).info(
-                        f"[{self.name}] GPR line finished: {info['scans']} scans over "
-                        f"{info['length']} (app units).")
-                    return info
+            info = self._line_info(ctx) or info
+            if info is not None and info["finished"]:
+                self._log(ctx).info(
+                    f"[{self.name}] GPR line finished: {info['scans']} scans over "
+                    f"{info['length']} (app units).")
+                return info
             if time.time() >= deadline:
                 self._log(ctx).warn(
                     f"[{self.name}] GPR line not reported finished within {timeout:.0f} s "
-                    f"(last: {info}); exporting anyway.")
+                    f"(last: {info}).")
                 return info
             time.sleep(0.5)
 
@@ -388,7 +512,8 @@ class GprSweep:
         outcome for the manifest."""
         path = str(ctx.get("gpr_export_path", self.EXPORT_PATH))
         self._activity(ctx, "Exporting the GPR line")
-        resp = self._request(ctx, "POST", path)
+        resp = self._request(ctx, "POST", path,
+                             timeout=float(ctx.get("gpr_export_timeout_s", self.EXPORT_TIMEOUT_S)))
         result = {"ok": False,
                   "status": None if resp is None else int(resp.status_code),
                   "measurement_name": self._measurement_name}
@@ -424,11 +549,14 @@ class GprSweep:
                 f"{sensor_paths.gpr_session_incoming_dir(ctx)}.")
         return result
 
-    def _finish_line(self, ctx):
+    def _finish_line(self, ctx, export=True):
         """line/stop -> wait finished -> export (one retry) -> measurement/stop,
-        the order the GP API flow chart prescribes. A transport failure on the
-        stop means the app is unreachable: the rest is skipped rather than each
-        call waiting out its timeout. Flags are cleared regardless."""
+        the order the GP API flow chart prescribes. The line is stopped only if
+        it started, and exported only once the app reports it finished; the
+        export returns only when the zip is complete, so the measurement stop
+        never lands on a running export. A transport failure on the stop means
+        the app is unreachable: the rest is skipped rather than each call
+        waiting out its timeout. Flags are cleared regardless."""
         if not (self.line_active or self.measurement_active):
             return
         log = self._log(ctx)
@@ -440,11 +568,21 @@ class GprSweep:
             reachable = resp is not None
             if not self._ok(resp):
                 log.warn(f"[{self.name}] GPR line stop failed.")
+            finished = False
             if reachable:
                 line_info = self._wait_line_finished(ctx)
+                finished = bool(line_info and line_info["finished"])
                 if self._record is not None:
                     self._record["probe_line"] = line_info
-            if reachable and bool(ctx.get("gpr_export_enabled", True)):
+            want_export = export and bool(ctx.get("gpr_export_enabled", True))
+            if reachable and want_export and not finished:
+                log.warn(
+                    f"[{self.name}] GPR line never reported finished; not exporting. "
+                    f"The traces stay on the app under '{self._measurement_name}'.")
+                if self._record is not None:
+                    self._record["export"] = {"ok": False, "skipped": "line not finished",
+                                              "measurement_name": self._measurement_name}
+            if reachable and want_export and finished:
                 time.sleep(float(ctx.get("gpr_export_delay_s", self.EXPORT_DELAY_S)))
                 export = self._export(ctx)
                 if not export["ok"]:

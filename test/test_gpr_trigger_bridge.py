@@ -104,9 +104,12 @@ def test_a_dead_bridge_refuses_the_segment_before_anything_starts(state):
         gpr_trigger_bridge_status_stamp=time.time(),
         gpr_enabled=True,
     )
-    reason = state.begin_segment(ctx, 0, 0, 0, (0.0, 0.0, 1.0), (1.0, 0.0, 1.0), "map")
+    reason = state.open_measurement(ctx, 0, 0, 0)
     assert "not answering" in reason
     assert not state.measurement_active and not state.armed
+    # ... and again at the line start, in case it died during the approach.
+    reason = state.start_line(ctx, (0.0, 0.0, 1.0), (1.0, 0.0, 1.0), "map")
+    assert "not answering" in reason
 
 
 # ----------------------------------------------------------------------
