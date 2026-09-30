@@ -168,7 +168,9 @@ class ScanWall(State):
         self._nav_goal_handle = None   # in-flight base goal, so it can be cancelled
         self._preapproach_standoff = None   # plate standoff before arm_approach
         self._transit_goal = None    # base goal for the pending transit
-        self._folded_for_transit = False   # arm tucked away for the base move
+        # Is the arm known to be in the fold pose? Set only once a fold has
+        # settled; parking requires it (see _begin_park_phase).
+        self._arm_folded = False
         # Is the arm actually out in the scanning pose? ArmUnfolding now hands the
         # arm over FOLDED for wall scans (it would only be folded again for the
         # first transit), so this state can no longer assume the pre-approach left
@@ -278,7 +280,7 @@ class ScanWall(State):
         self._nav_goal_handle = None
         self._preapproach_standoff = None
         self._transit_goal = None
-        self._folded_for_transit = False
+        self._arm_folded = False
         self._arm_unfolded = False
         self._sweep_from = None
         self._sweep_to = None
@@ -1127,21 +1129,29 @@ class ScanWall(State):
         self._park_saw_active = False
         self._park_wait_start = None
 
-    def _begin_park_phase(self):
-        """Enter the "park" phase — unfolding first if the arm is still tucked away.
+    def _begin_park_phase(self, ctx):
+        """Enter the park — folding first unless the arm is known to be folded.
 
         Three paths arrive here: the transit was not needed, the transit goal was
-        recomputed as unnecessary, or the transit finished. Since the pre-approach
-        deliberately leaves the arm folded whenever the transit would fold it
-        anyway, none of them may assume the arm is out — and parking leads straight
-        into the sweep, which with a folded arm would drag the plate nowhere near
-        the wall. ``transit_unfold`` comes back through here once the arm is out.
+        recomputed as unnecessary, or the transit finished. The park always runs
+        with the arm folded: rotating the chassis with the arm out sometimes put
+        the plate into the wall, the turret's compensation notwithstanding. So an
+        arm that is out, or whose pose is unknown (a new line inherits the
+        post-scan retract, which leaves it in unfolded_fsm), is folded first.
+        The unfold comes after the park (_after_park_phase), which also covers
+        the pre-approach leaving the arm folded: the sweep, with a folded arm,
+        would drag the plate nowhere near the wall.
         """
-        if not self._arm_unfolded:
-            self._seg_phase = "transit_unfold"
-            return
         self._reset_park_state()
-        self._seg_phase = "park"
+        if not bool(ctx.get("scan_wall_park_base", True)):
+            # Nothing rotates, so there is nothing to fold for.
+            self._after_park_phase()
+            return
+        self._seg_phase = "park" if self._arm_folded else "park_fold"
+
+    def _after_park_phase(self):
+        """Unfold for the sweep unless the arm is already out."""
+        self._seg_phase = "sweep_setup" if self._arm_unfolded else "unfold"
 
     def _run_parking(self, ctx):
         """Align the diff-drive chassis with the turret before the sweep.
@@ -1309,9 +1319,9 @@ class ScanWall(State):
         # When the transit folds the arm anyway, unfolding now is pure waste: the
         # first thing the segment loop does is send folded_fsm again. Leave the arm
         # where it is and let the loop unfold once, after the base has arrived.
-        # Safe because every path out of "transit_clear" unfolds before it sweeps —
-        # the transit path via transit_unfold, the no-transit path via the
-        # _arm_unfolded check. Nothing downstream may assume the arm is out.
+        # Safe because every path out of "transit_clear" goes through the park,
+        # which unfolds after it (see _begin_park_phase). Nothing downstream may
+        # assume the arm is out.
         # The column still moves below: folded is the safest pose to raise it in.
         if not self.pose_reached and self._fold_for_transit(ctx):
             self.current_line_z = self._resolve_current_line_z(ctx)
@@ -1374,6 +1384,7 @@ class ScanWall(State):
                 ctx["execution_status"] = False
                 self.pose_reached = True
                 self._arm_unfolded = True
+                self._arm_folded = False
                 self._capture_unfolded_joints(ctx)
                 node.get_logger().info(f"[{self.name}] Arm at unfolded_fsm pose.")
             else:
@@ -1586,7 +1597,7 @@ class ScanWall(State):
                     f"[{self.name}] Base already at segment {self._seg_idx + 1} start; "
                     f"skipping transit."
                 )
-                self._begin_park_phase()
+                self._begin_park_phase(ctx)
                 return
 
             if self._fold_for_transit(ctx):
@@ -1599,7 +1610,7 @@ class ScanWall(State):
                 if not self._send_named_pose(
                         ctx, str(ctx.get("scan_wall_fold_pose", "folded_fsm"))):
                     return
-                self._folded_for_transit = True
+                self._arm_unfolded = False
                 self._seg_phase = "transit_fold_wait"
                 return
 
@@ -1648,44 +1659,11 @@ class ScanWall(State):
                     f"[{self.name}] Could not fold the arm; skipping segment "
                     f"{self._seg_idx + 1} rather than transiting with it extended."
                 )
-                self._folded_for_transit = False
                 self._seg_idx += 1
                 self._seg_phase = "transit_clear"
                 return
-            self._arm_unfolded = False
+            self._arm_folded = True
             self._seg_phase = "transit"
-            return
-
-        if self._seg_phase == "transit_unfold":
-            self.set_activity(
-                ctx,
-                f"Unfolding the arm at wall segment {seg_no}/{seg_total}",
-                progress_current=seg_no,
-                progress_total=seg_total,
-            )
-            if not self._send_named_pose(ctx, "unfolded_fsm"):
-                return
-            self._seg_phase = "transit_unfold_wait"
-            return
-
-        if self._seg_phase == "transit_unfold_wait":
-            outcome = self._named_pose_settled(ctx)
-            if outcome == "wait":
-                return
-            self._arm_goal_start = None
-            self._folded_for_transit = False
-            if outcome == "done":
-                self._arm_unfolded = True
-                self._capture_unfolded_joints(ctx)
-            if outcome == "failed":
-                node.get_logger().error(
-                    f"[{self.name}] Could not unfold the arm after the transit; "
-                    f"skipping segment {self._seg_idx + 1}."
-                )
-                self._seg_idx += 1
-                self._seg_phase = "transit_clear"
-                return
-            self._begin_park_phase()
             return
 
         if self._seg_phase == "transit":
@@ -1706,7 +1684,7 @@ class ScanWall(State):
             if goal_xy is None:
                 needed, goal_xy = self._transit_goal_for(ctx, seg_start)
                 if not needed:
-                    self._begin_park_phase()
+                    self._begin_park_phase(ctx)
                     return
             node.get_logger().info(
                 f"[{self.name}] Transit to segment {self._seg_idx + 1}/{len(self._segments)} "
@@ -1722,10 +1700,7 @@ class ScanWall(State):
                 return
             if self._nav_status == GoalStatus.STATUS_SUCCEEDED:
                 self._transit_goal = None
-                if self._folded_for_transit:
-                    self._seg_phase = "transit_unfold"
-                    return
-                self._begin_park_phase()
+                self._begin_park_phase(ctx)
             else:
                 node.get_logger().warn(
                     f"[{self.name}] Transit to segment {self._seg_idx + 1} failed "
@@ -1735,13 +1710,46 @@ class ScanWall(State):
                 self._seg_phase = "transit_clear"
             return
 
+        if self._seg_phase == "park_fold":
+            self.set_activity(
+                ctx,
+                f"Folding the arm before parking at wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            if not self._send_named_pose(
+                    ctx, str(ctx.get("scan_wall_fold_pose", "folded_fsm"))):
+                return
+            self._arm_unfolded = False
+            self._seg_phase = "park_fold_wait"
+            return
+
+        if self._seg_phase == "park_fold_wait":
+            outcome = self._named_pose_settled(ctx)
+            if outcome == "wait":
+                return
+            self._arm_goal_start = None
+            if outcome == "failed":
+                # Same trade as the transit fold: one stretch of wall is cheaper
+                # than rotating the chassis with the plate out by the wall.
+                node.get_logger().error(
+                    f"[{self.name}] Could not fold the arm; skipping segment "
+                    f"{self._seg_idx + 1} rather than parking with it extended."
+                )
+                self._seg_idx += 1
+                self._seg_phase = "transit_clear"
+                return
+            self._arm_folded = True
+            self._seg_phase = "park"
+            return
+
         if self._seg_phase == "park":
             # Square the diff-drive chassis to the wall now that the base has reached the
             # segment start (transit done/skipped). Parking is the LAST base motion before
             # the sweep — nothing navigates the base back to the segment start afterwards —
-            # so the alignment is preserved. The arm is already in the unfolded_fsm pose;
-            # the turret joint compensates to hold it world-stationary while the chassis
-            # rotates. Driven by _run_parking's enable->request->settle->disable sequence.
+            # so the alignment is preserved. The arm is folded (see _begin_park_phase) and
+            # unfolds only once the chassis has stopped. Driven by _run_parking's
+            # enable->request->settle->disable sequence.
             self.set_activity(
                 ctx,
                 f"Parking chassis to square it against wall segment {seg_no}/{seg_total}",
@@ -1750,7 +1758,38 @@ class ScanWall(State):
             )
             self._run_parking(ctx)
             if self.park_done:
-                self._seg_phase = "sweep_setup"
+                self._after_park_phase()
+            return
+
+        if self._seg_phase == "unfold":
+            self.set_activity(
+                ctx,
+                f"Unfolding the arm at wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            if not self._send_named_pose(ctx, "unfolded_fsm"):
+                return
+            self._arm_folded = False
+            self._seg_phase = "unfold_wait"
+            return
+
+        if self._seg_phase == "unfold_wait":
+            outcome = self._named_pose_settled(ctx)
+            if outcome == "wait":
+                return
+            self._arm_goal_start = None
+            if outcome == "failed":
+                node.get_logger().error(
+                    f"[{self.name}] Could not unfold the arm after parking; "
+                    f"skipping segment {self._seg_idx + 1}."
+                )
+                self._seg_idx += 1
+                self._seg_phase = "transit_clear"
+                return
+            self._arm_unfolded = True
+            self._capture_unfolded_joints(ctx)
+            self._seg_phase = "sweep_setup"
             return
 
         if self._seg_phase == "sweep_setup":

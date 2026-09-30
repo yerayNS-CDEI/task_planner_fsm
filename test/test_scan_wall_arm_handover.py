@@ -7,7 +7,7 @@ the pre-approach left the arm extended.
 
 The failure this guards against is silent. Nothing errors if the sweep starts
 folded — the plate simply sits nowhere near the wall and the whole segment is
-scanned as garbage. So every path that reaches "park" (and from there the sweep)
+scanned as garbage. So every path through "park" (and from there the sweep)
 is pinned here, not just the common one.
 """
 
@@ -43,28 +43,63 @@ def ctx_for(node, **overrides):
 
 
 # ---------------------------------------------------------------- park guard
+#
+# The park runs with the arm folded (rotating the chassis with it out has put the
+# plate into the wall) and the unfold follows it. Both halves are pinned: a park
+# with the arm out, and a sweep with it folded.
 
-def test_park_unfolds_first_when_the_arm_is_still_folded(state):
-    """The core of the handover change: no transit to unfold it, so park must."""
-    state._arm_unfolded = False
-    state._begin_park_phase()
-    assert state._seg_phase == "transit_unfold", (
-        "a folded arm reached the sweep: the plate would never touch the wall")
-
-
-def test_park_proceeds_directly_once_the_arm_is_out(state):
+def test_park_folds_first_when_the_arm_is_out(state, node):
     state._arm_unfolded = True
-    state._begin_park_phase()
+    state._arm_folded = False
+    state._begin_park_phase(ctx_for(node))
+    assert state._seg_phase == "park_fold", "the chassis would rotate with the arm out"
+
+
+def test_park_folds_first_when_the_arm_pose_is_unknown(state, node):
+    """A new line starts here: the post-scan retract left the arm in unfolded_fsm,
+    but nothing on this entry has seen it, so neither flag is set."""
+    state._arm_unfolded = False
+    state._arm_folded = False
+    state._begin_park_phase(ctx_for(node))
+    assert state._seg_phase == "park_fold"
+
+
+def test_park_proceeds_directly_when_the_arm_is_folded(state, node):
+    state._arm_folded = True
+    state._begin_park_phase(ctx_for(node))
     assert state._seg_phase == "park"
 
 
-def test_park_resets_the_parking_cycle_it_is_about_to_run(state):
-    """Guard against the unfold detour skipping _reset_park_state: a stale
-    park_done from the previous segment would skip chassis alignment entirely."""
+def test_the_arm_unfolds_after_the_park(state):
+    """The core of the handover change: nothing else unfolds it before the sweep."""
+    state._arm_unfolded = False
+    state._after_park_phase()
+    assert state._seg_phase == "unfold", (
+        "a folded arm reached the sweep: the plate would never touch the wall")
+
+
+def test_the_sweep_follows_the_park_when_the_arm_is_already_out(state):
     state._arm_unfolded = True
+    state._after_park_phase()
+    assert state._seg_phase == "sweep_setup"
+
+
+def test_no_fold_when_parking_is_disabled(state, node):
+    """Nothing rotates, so the fold would be pure waste — but the unfold still
+    has to happen."""
+    state._arm_unfolded = False
+    state._arm_folded = True
+    state._begin_park_phase(ctx_for(node, scan_wall_park_base=False))
+    assert state._seg_phase == "unfold"
+
+
+def test_park_resets_the_parking_cycle_it_is_about_to_run(state, node):
+    """Guard against the fold detour skipping _reset_park_state: a stale
+    park_done from the previous segment would skip chassis alignment entirely."""
+    state._arm_folded = False
     state.park_done = True
     state._park_phase = "settle"
-    state._begin_park_phase()
+    state._begin_park_phase(ctx_for(node))
     assert not state.park_done and state._park_phase == "enable"
 
 
