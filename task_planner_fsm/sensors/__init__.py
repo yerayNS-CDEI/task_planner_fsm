@@ -75,6 +75,22 @@ class VendorUnavailable(RuntimeError):
     """
 
 
+def _headless_plots():
+    """Render the pipelines' figures to files only (matplotlib's Agg backend).
+
+    The GPR pipelines draw B-scans with pyplot and only ever save them. With a
+    DISPLAY set -- fsm_node started from the desktop UI -- pyplot picks an X11
+    backend instead, and a figure the X server refuses (X_CreatePixmap
+    BadValue) kills the whole process: from SensorDataProcessing's background
+    thread, that is the FSM. No state shows a matplotlib window.
+    """
+    try:
+        import matplotlib
+    except ImportError:
+        return                          # require() reports it where it matters
+    matplotlib.use("Agg", force=True)
+
+
 def import_vendor(module_name):
     """Import a vendored module (``"gpr_integration"``, ``"hsi_integration"``...).
 
@@ -83,6 +99,7 @@ def import_vendor(module_name):
     as "install requirements-sensors.txt", not as a traceback.
     """
     bootstrap_vendor_path()
+    _headless_plots()
     try:
         return importlib.import_module(module_name)
     except ImportError as exc:

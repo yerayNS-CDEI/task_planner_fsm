@@ -1,0 +1,22 @@
+{
+  "hyperbola_detected": true,
+  "n_valid_detections": 2,
+  "detections": [
+    {
+      "id": "H001",
+      "type": "hyperbola",
+      "position": {"x_m": 0.55, "x_cm": 55.0, "x_relative": 0.31},
+      "depth": {"depth_cm": 4.2},
+      "geometry": {"arc_half_width_m": 0.12},
+      "robustness": {"confidence_mean": 0.93}
+    },
+    {
+      "id": "H002",
+      "type": "hyperbola",
+      "position": {"x_m": 1.12, "x_cm": 112.0, "x_relative": 0.63},
+      "depth": {"depth_cm": 7.8},
+      "geometry": {"arc_half_width_m": 0.10},
+      "robustness": {"confidence_mean": 0.88}
+    }
+  ]
+}

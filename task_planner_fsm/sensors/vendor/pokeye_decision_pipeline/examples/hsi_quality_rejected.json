@@ -1,0 +1,10 @@
+{
+  "sensor": "hyperspectral",
+  "confidence_threshold": 0.8,
+  "sample_index": 0,
+  "detected": false,
+  "material": null,
+  "confidence": null,
+  "status": "quality_rejected",
+  "reason": "control de calidad físico (rango, media o máximo de reflectancia fuera de umbral)"
+}

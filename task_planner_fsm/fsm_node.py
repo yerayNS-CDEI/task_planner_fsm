@@ -62,6 +62,7 @@ from task_planner_fsm.states.proc_utils import (
     wait_services_ready,
     ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
 )
+from task_planner_fsm.sensors import paths as sensor_paths
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
 from task_planner_fsm.utils.wall_geometry import build_wall_data, left_scan_endpoint
 
@@ -156,6 +157,13 @@ NAV_CLIENT_BOOTSTRAP_STATES = {
     "HomePosition",
 }
 
+# States that work on what is already on disk and touch no hardware. Starting
+# at one of these is an offline run: no robot stack is launched, nothing
+# prompts for walls, and the run ends there (fsm_stop_after) instead of
+# carrying on into ArmFolding / SendDataToPokeye. See
+# _bootstrap_sensor_processing.
+OFFLINE_INITIAL_STATES = {"SensorDataProcessing"}
+
 # GeometryReconstruction is the first state of the wall-processing/scanning
 # pipeline: it itself only needs navi_wall's detected_walls.yaml on disk, but it
 # flows straight into ComputeWallPoints -> WallTargetSelection -> NavigateToTarget,
@@ -165,7 +173,7 @@ NAV_CLIENT_BOOTSTRAP_STATES = {
 NAV_SIM_REQUIRED_START_STATES = {
     s
     for s in FSM_STATE_ORDER[FSM_STATE_ORDER.index("GeometryReconstruction") :]
-    if s not in {"Finished", "Error"}
+    if s not in {"Finished", "Error"} | OFFLINE_INITIAL_STATES
 }
 
 # States a restart (/fsm/restart, from Error or Finished only) may start a new
@@ -223,6 +231,17 @@ RESTART_KEPT_HANDLE_TYPES = (
     Timer,
     subprocess.Popen,
 )
+
+
+class BootstrapError(RuntimeError):
+    """The bootstrap could not assemble what the initial state needs.
+
+    Raised instead of flagging ``error_triggered``, because the first state's
+    ``on_enter`` clears that flag and would run anyway -- for a bench start
+    that means unfolding the arm with no wall to sweep. Whatever the bootstrap
+    launched has already been stopped when this is raised.
+    """
+
 
 
 # Fallback walls, only used when navi_wall's detected_walls.yaml cannot be
@@ -1034,6 +1053,109 @@ class RobotFSMNode(Node):
                 f"[FSM] Failed to start navigation + localization simulation during bootstrap: {exc}"
             )
 
+    def _bootstrap_sensor_processing(self):
+        """Point SensorDataProcessing at a recorded session and run it alone.
+
+        The state reads everything from disk: the hyperspectral session
+        (``hyperspectral_session_dir``), the GPR line manifest that shares its
+        stamp with its own exports, and whatever GP8800 exports sit in the
+        shared ``data/raw/gpr/incoming``. Unless a session is named explicitly
+        (``-p hyperspectral_session_dir:=...`` or ``-p sensor_session_id:=...``)
+        the most recent one under ``data/raw/hyperspectral`` is taken, which is
+        what "process what we just recorded" means after a bench run or a
+        mission that was cut short. With no hyperspectral record at all -- a
+        sweep with the camera off, so GPR only -- the most recent
+        ``data/raw/gpr/session_<stamp>/`` with a manifest is taken instead;
+        otherwise the fresh stamp minted for the run would point the GPR phase
+        at an empty folder. Results land in
+        ``data/processed/session_<same stamp>/``.
+
+        No robot: no stack is launched, and the run ends in Finished rather
+        than folding an arm that was never unfolded. The legacy simulation mock
+        is disabled so a real record is never replaced by the fake verdict, and
+        hyperspectral processing is forced on (the camera is off by definition
+        when re-processing).
+        """
+        explicit = self.ctx.get("hyperspectral_session_dir")
+        explicit_id = self.ctx.get("sensor_session_id")
+        if explicit:
+            session = os.path.expanduser(str(explicit))
+            if not os.path.isdir(session):
+                self._abort_bootstrap(f"hyperspectral_session_dir '{session}' does not exist")
+            self.get_logger().info(f"[FSM Bootstrap] Processing the session given: {session}")
+        elif explicit_id not in (None, ""):
+            # A GPR-only session named by its stamp (or its folder's name, for a
+            # record renamed by hand): the manifest and the exports live under it.
+            self.ctx["sensor_session_id"] = str(explicit_id)
+            gpr_dir = sensor_paths.gpr_session_dir(self.ctx)
+            if not gpr_dir.is_dir():
+                self._abort_bootstrap(f"sensor_session_id '{explicit_id}': {gpr_dir} does not exist")
+            self.get_logger().info(
+                f"[FSM Bootstrap] Processing the GPR session given: {gpr_dir} "
+                f"(no hyperspectral record; the GPR half only)")
+        else:
+            latest = sensor_paths.latest_raw_session_dir(self.ctx)
+            if latest is None:
+                latest_gpr = sensor_paths.latest_gpr_session_dir(self.ctx)
+                if latest_gpr is None:
+                    self.get_logger().warn(
+                        f"[FSM Bootstrap] No recorded session under "
+                        f"{sensor_paths.raw_hyperspectral_root(self.ctx)} or "
+                        f"{sensor_paths.raw_gpr_root(self.ctx)}; only GPR exports "
+                        f"in the shared inbox {sensor_paths.gpr_incoming_dir(self.ctx)} will "
+                        f"be processed."
+                    )
+                else:
+                    self.ctx["sensor_session_id"] = sensor_paths.session_stamp_of(latest_gpr)
+                    others = len(sensor_paths.gpr_session_dirs(self.ctx)) - 1
+                    self.get_logger().info(
+                        f"[FSM Bootstrap] No hyperspectral record; processing the latest "
+                        f"GPR session: {latest_gpr}"
+                        + (f" ({others} other GPR session(s) left alone; name one with "
+                           f"-p sensor_session_id:=<stamp> to process it instead)"
+                           if others else "")
+                    )
+            else:
+                session = str(latest)
+                self.ctx["hyperspectral_session_dir"] = session
+                others = len(sensor_paths.raw_session_dirs(self.ctx)) - 1
+                self.get_logger().info(
+                    f"[FSM Bootstrap] Processing the latest recorded session: {session}"
+                    + (f" ({others} older session(s) left alone; name one with "
+                       f"-p hyperspectral_session_dir:=<dir> to process it instead)"
+                       if others else "")
+                )
+        # Every wall in the record: there is no "wall just scanned" here.
+        self.ctx.setdefault("current_wall_index", None)
+        self.ctx.setdefault("sensor_processing_mock", False)
+        # Processing a recorded session IS the point here, so the phase runs even
+        # though the camera is off (hyperspectral_enabled, which normally gates
+        # it -- see SensorDataProcessing._hyperspectral_processing_enabled).
+        # setdefault: -p hyperspectral_processing_enabled:=false still wins, for
+        # re-running only the GPR half over an existing session.
+        self.ctx.setdefault("hyperspectral_processing_enabled", True)
+        self.ctx.setdefault("fsm_stop_after", "SensorDataProcessing")
+        self.get_logger().info(
+            f"[FSM Bootstrap] Offline run: no robot stack; the FSM finishes after "
+            f"{self.ctx['fsm_stop_after']}."
+        )
+
+    def _abort_bootstrap(self, reason: str):
+        """Stop whatever the bootstrap launched and refuse to start the machine.
+
+        On a restart nothing is stopped: the robot stack belongs to the session,
+        not to the run, and the restart is only refused (see _perform_restart).
+        """
+        if getattr(self, "_restarting", False):
+            self.get_logger().error(f"[FSM Bootstrap] {reason}; not restarting the FSM.")
+            raise BootstrapError(reason)
+        self.get_logger().error(f"[FSM Bootstrap] {reason}; not starting the FSM.")
+        try:
+            stop_all(self.ctx)
+        except Exception as exc:   # noqa: BLE001 - report, then still refuse
+            self.get_logger().warn(f"[FSM Bootstrap] cleanup after the failure: {exc}")
+        raise BootstrapError(reason)
+
     def _ensure_nav_client(self):
         if self.ctx.get("nav_client") is None:
             self.ctx["nav_client"] = ActionClient(self, NavigateToPose, "/navigate_to_pose")
@@ -1069,6 +1191,10 @@ class RobotFSMNode(Node):
         )
         # Skip external start gate when starting from any non-initial state.
         self.ctx["start"] = True
+
+        if initial_state in OFFLINE_INITIAL_STATES:
+            self._bootstrap_sensor_processing()
+            return
 
         if initial_state in WALL_DATA_REQUIRED_INITIAL_STATES:
             walls_data = self._prompt_walls_data()
@@ -1268,6 +1394,7 @@ class RobotFSMNode(Node):
             )
         self._reset_ctx_for_restart(target)
 
+        self._restarting = True
         try:
             self._bootstrap_context_for_initial_state(target, request.get("scan_phase"))
             if self.ctx.get("error_triggered"):
@@ -1281,6 +1408,8 @@ class RobotFSMNode(Node):
             self.publish_fsm_status(dict(self.ctx["_fsm_status"]))
             self._reject_restart(f"bootstrap for {target} failed: {reason}", level="error")
             return
+        finally:
+            self._restarting = False
 
         self.initial_state = target
         self.machine.restart(target, reason=f"restart_run_{self._run_index}")
@@ -1487,12 +1616,18 @@ def main(args=None):
     # Initialize rclpy with remaining args (ROS-specific arguments)
     rclpy.init(args=remaining_args)
 
-    node = RobotFSMNode(
-        sim=sim,
-        initial_state=parsed_args.initial_state,
-        scan_phase=parsed_args.scan_phase,
-        planner_backend=parsed_args.planner_backend,
-    )
+    try:
+        node = RobotFSMNode(
+            sim=sim,
+            initial_state=parsed_args.initial_state,
+            scan_phase=parsed_args.scan_phase,
+            planner_backend=parsed_args.planner_backend,
+        )
+    except BootstrapError as exc:
+        # Already logged and cleaned up by the bootstrap; exit without a
+        # traceback so the cause is the last line on the terminal.
+        rclpy.shutdown()
+        sys.exit(f"[FSM] bootstrap failed: {exc}")
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

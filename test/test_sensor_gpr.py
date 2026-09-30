@@ -1,0 +1,270 @@
+"""GPR post-processing plumbing: the line manifest ScanWall writes, matching
+exported scans to lines, and putting a scan-local x back on the wall. The
+pipelines themselves are not run here (they need torch/obspy and a real SEGY)."""
+
+import importlib.util
+import json
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from task_planner_fsm.sensors import gpr, manifest, paths
+
+
+# ----------------------------------------------------------------------
+# paths / session
+# ----------------------------------------------------------------------
+def test_session_id_is_adopted_from_the_hyperspectral_session(tmp_path):
+    ctx = {"sensor_data_dir": str(tmp_path),
+           "hyperspectral_session_dir": "/somewhere/session_20260914_153000"}
+    assert paths.session_id(ctx) == "20260914_153000"
+    assert ctx["sensor_session_id"] == "20260914_153000"
+    assert paths.processed_dir(ctx) == tmp_path / "processed" / "session_20260914_153000"
+    assert paths.gpr_manifest_path(ctx) == (
+        tmp_path / "raw" / "gpr" / "session_20260914_153000" / "gpr_lines.jsonl")
+    assert paths.gpr_incoming_dir(ctx) == tmp_path / "raw" / "gpr" / "incoming"
+    assert paths.gpr_session_incoming_dir(ctx) == (
+        tmp_path / "raw" / "gpr" / "session_20260914_153000" / "incoming")
+    assert paths.gpr_incoming_dirs(ctx) == [
+        paths.gpr_session_incoming_dir(ctx), paths.gpr_incoming_dir(ctx)]
+
+
+def test_session_id_is_minted_once_and_cached(tmp_path):
+    ctx = {"sensor_data_dir": str(tmp_path)}
+    first = paths.session_id(ctx)
+    assert paths.session_id(ctx) == first
+    assert len(first) == len("20260914_153000")
+
+
+def test_model_paths_follow_the_overrides(tmp_path):
+    assert paths.gpr_weights_path({}) == paths.PACKAGE_ROOT / "models" / "gpr" / "best.pt"
+    assert paths.hsi_model_path({"sensor_models_dir": str(tmp_path)}) == tmp_path / "hsi" / "classifier.joblib"
+    assert paths.gpr_weights_path({"gpr_weights_path": "~/w.pt"}) == Path(os.path.expanduser("~/w.pt"))
+
+
+# ----------------------------------------------------------------------
+# manifest
+# ----------------------------------------------------------------------
+def test_manifest_rows_round_trip_with_a_stable_key(tmp_path):
+    ctx = {"sensor_data_dir": str(tmp_path), "sensor_session_id": "s1"}
+    path = manifest.append_gpr_line(ctx, {
+        "wall_index": 2, "line_idx": 1, "seg_idx": 0,
+        "seg_start": [0.0, 0.0, 1.0], "seg_end": [2.0, 0.0, 1.0],
+        "t_start_epoch": 100.0, "t_stop_epoch": 130.0,
+    })
+    manifest.append_gpr_line(ctx, {"wall_index": 2, "line_idx": 1, "seg_idx": 1})
+    rows = manifest.read_gpr_lines(path)
+    assert [r["key"] for r in rows] == ["w02_l01_s00", "w02_l01_s01"]
+    assert rows[0]["seg_end"] == [2.0, 0.0, 1.0]
+    assert "t_written" in rows[0]
+    assert manifest.line_key(None, 0, 0) == "wxx_l00_s00"
+    assert manifest.read_gpr_lines(tmp_path / "nope.jsonl") == []
+
+
+# ----------------------------------------------------------------------
+# matching
+# ----------------------------------------------------------------------
+def _touch_scan(folder, stem, mtime, sidecar=True):
+    folder.mkdir(parents=True, exist_ok=True)
+    sgy = folder / f"{stem}.sgy"
+    sgy.write_bytes(b"segy")
+    os.utime(sgy, (mtime, mtime))
+    if sidecar:
+        (folder / f"{stem}.csv").write_text("meta")
+    return sgy
+
+
+def test_only_scans_with_a_sidecar_are_found_oldest_first(tmp_path):
+    _touch_scan(tmp_path, "b", 200)
+    _touch_scan(tmp_path, "a", 100)
+    _touch_scan(tmp_path, "orphan", 150, sidecar=False)
+    found = gpr.find_scan_files(tmp_path)
+    assert [f["stem"] for f in found] == ["a", "b"]
+    assert gpr.find_scan_files(tmp_path / "missing") == []
+
+
+def test_scans_are_found_across_the_session_folder_and_the_shared_inbox(tmp_path):
+    own, shared = tmp_path / "session" / "incoming", tmp_path / "incoming"
+    own.mkdir(parents=True); shared.mkdir()
+    _touch_scan(shared, "old", 100)
+    _touch_scan(own, "mine", 200)
+    found = gpr.find_scan_files([own, shared, tmp_path / "missing", own])
+    assert [f["stem"] for f in found] == ["old", "mine"]          # oldest first, no duplicates
+    assert gpr.find_scan_files(own) == [found[1]]                 # a single folder still works
+
+
+def test_export_zip_is_unpacked_flat_under_the_line_key(tmp_path):
+    """The app's export nests everything in a folder named after the
+    measurement; the pipeline wants <stem>.sgy + <stem>.csv flat in the
+    incoming folder, and the line key in the name is what the matcher keys on."""
+    import zipfile
+    zip_path = tmp_path / "export.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("GPR API Test002_20260916/GPR API Test002_20260916.sgy", b"segy")
+        zf.writestr("GPR API Test002_20260916/GPR API Test002_20260916.csv", b"csv")
+        zf.writestr("GPR API Test002_20260916/GPR API Test002_20260916.json", b"{}")
+        zf.writestr("GPR API Test002_20260916/thumb.png", b"png")     # not wanted
+        zf.writestr("../escape.sgy", b"x")                            # basename only
+    incoming = tmp_path / "incoming"
+    written = gpr.unpack_export(zip_path, incoming, "w02_l01_s00")
+    names = sorted(os.path.basename(w) for w in written)
+    assert names == [
+        "w02_l01_s00_GPR API Test002_20260916.csv",
+        "w02_l01_s00_GPR API Test002_20260916.json",
+        "w02_l01_s00_GPR API Test002_20260916.sgy",
+        "w02_l01_s00_escape.sgy",
+    ]
+    assert not (tmp_path / "escape.sgy").exists()
+    # the .sgy is written last, after its sidecar
+    assert written[-1].endswith(".sgy") and written[0].endswith((".csv", ".json"))
+    found = gpr.find_scan_files(incoming)
+    assert [f["stem"] for f in found] == ["w02_l01_s00_GPR API Test002_20260916"]
+    lines = [{"key": "w02_l01_s00", "measurement_name": "scan_wall line 2 seg 1001"}]
+    assert gpr.match_files_to_lines(found, lines)[0][1]["key"] == "w02_l01_s00"
+
+
+def test_scans_match_lines_by_name_first_then_by_time(tmp_path):
+    lines = [
+        {"key": "w02_l00_s00", "measurement_name": "scan_wall line 1 seg 1", "t_start_epoch": 100},
+        {"key": "w02_l01_s00", "measurement_name": "scan_wall line 2 seg 1", "t_start_epoch": 200},
+        {"key": "w02_l02_s00", "measurement_name": "scan_wall line 3 seg 1", "t_start_epoch": 300},
+    ]
+    files = [
+        {"stem": "export_W02_L01_S00", "mtime": 50, "sgy": "x"},      # name wins over time
+        {"stem": "GP8800_0007", "mtime": 250, "sgy": "y"},            # after line 2 started
+        {"stem": "GP8800_0008", "mtime": 320, "sgy": "z"},            # after line 3
+        {"stem": "GP8800_0009", "mtime": 330, "sgy": "w"},            # nothing left
+    ]
+    pairs = dict((f["stem"], (ln or {}).get("key")) for f, ln in gpr.match_files_to_lines(files, lines))
+    assert pairs["export_W02_L01_S00"] == "w02_l01_s00"
+    assert pairs["GP8800_0007"] == "w02_l00_s00"     # line 2 already taken by name; latest free start <= 250 is line 1
+    assert pairs["GP8800_0008"] == "w02_l02_s00"
+    assert pairs["GP8800_0009"] is None              # every line is taken
+
+
+def test_a_scan_older_than_every_line_is_unassociated():
+    pairs = gpr.match_files_to_lines([{"stem": "old", "mtime": 10, "sgy": "o"}],
+                                     [{"key": "k", "t_start_epoch": 100}])
+    assert pairs == [({"stem": "old", "mtime": 10, "sgy": "o"}, None)]
+
+
+# ----------------------------------------------------------------------
+# geo-referencing
+# ----------------------------------------------------------------------
+def test_scan_x_is_placed_along_the_segment():
+    assert gpr.scan_to_map(0.5, [0, 0, 1.2], [2, 0, 1.2]) == [0.5, 0.0, 1.2]
+    # Direction from the segment, not the axes; z is the segment's.
+    assert gpr.scan_to_map(1.0, [0, 0, 0.8], [0, -3, 0.8]) == [0.0, -1.0, 0.8]
+    # Degenerate segment: stay at the start rather than divide by zero.
+    assert gpr.scan_to_map(1.0, [1, 1, 1], [1, 1, 1]) == [1.0, 1.0, 1.0]
+
+
+def test_hyperbolae_are_compacted_and_geo_referenced():
+    vendor_result = {
+        "hyperbola_detected": True, "n_valid_detections": 1,
+        "calibration": {"scan_distance_m": 2.0},
+        "detections": [{
+            "id": "H001", "position": {"x_m": 0.8, "x_relative": 40.0},
+            "depth": {"depth_cm": 6.1},
+            "robustness": {"gain_support": 1, "confidence_max": 0.91, "confidence_mean": 0.91},
+        }],
+    }
+    line = {"seg_start": [1.0, 2.0, 1.0], "seg_end": [3.0, 2.0, 1.0]}
+    out = gpr._compact_hyperbolae(vendor_result, line)
+    assert out["n"] == 1 and out["detected"] is True
+    assert out["detections"][0]["position_map"] == [1.8, 2.0, 1.0]
+    assert out["detections"][0]["depth_cm"] == 6.1
+    # Without a line there is nothing to place it with.
+    assert "position_map" not in gpr._compact_hyperbolae(vendor_result, None)["detections"][0]
+
+
+def test_map_transform_is_none_when_the_line_has_no_geometry():
+    """One rule for whether a scan can be placed at all, shared by the compact
+    detections and the NO_DRILL constraints."""
+    assert gpr.map_transform(None) is None
+    assert gpr.map_transform({"key": "w02_l00_s00"}) is None
+    assert gpr.map_transform({"seg_start": [0, 0, 1], "seg_end": None}) is None
+    to_map = gpr.map_transform({"seg_start": [1.0, 0.0, 1.0], "seg_end": [3.0, 0.0, 1.0]})
+    assert to_map(0.5) == [1.5, 0.0, 1.0]
+
+
+def test_the_summary_is_read_back_across_passes(tmp_path):
+    """The NO_DRILL constraints are read from the session's whole GPR record,
+    not just the pass that happened to run last."""
+    assert gpr.load_summary(tmp_path) is None
+    with open(tmp_path / gpr.SUMMARY_FILENAME, "w") as handle:
+        json.dump({"entries": []}, handle)
+    assert gpr.load_summary(tmp_path) is None          # nothing processed yet
+    with open(tmp_path / gpr.SUMMARY_FILENAME, "w") as handle:
+        json.dump({"entries": [{"key": "w02_l00_s00"}]}, handle)
+    assert gpr.load_summary(tmp_path)["entries"][0]["key"] == "w02_l00_s00"
+
+
+def test_an_entry_reports_the_no_drill_positions_it_produced():
+    entry = {"key": "w02_l00_s00", "associated": True, "errors": {},
+             "hyperbolae": {"n": 2}, "lines": {"n": 1},
+             "no_drill": {"n_no_drill_positions": 2, "n_located": 1}}
+    text = gpr.describe_entry(entry)
+    assert "2 hyperbolae" in text
+    assert "2 NO_DRILL (1 placed on the wall)" in text
+    entry["no_drill"] = {"n_no_drill_positions": 0, "n_located": 0}
+    assert "NO_DRILL" not in gpr.describe_entry(entry)
+
+
+def test_pending_files_ignores_what_the_registry_already_has(tmp_path):
+    incoming, out = tmp_path / "in", tmp_path / "out"
+    a = _touch_scan(incoming, "a", 100)
+    _touch_scan(incoming, "b", 200)
+    out.mkdir()
+    with open(out / gpr.REGISTRY_FILENAME, "w") as handle:
+        json.dump({f"{a}@100": {"key": "a", "associated": False}}, handle)
+    assert [f["stem"] for f in gpr.pending_files(incoming, out)] == ["b"]
+
+
+def test_process_incoming_needs_the_segy_reader(tmp_path):
+    """Without obspy nothing can be read: one clear error, not a traceback per file."""
+    if importlib.util.find_spec("obspy") is not None:
+        pytest.skip("obspy installed; the error path is not reachable")
+    from task_planner_fsm.sensors import VendorUnavailable
+    _touch_scan(tmp_path / "in", "a", time.time())
+    with pytest.raises(VendorUnavailable, match="obspy"):
+        gpr.process_incoming(tmp_path / "in", tmp_path / "m.jsonl", tmp_path / "out",
+                             tmp_path / "w.pt")
+
+
+def test_the_summary_is_written_per_scan_like_the_registry(tmp_path, monkeypatch):
+    """A run killed between two scans (or a state left mid-job) must not leave
+    a scan in the registry -- never offered again -- but out of the summary the
+    NO_DRILL constraints are read from."""
+    monkeypatch.setattr(gpr, "require", lambda *names: None)
+    calls = []
+
+    def fake_process_scan(scan, line, out_dir, weights, logger=None, **kw):
+        calls.append(scan["stem"])
+        if len(calls) == 2:
+            raise KeyboardInterrupt          # the second scan is cut short
+        return {"key": scan["stem"], "sgy": scan["sgy"], "line": line, "associated": False,
+                "out_dir": str(out_dir), "hyperbolae": None, "no_drill": None,
+                "lines": None, "errors": {}}
+
+    monkeypatch.setattr(gpr, "process_scan", fake_process_scan)
+    _touch_scan(tmp_path / "in", "a", 1_000)
+    _touch_scan(tmp_path / "in", "b", 2_000)
+    with pytest.raises(KeyboardInterrupt):
+        gpr.process_incoming(tmp_path / "in", tmp_path / "m.jsonl", tmp_path / "out",
+                             tmp_path / "w.pt", run_hyperbolae=False)
+    registry = json.load(open(tmp_path / "out" / gpr.REGISTRY_FILENAME))
+    assert [v["key"] for v in registry.values()] == ["a"]
+    assert [e["key"] for e in gpr.load_summary(tmp_path / "out")["entries"]] == ["a"]
+
+    # The next pass picks up only b and appends it to the same summary.
+    calls.clear()
+    result = gpr.process_incoming(tmp_path / "in", tmp_path / "m.jsonl", tmp_path / "out",
+                                  tmp_path / "w.pt", run_hyperbolae=False)
+    assert calls == ["b"] and result["n_new"] == 1
+    assert [e["key"] for e in gpr.load_summary(tmp_path / "out")["entries"]] == ["a", "b"]
+
+
+# ScanWall's manifest rows are GprSweep's on this branch: test/test_gpr_sweep.py.

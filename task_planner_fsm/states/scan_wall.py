@@ -2,6 +2,7 @@ from ..state import State
 from ..utils.chassis_parking import ChassisParker
 from ..utils.column_control import ColumnController
 from ..utils.gpr_sweep import GprSweep
+from ..utils.hyperspectral_sampler import HyperspectralSampler
 from ..utils.costmap_utils import (
     COSTMAP_WAIT_TIMEOUT_S,
     base_standoff_goal,
@@ -253,6 +254,14 @@ class ScanWall(State):
         # On for the real robot, off in sim; ctx["gpr_enabled"] overrides.
         self._gpr = GprSweep(name, self)
 
+        # Hyperspectral camera: one capture every hyperspectral_sample_spacing_m
+        # of plate travel, started with the GPR's clock. Each sample is a service
+        # round-trip plus an integration time, not a pulse. Off unless
+        # ctx["hyperspectral_enabled"], and it never aborts a line: a failed
+        # point is recorded and skipped. Records RAW spectra only -- reflectance
+        # and material prediction run afterwards, in SensorDataProcessing.
+        self._hs = HyperspectralSampler(name)
+
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Entering scanning state.")
@@ -303,7 +312,13 @@ class ScanWall(State):
         self.force_mode_active = False
         self._press_settle_start = None
         self._gpr.abort(ctx)          # close anything a previous entry left open
+        self._hs.stop_timer(ctx)      # ditto, hyperspectral
         ctx["error_triggered"] = False
+
+        # Binds the session directory and the raw record on first entry, and
+        # re-attaches to them on every later line and wall -- the session spans
+        # the whole mission. No-op when hyperspectral sampling is disabled.
+        self._hs.configure(node, ctx)
 
         self.column.reset()
         self.column.configure(node, ctx)
@@ -1263,6 +1278,15 @@ class ScanWall(State):
     def run(self, ctx):
         node = ctx["node"]
 
+        # Fetch GDS/GRF once per mission. Non-blocking and re-entrant: it walks
+        # GET_GDS -> GET_GRF -> GET_MTI over the ticks of the pre-approach, so
+        # the calibration is cached well before the first sweep -- and an
+        # uncalibrated or unreachable camera is discovered while the arm is
+        # still moving into place, not after a wall has been swept against a
+        # calibration that does not exist.
+        if self._hs.enabled(ctx):
+            self._hs.calibration_ready(ctx)
+
         if ctx.get("walls_left", 0) <= 0:
             node.get_logger().info(f"[{self.name}] No walls left to scan.")
             ctx["scan_done"] = True
@@ -1822,6 +1846,7 @@ class ScanWall(State):
                 return
             # Force mode has the wheel on the wall already (_wall_contact_ready).
             self._arm_gpr_triggers(ctx, seg_start, seg_end)
+            self._start_hyperspectral(ctx, seg_start, seg_end)
             self._seg_phase = "sweep_wait"
             return
 
@@ -1852,6 +1877,7 @@ class ScanWall(State):
                 f"[{self.name}] Segment sweep finished (status={status}). Stopping GPR, "
                 f"force mode + arm processes..."
             )
+            self._hs.stop_line(ctx)         # the plate has stopped: close the camera's segment
             self._gpr.end_segment(ctx)      # stop line, export, stop measurement, before releasing the press
             self._stop_force_mode(ctx)      # release the press before the arm retracts
             # Keep the reader running: the next segment's transit_clear needs the
@@ -2408,6 +2434,7 @@ class ScanWall(State):
             if seated and not self._gpr.armed and self._seg_phase == "sweep_wait":
                 seg_start, seg_end = self._segments[self._seg_idx][:2]
                 self._arm_gpr_triggers(ctx, seg_start, seg_end)
+                self._start_hyperspectral(ctx, seg_start, seg_end)
             if status != "running: approach":
                 self._gpr.note_contact(ctx, seated)
             return
@@ -2426,6 +2453,34 @@ class ScanWall(State):
         else:
             speed = float(ctx.get("sweep_speed_limit", self.SWEEP_SPEED_LIMIT_MS))
         self._gpr.arm_triggers(ctx, "map", seg_start, seg_end, speed)
+
+    def _start_hyperspectral(self, ctx, seg_start, seg_end):
+        """Plate seated and about to travel: sample #0 here, then one capture per
+        spacing of plate travel along the segment.
+
+        Started at the same moment as the GPR's clock and measured the same
+        way -- in map, along seg_start -> seg_end, off the plate lookup the
+        triggers use (one TF fallback chain, one cached EE frame) -- so a
+        material sample and the GPR trace taken at the same instant sit at the
+        same distance along the line. Under the whole-body sweep that moment is
+        the node's first "running: seated": the plate is already starting to
+        move, so sample #0 is taken on the way rather than at rest as the
+        press_settle route of sensor_implementation had it.
+        """
+        if not self._hs.enabled(ctx):
+            return
+        pose_fn = lambda frame, timeout: self._gpr._lookup_plate_xyz(  # noqa: E731
+            ctx, frame, timeout_s=timeout)
+        dx, dy = seg_end[0] - seg_start[0], seg_end[1] - seg_start[1]
+        norm = math.hypot(dx, dy)
+        axis = (dx / norm, dy / norm, 0.0) if norm > 1e-6 else None
+        ident = dict(wall_index=ctx.get("current_wall_index"),
+                     line_idx=ctx.get("current_line_idx", 0),
+                     seg_idx=self._seg_idx)
+        if self._hs.begin_segment(ctx, pose_fn, ref="map", world="map", **ident):
+            self._hs.capture_at_start(ctx)
+        self._hs.start_line(ctx, seg_start, seg_end, pose_fn, ref="map", axis=axis,
+                            world="map", **ident)
 
     def _wbc_sweep_tick(self, ctx):
         """Per-tick watchdog for a sweep whose node stopped talking.
@@ -2671,9 +2726,15 @@ class ScanWall(State):
         self._stop_sweep_crawl(ctx, publish_stop=True)
         self._stop_wbc_sweep(ctx)
         self._restore_sweep_speed(ctx)
+        self._hs.abort(ctx)   # disarm, close the open segment, persist metrics
         self._gpr.abort(ctx)
         self._stop_force_mode(ctx)
         self._stop_arm_processes(ctx)
+
+    def reset_run(self, ctx):
+        # The sampler keeps its session for the whole mission (configure() is
+        # idempotent); a restarted run is a new mission with its own session.
+        self._hs.new_mission()
 
     def check_transition(self, ctx):
         if self.finished and self.more_lines:

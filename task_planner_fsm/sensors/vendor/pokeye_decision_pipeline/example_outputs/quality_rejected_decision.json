@@ -1,0 +1,19 @@
+{
+  "decision_valid": true,
+  "pokeye_required": true,
+  "decision": "SEND_TO_POKEYE",
+  "reason": "HSI_QUALITY_REJECTED",
+  "requested_action": "MATERIAL_IDENTIFICATION",
+  "message": "HSI acquisition did not pass the quality filter; request destructive material identification.",
+  "hsi_evidence": {
+    "status": "quality_rejected",
+    "detected": false,
+    "material": null,
+    "confidence": null,
+    "confidence_threshold": 0.8,
+    "sensor_reason": "control de calidad físico (rango, media o máximo de reflectancia fuera de umbral)"
+  },
+  "mode": "single",
+  "confidence_threshold": 0.8,
+  "sample_index": 0
+}

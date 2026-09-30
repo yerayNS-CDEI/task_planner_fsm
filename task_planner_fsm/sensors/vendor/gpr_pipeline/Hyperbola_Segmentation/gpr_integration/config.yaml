@@ -1,0 +1,74 @@
+# DISCOVER / OLIWALL GPR robot-facing integration configuration.
+# All repository paths are relative to this file. Runtime output paths are configurable.
+
+paths:
+  output_dir: ../outputs
+  tahzeeb_dir: ../tahzeeb_original
+  weights: ../models/best.pt
+  tahzeeb_config: ../tahzeeb_original/config.yaml
+
+preprocessing:
+  # Same GP8800 acquisition rendered under several display gains. These are NOT
+  # independent measurements; gain support is only a robustness indicator.
+  gains_db: [40]
+  edits_order: [time_zero, background_removal, gain]
+  time_zero:
+    method: 2
+    threshold: 0.20
+    start_sample: 0
+    backup_samples: 0
+  plot:
+    colormap: gray
+    axes: false
+    # These are the current GPRTools final-render settings used by the supplied
+    # batch code. The tiler then makes native 640x640 model inputs.
+    plot_scale: 8.0
+    aspect_ratio: null
+    render_upsample: 3.0
+
+metadata:
+  # Proceq confirmed the GP8800 sidecar value 16 ns is erroneous for these exports.
+  # GPRTools/info/segy_info.py subtracts 4 ns, so the effective raw window is 12 ns.
+  expected_corrected_time_window_ns: 12.0
+  time_window_note: "GP8800 sidecar reports 16 ns; Proceq-confirmed correction is -4 ns, therefore 12 ns. GPRTools applies the correction once."
+
+# Explicitly match Tahzeeb's supplied config rather than relying on tiler defaults.
+tiling:
+  extra_args: ["--crop-size", "640", "--overlap-x", "0.35", "--overlap-y", "0.0"]
+
+inference:
+  model_type: maskrcnn
+  backbone: resnet101
+  confidence_threshold: 0.25
+  device: null
+  save_masks: true
+  # Load the 241 MB model once for all gain tiles, then split detections back by gain.
+  batch_all_gains: true
+
+postprocessing:
+  # Representative concrete relative permittivity requested for depth estimation.
+  # This is an assumption, not a sensor-measured material property.
+  epsilon_r_assumed: 6.0
+  epsilon_r_basis: "representative concrete relative permittivity; assumed, not sensor-measured"
+
+consensus:
+  # Initial demo value. A low-gain miss does not veto a candidate; it simply casts no vote.
+  min_gain_support: 1
+  x_tolerance_m: 0.06
+  depth_tolerance_cm: 4.0
+
+# Tahzeeb 03_quantify + 04_export are run AFTER cross-gain consensus only to preserve
+# compatibility with the MIP/digital-twin workflow. gpr_result.json remains the robot API.
+tahzeeb_final_export:
+  enabled: true
+  run_visualization: true
+  # Optional explicit element type for 03_quantify. Leave null unless known externally.
+  # Examples: floor_slab, partition_pladur, brick_wall, retaining_wall, wall.
+  element_type_override: null
+
+outputs:
+  save_json: true
+  save_csv: true
+  save_excel: true
+  save_final_image: true
+  visualization_gain_db: 40

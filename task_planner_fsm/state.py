@@ -23,11 +23,6 @@ class State:
         Only needed for bookkeeping that outlives on_enter/on_exit on purpose
         -- e.g. which walls were already scanned -- and would otherwise leak
         into the next run. Clients, publishers and config stay as they are.
-
-        TODO(hyperspectral): when the HyperspectralSampler is ported from
-        sensor_implementation, ScanWall needs a reset_run() calling
-        self._hs.new_mission() (see 0b9cb80 there), or a restarted run keeps
-        appending to the previous run's session.
         """
         pass
 

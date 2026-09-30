@@ -1,0 +1,19 @@
+{
+  "decision_valid": true,
+  "pokeye_required": false,
+  "decision": "NO_ACTION",
+  "reason": "HSI_CONFIDENT_CLASSIFICATION",
+  "requested_action": "NONE",
+  "message": "HSI material classification is sufficiently confident; POKEYE is not required.",
+  "hsi_evidence": {
+    "status": "detected",
+    "detected": true,
+    "material": "gypsum",
+    "confidence": 0.994,
+    "confidence_threshold": 0.8,
+    "sensor_reason": null
+  },
+  "mode": "single",
+  "confidence_threshold": 0.8,
+  "sample_index": 2
+}

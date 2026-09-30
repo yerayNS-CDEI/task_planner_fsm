@@ -1,0 +1,10 @@
+{
+  "sensor": "hyperspectral",
+  "confidence_threshold": 0.8,
+  "sample_index": 2,
+  "detected": true,
+  "material": "gypsum",
+  "confidence": 0.994,
+  "status": "detected",
+  "reason": null
+}

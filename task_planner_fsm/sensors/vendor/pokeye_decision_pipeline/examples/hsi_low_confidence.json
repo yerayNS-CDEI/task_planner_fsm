@@ -1,0 +1,10 @@
+{
+  "sensor": "hyperspectral",
+  "confidence_threshold": 0.8,
+  "sample_index": 242,
+  "detected": false,
+  "material": null,
+  "confidence": 0.7848,
+  "status": "low_confidence",
+  "reason": "confidence below threshold 0.800"
+}

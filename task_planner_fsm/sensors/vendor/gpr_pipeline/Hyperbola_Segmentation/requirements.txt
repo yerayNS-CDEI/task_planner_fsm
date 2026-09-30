@@ -1,0 +1,11 @@
+numpy
+pandas
+pyyaml
+scipy
+pillow
+matplotlib
+opencv-python
+openpyxl
+obspy
+torch
+torchvision
