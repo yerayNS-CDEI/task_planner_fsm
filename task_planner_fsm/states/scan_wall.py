@@ -26,6 +26,7 @@ from controller_manager_msgs.srv import ListControllers, SwitchController
 # safety net for a sweep that died before it could restore. Share the one list
 # so the net cannot name a controller the sweep would never have displaced.
 from ..wbc.controller_switch import TRAJECTORY_CONTROLLERS as WBC_TRAJECTORY_CONTROLLERS
+from ..utils.controller_ready import TrajectoryControllerGate
 from std_msgs.msg import String
 from ur_msgs.srv import SetForceMode
 from std_srvs.srv import Trigger
@@ -100,6 +101,9 @@ class ScanWall(State):
         # enable -> request -> settle -> disable. See _run_parking.
         self.park_client = None            # ~/park_now Trigger client (created once)
         self.park_enable_client = None     # /set_parameters client (created once)
+        # Named poses wait for a trajectory controller to be active; see
+        # _send_named_pose.
+        self._controller_gate = TrajectoryControllerGate()
         self.park_done = False
         self._park_phase = "enable"
         self.park_future = None
@@ -294,6 +298,7 @@ class ScanWall(State):
 
         if self.position_client is None:
             self.position_client = node.create_client(SendPosition, "/send_position")
+        self._controller_gate.reset()
 
         if ctx.get("nav_client") is None:
             node.get_logger().info(f"[{self.name}] Navigation client missing. Creating one for scan trajectory.")
@@ -657,6 +662,13 @@ class ScanWall(State):
     def _send_named_pose(self, ctx, position_name):
         """Ask the arm for a named pose. True once the request is away."""
         node = ctx["node"]
+        # A pose sent while the External Control program is still starting is
+        # rejected with "Controller is not running." — and the program takes
+        # longer to come up with the pendant speed slider turned down (seen at
+        # 50% on the fold before a transit). Hold the request until a trajectory
+        # controller reports active; the caller retries on the next tick.
+        if not self._controller_gate.ready(node):
+            return False
         if not self.position_client.service_is_ready():
             node.get_logger().warn(f"[{self.name}] Waiting for /send_position service...")
             return False
@@ -666,6 +678,9 @@ class ScanWall(State):
         ctx["planner_goal_failed"] = False
         self.pose_future = self.position_client.call_async(request)
         self._arm_goal_start = None
+        # Re-arm so the next named pose checks again: a sweep in between can
+        # swap the arm onto a streaming controller or drop the program.
+        self._controller_gate.reset()
         node.get_logger().info(f"[{self.name}] Sending the arm to '{position_name}'.")
         return True
 
