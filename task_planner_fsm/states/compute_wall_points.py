@@ -157,7 +157,9 @@ class ComputeWallPoints(State):
 
     def check_transition(self, ctx):
         if ctx.get("database_generated") and ctx.get("walls_left", 0) > 0:
-            return "WallTargetSelection"
+            # Fold before the first navigation; ArmFolding goes on to
+            # WallTargetSelection while scan_done is still False.
+            return "ArmFolding"
         if ctx.get("error_triggered"):
             return "Error"
         return None

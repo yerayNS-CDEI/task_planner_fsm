@@ -34,7 +34,7 @@ _DEFAULT_EDGES = [
     ("ObjectID", "WallLinesComputation", "forward"),
     ("WallLinesComputation", "GeometryReconstruction", "forward"),
     ("GeometryReconstruction", "ComputeWallPoints", "forward"),
-    ("ComputeWallPoints", "WallTargetSelection", "forward"),
+    ("ComputeWallPoints", "ArmFolding", "forward"),
     ("WallTargetSelection", "NavigateToTarget", "forward"),
     ("NavigateToTarget", "ArmUnfolding", "forward"),
     ("ArmUnfolding", "ScanWall", "phase1"),
