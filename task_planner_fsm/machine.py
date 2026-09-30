@@ -1,27 +1,99 @@
 import os
+import shutil
 import time
 import traceback
 from task_planner_fsm.states.proc_utils import install_global_cleanup
 
 # Where wall_detection_node writes detected_walls.yaml, and where
-# GeometryReconstruction reads it back.
+# GeometryReconstruction and the bootstrap wall prompt read it back: the
+# navi-wall SOURCE checkout's rgb_detections/, the one copy of the walls that
+# persists across runs. navi_wall no longer installs that folder -- a colcon
+# build used to copy a stale source file over the detector's live output in
+# share/, and a run started seconds later scanned whichever wall the old list
+# numbered the same (2026-09-30).
 #
-# This deliberately lives OUTSIDE the install space. navi_wall's CMakeLists
-# installs rgb_detections/ from source, so the detector's runtime output used to
-# land in the install tree: a directory that is not cleared between runs and is
-# shared by every environment the robot is driven in. A read before the detector
-# had saved picked up whatever the last run left there — a different building, a
-# different Gazebo world, or a capture from weeks earlier. Intermittent, and
-# silent: the markers just showed the wrong walls.
-#
-# Split by sim/real as well, so a simulation run can never read walls left over
-# from the robot (or vice versa).
-WALL_RUN_DIR = "/tmp/navi_wall_run"
+# Sim gets its own file, so a simulation run never overwrites (or reads) the
+# robot's walls.
+WALL_FILE_NAMES = {False: "detected_walls.yaml", True: "detected_walls_sim.yaml"}
 
 
-def wall_file_path(sim: bool) -> str:
-    """Absolute path to this run's detected_walls.yaml (see WALL_RUN_DIR)."""
-    return os.path.join(WALL_RUN_DIR, "sim" if sim else "real", "detected_walls.yaml")
+def navi_wall_detections_dir():
+    """``<ws>/src/navi-wall/rgb_detections``, found from navi_wall's install
+    share path, or None when navi_wall is not built from a workspace source
+    checkout. navi-wall's launch files resolve the same folder the same way.
+    """
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share = get_package_share_directory("navi_wall")
+    except Exception:
+        return None
+    marker = os.sep + "install" + os.sep
+    if marker not in share:
+        return None
+    ws = share.split(marker, 1)[0]
+    for pkg_dir in ("navi-wall", "navi_wall"):
+        src = os.path.join(ws, "src", pkg_dir)
+        if os.path.isdir(src):
+            return os.path.join(src, "rgb_detections")
+    return None
+
+
+def wall_file_path(sim: bool):
+    """Absolute path to the walls YAML for a sim or real run, or None."""
+    detections_dir = navi_wall_detections_dir()
+    if detections_dir is None:
+        return None
+    return os.path.join(detections_dir, WALL_FILE_NAMES[bool(sim)])
+
+
+def navi_wall_detect_walls() -> bool:
+    """``detect_walls`` from navi_wall's config/wall_detection_params.yaml.
+
+    The one switch for wall detection: navi-wall's launch files default to the
+    same key, so the stack the FSM starts and the FSM's own waiting agree
+    without anything being passed at FSM start (the UI cannot pass it).
+    Missing file or key -> true, which is also the launch files' fallback.
+    """
+    try:
+        import yaml
+        from ament_index_python.packages import get_package_share_directory
+        path = os.path.join(get_package_share_directory("navi_wall"), "config",
+                            "wall_detection_params.yaml")
+        with open(path) as f:
+            params = yaml.safe_load(f)["wall_detection_node"]["ros__parameters"]
+        return bool(params.get("detect_walls", True))
+    except Exception:
+        return True
+
+
+def wall_detection_enabled(ctx) -> bool:
+    """Whether this run detects the walls, read once from navi-wall (see
+    navi_wall_detect_walls) and pinned in ctx so every reader agrees.
+
+    true: launch the detector, and wait until it has written THIS run's walls
+    before reading them. false: launch only the republisher and read whatever
+    walls the file already holds, without waiting.
+    """
+    if "wall_detection" not in ctx:
+        ctx["wall_detection"] = navi_wall_detect_walls()
+    return bool(ctx["wall_detection"])
+
+
+def backup_previous_walls(path, started):
+    """Copy the walls a detection run is about to replace to ``<name>.prev.yaml``.
+
+    Only a file older than this run is the previous run's list; one written
+    since belongs to this run and must not overwrite the backup. Returns the
+    backup path, or None when there was nothing to keep.
+    """
+    try:
+        if not path or os.path.getmtime(path) >= started:
+            return None
+    except OSError:
+        return None
+    backup = os.path.splitext(path)[0] + ".prev.yaml"
+    shutil.copy2(path, backup)
+    return backup
 
 
 def seed_wall_detection_ctx(ctx) -> None:
@@ -39,16 +111,29 @@ def seed_wall_detection_ctx(ctx) -> None:
     """
     sim = bool(ctx.get('sim', False))
     sim_value = 'true' if sim else 'false'
-    walls_yaml = wall_file_path(sim)
+    detect = wall_detection_enabled(ctx)
+    walls_yaml = ctx.get('geometry_reconstruction_wall_file_path') or wall_file_path(sim)
+    if not walls_yaml:
+        raise RuntimeError(
+            "Cannot locate navi-wall's source rgb_detections/ folder (navi_wall is "
+            "not installed from a <ws>/src checkout); set the "
+            "geometry_reconstruction_wall_file_path parameter to the walls YAML."
+        )
     ctx.setdefault('geometry_reconstruction_wall_file_path', walls_yaml)
+    # Only a run that detects has anything new to wait for.
+    ctx.setdefault('geometry_reconstruction_require_fresh_walls', detect)
     ctx.setdefault('wall_detection_cmd', [
         'ros2', 'launch', 'navi_wall', 'wall_detection.launch.py',
         f'use_sim_time:={sim_value}',
+        f"detect_walls:={'true' if detect else 'false'}",
         f'wall_file_path:={walls_yaml}',
     ])
     # Wall-clock reference for the staleness guard: a detected_walls.yaml older
     # than this was not produced by this run and must not be trusted.
     ctx.setdefault('fsm_start_wall_time', time.time())
+    if detect and 'wall_file_backup' not in ctx:
+        ctx['wall_file_backup'] = backup_previous_walls(
+            walls_yaml, ctx['fsm_start_wall_time'])
 
 
 class StateMachine:

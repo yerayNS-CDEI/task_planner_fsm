@@ -19,7 +19,12 @@ import tf2_ros
 from rclpy.duration import Duration
 from std_msgs.msg import Bool, Float32MultiArray, String
 
-from task_planner_fsm.machine import StateMachine, seed_wall_detection_ctx
+from task_planner_fsm.machine import (
+    StateMachine,
+    seed_wall_detection_ctx,
+    wall_detection_enabled,
+)
+from task_planner_fsm.states.geometry_reconstruction import WALL_FILE_SETTLE_S
 from task_planner_fsm.states import (
     ArmFolding,
     ArmUnfolding,
@@ -260,6 +265,14 @@ class RobotFSMNode(Node):
         # be in ctx. StateMachine seeds these too, but it is constructed after
         # the bootstrap runs.
         seed_wall_detection_ctx(self.ctx)
+        self.get_logger().info(
+            f"[FSM] Walls file: {self.ctx['geometry_reconstruction_wall_file_path']} "
+            + ("(navi-wall detect_walls=true: waiting for this run's detection before reading it"
+               + (f"; previous list kept as {self.ctx['wall_file_backup']})"
+                  if self.ctx.get('wall_file_backup') else ")")
+               if wall_detection_enabled(self.ctx)
+               else "(navi-wall detect_walls=false: reading the saved walls as they are)")
+        )
 
         # Build test context for non-default initial state.
         self._bootstrap_context_for_initial_state(initial_state, scan_phase)
@@ -471,12 +484,10 @@ class RobotFSMNode(Node):
         feeds into ComputeWallPoints. Falls back to ``PREDEFINED_WALLS`` only when
         the YAML is missing/empty so a demo run without navi_wall still works.
         """
-        detections_dir = self._resolve_detections_dir()
-        yaml_path = (
-            os.path.join(detections_dir, "detected_walls.yaml")
-            if detections_dir is not None
-            else None
-        )
+        # The very file the detector writes and GeometryReconstruction reads.
+        yaml_path = self.ctx.get("geometry_reconstruction_wall_file_path")
+        if yaml_path and wall_detection_enabled(self.ctx):
+            yaml_path = self._wait_for_fresh_bootstrap_walls(yaml_path)
         raw_walls = self._load_walls_from_yaml(yaml_path) if yaml_path else []
         if not raw_walls:
             self.get_logger().warn(
@@ -502,6 +513,51 @@ class RobotFSMNode(Node):
             f"[FSM Bootstrap] Loaded {len(walls)} wall(s) from '{yaml_path}'."
         )
         return walls
+
+    def _wait_for_fresh_bootstrap_walls(self, yaml_path: str) -> str:
+        """Block until the detector has written THIS run's walls; the path.
+        Raises after the timeout rather than letting the caller fall back to
+        PREDEFINED_WALLS, which would scan walls from nowhere.
+
+        The wall prompt runs before the bootstrap would otherwise start the
+        stack, so with wall_detection on it would offer the PREVIOUS run's list
+        -- numbered differently from the walls about to be detected. Start the
+        stack (which runs the detector) first, then wait for its save. Same
+        freshness rule and timeout as GeometryReconstruction.
+        """
+        started = float(self.ctx.get("fsm_start_wall_time", 0.0))
+        timeout = float(self.ctx.get("geometry_reconstruction_wall_file_timeout_s", 120.0))
+
+        settle = float(self.ctx.get("geometry_reconstruction_wall_file_settle_s",
+                                    WALL_FILE_SETTLE_S))
+
+        def fresh():
+            # Written this run, and no longer changing: see
+            # GeometryReconstruction._wall_file_is_fresh for the double save.
+            try:
+                mtime = os.path.getmtime(yaml_path)
+            except OSError:
+                return False
+            return mtime >= started and time.time() - mtime >= settle
+
+        if fresh():
+            return yaml_path
+        self._ensure_nav_sim_running()
+        self.get_logger().info(
+            f"[FSM Bootstrap] navi-wall detect_walls=true: waiting up to {timeout:.0f}s for "
+            f"wall_detection_node to save this run's walls to '{yaml_path}'..."
+        )
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if fresh():
+                return yaml_path
+            time.sleep(1.0)
+        raise RuntimeError(
+            f"No walls saved to '{yaml_path}' within {timeout:.0f}s of starting the "
+            f"detector (is /rtabmap/cloud_map being published?). Set detect_walls: "
+            f"false in navi-wall's config/wall_detection_params.yaml to use the "
+            f"saved walls instead."
+        )
 
     def _resolve_detections_dir(self) -> Optional[str]:
         """Locate the navi_wall ``rgb_detections`` directory.
@@ -843,6 +899,9 @@ class RobotFSMNode(Node):
                     # This launch starts wall_detection_node itself, so it must
                     # write the very file GeometryReconstruction reads back.
                     f"wall_file_path:={self.ctx['geometry_reconstruction_wall_file_path']}",
+                    # Detector (true) or republisher of the saved walls (false),
+                    # matching what GeometryReconstruction waits for.
+                    f"wall_detection:={'true' if wall_detection_enabled(self.ctx) else 'false'}",
                     # Push out launch's own SIGKILL deadline so ros2_control survives
                     # long enough to retract the column on shutdown.
                     *ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,

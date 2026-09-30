@@ -16,6 +16,12 @@ from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
 
+# How long the walls file must go unmodified before it counts as this run's
+# final detection (see _wall_file_is_fresh). The node's second save follows the
+# first by ~50-80 ms.
+WALL_FILE_SETTLE_S = 2.0
+
+
 class GeometryReconstruction(State):
     def __init__(self, name):
         super().__init__(name)
@@ -642,7 +648,17 @@ class GeometryReconstruction(State):
             mtime = None
 
         if mtime is not None and mtime >= started:
-            return True
+            # wall_detection_node saves TWICE per detection: first before /map
+            # has arrived, with the normals' sides unchecked, then again tens of
+            # ms later once it has re-oriented them against the map (seen on
+            # every run on 2026-09-30). Read only a file that has stopped
+            # changing, or a tick landing between the two gets walls whose
+            # normals may point the scan at the wrong side of the wall.
+            settle = float(ctx.get("geometry_reconstruction_wall_file_settle_s",
+                                   WALL_FILE_SETTLE_S))
+            if now - mtime >= settle:
+                return True
+            return False
 
         if now - self._walls_wait_start < timeout:
             if not self._walls_wait_logged:
