@@ -841,6 +841,50 @@ class WholeBodySweepNode(Node):
         # so the plate squares itself over a few seconds instead of in one
         # twist. On the way in (SEEK) any load stops the rotation outright.
         self.declare_parameter("w_align_contact_max", 0.005)
+        # Torque squaring. While PRESSING, the plate's two tilt axes are squared
+        # on where the LOAD sits rather than on what the ranges say. The ranges
+        # cannot see a lifted caster: they read the plate square to +/-1 deg
+        # (the deadband above), and 1 deg over the 0.36 m between the caster
+        # pairs is 6 mm — all of one pair's travel. On 2026-09-25 17:04 the
+        # reverse line ran +1..2 deg off with the whole load on the +x pair
+        # (T_y +2 Nm, centroid +14 cm) for 180 s while the ranges sat on the
+        # deadband's edge, and the 2 deg seat gate throttled the base to
+        # 34 mm/s against the forward line's 41.
+        #
+        # The centroid is solved from the F/T: a normal load p at (dx, dy)
+        # from the point the wrench is reported about gives T_x = -p dy,
+        # T_y = p dx. Everything is tared over the press's TARE window.
+        self.declare_parameter("torque_square", True)
+        # rad/s of plate tilt per metre of centroid past the deadband, added to
+        # the ranges' own command (k_align x their error past align_deadband)
+        # and capped with it by w_align_contact_max like any rotation in
+        # contact. 0.3 lets 2 cm of excess outweigh the ranges at 1.4 deg.
+        self.declare_parameter("torque_square_gain", 0.3)
+        # Where the load should sit, plate xy, m: the centre of the four
+        # casters, which is the centre of the sensor array (SENSOR_XY is
+        # symmetric about it).
+        self.declare_parameter("torque_square_centre", [0.0, 0.0])
+        # Soft deadband on the centroid, m. Wide on purpose: it only has to keep
+        # the load off one pair of casters, and 8 cm from the centre is still
+        # 70/30 between the pairs. It also contains the GPR's contact point
+        # (-0.08, 0), so a GPR standing proud of the casters — all of the load
+        # on it, which no tilt can move — asks for nothing.
+        self.declare_parameter("torque_square_deadband", 0.08)
+        # Below this fraction of the target force the centroid is torque noise
+        # over a small divisor, so the ranges keep the plate.
+        self.declare_parameter("torque_square_min_fraction", 0.5)
+        # Low-pass on the centroid, s. The caster ripple is ~1 Hz.
+        self.declare_parameter("torque_square_tau", 0.5)
+        # The torque may not take the plate further than this from what the
+        # ranges call square. The two disagree by the caster heights and the
+        # range calibration (~1 deg); more than this is a reading gone wrong.
+        self.declare_parameter("torque_square_max_tilt", math.radians(3.0))
+        # The point the UR reports its torque about, in the PLATE frame. The
+        # e-series wrench is at the ACTIVE pendant TCP ('Sensor_plate', the
+        # same point as contact_point), and ur_robot_driver only rotates it
+        # into the tool axes, which are the plate's. Change it with the
+        # pendant TCP.
+        self.declare_parameter("wrench_reference_point", [-0.08, 0.0, 0.17])
         # The alignment belongs to the ARM. Six joints fully determine the
         # plate's orientation, and the base's yaw adds nothing to it except a
         # lever: the turret sits ~1 m behind the plate and the GPR's contact
@@ -907,6 +951,41 @@ class WholeBodySweepNode(Node):
         # (the sweep is tangential) but is a soft term, not a constraint, so the
         # base can still follow a wall that is not straight.
         self.declare_parameter("weight_base_normal", 100.0)
+        # Reach keeping. The base does not HOLD STILL along the normal any more:
+        # it follows the arm. The arm's extension toward the wall is latched
+        # when the press first loads, and the base is asked to move along the
+        # normal at gain x (extension - latched), past a deadband, so the arm
+        # hands back whatever it has had to absorb. The press row holds the
+        # plate on the wall meanwhile, so the arm folds by what the base
+        # closes and the plate does not move.
+        #
+        # Why: a turret heading off the wall drives the base away from it at
+        # sweep_speed x sin(error), and without this the arm took all of it.
+        # 2026-09-25 17:58: 56 cm of stretch over 5.5 m (~6 deg), the elbow
+        # 2.28 -> 0.74 rad, reach 1.38 m, then force spikes and 46 N.
+        # 2026-09-28: 4.8 mm/s (~10 deg) — the first attempt never re-seated
+        # at 3.1 m. The turret encoder has no absolute zero, so this error is
+        # different every power-up; this follows it whatever it is.
+        #
+        # Only with the press on (the real robot's mode): the latch needs a
+        # moment where the arm is where it should be, and first contact is it.
+        self.declare_parameter("reach_keep", True)
+        self.declare_parameter("reach_keep_gain", 0.2)          # 1/s on the excess
+        # Soft deadband, m: under this the base holds still along the normal,
+        # as it always has. Above the press's own normal excursions (a
+        # re-contact moves the arm a centimetre or two).
+        self.declare_parameter("reach_keep_deadband", 0.03)
+        # Cap on the base speed it asks for, m/s. 10 deg of heading error at
+        # 45 mm/s is 7.8 mm/s of drift; the base holds ~30 mm/s sideways.
+        self.declare_parameter("reach_keep_speed_max", 0.010)
+        # If the base cannot close the gap (the base_wall_min_gap floor, an
+        # obstacle, a drift faster than the cap), the TRAVEL slows from full
+        # at reach_keep_slow of extra stretch to stopped at reach_keep_stop.
+        # 09-25 17:58 was fine to +44 cm and failing past it; stopping at 30
+        # leaves margin. A stopped base is then the no-progress watchdog's to
+        # end, which beats pressing on to the hard limit.
+        self.declare_parameter("reach_keep_slow", 0.15)
+        self.declare_parameter("reach_keep_stop", 0.30)
         # Temporal regularisation: how hard the solve is pulled toward the
         # answer it gave last cycle. This is the term that makes the SOLUTION
         # continuous rather than truncating its jumps afterwards.
@@ -1158,6 +1237,20 @@ class WholeBodySweepNode(Node):
         # frozen; the side-load trip is measured above it.
         self.side_bias = 0.0
         self._side_tare = []
+        # The raw wrench, tool axes (= plate axes), UR sign: [Fx, Fy, Fz, Tx, Ty].
+        # Tared over the press's TARE window like the side load; the tare is
+        # None until that window has closed.
+        self.wrench = np.zeros(5)
+        self.wrench_bias = None
+        self._wrench_tare = []
+        # Where the normal load sits on the plate, plate xy, m, filtered. None
+        # while it cannot be trusted (not pressing, or too little force).
+        self.load_centre = None
+        # The arm's extension toward the wall, latched at the first PRESS, and
+        # how far past it the arm is now (m, + = stretched further). None
+        # until latched. See reach_keep.
+        self.reach_ref = None
+        self.reach_error = None
         self.wrench_stamp = None
         # When the sweep started waiting for the wheel to reach the wall. None
         # means it is not waiting — either it has touched, or it is not pressing.
@@ -1570,6 +1663,8 @@ class WholeBodySweepNode(Node):
         self.press_force = -float(msg.wrench.force.z)
         self.side_force = math.hypot(float(msg.wrench.force.x), float(msg.wrench.force.y))
         self.plate_torque = math.hypot(float(msg.wrench.torque.x), float(msg.wrench.torque.y))
+        self.wrench = np.array([msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z,
+                                msg.wrench.torque.x, msg.wrench.torque.y], dtype=float)
         self.wrench_stamp = self._now()
 
     def _on_costmap(self, msg):
@@ -2298,6 +2393,7 @@ class WholeBodySweepNode(Node):
             # Learn how stiff this surface is, from the travel the last solve
             # asked for and the force that came back.
             self._stiffness_step(press_dt)
+            self._update_load_centre(press_dt)
             if self.press.fault:
                 self.finish("failed", self.press.fault)
                 return
@@ -2332,6 +2428,7 @@ class WholeBodySweepNode(Node):
         reachable = self.limits.max_speed_along(
             heading - yaw, heading - (yaw - phi)) * float(p("sweep_speed_margin").value)
         speed = min(self.sweep_speed, remaining, reachable)
+        speed *= self._update_reach(p_plate, p_base, m_hat)
         gate = bool(p("press_gate_travel").value)
         preroll = float(p("base_preroll_seconds").value)
         prerolling = (self.press is not None and gate and not self.press.touched
@@ -2562,9 +2659,12 @@ class WholeBodySweepNode(Node):
         if self.press is not None:
             if self.press.state == TARE:
                 self._side_tare.append(self.side_force)
+                self._wrench_tare.append(self.wrench.copy())
             elif self._side_tare:
                 self.side_bias = float(np.mean(self._side_tare))
                 self._side_tare = []
+                self.wrench_bias = np.mean(self._wrench_tare, axis=0)
+                self._wrench_tare = []
             side = self.side_force - self.side_bias
             side_loaded = side > float(p("press_side_force_limit").value)
             if side_loaded:
@@ -2579,6 +2679,7 @@ class WholeBodySweepNode(Node):
             if side_loaded or self.press.overloaded or (self.press.loaded and self.press.state != PRESS):
                 w_ref = np.zeros(3)
             elif self.press.state == PRESS:
+                w_ref = self._torque_squaring(w_ref, R_plate, align_error)
                 w_contact = float(p("w_align_contact_max").value)
                 if np.linalg.norm(w_ref) > w_contact:
                     w_ref = w_ref * (w_contact / np.linalg.norm(w_ref))
@@ -2644,7 +2745,9 @@ class WholeBodySweepNode(Node):
         tasks = press_task + [
             Task(J_task, xdot_task, weights),
             Task(np.diag(damping), np.zeros(3 + n_arm), 1.0),
-            Task(base_normal_row, np.zeros(1), float(p("weight_base_normal").value)),
+            # Still at zero until the arm has had to stretch; see reach_keep.
+            Task(base_normal_row, np.array([self._reach_keep_speed()]),
+                 float(p("weight_base_normal").value)),
             # Posture: pull the arm back toward the pose the sweep started from,
             # so the redundancy is spent keeping the arm workable instead of
             # slowly stretching it out over the length of the wall.
@@ -2877,6 +2980,119 @@ class WholeBodySweepNode(Node):
             # cap cannot use — and it is the same wall either side of a
             # hollow.
             self.stiffness.reset()
+
+    def _update_reach(self, p_plate, p_base, m_hat):
+        """Track the arm's stretch toward the wall; return the travel factor.
+
+        The extension is the plate's distance in front of the turret axis
+        along the sensed normal — (plate - base) . normal, horizontal. It
+        leaves out the ODOMETRY: both ends come from the same TF tree a few
+        links apart, so what it measures is the arm's own geometry, which is
+        what runs out. (Odometry saw 4-7 cm of the 56 cm the arm took up on
+        2026-09-25.) Latched at the first PRESS; ``reach_error`` is how far
+        past that the arm is now.
+
+        The factor is 1 until reach_keep_slow of extra stretch and falls to 0
+        at reach_keep_stop — the backstop for when the base cannot close.
+        """
+        p = self.get_parameter
+        if self.press is None or not bool(p("reach_keep").value):
+            self.reach_error = None
+            return 1.0
+        extension = float(np.dot(p_plate[:2] - p_base[:2], m_hat[:2]))
+        if self.reach_ref is None:
+            if self.press.state != PRESS:
+                return 1.0
+            self.reach_ref = extension
+        self.reach_error = extension - self.reach_ref
+        slow = float(p("reach_keep_slow").value)
+        stop = float(p("reach_keep_stop").value)
+        if self.reach_error <= slow or stop <= slow:
+            return 1.0
+        factor = float(np.clip((stop - self.reach_error) / (stop - slow), 0.0, 1.0))
+        self.get_logger().warn(
+            f"Arm stretched {self.reach_error * 100:+.0f} cm toward the wall since "
+            f"contact and the base is not closing it: travel at {factor * 100:.0f}% "
+            f"(stops at {stop * 100:.0f} cm). Check base_wall_min_gap and the "
+            f"turret heading.",
+            throttle_duration_sec=2.0)
+        return factor
+
+    def _reach_keep_speed(self):
+        """Base speed along the sensed normal (+ = toward the wall), m/s."""
+        if self.reach_error is None:
+            return 0.0
+        p = self.get_parameter
+        excess = float(soft_deadband(np.array([self.reach_error]),
+                                     float(p("reach_keep_deadband").value))[0])
+        return _clamp(float(p("reach_keep_gain").value) * excess,
+                      float(p("reach_keep_speed_max").value))
+
+    def _update_load_centre(self, dt):
+        """Where on the plate the wall is pushing, plate xy, m (filtered).
+
+        The wrench is reported about ``wrench_reference_point``. A normal load
+        p (pressing, so -p along the tool Z) at d = (dx, dy, dz) from that
+        point, plus the friction (Fx, Fy) it drags with it, gives
+
+            T_x = -p dy - dz Fy        T_y = p dx + dz Fx
+
+        and dz — contact plane minus reference — is ~0 with the reference on
+        the pendant TCP, which is why that is the default: the friction flips
+        with the travel direction, and through a lever it would read as the
+        load moving from one pair of casters to the other.
+
+        None unless PRESSING with at least torque_square_min_fraction of the
+        target on the wheel: under that the divisor is small enough for the
+        F/T's own noise to throw the centroid across the plate.
+        """
+        p = self.get_parameter
+        if (self.press is None or self.wrench_bias is None or self.press.state != PRESS
+                or self.press.force < float(p("torque_square_min_fraction").value)
+                * self.press.target_force):
+            self.load_centre = None
+            return
+        fx, fy, _, tx, ty = self.wrench - self.wrench_bias
+        load = self.press.force
+        ref = np.array(p("wrench_reference_point").value, dtype=float)
+        dz = float(np.array(p("contact_point").value, dtype=float)[2] - ref[2])
+        sample = ref[:2] + np.array([(ty - dz * fx) / load, -(tx + dz * fy) / load])
+        if self.load_centre is None:
+            self.load_centre = sample
+            return
+        tau = float(p("torque_square_tau").value)
+        alpha = (1.0 - math.exp(-dt / tau)) if tau > 0.0 else 1.0
+        self.load_centre = self.load_centre + alpha * (sample - self.load_centre)
+
+    def _torque_squaring(self, w_ref, R_plate, align_error):
+        """The angular reference while PRESSING, plus a tilt from the load.
+
+        ADDED to the ranges' command, not swapped for it: inside its deadband
+        the torque asks for nothing and the ranges square the plate exactly
+        as they did before, and past it the torque term outgrows theirs (at
+        the default gain 2 cm past the band outweighs the ranges at 1.4 deg).
+        A load past the deadband toward +x rotates the plate about +y, which
+        moves its +x edge back off the wall (the plate's +Z faces the wall);
+        a load toward +y rotates it about -x for the same reason. Nothing is
+        added about the normal — the load says nothing about that rotation.
+
+        Bounded by the ranges: once the plate is torque_square_max_tilt from
+        what they call square, a torque tilt that would take it further is
+        dropped.
+        """
+        p = self.get_parameter
+        if not bool(p("torque_square").value) or self.load_centre is None:
+            return w_ref
+        centre = np.array(p("torque_square_centre").value, dtype=float)
+        excess = soft_deadband(self.load_centre - centre, float(p("torque_square_deadband").value))
+        k = float(p("torque_square_gain").value)
+        w_torque = np.array([-k * excess[1], k * excess[0], 0.0])
+        if float(np.linalg.norm(align_error)) > float(p("torque_square_max_tilt").value):
+            toward_square = R_plate.T @ align_error
+            for axis in (0, 1):
+                if w_torque[axis] * toward_square[axis] < 0.0:
+                    w_torque[axis] = 0.0
+        return w_ref + R_plate @ w_torque
 
     def _update_wall_drift(self, dt):
         """How fast the wall is going away from the plate, m/s.
@@ -3228,6 +3444,12 @@ class WholeBodySweepNode(Node):
     #              force barrier's approach cap, m/s (NaN when inactive)
     #   [8+2n+n_arm+3]
     #              estimated contact stiffness, N/m (NaN when not pressing)
+    #   [8+2n+n_arm+4:8+2n+n_arm+6]
+    #              load centroid on the plate, plate x and y, m (NaN while
+    #              there is none — see _update_load_centre)
+    #   [8+2n+n_arm+6]
+    #              arm stretch toward the wall since first contact, m (NaN
+    #              until latched — see reach_keep)
     #
     # The last entries are APPENDED rather than folded into the header, so that
     # every index a recorded bag or a plotting script already knows keeps the
@@ -3282,6 +3504,11 @@ class WholeBodySweepNode(Node):
         # the stiffness is the term that converted the one into the other.
         row.append(self.force_cap if np.isfinite(self.force_cap) else float("nan"))
         row.append(float("nan") if self.press is None else self.stiffness.value)
+        # What torque squaring steers on, beside the force in [6]: a centroid
+        # parked on one pair of casters is a plate the ranges call square.
+        row.extend([float("nan")] * 2 if self.load_centre is None
+                   else [float(v) for v in self.load_centre])
+        row.append(float("nan") if self.reach_error is None else self.reach_error)
         self.diag_pub.publish(Float64MultiArray(data=row))
 
     def _log_cycle(self, solution, distance, remaining, phi):
@@ -3300,7 +3527,12 @@ class WholeBodySweepNode(Node):
         if self.press is None:
             press = ""
         else:
-            approach = (f"gain x{self.press.gain_scale:.1f} drift={self.wall_drift * 1000:+.1f}mm/s "
+            load = ("" if self.load_centre is None else
+                    f"load=({self.load_centre[0] * 100:+.0f},{self.load_centre[1] * 100:+.0f})cm ")
+            if self.reach_error is not None:
+                load += (f"reach={self.reach_error * 100:+.1f}cm"
+                         f"(base {self._reach_keep_speed() * 1000:+.1f}mm/s) ")
+            approach = (f"gain x{self.press.gain_scale:.1f} drift={self.wall_drift * 1000:+.1f}mm/s {load}"
                         if self.press.state == PRESS
                         else f"app={self.press.approach_speed * 1000:.1f}mm/s"
                              f"{'(re)' if self.press.recontacting else ''} ")

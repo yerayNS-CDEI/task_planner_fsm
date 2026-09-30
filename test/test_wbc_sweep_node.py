@@ -1805,6 +1805,238 @@ def test_a_plate_arriving_off_square_is_squared_without_overloading_the_wheel():
         f"base yaw reached {max(yaw_commands):.4f} rad/s against a {yaw_max} cap")
 
 
+class CasterRobot(KinematicRobot):
+    """The plate on four sprung casters instead of one rigid contact point.
+
+    The casters sit at the plate's corners, in the contact plane, with the +x
+    pair ``proud`` metres nearer the wall than the -x pair: a plate the ranges
+    hold square then carries its whole load on the +x pair, which is the
+    2026-09-25 reverse line. The wrench is what the UR would report — tool
+    axes (= plate axes), about the pendant TCP, the wall pushing the plate
+    back along -Z.
+    """
+
+    CASTER_XY = np.array([[0.18, 0.18], [0.18, -0.18], [-0.18, 0.18], [-0.18, -0.18]])
+
+    def __init__(self, *args, proud=0.003, stiffness=5.0e3, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.casters = np.column_stack((
+            self.CASTER_XY,
+            PLATE_STANDOFF + np.where(self.CASTER_XY[:, 0] > 0.0, proud, 0.0)))
+        self.stiffness = stiffness
+
+    def caster_forces(self):
+        T = self.tip()
+        points = T[:3, 3] + self.casters @ T[:3, :3].T
+        return np.maximum(0.0, -self.stiffness * (WALL_X - points[:, 0]))
+
+    def press_force(self, stiffness=None):
+        return float(self.caster_forces().sum())
+
+    def load_centre(self):
+        f = self.caster_forces()
+        return (f @ self.CASTER_XY) / f.sum() if f.sum() > 0.0 else np.full(2, np.nan)
+
+    def wrench(self):
+        R = self.tip()[:3, :3]
+        force, torque = np.zeros(3), np.zeros(3)
+        for f, r in zip(self.caster_forces(), self.casters):
+            F = R.T @ np.array([-f, 0.0, 0.0])      # the wall pushes along world -x
+            force += F
+            torque += np.cross(r - CONTACT_POINT, F)
+        return np.array([force[0], force[1], force[2], torque[0], torque[1]])
+
+
+def _caster_press(torque_square, cycles=1200):
+    node = _press_node(torque_square=torque_square,
+                       wrench_reference_point=CONTACT_POINT.tolist())
+    base = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.03, tilt=0.0)
+    robot = CasterRobot(node.chain, base.base_xy, base.yaw, base.q, base.dt)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    sensed = []
+
+    def on_cycle(cycle):
+        node.wrench = robot.wrench()
+        node.plate_torque = float(np.hypot(*node.wrench[3:]))
+        sensed.append(np.nan if node.load_centre is None else node.load_centre[0])
+
+    forces, travel = _press_run(node, robot, cycles=cycles, on_cycle=on_cycle)
+    return node, robot, forces, travel, np.array(sensed)
+
+
+def test_a_load_on_one_pair_of_casters_is_squared_off_it_by_the_torque():
+    """The 2026-09-25 17:04 reverse line, as a regression.
+
+    The ranges read the plate square while the whole load sat on the +x
+    casters — they cannot see 3 mm over the 0.36 m between the pairs, and
+    their deadband is 1 deg. The torque can: the node must find the load
+    where it is, tilt the plate off that pair until the load is back inside
+    the deadband, and keep the press and the sweep going while it does.
+    """
+    node, robot, forces, travel, sensed = _caster_press(torque_square=True)
+
+    assert node.pending_status is None, f"the sweep ended early: {node.pending_status}"
+    assert node.press.state == PRESS
+    # What the node measured is where the load really was.
+    assert sensed[-1] == pytest.approx(robot.load_centre()[0], abs=0.01)
+    deadband = float(node.get_parameter("torque_square_deadband").value)
+    assert abs(robot.load_centre()[0]) < deadband + 0.02, (
+        f"load still {robot.load_centre()[0] * 100:+.1f} cm off the centre")
+    assert robot.caster_forces().min() > 0.0, "all four casters on the wall"
+    assert forces[-100:].mean() == pytest.approx(5.0, abs=1.5), "holding the target"
+    assert forces.max() < 0.5 * node.press.force_limit
+    assert travel[-50:].mean() > 0.5 * node.sweep_speed, "and sweeping"
+
+
+def test_without_torque_squaring_the_ranges_leave_the_load_on_a_corner():
+    """The control for the test above: the same plate squared by the ranges
+    alone. It lands on the proud pair, and then — as it sweeps, the plate's
+    orientation wanders by the ~0.8 deg the range deadband cannot see — the
+    load walks across to the far corner and three casters leave the wall."""
+    node, robot, forces, _, sensed = _caster_press(torque_square=False)
+
+    assert node.press.state == PRESS
+    assert sensed[~np.isnan(sensed)][0] > 0.15, "it lands on the +x pair"
+    assert np.linalg.norm(robot.load_centre()) > 0.2, "and ends on a corner"
+    assert (robot.caster_forces() == 0.0).sum() >= 2, "with casters off the wall"
+    # Measured all the same, for the log and the diagnostics.
+    assert sensed[-1] == pytest.approx(robot.load_centre()[0], abs=0.01)
+
+
+def test_a_centroid_the_tilt_cannot_move_asks_for_nothing():
+    """A GPR standing proud of the casters takes the whole load at the TCP,
+    8 cm off the centre, and no tilt short of landing a caster moves it. That
+    point is inside the deadband, so torque squaring adds nothing and the
+    ranges' command passes through untouched, rather than tilting the plate
+    for ever."""
+    node = _press_node(wrench_reference_point=CONTACT_POINT.tolist())
+    node.load_centre = CONTACT_POINT[:2].copy()
+    w_ref = np.array([0.001, -0.002, 0.003])
+    assert node._torque_squaring(w_ref, np.eye(3), np.zeros(3)) == pytest.approx(w_ref)
+
+
+def test_torque_squaring_never_tilts_the_plate_further_than_the_ranges_allow():
+    """A torque that says 'tilt' while the ranges already read the plate
+    torque_square_max_tilt off is a reading gone wrong: the tilt AWAY from
+    square is dropped, the one toward it kept."""
+    node = _press_node()
+    node.load_centre = np.array([0.20, 0.20])     # asks for +y and -x rotation
+    max_tilt = float(node.get_parameter("torque_square_max_tilt").value)
+    # Ranges: the plate is off square, and square lies toward -y and -x.
+    align_error = np.array([-1.0, -1.0, 0.0]) * max_tilt
+    w = node._torque_squaring(np.zeros(3), np.eye(3), align_error)
+    assert w[1] == 0.0, "the tilt away from square is dropped"
+    assert w[0] < 0.0, "the tilt toward square is kept"
+
+
+class CrabRobot(KinematicRobot):
+    """A base that drives ``crab`` radians off the direction it is told.
+
+    The turret encoder has no absolute zero, so on the robot the chassis runs
+    a few degrees off wherever the model thinks it is pointing, and the base
+    walks away from (or into) the wall at sweep_speed x sin(crab). Negative
+    here is AWAY: in the along-wall geometry turret-forward is world -y and
+    the wall is at +x.
+    """
+
+    def __init__(self, *args, crab=0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.crab = float(crab)
+
+    def step(self, twist, arm, mode=POSITION):
+        c, s_ = np.cos(self.crab), np.sin(self.crab)
+        vx, vy = twist[0], twist[1]
+        super().step([c * vx - s_ * vy, s_ * vx + c * vy, twist[2]], arm, mode)
+
+    def extension(self):
+        """The plate's distance in front of the turret axis, along the normal."""
+        return float(self.tip()[0, 3] - self.base_xy[0])
+
+
+def _crab_press(reach_keep, crab=np.radians(-8.0), cycles=2800):
+    node = _press_node(reach_keep=reach_keep)
+    base = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.03, tilt=0.0)
+    robot = CrabRobot(node.chain, base.base_xy, base.yaw, base.q, base.dt, crab=crab)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    stretch = []
+    seat = {}
+
+    def on_cycle(cycle):
+        if "extension" not in seat and node.press.state == PRESS:
+            seat["extension"] = robot.extension()
+        stretch.append(robot.extension() - seat.get("extension", robot.extension()))
+
+    start_y = robot.base_xy[1]
+    forces, travel = _press_run(node, robot, cycles=cycles, on_cycle=on_cycle)
+    return node, robot, forces, np.array(stretch), abs(robot.base_xy[1] - start_y)
+
+
+def test_a_base_driving_off_the_wall_is_followed_so_the_arm_keeps_its_reach():
+    """2026-09-25 17:58 and 2026-09-28, as a regression.
+
+    The base ran 6-10 deg off the wall and the arm took all of it: 56 cm of
+    stretch in 5.5 m on 09-25, until the elbow was nearly straight and the
+    press lost control of the force (46 N). The base now follows the arm
+    along the normal, so over the same travel the arm's stretch stays near
+    the deadband instead of growing with the distance swept.
+    """
+    node, robot, forces, stretch, swept = _crab_press(reach_keep=True)
+    drift = swept * np.sin(np.radians(8.0))
+    assert swept > 1.0, f"the sweep should cover the segment, did {swept:.2f} m"
+    assert drift > 0.13, "the fixture should have driven the base well off the wall"
+    band = float(node.get_parameter("reach_keep_deadband").value)
+    assert stretch.max() < band + 0.05, (
+        f"the arm stretched {stretch.max() * 100:.1f} cm against {drift * 100:.1f} cm of drift")
+    assert node.reach_error == pytest.approx(stretch[-1], abs=0.01), "and the node sees it"
+    press_cycles = forces[len(forces) // 3:]
+    assert press_cycles.mean() == pytest.approx(5.0, abs=1.5), "the press held on"
+    assert forces.max() < 0.5 * node.press.force_limit
+
+
+def test_without_reach_keeping_the_arm_absorbs_all_of_the_drift():
+    """The control: the base held still along the normal, as it used to."""
+    node, robot, forces, stretch, swept = _crab_press(reach_keep=False)
+    drift = swept * np.sin(np.radians(8.0))
+    assert stretch.max() > 0.8 * drift, (
+        f"the arm took {stretch.max() * 100:.1f} cm of {drift * 100:.1f} cm")
+
+
+def test_the_base_is_asked_toward_the_wall_only_past_the_deadband_and_never_fast():
+    node = _press_node()
+    band = float(node.get_parameter("reach_keep_deadband").value)
+    cap = float(node.get_parameter("reach_keep_speed_max").value)
+    gain = float(node.get_parameter("reach_keep_gain").value)
+    node.reach_error = None
+    assert node._reach_keep_speed() == 0.0, "nothing before first contact"
+    node.reach_error = 0.9 * band
+    assert node._reach_keep_speed() == 0.0, "inside the band the base holds still"
+    node.reach_error = band + 0.01
+    assert node._reach_keep_speed() == pytest.approx(gain * 0.01), "toward the wall"
+    node.reach_error = -(band + 0.01)
+    assert node._reach_keep_speed() == pytest.approx(-gain * 0.01), "and away"
+    node.reach_error = 1.0
+    assert node._reach_keep_speed() == pytest.approx(cap), "capped"
+
+
+def test_a_stretch_the_base_cannot_close_slows_the_travel_to_a_stop():
+    """The backstop: if the base is at its wall floor or the drift outruns the
+    cap, the sweep must not carry on until the arm is straight."""
+    node = _press_node()
+    slow = float(node.get_parameter("reach_keep_slow").value)
+    stop = float(node.get_parameter("reach_keep_stop").value)
+    normal = np.array([1.0, 0.0, 0.0])
+    base = np.zeros(3)
+    node.press.state = PRESS
+    assert node._update_reach(np.array([1.0, 0.0, 0.0]), base, normal) == 1.0
+    assert node.reach_ref == pytest.approx(1.0), "latched at contact"
+    assert node._update_reach(np.array([1.0 + slow, 0.0, 0.0]), base, normal) == 1.0
+    halfway = 1.0 + 0.5 * (slow + stop)
+    assert node._update_reach(np.array([halfway, 0.0, 0.0]), base, normal) == pytest.approx(0.5)
+    assert node._update_reach(np.array([1.0 + stop, 0.0, 0.0]), base, normal) == 0.0
+
+
 def _heading_error(robot, t_hat=np.array([0.0, -1.0])):
     """Angle from the turret's forward axis to the sweep tangent, radians."""
     c, s_ = np.cos(robot.yaw), np.sin(robot.yaw)
@@ -2263,7 +2495,7 @@ def test_the_diagnostics_row_carries_all_three_velocities():
     assert rows, "diagnostics were enabled but nothing was published"
     n = 3 + node.chain.n_joints
     header = node.DIAG_HEADER
-    assert len(rows[-1]) == header + 2 * n + len(ARM_JOINTS) + 4
+    assert len(rows[-1]) == header + 2 * n + len(ARM_JOINTS) + 7
     row = rows[-1]
     assert row[1] == pytest.approx(1.0 / node.control_rate), "the SOLVE period"
     assert row[2] > 0.0, "solve duration should be recorded"
@@ -2272,13 +2504,15 @@ def test_the_diagnostics_row_carries_all_three_velocities():
     # Appended rather than folded into the header, so every index a recorded bag
     # already knows keeps its meaning. Read beside [1] the stream period says the
     # two rates really are different numbers.
-    assert row[-4] == pytest.approx(1.0 / node.stream_rate), "the STREAM period"
+    assert row[-7] == pytest.approx(1.0 / node.stream_rate), "the STREAM period"
     # This node has no press, so nothing was gating the travel and no force
     # barrier was built — NaN, not zeros that would read as a closed gate and a
     # barrier holding the plate still.
-    assert np.isnan(row[-3]), "the base travel authority"
-    assert np.isnan(row[-2]), "the force barrier's approach cap"
-    assert np.isnan(row[-1]), "the contact stiffness"
+    assert np.isnan(row[-6]), "the base travel authority"
+    assert np.isnan(row[-5]), "the force barrier's approach cap"
+    assert np.isnan(row[-4]), "the contact stiffness"
+    assert np.isnan(row[-3]) and np.isnan(row[-2]), "the load centroid"
+    assert np.isnan(row[-1]), "the arm's stretch since contact"
 
 
 def test_diagnostics_are_on_by_default_while_the_press_is_under_investigation():
