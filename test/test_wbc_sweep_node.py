@@ -2724,6 +2724,39 @@ def test_the_arm_acceleration_changes_no_faster_than_the_jerk_bound():
     assert free_jerk > 3.0 * bounded_jerk, "the fixture must actually exercise the bound"
 
 
+def test_the_jerk_bound_is_for_the_air_and_stands_aside_on_the_wall():
+    """Pressing needs the arm's quick small corrections: with the bound on the
+    wall too, the squeezed press sat at 7 N against its 5 N target. So with the
+    wheel loaded during the sweep the bound is arm_jerk_max_contact (off by
+    default), and everywhere else — the approach, the retreat that pulls the
+    plate off, the return — it is arm_jerk_max."""
+    node = _press_node(arm_jerk_max=10.0)
+    n = 3 + node.chain.n_joints
+    dt = 1.0 / node.control_rate
+    wide = np.full(n, np.inf)
+
+    def arm_ceiling():
+        node.u_qp_prev = np.zeros(n)
+        node.a_qp_prev = np.zeros(n)
+        node.qp_stamp = None
+        _, hi = node._accel_bounds(-wide, wide, 0.0)
+        return float(hi[3:].max())
+
+    air = 10.0 * dt * dt                              # one cycle of jerk from rest
+    wall = float(node.accel_max[3]) * dt              # the acceleration bound alone
+
+    node.press.state = SEEK
+    assert arm_ceiling() == pytest.approx(air), "approaching in the air: bounded"
+    node.press.state = PRESS
+    assert arm_ceiling() == pytest.approx(wall), "on the wall: acceleration bound only"
+    node.phase = "retreat"
+    assert arm_ceiling() == pytest.approx(air), "pulling off the wall is in the air"
+
+    node = _press_node(arm_jerk_max=10.0, arm_jerk_max_contact=30.0)
+    node.press.state = PRESS
+    assert arm_ceiling() == pytest.approx(30.0 * dt * dt), "a contact bound, when asked for"
+
+
 def test_a_settled_stop_holds_the_setpoint_and_a_fault_holds_the_measurement():
     """Holding at the measurement is right for a fault — the setpoint may be
     running ahead of an arm that stopped following — but steps the arm back

@@ -1165,6 +1165,13 @@ class WholeBodySweepNode(Node):
         # press-sized change of rate (a few mrad/s) still settles in ~40 ms.
         # Arm only: the base's own controller already shapes its ramps.
         self.declare_parameter("arm_jerk_max", 10.0)                # rad/s^3
+        # The same bound while the wheel is on the wall; 0 disables it there.
+        # Pressing is not where the jolt is, and the press needs the arm's
+        # quick small corrections: at 10 a base pushed toward the wall outran
+        # the arm handing it back, and the force sat at 7 N in a sawtooth
+        # against a 5 N target (test_the_press_normal_task_already_couples...).
+        # At 30 and above it made no difference there.
+        self.declare_parameter("arm_jerk_max_contact", 0.0)         # rad/s^3
         # The UR's execution speed (teach-pendant slider, safety reduced mode)
         # scales the ARM but not the base, which desynchronises a whole-body
         # command. Reading it lets the whole command be scaled together. Absent
@@ -1382,6 +1389,7 @@ class WholeBodySweepNode(Node):
             np.array(p("base_accel_max").value, dtype=float),
             np.full(len(self.arm_joints), float(p("arm_accel_max").value))))
         self.arm_jerk_max = float(p("arm_jerk_max").value)
+        self.arm_jerk_max_contact = float(p("arm_jerk_max_contact").value)
         self.min_speed_scaling = float(p("min_speed_scaling").value)
         # "sweep" -> "retreat" (backing the plate off the wall) -> "return"
         # (joint space, to the planner's pose) -> "brake" (to rest under the
@@ -3498,8 +3506,11 @@ class WholeBodySweepNode(Node):
 
         ``lo``/``hi`` are the velocity box before the acceleration narrowing;
         crossings are left for the caller's fallback like any other.
+
+        With the wheel on the wall the bound is ``arm_jerk_max_contact``
+        instead — see :meth:`_in_contact`.
         """
-        jerk = self.arm_jerk_max
+        jerk = self.arm_jerk_max_contact if self._in_contact() else self.arm_jerk_max
         if jerk <= 0.0 or self.a_qp_prev is None:
             return
         arm = slice(3, None)
@@ -3514,6 +3525,16 @@ class WholeBodySweepNode(Node):
         a_lo = np.minimum(a_lo, a_hi)
         lo_new[arm] = np.maximum(lo_new[arm], u0 + a_lo * dt)
         hi_new[arm] = np.minimum(hi_new[arm], u0 + a_hi * dt)
+
+    def _in_contact(self):
+        """Is the wheel on the wall this cycle, as far as the jerk bound cares?
+
+        Loaded, not latched: the first touch is already a press the arm has to
+        answer, before the dwell confirms it. Only in the sweep — the retreat
+        starts on the wall, but it is the arm pulling away, which is the in-air
+        motion the bound is for.
+        """
+        return self.phase == "sweep" and self.press is not None and self.press.loaded
 
     def _stale_inputs(self, now):
         stale = []
