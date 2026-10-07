@@ -196,6 +196,14 @@ class ArmStream:
             return 0.0
         return float(np.max(np.abs(self.command - np.asarray(q_measured, dtype=float))))
 
+    def flush(self, timeout=1.0):
+        """Everything is on the wire already; see RemoteArmStream.flush."""
+        return True
+
+    def close(self, timeout=1.0):
+        """Nothing to end in-process; see RemoteArmStream.close."""
+        return True
+
     # ------------------------------------------------------------------
     def _publish(self, values):
         self.published = np.asarray(values, dtype=float)

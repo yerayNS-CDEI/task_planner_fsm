@@ -170,6 +170,9 @@ def _node(seg_start, seg_end, **overrides):
         rclpy.parameter.Parameter("sensor_plane_z", value=0.0),
         rclpy.parameter.Parameter("press_contact_distance", value=PLATE_STANDOFF),
         rclpy.parameter.Parameter("press_min_distance", value=PLATE_STANDOFF - 0.02),
+        # The stream runs in-process here, on the fake clock; the streamer
+        # process has tests of its own (test_wbc_arm_streamer.py).
+        rclpy.parameter.Parameter("arm_stream_process", value=False),
     ]
     params += [rclpy.parameter.Parameter(k, value=v) for k, v in overrides.items()]
     node = WholeBodySweepNode(parameter_overrides=params)
@@ -2576,7 +2579,8 @@ def test_the_default_contact_point_lands_on_the_pendant_tcp():
     real layout.
     """
     node = WholeBodySweepNode(parameter_overrides=[
-        rclpy.parameter.Parameter("arm_joints", value=["wrist"])])
+        rclpy.parameter.Parameter("arm_joints", value=["wrist"]),
+        rclpy.parameter.Parameter("arm_stream_process", value=False)])
     tip = str(node.get_parameter("arm_tip_link").value)
     contact = np.array(node.get_parameter("contact_point").value, dtype=float)
     chain = SerialChain.from_urdf(WRIST_URDF, "arm_base_link", tip)
@@ -2871,3 +2875,32 @@ def test_the_self_collision_rows_reach_the_sweep_qp():
     finally:
         sweep_module.solve_velocity_qp = original
     assert seen and all("self_collision" in names for names in seen)
+
+
+def test_the_sweep_node_streams_through_its_own_process_by_default():
+    """On the robot the stream runs in a process of its own (see
+    wbc/arm_streamer.py): the node waits for it before sweeping, hands it the
+    solve's velocities, and leaves only once its last hold is confirmed."""
+    import time
+
+    from task_planner_fsm.wbc.arm_streamer import RemoteArmStream
+
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.2, 0.0), arm_stream_process=True,
+                 arm_command_topic="/test_sweep_streamer/commands",
+                 joint_states_topic="/test_sweep_streamer/joint_states")
+    try:
+        assert isinstance(node.arm_stream, RemoteArmStream)
+        if not node.arm_stream.ready():
+            assert "arm streamer" in node._missing_inputs()
+        end = time.monotonic() + 30.0
+        while not node.arm_stream.ready() and time.monotonic() < end:
+            time.sleep(0.02)
+        assert node.arm_stream.ready()
+        assert "arm streamer" not in node._missing_inputs()
+        node.arm_stream.initial_command([0.0] * len(ARM_JOINTS))
+        node.arm_stream.velocity([0.01] * len(ARM_JOINTS), 0.5, True)
+        node._hold_arm()
+    finally:
+        assert node.arm_stream.close(2.0), "the final hold was not confirmed"
+        node.destroy_node()
+    assert not node.arm_stream._alive()

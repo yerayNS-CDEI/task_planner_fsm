@@ -62,6 +62,7 @@ from std_msgs.msg import Float32MultiArray, Float64MultiArray, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .admittance import PRESS, SEEK, TARE, AdmittancePress
+from .arm_streamer import RemoteArmStream
 from .avoidance import AvoidanceConfig, ObstacleField, avoidance_rows
 from .base_model import BaseLimits, box_bounds, constraint_rows, wheel_and_turret_rates
 from .hardware import HardwareMonitor
@@ -197,6 +198,24 @@ class WholeBodySweepNode(Node):
         # ~30 ms lag is ~0.015 rad), so this is an order of magnitude of
         # headroom and only bites when the arm is genuinely not following.
         self.declare_parameter("arm_stream_max_lead", 0.2)
+        # Stream the position setpoints from a process of their own (see
+        # wbc/arm_streamer.py): in this one the stream shared an interpreter
+        # with the solve and reached the arm 24 ms apart at the median and up
+        # to ~400 ms at worst, against the 10 ms it was timed for, and the arm
+        # at 100 % stopped and started on every late one. Position mode only;
+        # off runs the stream on a timer here, as before (the unit tests do).
+        self.declare_parameter("arm_stream_process", True)
+        # The streamer's guard for an arm that has stopped following in the air
+        # (16:10:28 on 2026-10-07: 2.6 s still while the setpoint wound up to
+        # max_lead). Re-anchor at the arm once the setpoint is moving faster
+        # than arm_follow_moving_speed, the arm slower than
+        # arm_follow_still_speed (rad/s, worst joint), the lead is past
+        # arm_follow_lead (rad) — normal tracking lag in the air is 10-40
+        # mrad — and all three have held for arm_follow_seconds.
+        self.declare_parameter("arm_follow_lead", 0.05)
+        self.declare_parameter("arm_follow_moving_speed", 0.01)
+        self.declare_parameter("arm_follow_still_speed", 0.005)
+        self.declare_parameter("arm_follow_seconds", 0.25)
         # --- The GPR press (real robot only) ----------------------------------
         # Regulate CONTACT FORCE on the wall-normal axis instead of a standoff
         # distance, so the GPR wheel actually touches. This is our own admittance
@@ -1487,11 +1506,32 @@ class WholeBodySweepNode(Node):
             self.create_publisher(
                 MarkerArray, str(p("self_collision_markers_topic").value), 1)
             if bool(p("self_collision_markers").value) else None)
-        self.arm_stream = ArmStream(
-            self, self.arm_joints,
-            mode=str(p("arm_stream_interface").value),
-            topic=str(p("arm_command_topic").value) or None,
-            max_lead=float(p("arm_stream_max_lead").value))
+        self.arm_stream_remote = (bool(p("arm_stream_process").value)
+                                  and str(p("arm_stream_interface").value) == POSITION)
+        if self.arm_stream_remote:
+            # Started here, so it is up by the time wait_until_ready lets the
+            # sweep begin: a fresh interpreter takes a second or two to import
+            # rclpy on the Jetson. See wbc/arm_streamer.py.
+            self.arm_stream = RemoteArmStream(
+                self, self.arm_joints,
+                topic=str(p("arm_command_topic").value) or None,
+                max_lead=float(p("arm_stream_max_lead").value),
+                config=dict(
+                    node_name=f"{self.get_name()}_arm_streamer",
+                    use_sim_time=bool(p("use_sim_time").value),
+                    joint_states_topic=str(p("joint_states_topic").value),
+                    stream_rate=self.stream_rate,
+                    stream_period_max_factor=self.stream_period_max_factor,
+                    follow_lead=float(p("arm_follow_lead").value),
+                    follow_moving_speed=float(p("arm_follow_moving_speed").value),
+                    follow_still_speed=float(p("arm_follow_still_speed").value),
+                    follow_seconds=float(p("arm_follow_seconds").value)))
+        else:
+            self.arm_stream = ArmStream(
+                self, self.arm_joints,
+                mode=str(p("arm_stream_interface").value),
+                topic=str(p("arm_command_topic").value) or None,
+                max_lead=float(p("arm_stream_max_lead").value))
         self.arm_controller = (str(p("arm_stream_controller").value)
                                or DEFAULT_CONTROLLER[self.arm_stream.mode])
         self.hardware = HardwareMonitor(
@@ -2024,6 +2064,8 @@ class WholeBodySweepNode(Node):
         if (self.avoid and self.costmap_msg is None
                 and bool(self.get_parameter("avoid_require_costmap").value)):
             missing.append("costmap")
+        if self.arm_stream_remote and not self.arm_stream.ready():
+            missing.append("arm streamer")
         return missing
 
     def start(self):
@@ -2053,12 +2095,17 @@ class WholeBodySweepNode(Node):
         self.control_timer = self.create_timer(
             1.0 / self.control_rate, self._control_step,
             callback_group=self.control_group)
-        self.stream_timer = self.create_timer(
-            1.0 / self.stream_rate, self._stream_step,
-            callback_group=self.stream_group)
+        if not self.arm_stream_remote:
+            # With the streamer process the stream ticks THERE; a timer here
+            # would be the very thing it was moved out to get away from.
+            self.stream_timer = self.create_timer(
+                1.0 / self.stream_rate, self._stream_step,
+                callback_group=self.stream_group)
         self.get_logger().info(
             f"Sweeping: solving at {self.control_rate:.0f} Hz, streaming the arm "
-            f"setpoint at {self.stream_rate:.0f} Hz (timeout {self.timeout:.0f}s)."
+            f"setpoint at {self.stream_rate:.0f} Hz"
+            f"{' from its own process' if self.arm_stream_remote else ''} "
+            f"(timeout {self.timeout:.0f}s)."
         )
 
     def _seed_at_rest(self, now):
@@ -3547,6 +3594,11 @@ class WholeBodySweepNode(Node):
             # A press with no force feedback is an arm driving at a wall on a
             # timer. Hold, exactly as for a lost surface.
             stale.append("wrench")
+        if self.arm_stream_remote and not self.arm_stream.alive_since(now, self.max_data_age):
+            # The stream has stopped ticking: the controller is holding the last
+            # setpoint, a pose, so the arm is still — but the sweep cannot go on
+            # moving the base beside an arm nothing is commanding.
+            stale.append("arm streamer")
         return ", ".join(stale)
 
     def _strike(self, reason):
@@ -3681,6 +3733,13 @@ class WholeBodySweepNode(Node):
         with self._arm_lock:
             self.arm_qdot = qdot
             self.arm_qdot_stamp = now
+            if self.arm_stream_remote:
+                # Straight across to the streamer, with how long it may trust
+                # this velocity (the same horizon _stream_locked holds on) and
+                # whether its follow guard applies: the air only, never a press.
+                self.arm_stream.velocity(qdot, self._arm_command_max_age(),
+                                         not self._in_contact())
+                self.stream_cycle_period = self.arm_stream.tick_period()
 
         self._publish_diagnostics(now, u_qp, u)
         # The acceleration this answer implies, over the same clamped interval
@@ -4019,6 +4078,11 @@ def main(args=None):
         if spin_thread is not None:
             spin_thread.join(timeout=2.0)
         node.halt()
+        # With the streamer process, the hold halt() just sent has to be ON THE
+        # WIRE before the arm goes back to the trajectory controller, and the
+        # streamer has to be gone before a later sweep claims the arm again.
+        # close() waits for the first and ends the second.
+        node.arm_stream.close()
         switch.restore()
         node.destroy_node()
         rclpy.try_shutdown()
