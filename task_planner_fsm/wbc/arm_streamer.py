@@ -17,12 +17,15 @@ the part arriving late.
 
 So the stream moves out. This module is three pieces:
 
-* :class:`StreamCore` — the tick itself, unchanged in what it decides
-  (integrate the last trusted velocity, hold once when it goes stale), plus one
-  new guard, below. Plain Python, so it is tested without a process.
+* :class:`StreamCore` — the tick itself: integrate the last trusted velocity,
+  and when it goes stale bring it to rest at ``stale_decel`` (it was a hard
+  hold; see :meth:`StreamCore.tick`), plus one new guard, below. Plain Python,
+  so it is tested without a process.
 * :func:`run` — the process: its own interpreter, its own rclpy context, one
   timer and one ``/joint_states`` subscription on a single-threaded executor,
-  and a thread reading the pipe from ``sweep_node``.
+  and a thread reading the pipe from ``sweep_node``. Both run SCHED_FIFO when
+  allowed (see :func:`_realtime`): a process of its own fixed the interpreter
+  contention, not the CPU contention.
 * :class:`RemoteArmStream` — ``sweep_node``'s end, with the parts of
   :class:`~.streaming.ArmStream`'s interface the node uses.
 
@@ -81,7 +84,8 @@ REANCHORS = 3     # times the follow guard has re-anchored
 TICK_PERIOD = 4   # measured interval of the last tick, s
 HOLDING = 5       # 1 while no velocity is being integrated
 READY = 6         # 1 once the timer and subscription exist
-STATUS_SIZE = 7
+RT_PRIORITY = 7   # SCHED_FIFO priority the tick runs at, 0 if it could not get one
+STATUS_SIZE = 8
 
 
 class StreamCore:
@@ -93,7 +97,8 @@ class StreamCore:
 
     def __init__(self, node, joint_names, topic=None, max_lead=0.2, stream_rate=100.0,
                  stream_period_max_factor=50.0, follow_lead=0.05,
-                 follow_moving_speed=0.01, follow_still_speed=0.005, follow_seconds=0.25):
+                 follow_moving_speed=0.01, follow_still_speed=0.005, follow_seconds=0.25,
+                 stale_decel=2.0):
         self.stream = ArmStream(node, joint_names, mode=POSITION, topic=topic,
                                 max_lead=max_lead)
         self.logger = node.get_logger()
@@ -104,12 +109,18 @@ class StreamCore:
         self.follow_moving_speed = float(follow_moving_speed)
         self.follow_still_speed = float(follow_still_speed)
         self.follow_seconds = float(follow_seconds)
+        # rad/s^2, worst joint. 0 restores the hard hold at the measurement.
+        self.stale_decel = float(stale_decel)
 
         self.qdot = None            # the velocity being integrated, or None
         self.qdot_stamp = None      # when it arrived, on the streamer's clock
         self.max_age = None         # how long it stays trusted, s
         self.in_air = False
-        self.stale = False          # latched while holding on a stale velocity
+        self.stale = False          # latched while the velocity is stale
+        # The velocity actually being integrated while it differs from qdot:
+        # slowing to rest on a stale one, or ramping back up after it. None
+        # in normal streaming, when it is qdot itself.
+        self.v_ramp = None
         self.stream_stamp = None
         self.tick_period = 0.0
         self.q = None               # measured, controller order
@@ -160,46 +171,77 @@ class StreamCore:
         self.qdot_stamp = None
         self.stream_stamp = None
         self.stale = False
+        self.v_ramp = None
         self.still_since = None
 
     # ------------------------------------------------------------------
     def tick(self, now):
-        """One stream tick: what sweep_node's _stream_locked did, plus the guard."""
+        """One stream tick: what sweep_node's _stream_locked did, plus the
+        follow guard, and a stale velocity brought to rest instead of cut."""
         if self.qdot is None or self.qdot_stamp is None:
             return
-        if now - self.qdot_stamp > self.max_age:
-            # The solve has stopped, or its messages have: hold once, at the
-            # measurement, exactly as the in-process stream did.
-            if not self.stale:
-                self.stale = True
-                self.stream.hold(self.q)
-                self.logger.error(
-                    f"No control solution for {now - self.qdot_stamp:.2f}s: holding the "
-                    f"arm where it is rather than streaming on with the last velocity "
-                    f"it was given.")
-            self.stream_stamp = now
-            return
-        if self.stale:
-            self.stale = False
-            self.logger.warn("Control solutions are arriving again; resuming.")
-
         nominal = 1.0 / self.stream_rate
         elapsed = (now - self.stream_stamp) if self.stream_stamp else nominal
         dt = float(min(max(elapsed, nominal), self.stream_period_max_factor * nominal,
                        self.max_age))
         self.tick_period = elapsed
         self.stream_stamp = now
-        self._follow_guard(now)
-        self.stream.send(self.qdot, dt, self.q)
 
-    def _follow_guard(self, now):
+        if now - self.qdot_stamp > self.max_age:
+            # The solve has stopped, or its messages have. It used to be a hold
+            # at the measurement, on the spot, and that is a hard stop: on
+            # 2026-10-07 (16:57) the solve went quiet for 0.1-0.4 s 27 times in
+            # one sweep and every one braked the arm from whatever it was doing
+            # to nothing in a tick — up to 60 rad/s^2 in the return. Instead
+            # the velocity is brought to rest at stale_decel, along the same
+            # path; then the stream goes quiet and the controller holds the
+            # last setpoint. At 0.4 rad/s and 2 rad/s^2 that is 0.04 rad more
+            # travel; at pressing speeds it is nothing.
+            if not self.stale:
+                self.stale = True
+                self.v_ramp = self.qdot.copy() if self.v_ramp is None else self.v_ramp
+                self.logger.error(
+                    f"No control solution for {now - self.qdot_stamp:.2f}s: bringing the "
+                    f"arm to rest rather than streaming on with the last velocity it "
+                    f"was given.")
+                if self.stale_decel <= 0.0:
+                    self.v_ramp = np.zeros(self.n)
+                    self.stream.hold(self.q)
+                    return
+            peak = float(np.max(np.abs(self.v_ramp)))
+            if peak <= 1e-9:
+                return
+            self.v_ramp = self.v_ramp * (max(0.0, peak - self.stale_decel * dt) / peak)
+            self.stream.send(self.v_ramp, dt, self.q)
+            return
+
+        if self.stale:
+            self.stale = False
+            self.logger.warn("Control solutions are arriving again; resuming.")
+        v = self.qdot
+        if self.v_ramp is not None:
+            # Back up to the solve's velocity at the same rate it was brought
+            # down at, rather than in one step.
+            step = max(self.stale_decel, 0.0) * dt
+            if step <= 0.0:
+                self.v_ramp = None
+            else:
+                self.v_ramp = np.clip(self.qdot, self.v_ramp - step, self.v_ramp + step)
+                if np.allclose(self.v_ramp, self.qdot, atol=1e-9):
+                    self.v_ramp = None
+                else:
+                    v = self.v_ramp
+        self._follow_guard(now, v)
+        self.stream.send(v, dt, self.q)
+
+    def _follow_guard(self, now, v):
         """Re-anchor at the arm when, in the air, it has stopped following."""
         if (not self.in_air or self.q is None or self.qd is None
                 or self.stream.command is None):
             self.still_since = None
             return
         lead = float(np.max(np.abs(self.stream.command - self.q)))
-        moving = float(np.max(np.abs(self.qdot))) > self.follow_moving_speed
+        moving = float(np.max(np.abs(v))) > self.follow_moving_speed
         still = float(np.max(np.abs(self.qd))) < self.follow_still_speed
         if not (moving and still and lead > self.follow_lead):
             self.still_since = None
@@ -252,8 +294,10 @@ def run(conn, status, config):
         follow_lead=config["follow_lead"],
         follow_moving_speed=config["follow_moving_speed"],
         follow_still_speed=config["follow_still_speed"],
-        follow_seconds=config["follow_seconds"])
+        follow_seconds=config["follow_seconds"],
+        stale_decel=config.get("stale_decel", 2.0))
     lock = threading.Lock()
+    priority = int(config.get("rt_priority", 0))
     parent = os.getppid()
 
     def now():
@@ -267,6 +311,7 @@ def run(conn, status, config):
         status[HOLDING] = 0.0 if core.qdot is not None and not core.stale else 1.0
 
     def reader():
+        _realtime(priority, node.get_logger(), "pipe reader", quiet=True)
         while True:
             try:
                 msg = conn.recv()
@@ -302,6 +347,10 @@ def run(conn, status, config):
     node.create_subscription(JointState, config.get("joint_states_topic", "/joint_states"),
                              on_joint_states, 10)
     node.create_timer(1.0 / float(config["stream_rate"]), on_tick)
+    # The tick thread is this one: the executor spins here. Raised before the
+    # reader starts, which inherits nothing (it raises itself). The DDS threads
+    # rclpy.init made stay where they are.
+    status[RT_PRIORITY] = float(_realtime(priority, node.get_logger(), "stream tick"))
     threading.Thread(target=reader, name="arm_streamer_pipe", daemon=True).start()
     status[READY] = 1.0
 
@@ -317,6 +366,33 @@ def run(conn, status, config):
         executor.shutdown()
         node.destroy_node()
         rclpy.try_shutdown()
+
+
+def _realtime(priority, logger, what, quiet=False):
+    """Put the CALLING thread on SCHED_FIFO at ``priority``; return what it got.
+
+    16:57 on 2026-10-07: with the stream in its own process the setpoints came
+    10 ms apart at the median, but still 50-130 ms apart now and then, and those
+    were the jolts. Not the interpreter any more — the CPU: load 45 on 12 cores,
+    and this whole process tree at nice 19 behind rtabmap and icp_odometry at
+    70 % of a core each. The UR driver's own loops run SCHED_FIFO (controller
+    manager 50, EtherCAT 80, RTDE 99) for exactly this reason, and the user is
+    in the realtime group (RLIMIT_RTPRIO 99) on an RT kernel, so this may too.
+    Below the controller manager, which has to run first; a tick is
+    microseconds, and the kernel's RT throttling (95 %) is the backstop.
+    """
+    if priority <= 0:
+        return 0
+    try:
+        os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(priority))
+    except (PermissionError, OSError) as exc:
+        logger.warn(
+            f"Arm streamer {what}: could not get SCHED_FIFO {priority} ({exc}); running "
+            f"at normal priority, where a loaded CPU can delay the setpoints.")
+        return 0
+    if not quiet:
+        logger.info(f"Arm streamer {what} running SCHED_FIFO priority {priority}.")
+    return priority
 
 
 def main(argv=None):

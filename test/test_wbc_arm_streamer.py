@@ -97,8 +97,9 @@ def test_a_velocity_is_integrated_over_the_measured_tick():
     assert node.publisher.last == pytest.approx(list(expect))
 
 
-def test_a_stale_velocity_holds_once_at_the_arm_and_resumes_on_a_fresh_one():
-    node, core, seq, q = _seeded()
+def test_with_no_decel_a_stale_velocity_holds_once_at_the_arm():
+    """stale_decel=0 is the old behaviour, kept as the fallback."""
+    node, core, seq, q = _seeded(stale_decel=0.0)
     core.handle(seq(VELOCITY, [0.2, 0.0, 0.0], 0.1, True), 0.0)
     core.tick(0.01)
     moved = len(node.publisher.sent)
@@ -113,6 +114,69 @@ def test_a_stale_velocity_holds_once_at_the_arm_and_resumes_on_a_fresh_one():
     core.handle(seq(VELOCITY, [0.2, 0.0, 0.0], 0.1, True), 0.3)
     core.tick(0.31)
     assert node.publisher.last[0] > arm[0], "moving again from where it was held"
+
+
+def _velocities(node):
+    """Setpoint velocity per tick, from the published stream (fixed DT ticks)."""
+    out = np.array(node.publisher.sent)
+    return np.diff(out, axis=0) / DT
+
+
+def test_a_stale_velocity_is_brought_to_rest_not_cut():
+    """16:57 on 2026-10-07: 27 solve stalls in one sweep, each a hold at the
+    measurement on the spot — a stop from full speed in one tick, up to 60
+    rad/s^2 in the return. Now the velocity comes down at stale_decel along
+    the same path, and the stream goes quiet once it is at rest."""
+    decel, v0 = 2.0, np.array([0.4, -0.2, 0.0])
+    node, core, seq, q = _seeded(stale_decel=decel)
+    core.handle(seq(VELOCITY, list(v0), 0.05, True), 0.0)
+    t = 0.0
+    for _ in range(int(0.05 / DT)):                  # trusted for 50 ms
+        t += DT
+        core.tick(t)
+    start = len(node.publisher.sent) - 1
+    for _ in range(60):                              # then 0.6 s with nothing new
+        t += DT
+        core.tick(t)
+    v = _velocities(node)[start:]
+    peak = np.max(np.abs(v), axis=1)
+    assert np.all(np.diff(peak) >= -decel * DT * 1.01 - 1e-9), "no step down"
+    assert peak[-1] == pytest.approx(0.0, abs=1e-9), "at rest"
+    direction = v[np.argmax(peak > 0.05)]
+    assert direction / np.linalg.norm(direction) == pytest.approx(v0 / np.linalg.norm(v0)), (
+        "slowed along the path it was on")
+    travel = np.array(node.publisher.last) - np.array(node.publisher.sent[start])
+    expect = 0.4 ** 2 / (2 * decel)
+    assert abs(travel[0]) == pytest.approx(expect, rel=0.1), "v^2 / 2a of extra travel"
+    n = len(node.publisher.sent)
+    core.tick(t + DT)
+    assert len(node.publisher.sent) == n, "quiet once at rest"
+    assert any("No control solution" in m for m in node.logs)
+
+
+def test_after_a_stale_velocity_the_stream_ramps_back_up():
+    decel = 2.0
+    node, core, seq, q = _seeded(stale_decel=decel)
+    core.handle(seq(VELOCITY, [0.4, 0.0, 0.0], 0.05, True), 0.0)
+    t = 0.0
+    for _ in range(40):                              # trusted, then stale to rest
+        t += DT
+        core.tick(t)
+        core.measured(np.array(node.publisher.last), np.zeros(3))
+    core.handle(seq(VELOCITY, [0.4, 0.0, 0.0], 0.05, True), t)
+    start = len(node.publisher.sent) - 1
+    for _ in range(30):
+        t += DT
+        core.tick(t)
+        # An arm that follows: otherwise the setpoint pins at max_lead and the
+        # follow guard (rightly) re-anchors it, which is another test's subject.
+        core.measured(np.array(node.publisher.last), np.array([0.4, 0.0, 0.0]))
+        if _ % 4 == 3:                               # the solve keeps it fresh
+            core.handle(seq(VELOCITY, [0.4, 0.0, 0.0], 0.05, True), t)
+    v = _velocities(node)[start:, 0]
+    assert np.all(np.diff(v) <= decel * DT * 1.01 + 1e-12), "no step up"
+    assert v[-1] == pytest.approx(0.4), "back at the solve's velocity"
+    assert any("arriving again" in m for m in node.logs)
 
 
 def test_a_hold_stops_the_integration_immediately():
@@ -224,7 +288,8 @@ def _remote():
     config = dict(node_name="test_arm_streamer", use_sim_time=False,
                   joint_states_topic="/test_arm_streamer/joint_states",
                   stream_rate=RATE, stream_period_max_factor=50.0, follow_lead=0.05,
-                  follow_moving_speed=0.01, follow_still_speed=0.005, follow_seconds=0.25)
+                  follow_moving_speed=0.01, follow_still_speed=0.005, follow_seconds=0.25,
+                  stale_decel=2.0, rt_priority=40)
     return RemoteArmStream(_LogNode(), JOINTS, topic="/test_arm_streamer/commands",
                            max_lead=0.2, config=config)
 
@@ -246,6 +311,11 @@ def test_the_streamer_process_ticks_confirms_a_hold_and_exits_when_told():
         time.sleep(0.5)
         ticks = remote._status[streamer.HEARTBEAT] - beats
         assert ticks > 0.5 * RATE * 0.5, f"only {ticks:.0f} ticks in 0.5 s"
+        # SCHED_FIFO when the account may have it (the robot's: group realtime,
+        # RLIMIT_RTPRIO 99), and a clean fallback when it may not.
+        import resource
+        allowed = resource.getrlimit(resource.RLIMIT_RTPRIO)[0] >= 40
+        assert remote._status[streamer.RT_PRIORITY] == (40.0 if allowed else 0.0)
         remote.initial_command([0.1, -1.0, 1.5])
         remote.velocity([0.1, 0.0, 0.0], 0.5, True)
         remote.hold(None)

@@ -216,6 +216,17 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("arm_follow_moving_speed", 0.01)
         self.declare_parameter("arm_follow_still_speed", 0.005)
         self.declare_parameter("arm_follow_seconds", 0.25)
+        # SCHED_FIFO priority for the streamer's tick and pipe threads; 0 leaves
+        # them at the process's normal priority. Below ur_ros2_control's
+        # controller manager (50). See arm_streamer._realtime for why: 16:57 on
+        # 2026-10-07 still had 50-130 ms setpoint gaps from a CPU at load 45
+        # with this process tree at nice 19.
+        self.declare_parameter("arm_streamer_rt_priority", 40)
+        # When the solve goes quiet, the streamer brings the arm to rest at
+        # this deceleration (rad/s^2, worst joint) instead of holding it at the
+        # measurement on the spot — 27 such stops in the 16:57 sweep, up to 60
+        # rad/s^2 each. 0 restores the hard hold. Matches arm_accel_max.
+        self.declare_parameter("arm_stale_decel", 2.0)
         # --- The GPR press (real robot only) ----------------------------------
         # Regulate CONTACT FORCE on the wall-normal axis instead of a standoff
         # distance, so the GPR wheel actually touches. This is our own admittance
@@ -1525,7 +1536,9 @@ class WholeBodySweepNode(Node):
                     follow_lead=float(p("arm_follow_lead").value),
                     follow_moving_speed=float(p("arm_follow_moving_speed").value),
                     follow_still_speed=float(p("arm_follow_still_speed").value),
-                    follow_seconds=float(p("arm_follow_seconds").value)))
+                    follow_seconds=float(p("arm_follow_seconds").value),
+                    stale_decel=float(p("arm_stale_decel").value),
+                    rt_priority=int(p("arm_streamer_rt_priority").value)))
         else:
             self.arm_stream = ArmStream(
                 self, self.arm_joints,
