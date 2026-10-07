@@ -161,6 +161,7 @@ class StateMachine:
             f'sim:={sim_value}',
             f'use_sim_time:={sim_value}',
             'headless:=true',
+            'mode:=full',
         ])
         self.ctx.setdefault('explore_cmd', [
             'ros2', 'launch', 'navi_wall', 'exploration.launch.py',
