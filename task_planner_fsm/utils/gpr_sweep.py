@@ -156,11 +156,17 @@ class GprSweep:
         even with the probe off."""
         return bool(ctx.get("gpr_trigger_enabled", True))
 
+    def triggers_published(self, ctx):
+        """Send them on ``/gpr/trigger``? Off when the probe clocks its traces
+        from its own wheel (no ESP32 on it): the sampler still runs, so the
+        line record keeps its plate travel and unseated stretches."""
+        return self.triggers_enabled(ctx) and bool(ctx.get("gpr_trigger_publish", True))
+
     def bridge_ready(self, ctx):
         """(ok, reason) from the last gpr_trigger_bridge status. Always ok unless
         ``gpr_trigger_bridge_required`` is set (real robot with the ESP32): sim
         and bench runs keep working with nothing plugged in."""
-        if not (self.triggers_enabled(ctx) and bool(ctx.get("gpr_trigger_bridge_required", False))):
+        if not (self.triggers_published(ctx) and bool(ctx.get("gpr_trigger_bridge_required", False))):
             return True, ""
         status = ctx.get("gpr_trigger_bridge_status")
         stamp = ctx.get("gpr_trigger_bridge_status_stamp")
@@ -241,7 +247,8 @@ class GprSweep:
                 f"[{self.name}] GPR triggers: no sweep direction in '{ref}'; "
                 f"measuring path length instead of travel along the segment.")
         self._ref, self._axis = ref, axis
-        if self._pub is None:
+        publish = self.triggers_published(ctx)
+        if publish and self._pub is None:
             self._pub = node.create_publisher(
                 UInt32, str(ctx.get("gpr_trigger_topic", "/gpr/trigger")), 50)
         self._residual = self._travel = 0.0
@@ -249,13 +256,22 @@ class GprSweep:
         self._tf_warned = False
         self._last_xyz = self._lookup_plate_xyz(ctx, ref)
         rate = max(1.0, float(ctx.get("gpr_trigger_rate_hz", self.TRIGGER_RATE_HZ)))
+        self._timer = node.create_timer(1.0 / rate, lambda: self._tick(ctx))
+        if not publish:
+            self._log(ctx).info(
+                f"[{self.name}] GPR plate travel tracked in '{ref}' at {rate:.0f} Hz "
+                f"(no triggers: the probe runs on its own wheel).")
+            if self._last_xyz is None:
+                self._log(ctx).warn(
+                    f"[{self.name}] GPR travel: no {ref}->plate transform yet; d = 0 "
+                    f"is the first pose the sampler gets.")
+            return
         spacing = self._spacing(ctx)
         if speed_mps > 0.0 and rate < 2.0 * speed_mps / spacing:
             self._log(ctx).warn(
                 f"[{self.name}] GPR trigger sampling at {rate:.0f} Hz is coarse for "
                 f"{spacing * 100.0:.2f} cm spacing at {speed_mps:.3f} m/s; triggers "
                 f"will come in bursts. Raise gpr_trigger_rate_hz.")
-        self._timer = node.create_timer(1.0 / rate, lambda: self._tick(ctx))
         self._log(ctx).info(
             f"[{self.name}] GPR triggers armed: one every {spacing * 100.0:.2f} cm of "
             f"plate travel in '{ref}', sampled at {rate:.0f} Hz.")
@@ -623,10 +639,13 @@ class GprSweep:
             self._timer.cancel()
             ctx["node"].destroy_timer(self._timer)
             self._timer = None
-            if log_summary:
+            if log_summary and self.triggers_published(ctx):
                 self._log(ctx).info(
                     f"[{self.name}] GPR triggers: {self._count} fired over "
                     f"{self._travel:.3f} m of plate travel.")
+            elif log_summary:
+                self._log(ctx).info(
+                    f"[{self.name}] GPR plate travel {self._travel:.3f} m.")
         self._axis = None
         self._last_xyz = None
 
@@ -684,7 +703,10 @@ class GprSweep:
 
     def _emit(self, ctx):
         """One trigger on the topic. The UDP hop to the ESP32 is the bridge's
-        job, so this 50 Hz callback never waits on the Wi-Fi."""
+        job, so this 50 Hz callback never waits on the Wi-Fi. Nothing at all
+        when the probe runs on its own wheel."""
+        if not self.triggers_published(ctx):
+            return
         self._count += 1
         if self._pub is not None:
             self._pub.publish(UInt32(data=self._count))
@@ -781,6 +803,9 @@ class GprSweep:
             "arm_sweep": False,
             "probe_active": False,
             "trigger_distance_m": self._spacing(ctx),
+            # What clocked the probe's traces: our /gpr/trigger via the ESP32,
+            # or its own wheel (trigger_count stays 0, travel_m is still ours).
+            "trigger_source": "bridge" if self.triggers_published(ctx) else "probe_wheel",
             "t_start": gpr_manifest.utc_now(),
             "t_start_epoch": round(time.time(), 3),
         }

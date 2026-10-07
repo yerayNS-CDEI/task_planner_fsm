@@ -429,6 +429,33 @@ def test_unseated_stretch_keeps_firing_and_is_recorded(tmp_path, http):
     assert row["trigger_count"] == 11 and row["travel_m"] == 0.05
 
 
+def test_probe_wheel_mode_tracks_travel_and_unseated_without_triggers(tmp_path, http):
+    """No ESP32 on the probe (bridge box unticked): nothing on /gpr/trigger and
+    no per-trigger log, but the record still has the plate travel and the
+    unseated stretch."""
+    ctx = make_ctx(tmp_path, gpr_trigger_publish=False)
+    gpr = GprSweep("ScanWall", None)
+    _begin(gpr, ctx, 0, 0, 0)
+    ctx["tf_buffer"].xyz = [0.30, 0.0, 1.0]
+    gpr.arm_triggers(ctx, "map", *SEG, 0.045)
+    assert gpr.armed
+    gpr.note_contact(ctx, True)
+    _move_to(ctx, 0.31)
+    gpr.note_contact(ctx, False)
+    _move_to(ctx, 0.33)
+    gpr.note_contact(ctx, True)
+    for x in (0.36, 0.40):                       # under the 5 cm jump cap
+        _move_to(ctx, x)
+    gpr.end_segment(ctx)
+    assert ctx["node"].pub.sent == []
+    assert not any("GPR trigger #" in line for line in ctx["node"].logger.lines)
+    (row,) = _manifest(tmp_path)
+    (stretch,) = row["unseated"]
+    assert (stretch["from_m"], stretch["to_m"]) == (0.01, 0.03)
+    assert row["trigger_source"] == "probe_wheel"
+    assert row["trigger_count"] == 0 and row["travel_m"] == 0.1
+
+
 def test_contact_notes_before_arming_are_ignored(tmp_path, http):
     ctx = make_ctx(tmp_path)
     gpr = GprSweep("ScanWall", None)

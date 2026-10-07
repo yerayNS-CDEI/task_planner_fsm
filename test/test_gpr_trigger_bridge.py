@@ -60,6 +60,11 @@ def test_gate_is_open_when_triggers_disabled(state):
     assert state.bridge_ready(ctx) == (True, "")
 
 
+def test_gate_is_open_when_the_probe_runs_on_its_own_wheel(state):
+    ctx = make_ctx(gpr_trigger_publish=False, gpr_trigger_bridge_required=True)
+    assert state.bridge_ready(ctx) == (True, "")
+
+
 def test_gate_needs_a_status(state):
     ctx = make_ctx(gpr_trigger_bridge_required=True)
     ok, reason = state.bridge_ready(ctx)
