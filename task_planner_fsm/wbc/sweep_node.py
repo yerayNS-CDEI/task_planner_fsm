@@ -102,7 +102,17 @@ class WholeBodySweepNode(Node):
         # speed the casters cross it: there were ~5 N of headroom to the soft
         # limit at 24 mm/s, and when that closes, the speed has found its
         # limit rather than the gate having.
-        self.declare_parameter("sweep_speed", 0.045)      # m/s along the wall
+        #
+        # Back to 0.030 on 2026-10-09: on a wall with bumps (19:00) both lines
+        # ended on a bump the obstacle routine had already caught. The wheel
+        # went 4 -> 29 N in 80 ms and kept rising for the ~0.25-0.3 s from
+        # contact to the arm backing off — to 50 N / 7.9 Nm and 56 N, past
+        # press_force_limit and press_torque_limit. That reaction time is the
+        # loop's, so the distance driven into a bump scales with this speed.
+        # Also the speed this base holds sweeping sideways (see the warning
+        # in __init__). The FSM passes this explicitly
+        # (ScanWall.WBC_SWEEP_SPEED_MS), and clocks the GPR with it.
+        self.declare_parameter("sweep_speed", 0.030)      # m/s along the wall
         self.declare_parameter("standoff", 0.20)          # m, plate to wall
         self.declare_parameter("arrive_tolerance", 0.03)  # m of arc length
         # The sweep's overall clock. It used to be length / speed + a 30 s

@@ -504,7 +504,7 @@ def test_scan_wall_arms_on_first_seated_not_on_approach(scan_wall, tmp_path):
     _status(scan_wall, ctx, "running: unseated")
     _status(scan_wall, ctx, "running: seated")
     assert scan_wall._gpr.calls == [
-        ("arm", "map", SEG[0], 0.045),
+        ("arm", "map", SEG[0], scan_wall.WBC_SWEEP_SPEED_MS),
         ("contact", True), ("contact", False), ("contact", True),
     ]
     assert scan_wall._nav_status is None

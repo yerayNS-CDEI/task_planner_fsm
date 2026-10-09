@@ -2137,6 +2137,10 @@ class ScanWall(State):
     # Absolute base-speed cap during the sweep (0.0 => no limit). Found most
     # stable at 0.05 m/s; override via ctx["sweep_speed_limit"].
     SWEEP_SPEED_LIMIT_MS = 0.05
+    # The whole-body sweep's speed along the wall when ctx["wbc_sweep_speed"]
+    # is not set. Passed to wbc/sweep_node AND used to clock the GPR, so both
+    # read it here; keep it equal to sweep_node's own sweep_speed default.
+    WBC_SWEEP_SPEED_MS = 0.030
     # Relaxed progress checker so a sub-0.1 m/s sweep is not aborted as "no
     # progress" (must move SWEEP_PROGRESS_RADIUS_M within SWEEP_PROGRESS_TIME_S).
     SWEEP_PROGRESS_RADIUS_M = 0.10
@@ -2347,7 +2351,7 @@ class ScanWall(State):
         cmd += [
             # The fallback has to track wbc/sweep_node's own default, or the
             # node's is dead code: this is always passed.
-            "-p", f"sweep_speed:={float(ctx.get('wbc_sweep_speed', 0.045))}",
+            "-p", f"sweep_speed:={float(ctx.get('wbc_sweep_speed', self.WBC_SWEEP_SPEED_MS))}",
             "-p", f"status_topic:={ctx.get('wbc_status_topic', self.WBC_STATUS_TOPIC)}",
             # Everything in the loop — control period, data ages, the sweep
             # deadline — ticks on the node's clock. Gazebo runs well below
@@ -2446,7 +2450,7 @@ class ScanWall(State):
     def _arm_gpr_triggers(self, ctx, seg_start, seg_end):
         """Plate on the wall and about to travel: start the GPR's clock."""
         if self._wbc_enabled(ctx):
-            speed = float(ctx.get("wbc_sweep_speed", 0.045))
+            speed = float(ctx.get("wbc_sweep_speed", self.WBC_SWEEP_SPEED_MS))
         elif bool(ctx.get("sweep_use_crawl", False)):
             speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
         else:
