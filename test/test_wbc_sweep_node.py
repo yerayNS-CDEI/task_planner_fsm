@@ -3095,9 +3095,10 @@ def test_a_re_contact_at_the_default_floor_takes_seconds_not_a_minute():
         f"landed at {forces.max():.1f} N")
 
 
-def _rough_wall_run(wheel, along, cycles=600):
+def _rough_wall_run(wheel, along, cycles=600, torque=lambda c: 0.0):
     """The press sweeping in contact while ``wheel(cycle)`` N is added to the
-    wheel force and ``along(cycle)`` N pushes against the travel."""
+    wheel force, ``along(cycle)`` N pushes against the travel and
+    ``torque(cycle)`` Nm sits on the plate about its x axis."""
     node = _press_node(press_tare_seconds=0.0)
     robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
     node.q_posture = robot.q.copy()
@@ -3108,7 +3109,7 @@ def _rough_wall_run(wheel, along, cycles=600):
         R = robot.tip()[:3, :3]
         node.press_force = robot.press_force() + wheel(cycle)
         node.wrench = np.concatenate(((R.T @ np.array([0.0, along(cycle), 0.0]))[:2],
-                                      np.zeros(3)))
+                                      np.zeros(1), [torque(cycle), 0.0]))
 
     _press_run(node, robot, cycles=cycles, on_cycle=on_cycle)
     return node
@@ -3137,3 +3138,49 @@ def test_a_snag_well_beyond_friction_is_an_obstacle():
     node = _rough_wall_run(wheel=lambda c: 0.0,
                            along=lambda c: 12.0 if c >= 100 else 1.0, cycles=200)
     assert node.obstacle_events == 1
+
+
+def test_a_steady_corner_load_torque_is_not_an_obstacle():
+    """10-09 17:31 at 0.69 m: 4.1-4.5 Nm for over half a second with the load
+    on a corner of the plate and ~1 N of excess along the wall — the old 4 Nm
+    torque trigger sent the plate past 18 cm of wall for nothing."""
+    node = _rough_wall_run(wheel=lambda c: 0.0, along=lambda c: 1.0,
+                           torque=lambda c: 4.5 if c >= 100 else 1.0, cycles=300)
+    assert float(node.get_parameter("obstacle_torque").value) == 0.0, "off by default"
+    assert node.obstacle_events == 0
+
+
+def test_the_force_trigger_is_watched_at_the_ft_rate():
+    """At the 16-24 Hz the loop really runs, the 0.06 s dwell took ~0.2 s and
+    the bar at 4.80 m (10-09 17:31) reached 50 N on the wheel first. The
+    wrench callback runs the same trigger on every sample and latches it; the
+    next cycle acts on it without a dwell of its own."""
+    node = _rough_wall_run(wheel=lambda c: 0.0, along=lambda c: 1.0, cycles=100)
+    assert node.obstacle_events == 0 and node.press.touched
+    assert node.obstacle_frame is not None
+    R, t_hat = node.obstacle_frame
+    node.wrench = np.concatenate(((R.T @ (-12.0 * t_hat))[:2], np.zeros(3)))
+    dwell = float(node.get_parameter("obstacle_dwell").value)
+    t0 = 1000.0
+    for k in range(5):                               # 100 Hz, 0-40 ms: short of the dwell
+        node._watch_obstacle(t0 + 0.01 * k)
+    assert node.obstacle_latched is None
+    node._watch_obstacle(t0 + dwell + 0.001)
+    assert node.obstacle_latched is not None
+    node._obstacle_step(t0 + dwell + 0.002, node.surface.distance)
+    assert node.obstacle_phase == "relieve" and node.obstacle_events == 1
+    assert node.obstacle_latched is None
+
+
+def test_a_latch_left_over_from_a_phase_does_not_fire_after_it():
+    """The watch runs on its own thread, so it can latch as the control loop
+    enters an obstacle phase; that latch is dropped, not acted on at landing."""
+    node = _rough_wall_run(wheel=lambda c: 0.0, along=lambda c: 1.0, cycles=100)
+    node.obstacle_phase = "pass"
+    node.obstacle_hit_progress = node.progress
+    node.obstacle_latched = (12.0, 5.0)
+    node._obstacle_step(1000.0, node.surface.distance)
+    assert node.obstacle_latched is None
+    node.obstacle_phase = None
+    node._obstacle_step(1000.1, node.surface.distance)
+    assert node.obstacle_phase is None and node.obstacle_events == 0

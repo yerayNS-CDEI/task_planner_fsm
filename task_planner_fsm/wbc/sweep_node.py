@@ -424,13 +424,31 @@ class WholeBodySweepNode(Node):
         # friction: the bar at 4.74 m was 30 N against the travel with 24 N on
         # the wheel. Replayed over every bag of that line (10-08 10:59, 10-09
         # 14:16, 15:22), 0.4 and 6 N fire on the bar in all three, at 14-29 N
-        # on the wheel, and on nothing that was not a snag. The torque is
-        # |T_xy| against its tare (an edge load). The wheel force alone is not
-        # a trigger: a hard landing (28 N, 2.5 N along the wall, 15:27:57) is
-        # the press's to relieve, and a wedge shows as excess along-wall force.
+        # on the wheel, and on nothing that was not a snag. The wheel force
+        # alone is not a trigger: a hard landing (28 N, 2.5 N along the wall,
+        # 15:27:57) is the press's to relieve, and a wedge shows as excess
+        # along-wall force.
+        #
+        # The force is also watched on every F/T sample (_watch_obstacle), not
+        # only once per control cycle: at the 16-24 Hz the loop really runs,
+        # the dwell took ~0.2 s to complete, and on 2026-10-09 17:31 the bar
+        # went from 20 to 50 N on the wheel in that time — the trigger fired
+        # 118 ms before press_force_limit ended the line. At the F/T's 101 Hz,
+        # replayed over every bag of the line (10-08 10:59, 10-09 14:16, 15:22,
+        # 17:31 x2), the same 6 N and 0.06 s fire 80-90 ms earlier on the bar,
+        # at 17-21 N on the wheel, and still on nothing else (a 0.03 s dwell
+        # adds two false ones).
+        #
+        # obstacle_torque, |T_xy| against its tare (an edge load), is OFF
+        # (0) since 2026-10-09: in that replay it never caught anything the
+        # force had not caught 0.03-0.16 s earlier, and its one catch of its
+        # own was a false one — 17:31 at 0.69 m, a steady 4.1-4.5 Nm with the
+        # load on a corner of the plate, 13 N on the wheel and ~1 N of excess.
+        # The plate then flew 18 cm of wall for nothing. press_torque_limit
+        # still ends the line on a real overload.
         self.declare_parameter("obstacle_force", 6.0)           # N, excess over friction
         self.declare_parameter("obstacle_friction", 0.4)        # x wheel force
-        self.declare_parameter("obstacle_torque", 4.0)          # Nm, tared
+        self.declare_parameter("obstacle_torque", 0.0)          # Nm, tared; 0 = off
         self.declare_parameter("obstacle_dwell", 0.06)          # s
         # Freed: the wheel unloaded and the along-wall force below this.
         self.declare_parameter("obstacle_clear_force", 2.5)     # N
@@ -1440,6 +1458,12 @@ class WholeBodySweepNode(Node):
         self.obstacle_phase = None
         self.obstacle_since = None          # when the current phase began
         self.obstacle_trigger_since = None  # a trigger first seen, for the dwell
+        # The F/T-rate watch (_watch_obstacle): the plate frame and travel
+        # direction from the last control cycle, its own dwell start, and a
+        # trigger it has latched for the next cycle as (resistance N, wheel N).
+        self.obstacle_frame = None
+        self.obstacle_fast_since = None
+        self.obstacle_latched = None
         self.obstacle_hit_progress = 0.0    # plate progress where it was caught
         self.obstacle_contact_distance = 0.0  # sensed distance when caught
         self.obstacle_clearance_now = 0.0
@@ -1950,6 +1974,7 @@ class WholeBodySweepNode(Node):
         self.wrench = np.array([msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z,
                                 msg.wrench.torque.x, msg.wrench.torque.y], dtype=float)
         self.wrench_stamp = self._now()
+        self._watch_obstacle(self.wrench_stamp)
 
     def _on_costmap(self, msg):
         self.costmap_msg = msg
@@ -2885,6 +2910,7 @@ class WholeBodySweepNode(Node):
                 self.finish("failed", self.press.fault)
                 return
             self.lateral = self._lateral_load(R_plate, t_hat)
+            self.obstacle_frame = (R_plate, t_hat)
             torque_limit = float(p("press_torque_limit").value)
             # Against the free-air tare once there is one: the plate's own
             # weight puts ~1-4 Nm on the sensor with nothing touching (it was
@@ -3709,6 +3735,37 @@ class WholeBodySweepNode(Node):
         wheel = max(0.0, float(self.press.raw)) if self.press is not None else 0.0
         return self.lateral[0] - float(self.get_parameter("obstacle_friction").value) * wheel
 
+    def _watch_obstacle(self, now):
+        """The obstacle force trigger on every F/T sample, latched for the
+        control loop (see obstacle_force for why).
+
+        Runs in the wrench callback, beside the control loop rather than in
+        it: the plate frame and travel direction are the last cycle's, which
+        at 16-24 Hz is a few mm of travel and no measurable turn. The same
+        excess and dwell as the per-cycle check in _obstacle_step, which stays
+        as it was; this one only gets there sooner.
+        """
+        p = self.get_parameter
+        press = self.press
+        frame = self.obstacle_frame
+        if (press is None or frame is None or self.wrench_bias is None
+                or self.obstacle_phase is not None or self.obstacle_latched is not None
+                or not press.touched or press.state == TARE
+                or not bool(p("obstacle_handling").value)):
+            self.obstacle_fast_since = None
+            return
+        resistance = self._lateral_load(*frame)[0]
+        wheel = max(0.0, self.press_force - press.bias)
+        excess = resistance - float(p("obstacle_friction").value) * wheel
+        if excess < float(p("obstacle_force").value):
+            self.obstacle_fast_since = None
+            return
+        if self.obstacle_fast_since is None:
+            self.obstacle_fast_since = now
+        if now - self.obstacle_fast_since >= float(p("obstacle_dwell").value):
+            self.obstacle_latched = (resistance, wheel)
+            self.obstacle_fast_since = None
+
     def _obstacle_step(self, now, distance):
         """Detect an obstacle and step relieve -> pass -> pressing again.
 
@@ -3721,24 +3778,34 @@ class WholeBodySweepNode(Node):
         excess = self._resistance_excess()
         torque = self.lateral[2] if self.lateral is not None else 0.0
         obstacle_force = float(p("obstacle_force").value)
+        # Taken every cycle, so one the F/T watch set as a phase began (it runs
+        # on its own thread) is dropped here instead of firing after the pass.
+        latched, self.obstacle_latched = self.obstacle_latched, None
 
         if self.obstacle_phase is None:
             if not press.touched or press.state == TARE:
                 self.obstacle_trigger_since = None
                 return True
             why = None
-            if excess >= obstacle_force:
+            torque_trigger = float(p("obstacle_torque").value)
+            if latched is not None:
+                # Held for the dwell already, at the F/T's rate (_watch_obstacle).
+                why = (f"{latched[0]:+.1f} N along the wall against the travel with "
+                       f"{latched[1]:.1f} N on the wheel")
+            elif excess >= obstacle_force:
                 why = (f"{resistance:+.1f} N along the wall against the travel with "
                        f"{press.raw:.1f} N on the wheel")
-            elif self.lateral is not None and torque >= float(p("obstacle_torque").value):
+            elif (self.lateral is not None and torque_trigger > 0.0
+                  and torque >= torque_trigger):
                 why = f"{torque:.1f} Nm on the plate edge"
             if why is None:
                 self.obstacle_trigger_since = None
                 return True
-            if self.obstacle_trigger_since is None:
-                self.obstacle_trigger_since = now
-            if now - self.obstacle_trigger_since < float(p("obstacle_dwell").value):
-                return True
+            if latched is None:
+                if self.obstacle_trigger_since is None:
+                    self.obstacle_trigger_since = now
+                if now - self.obstacle_trigger_since < float(p("obstacle_dwell").value):
+                    return True
             self.obstacle_trigger_since = None
             same = (self.obstacle_last_end is not None
                     and self.progress - self.obstacle_last_end
@@ -3821,6 +3888,10 @@ class WholeBodySweepNode(Node):
     def _enter_obstacle(self, phase, now, message):
         self.obstacle_phase = phase
         self.obstacle_since = now
+        # A latch the F/T watch set for this same catch must not outlive it
+        # and fire again the moment the plate lands past it.
+        self.obstacle_latched = None
+        self.obstacle_fast_since = None
         self.get_logger().warn(message)
 
     def _obstacle_motion(self, distance, speed_cap):
