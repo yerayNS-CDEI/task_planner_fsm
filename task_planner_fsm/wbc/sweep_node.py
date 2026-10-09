@@ -400,16 +400,24 @@ class WholeBodySweepNode(Node):
         # stretch reaches the FSM as an unseated contact, so the GPR marks it.
         # Off restores the old behaviour (throttle, stop, abort).
         self.declare_parameter("obstacle_handling", True)
-        # The triggers, any one of them held for obstacle_dwell. The force is
-        # the along-wall component resisting the travel, measured against the
-        # free-air tare as a VECTOR (rolling drag is ~2 N, a caster skidding
-        # sideways ~2 N more); the torque is |T_xy| against its tare (an edge
-        # load); the press force, with some of that along-wall force, is the
-        # wedge already under way (a shove straight into the wall, with none,
-        # stays the press's to relieve).
-        self.declare_parameter("obstacle_force", 8.0)           # N, against travel
+        # The triggers, either held for obstacle_dwell. The force is the
+        # along-wall component resisting the travel, measured against the
+        # free-air tare as a VECTOR, LESS the friction the wheel's own load
+        # explains: obstacle_friction times the (raw) wheel force. Rolling
+        # drag is friction and scales with the press — on the rough last
+        # metre of the 2026-10-09 15:22 line the wheel swung 4-18 N and the
+        # drag followed it at ~0.45x, reaching 8 N at the peaks, which a bare
+        # 8 N threshold called an obstacle. A real one pushes back far beyond
+        # friction: the bar at 4.74 m was 30 N against the travel with 24 N on
+        # the wheel. Replayed over every bag of that line (10-08 10:59, 10-09
+        # 14:16, 15:22), 0.4 and 6 N fire on the bar in all three, at 14-29 N
+        # on the wheel, and on nothing that was not a snag. The torque is
+        # |T_xy| against its tare (an edge load). The wheel force alone is not
+        # a trigger: a hard landing (28 N, 2.5 N along the wall, 15:27:57) is
+        # the press's to relieve, and a wedge shows as excess along-wall force.
+        self.declare_parameter("obstacle_force", 6.0)           # N, excess over friction
+        self.declare_parameter("obstacle_friction", 0.4)        # x wheel force
         self.declare_parameter("obstacle_torque", 4.0)          # Nm, tared
-        self.declare_parameter("obstacle_press_force", 25.0)    # N, on the wheel
         self.declare_parameter("obstacle_dwell", 0.06)          # s
         # Freed: the wheel unloaded and the along-wall force below this.
         self.declare_parameter("obstacle_clear_force", 2.5)     # N
@@ -3678,7 +3686,15 @@ class WholeBodySweepNode(Node):
         """
         if self.lateral is None or not bool(self.get_parameter("obstacle_handling").value):
             return self.side_force - self.side_bias
-        return max(0.0, self.lateral[0]) if drag else self.lateral[3]
+        return max(0.0, self._resistance_excess()) if drag else self.lateral[3]
+
+    def _resistance_excess(self):
+        """The force against the travel beyond what the wheel's load explains
+        as friction, N (see obstacle_force). 0 before the tare."""
+        if self.lateral is None:
+            return 0.0
+        wheel = max(0.0, float(self.press.raw)) if self.press is not None else 0.0
+        return self.lateral[0] - float(self.get_parameter("obstacle_friction").value) * wheel
 
     def _obstacle_step(self, now, distance):
         """Detect an obstacle and step relieve -> pass -> pressing again.
@@ -3689,6 +3705,7 @@ class WholeBodySweepNode(Node):
         p = self.get_parameter
         press = self.press
         resistance = self.lateral[0] if self.lateral is not None else 0.0
+        excess = self._resistance_excess()
         torque = self.lateral[2] if self.lateral is not None else 0.0
         obstacle_force = float(p("obstacle_force").value)
 
@@ -3697,15 +3714,11 @@ class WholeBodySweepNode(Node):
                 self.obstacle_trigger_since = None
                 return True
             why = None
-            if resistance >= obstacle_force:
-                why = f"{resistance:+.1f} N along the wall against the travel"
+            if excess >= obstacle_force:
+                why = (f"{resistance:+.1f} N along the wall against the travel with "
+                       f"{press.raw:.1f} N on the wheel")
             elif self.lateral is not None and torque >= float(p("obstacle_torque").value):
                 why = f"{torque:.1f} Nm on the plate edge"
-            elif (press.force >= float(p("obstacle_press_force").value)
-                    and resistance >= float(p("obstacle_clear_force").value)):
-                # A wedge under way. Not the force alone: a shove straight
-                # into the wall is the press's to relieve, and it does.
-                why = f"{press.force:.1f} N on the wheel, {resistance:+.1f} N against the travel"
             if why is None:
                 self.obstacle_trigger_since = None
                 return True
@@ -3762,7 +3775,7 @@ class WholeBodySweepNode(Node):
             return True
 
         # pass
-        if press.force >= press.contact_force or resistance >= obstacle_force:
+        if press.force >= press.contact_force or excess >= obstacle_force:
             raised = self.obstacle_clearance_now + float(p("obstacle_clearance_step").value)
             if raised > float(p("obstacle_clearance_max").value) + 1e-9:
                 self.finish(

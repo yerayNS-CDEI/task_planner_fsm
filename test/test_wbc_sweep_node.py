@@ -3050,7 +3050,9 @@ def test_a_wedging_snag_is_caught_before_the_force_limit():
         lateral = min(60.0, 2000.0 * into)          # 2 N per mm driven into the snag
         node.wrench = np.concatenate(((T[:3, :3].T @ np.array([0.0, lateral, 0.0]))[:2],
                                       np.zeros(3)))
-        node.press_force = robot.press_force() + 1.5 * lateral   # the wedge loads the wheel
+        # The wedge loads the wheel too: 0.9 N per N along the wall, the
+        # ratio the 10-08 11:03:23 trace climbed at (14.8 N against 20.9).
+        node.press_force = robot.press_force() + 0.9 * lateral
         peak.append(node.press_force)
 
     _press_run(node, robot, cycles=900, on_cycle=on_cycle)
@@ -3091,3 +3093,47 @@ def test_a_re_contact_at_the_default_floor_takes_seconds_not_a_minute():
     assert touched / node.control_rate < 5.0, f"touched after {touched / node.control_rate:.1f} s"
     assert forces.max() < float(node.get_parameter("press_force_soft_limit").value), (
         f"landed at {forces.max():.1f} N")
+
+
+def _rough_wall_run(wheel, along, cycles=600):
+    """The press sweeping in contact while ``wheel(cycle)`` N is added to the
+    wheel force and ``along(cycle)`` N pushes against the travel."""
+    node = _press_node(press_tare_seconds=0.0)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    node.wrench_bias = np.zeros(5)
+
+    def on_cycle(cycle):
+        R = robot.tip()[:3, :3]
+        node.press_force = robot.press_force() + wheel(cycle)
+        node.wrench = np.concatenate(((R.T @ np.array([0.0, along(cycle), 0.0]))[:2],
+                                      np.zeros(3)))
+
+    _press_run(node, robot, cycles=cycles, on_cycle=on_cycle)
+    return node
+
+
+def test_friction_riding_a_swinging_wheel_force_is_not_an_obstacle():
+    """10-09 15:27:34: on the rough last metre the wheel swung 4-18 N and the
+    rolling drag followed it at ~0.45x, reaching 8 N at the peaks — called an
+    obstacle by a bare 8 N threshold. Friction is subtracted now."""
+    swing = lambda c: 7.0 + 7.0 * math.sin(2.0 * math.pi * c / 20.0)   # 0-14 N on top
+    node = _rough_wall_run(wheel=swing,
+                           along=lambda c: 0.45 * (5.0 + swing(c)))
+    assert node.obstacle_events == 0, "friction, not a snag"
+
+
+def test_a_hard_landing_alone_is_not_an_obstacle():
+    """10-09 15:27:57: 28 N on the wheel with 2.5 N along the wall after a
+    landing was called an obstacle by the wheel-force trigger, now removed:
+    the press relieves an overload, and a wedge shows as along-wall force."""
+    node = _rough_wall_run(wheel=lambda c: 23.0 if 100 <= c < 140 else 0.0,
+                           along=lambda c: 2.5)
+    assert node.obstacle_events == 0
+
+
+def test_a_snag_well_beyond_friction_is_an_obstacle():
+    node = _rough_wall_run(wheel=lambda c: 0.0,
+                           along=lambda c: 12.0 if c >= 100 else 1.0, cycles=200)
+    assert node.obstacle_events == 1
