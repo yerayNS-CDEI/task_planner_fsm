@@ -62,7 +62,7 @@ from std_msgs.msg import Float32MultiArray, Float64MultiArray, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .admittance import PRESS, SEEK, TARE, AdmittancePress
-from .arm_streamer import RemoteArmStream
+from .arm_streamer import RemoteArmStream, _realtime
 from .avoidance import AvoidanceConfig, ObstacleField, avoidance_rows
 from .base_model import BaseLimits, box_bounds, constraint_rows, wheel_and_turret_rates
 from .hardware import HardwareMonitor
@@ -71,7 +71,8 @@ from .qp import SoftRows, Task, joint_limit_bounds, solve_velocity_qp
 from .self_collision import SelfCollisionConfig, SelfCollisionModel
 from .stiffness import ContactStiffness, force_limit_rows
 from .streaming import DEFAULT_CONTROLLER, POSITION, ArmStream, slew_limit
-from .surface import SENSOR_PLANE_Z, SurfaceEstimator, plate_orientation_target, sweep_tangent
+from .surface import (MIN_VALID_SENSORS, SENSOR_PLANE_Z, VALID_HI, VALID_LO, SurfaceEstimator,
+                      plate_orientation_target, sweep_tangent)
 
 ARM_JOINTS = [
     "arm_shoulder_pan_joint", "arm_shoulder_lift_joint", "arm_elbow_joint",
@@ -229,6 +230,15 @@ class WholeBodySweepNode(Node):
         # 2026-10-07 still had 50-130 ms setpoint gaps from a CPU at load 45
         # with this process tree at nice 19.
         self.declare_parameter("arm_streamer_rt_priority", 40)
+        # SCHED_FIFO priority for THIS process — the solve and every callback
+        # thread; 0 leaves it at normal priority. The whole process, not the
+        # control thread alone: a Python thread at normal priority holding the
+        # interpreter lock would otherwise stall a real-time solve behind it.
+        # Below the streamer (40) and the UR driver (50+). The solve costs
+        # ~13 ms; at nice 19 on the loaded Jetson its p90 was 35-41 ms and the
+        # loop ran at ~6 Hz (2026-10-08), too slow to see an obstacle wedge the
+        # plate in 0.3 s. Under SCHED_FIFO 30 the same solve's p90 was 13.7 ms.
+        self.declare_parameter("sweep_rt_priority", 30)
         # How fast the streamer lets the arm's velocity change, rad/s^2 (worst
         # joint): every new solve's velocity is reached on this ramp, and a
         # solve that goes quiet is a ramp to rest. The solve runs at ~6 Hz on
@@ -377,6 +387,51 @@ class WholeBodySweepNode(Node):
         # still under the limit for most of the rise. Tared over the press's
         # own TARE window, since the F/T's lateral idle sits around 3-5 N.
         self.declare_parameter("press_side_force_limit", 10.0)
+        # --- Obstacles on the wall: relieve and pass ---------------------------
+        # A light switch, a pilaster, a bump that catches the GPR's leading
+        # edge. On 2026-10-08 7 of 12 sweeps ended on one: the force along the
+        # wall AGAINST the travel rose for ~0.8 s (0 -> 7 N at 11:03:23), then
+        # the edge wedged and the press went 11 -> 47 N in 0.3 s, past the 45 N
+        # limit before a 6 Hz loop could answer. Pressing on, or stopping and
+        # waiting, both end the line. So on that early signal the sweep stops
+        # the base, frees the plate with the ARM alone (pulls it off the wall,
+        # and back along the wall a little if the edge is still hooked), then
+        # carries it past at a standoff and lands it again beyond. The skipped
+        # stretch reaches the FSM as an unseated contact, so the GPR marks it.
+        # Off restores the old behaviour (throttle, stop, abort).
+        self.declare_parameter("obstacle_handling", True)
+        # The triggers, any one of them held for obstacle_dwell. The force is
+        # the along-wall component resisting the travel, measured against the
+        # free-air tare as a VECTOR (rolling drag is ~2 N, a caster skidding
+        # sideways ~2 N more); the torque is |T_xy| against its tare (an edge
+        # load); the press force, with some of that along-wall force, is the
+        # wedge already under way (a shove straight into the wall, with none,
+        # stays the press's to relieve).
+        self.declare_parameter("obstacle_force", 8.0)           # N, against travel
+        self.declare_parameter("obstacle_torque", 4.0)          # Nm, tared
+        self.declare_parameter("obstacle_press_force", 25.0)    # N, on the wheel
+        self.declare_parameter("obstacle_dwell", 0.06)          # s
+        # Freed: the wheel unloaded and the along-wall force below this.
+        self.declare_parameter("obstacle_clear_force", 2.5)     # N
+        # How the arm frees the plate. Base stopped throughout.
+        self.declare_parameter("obstacle_retract_speed", 0.01)  # m/s off the wall
+        self.declare_parameter("obstacle_unhook_speed", 0.005)  # m/s back along it
+        self.declare_parameter("obstacle_unhook_distance", 0.02)  # m, at most
+        # How far off the wall it passes: the GPR's contact standoff plus this.
+        # A light switch stands 1-2 cm proud; a pilaster more, so a pass that
+        # meets the obstacle again lifts by another step, up to the maximum,
+        # and past that the line ends cleanly.
+        self.declare_parameter("obstacle_clearance", 0.03)      # m
+        self.declare_parameter("obstacle_clearance_step", 0.03)  # m
+        self.declare_parameter("obstacle_clearance_max", 0.12)  # m
+        # The pass: base and plate together at this speed, for this far past
+        # where the plate was caught (the GPR body, the obstacle and a margin).
+        self.declare_parameter("obstacle_pass_speed", 0.02)     # m/s
+        self.declare_parameter("obstacle_pass_length", 0.35)    # m
+        # Bounds: freeing the plate may take this long, and a line may meet
+        # this many obstacles, before it ends (with the usual retreat).
+        self.declare_parameter("obstacle_relieve_timeout", 10.0)  # s
+        self.declare_parameter("obstacle_max_events", 8)
         # Below this fraction of press_side_force_limit the plate is rolling
         # and the base may sweep at full speed; from there to the limit the
         # travel is throttled linearly to zero. A plate being dragged
@@ -1338,6 +1393,19 @@ class WholeBodySweepNode(Node):
         self.wrench = np.zeros(5)
         self.wrench_bias = None
         self._wrench_tare = []
+        # The lateral load against that tare, this cycle: (force resisting the
+        # travel N, vertical force N, |T_xy| Nm), or None before the tare.
+        self.lateral = None
+        # Obstacle handling (see obstacle_handling): None while sweeping
+        # normally, else "relieve" (arm freeing the plate, base stopped) or
+        # "pass" (carrying it past at a standoff).
+        self.obstacle_phase = None
+        self.obstacle_since = None          # when the current phase began
+        self.obstacle_trigger_since = None  # a trigger first seen, for the dwell
+        self.obstacle_hit_progress = 0.0    # plate progress where it was caught
+        self.obstacle_contact_distance = 0.0  # sensed distance when caught
+        self.obstacle_clearance_now = 0.0
+        self.obstacle_events = 0
         # Where the normal load sits on the plate, plate xy, m, filtered. None
         # while it cannot be trusted (not pressing, or too little force).
         self.load_centre = None
@@ -2081,6 +2149,15 @@ class WholeBodySweepNode(Node):
             missing.append("joint_states")
         if self.distances is None:
             missing.append("distance_sensors")
+        else:
+            # A message is not enough: right after multi_sensor_node starts it
+            # publishes zeros for the ultrasonics and out-of-range for the
+            # ToFs, and the first cycle then fails on "0/6 plate ranges valid"
+            # (four sweeps on 2026-10-07/08). Wait for a plane's worth.
+            d = np.asarray(self.distances, dtype=float)
+            n_valid = int((np.isfinite(d) & (d > VALID_LO) & (d < VALID_HI)).sum())
+            if n_valid < MIN_VALID_SENSORS:
+                missing.append(f"valid plate ranges ({n_valid}/6)")
         if self._mount_pose() is None:
             missing.append(f"TF {self.map_frame}->{self.arm_root_link}")
         if self._base_pose() is None:
@@ -2766,13 +2843,20 @@ class WholeBodySweepNode(Node):
             if self.press.fault:
                 self.finish("failed", self.press.fault)
                 return
+            self.lateral = self._lateral_load(R_plate, t_hat)
             torque_limit = float(p("press_torque_limit").value)
-            if self.press.state != TARE and torque_limit > 0.0 and self.plate_torque > torque_limit:
+            # Against the free-air tare once there is one: the plate's own
+            # weight puts ~1-4 Nm on the sensor with nothing touching (it was
+            # 3-4 Nm of an 8 Nm limit before the payload was recalibrated).
+            torque_now = self.lateral[2] if self.lateral is not None else self.plate_torque
+            if self.press.state != TARE and torque_limit > 0.0 and torque_now > torque_limit:
                 self.finish(
                     "failed",
-                    f"plate torque {self.plate_torque:.1f} Nm exceeded the {torque_limit:.0f} Nm "
+                    f"plate torque {torque_now:.1f} Nm exceeded the {torque_limit:.0f} Nm "
                     f"limit with {self.press.force:+.1f} N on the wheel: the load is on a "
                     f"corner, not the face")
+                return
+            if bool(p("obstacle_handling").value) and not self._obstacle_step(now, distance):
                 return
             if self.press.stalled:
                 self.finish(
@@ -2802,7 +2886,21 @@ class WholeBodySweepNode(Node):
         preroll = float(p("base_preroll_seconds").value)
         prerolling = (self.press is not None and gate and not self.press.touched
                       and self.start_stamp is not None and now - self.start_stamp < preroll)
-        if prerolling:
+        # What the BASE does along the wall. The same as the plate's travel
+        # except while an obstacle is being freed, when the arm moves the plate
+        # and the base stands still.
+        base_speed = None
+        if self.press is not None and self.obstacle_phase is not None:
+            v_normal, speed, base_speed = self._obstacle_motion(
+                distance, min(remaining, reachable))
+            self._set_contact(False)
+            # Stopped, or crawling past, on purpose: not a stall. The phases
+            # carry their own bounds (obstacle_relieve_timeout, the clearance
+            # limit, obstacle_max_events).
+            self.best_progress = self.progress
+            self.progress_stamp = now
+            self.unseated_since = now
+        elif prerolling:
             # See base_preroll_seconds: the base's first start happens now,
             # with the plate 20 cm off the wall, not at the moment the wheel
             # has just landed. The arm's own loops keep the standoff.
@@ -2884,7 +2982,7 @@ class WholeBodySweepNode(Node):
             # being dragged. On 2026-09-18 the base set off 0.1 s after the
             # latch with the plate 1.5 deg off and an edge touching; the force
             # went 5 -> 30 N in two seconds, one for one with the base speed.
-            side = self.side_force - self.side_bias
+            side = self._side_load(drag=True)
             side_limit = float(p("press_side_force_limit").value)
             free = float(p("press_drag_free_fraction").value) * side_limit
             # Never above the soft limit: past that the press is already
@@ -3009,6 +3107,8 @@ class WholeBodySweepNode(Node):
                     f"{self.travel_authority * 100:.0f}% of sweep speed. It stops itself "
                     f"if the contact does not seat.",
                     throttle_duration_sec=2.0)
+        if base_speed is None:
+            base_speed = speed
         v_ref = speed * t_hat + v_normal * m_hat + v_height * np.array([0.0, 0.0, 1.0])
 
         w_ref = soft_deadband(align_error, align_deadband) * float(p("k_align").value)
@@ -3034,7 +3134,7 @@ class WholeBodySweepNode(Node):
                 self._side_tare = []
                 self.wrench_bias = np.mean(self._wrench_tare, axis=0)
                 self._wrench_tare = []
-            side = self.side_force - self.side_bias
+            side = self._side_load(drag=False)
             side_loaded = side > float(p("press_side_force_limit").value)
             if side_loaded:
                 if self.press.state != PRESS:
@@ -3045,7 +3145,11 @@ class WholeBodySweepNode(Node):
                     f"{' and the approach' if self.press.state != PRESS else ''} "
                     f"until it clears.",
                     throttle_duration_sec=1.0)
-            if side_loaded or self.press.overloaded or (self.press.loaded and self.press.state != PRESS):
+            if (side_loaded or self.press.overloaded or self.obstacle_phase is not None
+                    or (self.press.loaded and self.press.state != PRESS)):
+                # An obstacle being freed or passed: hold the orientation the
+                # plate had. Squaring it against a protrusion would be squaring
+                # it to the protrusion.
                 w_ref = np.zeros(3)
             elif self.press.state == PRESS:
                 w_ref = self._torque_squaring(w_ref, R_plate, align_error)
@@ -3237,7 +3341,8 @@ class WholeBodySweepNode(Node):
         heading_error = math.atan2(float(t_base[1]), float(t_base[0]))
         if abs(heading_error) > math.pi / 2.0:   # travelling turret-backward: align that axis
             heading_error -= math.copysign(math.pi, heading_error)
-        loaded = self.press is not None and (self.press.loaded or side_loaded)
+        loaded = self.press is not None and (self.press.loaded or side_loaded
+                                             or self.obstacle_phase is not None)
         w_heading = 0.0 if loaded else _clamp(
             float(p("k_heading").value) * heading_error, float(p("w_heading_max").value))
         base_lo[2] = base_hi[2] = float(np.clip(w_heading, base_lo[2], base_hi[2]))
@@ -3258,7 +3363,7 @@ class WholeBodySweepNode(Node):
                     f"travel rather than pinning an axis that is not the travel axis.",
                     throttle_duration_sec=5.0)
             else:
-                pin = float(np.clip(speed * float(t_base[0]), base_lo[0], base_hi[0]))
+                pin = float(np.clip(base_speed * float(t_base[0]), base_lo[0], base_hi[0]))
                 engaged = (self.closest_obstacle < float(p("avoid_influence").value)
                            or base_gap < floor)
                 if engaged:
@@ -3393,7 +3498,9 @@ class WholeBodySweepNode(Node):
 
     def _reach_keep_speed(self):
         """Base speed along the sensed normal (+ = toward the wall), m/s."""
-        if self.reach_error is None:
+        if self.reach_error is None or self.obstacle_phase is not None:
+            # Freeing or passing an obstacle the arm is pulled in on purpose;
+            # following that with the base would undo the clearance.
             return 0.0
         p = self.get_parameter
         excess = float(soft_deadband(np.array([self.reach_error]),
@@ -3514,6 +3621,179 @@ class WholeBodySweepNode(Node):
         alpha = (1.0 - math.exp(-dt / tau)) if tau > 0.0 else 1.0
         self.wall_drift += alpha * (sample - self.wall_drift)
         self.press.drift = self.wall_drift
+
+    # ------------------------------------------------------------------
+    # Lateral load and obstacles
+    # ------------------------------------------------------------------
+    def _lateral_load(self, R_plate, t_hat):
+        """The load across the plate, against the free-air tare, as a VECTOR.
+
+        Returns (force resisting the travel N, vertical force N, |T_xy| Nm,
+        |F_xy| N), or None before the tare. The F/T reports the force ON the
+        tool, in tool axes, which share the plate's orientation; a wall
+        resisting the travel pushes the plate along -t_hat, so the resistance
+        is minus its component along the travel.
+
+        The old side load was |F_xy| minus a scalar tare, blind to direction:
+        a push along the wall at right angles to the plate's own weight barely
+        changes the magnitude (10 N of drag read ~2.4 N against ~20 N of
+        weight), while a static vertical preload read as "dragging". Split,
+        the obstacle signal is the along-wall part alone.
+        """
+        if self.wrench_bias is None:
+            return None
+        d = np.asarray(self.wrench, dtype=float) - np.asarray(self.wrench_bias, dtype=float)
+        f_world = R_plate @ np.array([d[0], d[1], 0.0])
+        return (-float(f_world @ t_hat), float(f_world[2]),
+                float(math.hypot(d[3], d[4])), float(math.hypot(d[0], d[1])))
+
+    def _side_load(self, drag):
+        """The side load the seating rules read, N.
+
+        ``drag``: the force resisting the travel (the plate being dragged, or
+        an edge catching), for the travel throttle. Otherwise the whole tared
+        lateral load, for the twist checks. Both fall back to the old
+        magnitude-minus-scalar-tare without a tare or with obstacle handling
+        off.
+        """
+        if self.lateral is None or not bool(self.get_parameter("obstacle_handling").value):
+            return self.side_force - self.side_bias
+        return max(0.0, self.lateral[0]) if drag else self.lateral[3]
+
+    def _obstacle_step(self, now, distance):
+        """Detect an obstacle and step relieve -> pass -> pressing again.
+
+        Returns False when it has ended the sweep (finish() was called).
+        See obstacle_handling for the why; _obstacle_motion for the how.
+        """
+        p = self.get_parameter
+        press = self.press
+        resistance = self.lateral[0] if self.lateral is not None else 0.0
+        torque = self.lateral[2] if self.lateral is not None else 0.0
+        obstacle_force = float(p("obstacle_force").value)
+
+        if self.obstacle_phase is None:
+            if not press.touched or press.state == TARE:
+                self.obstacle_trigger_since = None
+                return True
+            why = None
+            if resistance >= obstacle_force:
+                why = f"{resistance:+.1f} N along the wall against the travel"
+            elif self.lateral is not None and torque >= float(p("obstacle_torque").value):
+                why = f"{torque:.1f} Nm on the plate edge"
+            elif (press.force >= float(p("obstacle_press_force").value)
+                    and resistance >= float(p("obstacle_clear_force").value)):
+                # A wedge under way. Not the force alone: a shove straight
+                # into the wall is the press's to relieve, and it does.
+                why = f"{press.force:.1f} N on the wheel, {resistance:+.1f} N against the travel"
+            if why is None:
+                self.obstacle_trigger_since = None
+                return True
+            if self.obstacle_trigger_since is None:
+                self.obstacle_trigger_since = now
+            if now - self.obstacle_trigger_since < float(p("obstacle_dwell").value):
+                return True
+            self.obstacle_trigger_since = None
+            self.obstacle_events += 1
+            limit = int(p("obstacle_max_events").value)
+            if self.obstacle_events > limit:
+                self.finish("failed", f"more than {limit} obstacles on this line "
+                                      f"(the last at {self.progress:.2f} m: {why})")
+                return False
+            self.obstacle_hit_progress = self.progress
+            self.obstacle_contact_distance = distance
+            self.obstacle_clearance_now = float(p("obstacle_clearance").value)
+            self._enter_obstacle(
+                "relieve", now,
+                f"Obstacle at {self.progress:.2f} m ({why}): stopping the base and "
+                f"freeing the plate with the arm (#{self.obstacle_events}).")
+            return True
+
+        target = self.obstacle_contact_distance + self.obstacle_clearance_now
+        if self.obstacle_phase == "relieve":
+            freed = (press.force < press.release_force
+                     and resistance < float(p("obstacle_clear_force").value)
+                     and distance >= target - 0.005)
+            if freed:
+                self._enter_obstacle(
+                    "pass", now,
+                    f"Plate freed: passing the obstacle {target * 100:.0f} cm off the wall, "
+                    f"to {self.obstacle_hit_progress + float(p('obstacle_pass_length').value):.2f} m.")
+            elif now - self.obstacle_since > float(p("obstacle_relieve_timeout").value):
+                self.finish(
+                    "failed",
+                    f"could not free the plate from the obstacle at "
+                    f"{self.obstacle_hit_progress:.2f} m: {press.force:+.1f} N on the wheel, "
+                    f"{resistance:+.1f} N against the travel, {distance * 100:.1f} cm off")
+                return False
+            return True
+
+        # pass
+        if press.force >= press.contact_force or resistance >= obstacle_force:
+            raised = self.obstacle_clearance_now + float(p("obstacle_clearance_step").value)
+            if raised > float(p("obstacle_clearance_max").value) + 1e-9:
+                self.finish(
+                    "failed",
+                    f"the obstacle at {self.progress:.2f} m stands more than "
+                    f"{self.obstacle_clearance_now * 100:.0f} cm proud of the wall: "
+                    f"not passing it")
+                return False
+            self.obstacle_clearance_now = raised
+            self.obstacle_hit_progress = self.progress
+            self._enter_obstacle(
+                "relieve", now,
+                f"Met the obstacle again at {self.progress:.2f} m ({press.force:+.1f} N, "
+                f"{resistance:+.1f} N against the travel): lifting to "
+                f"{raised * 100:.0f} cm of clearance.")
+            return True
+        if self.progress >= self.obstacle_hit_progress + float(p("obstacle_pass_length").value):
+            self.obstacle_phase = None
+            self.obstacle_since = None
+            # Back to the press from scratch: the base waits for the wheel to
+            # seat again, through the same authority filter as any re-contact.
+            self.travel_authority = 0.0
+            self.seated_since = None
+            self.unseated_since = now
+            self.get_logger().info(
+                f"Past the obstacle at {self.progress:.2f} m: landing the plate again.")
+        return True
+
+    def _enter_obstacle(self, phase, now, message):
+        self.obstacle_phase = phase
+        self.obstacle_since = now
+        self.get_logger().warn(message)
+
+    def _obstacle_motion(self, distance, speed_cap):
+        """(v_normal, plate speed along the wall, base speed) while an obstacle
+        is being handled. + v_normal = toward the wall.
+
+        Relieve: the base stands still and the ARM does everything — pulls
+        the plate off the wall to the clearance standoff and, while the edge
+        is still loaded, slides it back along the wall by at most
+        obstacle_unhook_distance, slowly, to unhook it.
+
+        Pass: base and plate together at obstacle_pass_speed, the plate held
+        at the clearance standoff by its ranges — so a protrusion that comes
+        under the sensors (a pilaster face) lifts it further.
+        """
+        p = self.get_parameter
+        press = self.press
+        target = self.obstacle_contact_distance + self.obstacle_clearance_now
+        k = float(p("k_standoff").value)
+        resistance = self.lateral[0] if self.lateral is not None else 0.0
+        if self.obstacle_phase == "relieve":
+            retract = float(p("obstacle_retract_speed").value)
+            loaded = (press.force >= press.release_force
+                      or resistance >= float(p("obstacle_clear_force").value))
+            v_normal = -retract if loaded else _clamp(k * (distance - target), retract)
+            unhooked = self.obstacle_hit_progress - self.progress
+            tip = 0.0
+            if loaded and unhooked < float(p("obstacle_unhook_distance").value):
+                tip = -float(p("obstacle_unhook_speed").value)
+            return v_normal, tip, 0.0
+        v_normal = _clamp(k * (distance - target), float(p("v_normal_max").value))
+        speed = max(0.0, min(float(p("obstacle_pass_speed").value), speed_cap))
+        return v_normal, speed, speed
 
     def _accel_bounds(self, lo, hi, now):
         """Narrow the QP's box bounds to what the acceleration limit allows.
@@ -3975,8 +4255,16 @@ class WholeBodySweepNode(Node):
                         if self.press.state == PRESS
                         else f"app={self.press.approach_speed * 1000:.1f}mm/s"
                              f"{'(re)' if self.press.recontacting else ''} ")
+            # The tared lateral load (against the travel, vertical) and the
+            # obstacle phase, when there is one: what the relieve-and-pass
+            # decisions are made on, readable from the log alone.
+            lateral = ("" if self.lateral is None else
+                       f"lat=({self.lateral[0]:+.1f},{self.lateral[1]:+.1f})N ")
+            if self.obstacle_phase is not None:
+                lateral += (f"OBSTACLE={self.obstacle_phase}"
+                            f"@{self.obstacle_clearance_now * 100:.0f}cm ")
             press = (f"press={self.press.force:+.1f}N(raw{self.press.raw:+.1f})"
-                     f"/{self.press.target_force:.0f} "
+                     f"/{self.press.target_force:.0f} {lateral}"
                      f"[{self.press.state.upper() if self.press.state != SEEK else 'seek'}] "
                      f"{approach}bias={self.press.bias:+.1f}N "
                      f"auth={self.travel_authority:.2f} "
@@ -4042,6 +4330,10 @@ def main(args=None):
     # _ensure_arm_trajectory_controller then puts the controller back.
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = WholeBodySweepNode()
+    # Before the executor and its threads exist, so they inherit it. The
+    # streamer process is already running and sets its own priority.
+    _realtime(int(node.get_parameter("sweep_rt_priority").value), node.get_logger(),
+              "Sweep controller")
     switch = ArmControllerSwitch(node, controller=node.arm_controller)
 
     stopping = False

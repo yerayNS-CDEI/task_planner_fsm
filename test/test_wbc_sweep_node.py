@@ -11,6 +11,8 @@ sweep terminates on arc length.
 
 from types import SimpleNamespace
 
+import math
+
 import numpy as np
 import pytest
 
@@ -2097,8 +2099,12 @@ def test_a_dragging_plate_throttles_the_base_before_the_side_load_halts_it():
     lockstep with the base speed while the side load climbed 2 -> 6 N. The
     normal barrier could not see it; the side load could. Travel now throttles
     linearly from press_drag_free_fraction of press_side_force_limit to zero
-    at the limit, on the raw side load, without waiting for the filter."""
-    node = _press_node()
+    at the limit, on the raw side load, without waiting for the filter.
+
+    With obstacle_handling off: this is the scalar side load that path still
+    reads. With it on, the throttle reads the tared force against the travel,
+    and an obstacle takes over at obstacle_force — see the obstacle tests."""
+    node = _press_node(obstacle_handling=False)
     robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.03, tilt=0.0)
     node.q_posture = robot.q.copy()
     node.row_z = float(robot.tip()[2, 3])
@@ -2904,3 +2910,151 @@ def test_the_sweep_node_streams_through_its_own_process_by_default():
         assert node.arm_stream.close(2.0), "the final hold was not confirmed"
         node.destroy_node()
     assert not node.arm_stream._alive()
+
+
+# ----------------------------------------------------------------------
+# Obstacles on the wall: relieve and pass
+# ----------------------------------------------------------------------
+def test_the_lateral_load_is_split_against_the_travel_and_vertically_off_a_vector_tare():
+    """The F/T reports the force ON the tool, in plate axes. Resisting the
+    travel is a push along -t_hat; the tare is subtracted as a vector."""
+    node = _press_node()
+    node.wrench_bias = np.array([1.0, -2.0, 0.0, 0.3, 0.4])
+    node.wrench = np.array([1.0 + 6.0, -2.0 + 3.0, 0.0, 0.3 + 3.0, 0.4 + 4.0])
+    R = np.eye(3)                                  # plate x = world x, plate y = world y
+    t_hat = np.array([-1.0, 0.0, 0.0])             # travelling along plate -x
+    resistance, vertical, torque, magnitude = node._lateral_load(R, t_hat)
+    assert resistance == pytest.approx(6.0), "+x push against a -x travel"
+    assert torque == pytest.approx(5.0)
+    assert magnitude == pytest.approx(math.hypot(6.0, 3.0))
+    R_up = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])  # plate y = world z
+    assert node._lateral_load(R_up, t_hat)[1] == pytest.approx(3.0), "plate +y is up here"
+    node.destroy_node()
+
+
+def test_the_sweep_waits_for_a_plane_s_worth_of_valid_ranges():
+    """Right after multi_sensor_node starts it reports 0 for the ultrasonics
+    and out-of-range for the ToFs; four sweeps on 2026-10-07/08 started on that
+    and failed on their first cycle."""
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.2, 0.0))
+    node.distances = np.array([0.0, 0.0, 0.0, 0.338, 0.338, 0.338])
+    assert "valid plate ranges (0/6)" in node._missing_inputs()
+    node.distances = np.array([0.15, 0.0, 0.16, 0.338, 0.15, 0.338])
+    assert "valid plate ranges (3/6)" not in " ".join(node._missing_inputs())
+    assert not any(m.startswith("valid plate ranges") for m in node._missing_inputs())
+    node.destroy_node()
+
+
+def _obstacle_run(height, cycles, band=(0.95, 1.0), force=15.0, **overrides):
+    """A press sweeping -y along the wall, past a strip that stands ``height``
+    proud of it over ``band`` (world y). While the GPR's contact point is over
+    the strip and nearer the wall than ``height`` the strip pushes back on the
+    plate with ``force`` against the travel (+y), in the plate's own axes as the
+    F/T reports it. Returns (node, robot, trace) with one row per cycle:
+    (phase, true contact force, base forward command, contact gap, contact y)."""
+    node = _press_node(press_tare_seconds=0.0, **overrides)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    node.wrench_bias = np.zeros(5)                 # the tare the press window would take
+    trace = []
+
+    def contact_y():
+        T = robot.tip()
+        return float((T[:3, 3] + T[:3, :3] @ CONTACT_POINT)[1])
+
+    def on_cycle(cycle):
+        R = robot.tip()[:3, :3]
+        caught = band[0] <= contact_y() <= band[1] and robot.contact_gap() < height
+        f_world = np.array([0.0, force if caught else 0.0, 0.0])
+        node.wrench = np.concatenate(((R.T @ f_world)[:2], np.zeros(3)))
+
+    original = node._control_step
+
+    def recorded():
+        original()
+        trace.append((node.obstacle_phase, robot.press_force(), robot.contact_gap(), contact_y()))
+
+    node._control_step = recorded
+    forces, travel = _press_run(node, robot, cycles=cycles, on_cycle=on_cycle)
+    rows = [(ph, f, tr, gap, y) for (ph, f, gap, y), tr in zip(trace, travel)]
+    return node, robot, rows
+
+
+def test_an_obstacle_is_freed_by_the_arm_passed_and_the_plate_lands_beyond_it():
+    """A light-switch-sized snag: 1.5 cm proud, 5 cm along the wall."""
+    node, robot, rows = _obstacle_run(height=0.015, cycles=2600)
+    phases = [r[0] for r in rows]
+    assert node.pending_status in (None, "succeeded"), f"the line failed: {node.pending_status}"
+    assert "relieve" in phases and "pass" in phases, "it should have met the obstacle"
+    assert node.obstacle_events == 1
+    relieve = [r for r in rows if r[0] == "relieve"]
+    passing = [r for r in rows if r[0] == "pass"]
+    # Freeing it is the ARM's job: the base stands still, once its own
+    # acceleration bound has brought it to rest (base_accel_max: ~0.15 s).
+    settle = int(0.25 * node.control_rate)
+    assert max(abs(r[2]) for r in relieve[settle:]) < 1e-3, "the base should not move while freeing"
+    # Freed: the plate came off the wall, and passes it clear of the strip.
+    assert min(r[3] for r in passing) > 0.015, "the pass should clear the strip"
+    assert max(r[1] for r in passing) == pytest.approx(0.0), "no contact while passing"
+    assert np.mean([r[2] for r in passing]) > 0.5 * float(
+        node.get_parameter("obstacle_pass_speed").value), "and the base carries it past"
+    # Beyond the strip it lands and sweeps on, pressing again.
+    after = rows[phases.index("pass") + len(passing):]
+    assert after and all(r[0] is None for r in after)
+    assert max(r[4] for r in after) < 0.95, "landed beyond the strip"
+    assert np.mean([r[1] for r in after[-100:]]) == pytest.approx(5.0, abs=1.5), "pressing again"
+    assert np.mean([r[2] for r in after[-50:]]) > 0.5 * node.sweep_speed, "and sweeping on"
+
+
+def test_a_deeper_obstacle_is_met_again_and_passed_higher():
+    """A pilaster-like step, 5 cm proud: the first 3 cm clearance meets it
+    again, so the plate is freed once more and lifted by a step, then passes."""
+    node, robot, rows = _obstacle_run(height=0.05, cycles=3200, band=(0.85, 1.0))
+    assert node.pending_status in (None, "succeeded"), f"the line failed: {node.pending_status}"
+    assert node.obstacle_clearance_now > 0.05, "it should have lifted past 5 cm"
+    assert node.obstacle_events == 1, "one obstacle, met twice, is still one obstacle"
+    passing = [r for r in rows if r[0] == "pass"]
+    assert passing[-1][3] > 0.05, "and passed clear of it"
+
+
+def test_an_obstacle_too_proud_to_pass_ends_the_line_cleanly():
+    node, robot, rows = _obstacle_run(height=0.30, cycles=3000, band=(0.70, 1.0))
+    assert node.pending_status is not None and "stands more than" in node.pending_status, (
+        node.pending_status)
+    assert node.phase == "retreat", "ended with the usual retreat, not a hard stop"
+
+
+def test_with_obstacle_handling_off_the_snag_is_not_passed():
+    node, robot, rows = _obstacle_run(height=0.015, cycles=900, obstacle_handling=False)
+    assert all(r[0] is None for r in rows)
+
+
+def test_a_wedging_snag_is_caught_before_the_force_limit():
+    """10-08 11:03:23: the force against the travel rose for ~0.8 s, then the
+    edge wedged and the press went 11 -> 47 N in 0.3 s, past the 45 N limit.
+    Here the snag pushes back harder the further the plate drives into it,
+    and loads the wheel with it; the routine has to answer on the along-wall
+    force, early, and the press never come near the limit."""
+    node = _press_node(press_tare_seconds=0.0)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    node.wrench_bias = np.zeros(5)
+    edge, peak = 1.0, []
+
+    def on_cycle(cycle):
+        T = robot.tip()
+        y = float((T[:3, 3] + T[:3, :3] @ CONTACT_POINT)[1])
+        into = max(0.0, edge - y) if robot.contact_gap() < 0.02 and y > edge - 0.05 else 0.0
+        lateral = min(60.0, 2000.0 * into)          # 2 N per mm driven into the snag
+        node.wrench = np.concatenate(((T[:3, :3].T @ np.array([0.0, lateral, 0.0]))[:2],
+                                      np.zeros(3)))
+        node.press_force = robot.press_force() + 1.5 * lateral   # the wedge loads the wheel
+        peak.append(node.press_force)
+
+    _press_run(node, robot, cycles=900, on_cycle=on_cycle)
+    limit = float(node.get_parameter("press_force_limit").value)
+    assert node.pending_status in (None, "succeeded"), node.pending_status
+    assert node.obstacle_events >= 1
+    assert max(peak) < 0.6 * limit, f"the wheel saw {max(peak):.1f} N"

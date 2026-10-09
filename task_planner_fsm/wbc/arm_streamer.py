@@ -342,7 +342,7 @@ def run(conn, status, config):
         status[HOLDING] = 0.0 if core.qdot is not None and not core.stale else 1.0
 
     def reader():
-        _realtime(priority, node.get_logger(), "pipe reader", quiet=True)
+        _realtime(priority, node.get_logger(), "Arm streamer pipe reader", quiet=True)
         while True:
             try:
                 msg = conn.recv()
@@ -381,7 +381,7 @@ def run(conn, status, config):
     # The tick thread is this one: the executor spins here. Raised before the
     # reader starts, which inherits nothing (it raises itself). The DDS threads
     # rclpy.init made stay where they are.
-    status[RT_PRIORITY] = float(_realtime(priority, node.get_logger(), "stream tick"))
+    status[RT_PRIORITY] = float(_realtime(priority, node.get_logger(), "Arm streamer stream tick"))
     threading.Thread(target=reader, name="arm_streamer_pipe", daemon=True).start()
     status[READY] = 1.0
 
@@ -418,11 +418,11 @@ def _realtime(priority, logger, what, quiet=False):
         os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(priority))
     except (PermissionError, OSError) as exc:
         logger.warn(
-            f"Arm streamer {what}: could not get SCHED_FIFO {priority} ({exc}); running "
-            f"at normal priority, where a loaded CPU can delay the setpoints.")
+            f"{what}: could not get SCHED_FIFO {priority} ({exc}); running at normal "
+            f"priority, where a loaded CPU can delay it.")
         return 0
     if not quiet:
-        logger.info(f"Arm streamer {what} running SCHED_FIFO priority {priority}.")
+        logger.info(f"{what} running SCHED_FIFO priority {priority}.")
     return priority
 
 
