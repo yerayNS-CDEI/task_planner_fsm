@@ -212,18 +212,31 @@ class WholeBodySweepNode(Node):
         # time). Re-anchor at the arm once the setpoint is moving faster than
         # arm_follow_moving_speed (rad/s, worst joint), the arm makes less
         # than arm_follow_ratio of the commanded progress, the lead is past
-        # arm_follow_lead (rad) — normal tracking lag in the air is 10-40
-        # mrad — and all three have held for arm_follow_seconds.
-        self.declare_parameter("arm_follow_lead", 0.05)
+        # arm_follow_lead (rad) — under arm_stream_max_lead_air, or the guard
+        # could never see it — and all three have held for arm_follow_seconds.
+        self.declare_parameter("arm_follow_lead", 0.03)
         self.declare_parameter("arm_follow_moving_speed", 0.01)
         self.declare_parameter("arm_follow_ratio", 0.3)
         self.declare_parameter("arm_follow_seconds", 0.25)
         # The setpoint's lead clamp in the air, rad; arm_stream_max_lead stays
         # the clamp on the wall, where the setpoint leads the plate by design.
-        # Bounds how far ahead a setpoint can wind before the guard acts: at
-        # 0.2 it was 0.2 rad of lurch waiting (10-08 10:59). The highest air
-        # lead seen while following is ~40 mrad (0.6 rad/s in the return).
-        self.declare_parameter("arm_stream_max_lead_air", 0.1)
+        # 35 mrad because of how the UR takes a setpoint (ur_client_library
+        # external_control.urscript, targetWithinLimits): a command more than
+        # 40 mrad (20 rad/s x 2 ms) from the last one it ACCEPTED is rejected
+        # unless it is also within 40 mrad of the arm itself — and once one is
+        # rejected the arm stops on the last accepted one, so every later
+        # command is further from both and the UR ignores them all: the arm
+        # FREEZES until something lands near it again. A late burst of setpoints
+        # is enough to start that. 2026-10-09 16:16 froze 45 times (up to 3.2 s,
+        # with the driver's /joint_states 38/361 ms late p50/p99) and each time
+        # only the follow guard's re-anchor freed it, after which the arm
+        # surged 25-40 mrad per 100 ms; 17:31, with delivery healthy, still
+        # froze once in the 0.6 rad/s return. Kept within 35 mrad of the
+        # measured arm, every setpoint passes the UR's second check however
+        # late it arrives. Normal air lead on 10-09 14:16 and 15:22 was at most
+        # 18 mrad under 0.2 rad/s and 29 at 0.2-0.44; the cost is the fastest
+        # return topping out near 0.5 rad/s.
+        self.declare_parameter("arm_stream_max_lead_air", 0.035)
         # SCHED_FIFO priority for the streamer's tick and pipe threads; 0 leaves
         # them at the process's normal priority. Below ur_ros2_control's
         # controller manager (50). See arm_streamer._realtime for why: 16:57 on
