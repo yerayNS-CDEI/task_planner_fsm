@@ -3058,3 +3058,36 @@ def test_a_wedging_snag_is_caught_before_the_force_limit():
     assert node.pending_status in (None, "succeeded"), node.pending_status
     assert node.obstacle_events >= 1
     assert max(peak) < 0.6 * limit, f"the wheel saw {max(peak):.1f} N"
+
+
+def test_a_wide_obstacle_is_one_obstacle_passed_in_short_hops():
+    """A pass is short (a pen-width bar was the first one met on the robot);
+    a wider obstacle is caught again on landing, within a pass length of the
+    last pass, and that is the same obstacle: no new event, passed on."""
+    node, robot, rows = _obstacle_run(height=0.015, cycles=3500, band=(0.55, 1.0))
+    phases = [r[0] for r in rows]
+    assert node.pending_status in (None, "succeeded"), f"the line failed: {node.pending_status}"
+    assert node.obstacle_events == 1, f"{node.obstacle_events} events for one strip"
+    passes = sum(1 for a, b in zip(phases, phases[1:]) if a != "pass" and b == "pass")
+    assert passes >= 2, "a 45 cm strip takes more than one 18 cm pass"
+    landed = [r for r in rows if r[0] is None and r[4] < 0.55]
+    assert landed and np.mean([r[1] for r in landed[-100:]]) == pytest.approx(5.0, abs=1.5), (
+        "and the press lands beyond it")
+
+
+def test_a_re_contact_at_the_default_floor_takes_seconds_not_a_minute():
+    """2026-10-09: at the old 0.8 mm/s floor every re-contact crawled the last
+    centimetre — 10-40 s each, the last metre of the line in 102 s."""
+    node = _sweep_along_wall(press_enabled=True, press_force=5.0, press_gain=5.0e-5,
+                             press_v_max=0.005, press_seek_speed=0.01,
+                             press_filter_tau=0.09, press_tare_seconds=0.0)
+    assert float(node.get_parameter("press_approach_min_speed").value) == pytest.approx(0.003)
+    node.press.touched = True                        # a re-contact: the base waits
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF + 0.010, tilt=0.0)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    forces, _ = _press_run(node, robot, cycles=400)
+    touched = int(np.argmax(forces > 3.0)) if (forces > 3.0).any() else len(forces)
+    assert touched / node.control_rate < 5.0, f"touched after {touched / node.control_rate:.1f} s"
+    assert forces.max() < float(node.get_parameter("press_force_soft_limit").value), (
+        f"landed at {forces.max():.1f} N")

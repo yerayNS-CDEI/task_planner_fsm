@@ -425,9 +425,16 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("obstacle_clearance_step", 0.03)  # m
         self.declare_parameter("obstacle_clearance_max", 0.12)  # m
         # The pass: base and plate together at this speed, for this far past
-        # where the plate was caught (the GPR body, the obstacle and a margin).
+        # where the plate was caught: the GPR body (~12 cm along the wall),
+        # the unhook and a margin. 0.18, from 0.35 (2026-10-09): the first
+        # obstacle on the robot was a pen-width metal bar, and the plate flew
+        # a third of a metre past it. A wider one is caught again on landing,
+        # within a pass length of the last, and is then the SAME obstacle (see
+        # _obstacle_step): no new event, the raised clearance kept, another
+        # pass — several short passes on a pilaster instead of a long one at
+        # every switch.
         self.declare_parameter("obstacle_pass_speed", 0.02)     # m/s
-        self.declare_parameter("obstacle_pass_length", 0.35)    # m
+        self.declare_parameter("obstacle_pass_length", 0.18)    # m
         # Bounds: freeing the plate may take this long, and a line may meet
         # this many obstacles, before it ends (with the usual retreat).
         self.declare_parameter("obstacle_relieve_timeout", 10.0)  # s
@@ -565,7 +572,17 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("press_approach_margin", 0.0126)    # m
         # The floor, so a pessimistic estimate cannot stall the approach short
         # of the wall for ever.
-        self.declare_parameter("press_approach_min_speed", 0.0008)  # m/s
+        #
+        # 3 mm/s, from 0.8 (2026-10-09). At 0.8 every re-contact was a crawl:
+        # the ranges put the wall where the wheel already ought to touch
+        # (expecting contact near 15.3 cm on a stretch where it touched at
+        # 13.8-14.1), so the last centimetre ran at the floor, and on the
+        # robot only ~0.25 mm/s of it reached the wall. The last 1.14 m of
+        # that line took 102 s, in contact 31 % of it. 0.8 was sized for a
+        # loop at 6-10 Hz; at the ~20 Hz it now runs (sweep_rt_priority) the
+        # press stops on the first loaded sample, and the harness lands from
+        # 1 cm in 3.4 s with a 6.4 N peak on a 20 kN/m wall.
+        self.declare_parameter("press_approach_min_speed", 0.003)  # m/s
         self.declare_parameter("press_distance_tau", 0.15)         # s
         # How long the RAW force may sit above press_force_limit before it is a
         # fault. The filtered check keeps its immunity to a single spike; this
@@ -1406,6 +1423,9 @@ class WholeBodySweepNode(Node):
         self.obstacle_contact_distance = 0.0  # sensed distance when caught
         self.obstacle_clearance_now = 0.0
         self.obstacle_events = 0
+        # Where the last pass ended (plate progress), or None: a catch within
+        # a pass length of it is the same obstacle.
+        self.obstacle_last_end = None
         # Where the normal load sits on the plate, plate xy, m, filtered. None
         # while it cannot be trusted (not pressing, or too little force).
         self.load_centre = None
@@ -3694,13 +3714,26 @@ class WholeBodySweepNode(Node):
             if now - self.obstacle_trigger_since < float(p("obstacle_dwell").value):
                 return True
             self.obstacle_trigger_since = None
+            same = (self.obstacle_last_end is not None
+                    and self.progress - self.obstacle_last_end
+                    <= float(p("obstacle_pass_length").value))
+            self.obstacle_hit_progress = self.progress
+            if same:
+                # Caught again landing just past the last one: still the same
+                # obstacle, wider than one pass. Keep its contact distance and
+                # the clearance it needed, and pass on.
+                self._enter_obstacle(
+                    "relieve", now,
+                    f"Caught again at {self.progress:.2f} m ({why}), just past the "
+                    f"obstacle: the same one, wider than a pass; passing on at "
+                    f"{self.obstacle_clearance_now * 100:.0f} cm of clearance.")
+                return True
             self.obstacle_events += 1
             limit = int(p("obstacle_max_events").value)
             if self.obstacle_events > limit:
                 self.finish("failed", f"more than {limit} obstacles on this line "
                                       f"(the last at {self.progress:.2f} m: {why})")
                 return False
-            self.obstacle_hit_progress = self.progress
             self.obstacle_contact_distance = distance
             self.obstacle_clearance_now = float(p("obstacle_clearance").value)
             self._enter_obstacle(
@@ -3749,6 +3782,7 @@ class WholeBodySweepNode(Node):
         if self.progress >= self.obstacle_hit_progress + float(p("obstacle_pass_length").value):
             self.obstacle_phase = None
             self.obstacle_since = None
+            self.obstacle_last_end = self.progress
             # Back to the press from scratch: the base waits for the wheel to
             # seat again, through the same authority filter as any re-contact.
             self.travel_authority = 0.0
