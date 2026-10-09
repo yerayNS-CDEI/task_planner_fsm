@@ -206,27 +206,37 @@ class WholeBodySweepNode(Node):
         # off runs the stream on a timer here, as before (the unit tests do).
         self.declare_parameter("arm_stream_process", True)
         # The streamer's guard for an arm that has stopped following in the air
-        # (16:10:28 on 2026-10-07: 2.6 s still while the setpoint wound up to
-        # max_lead). Re-anchor at the arm once the setpoint is moving faster
-        # than arm_follow_moving_speed, the arm slower than
-        # arm_follow_still_speed (rad/s, worst joint), the lead is past
+        # (16:10:28 on 2026-10-07, and 11:03:33 on 10-08: the UR crept at
+        # 0.02-0.05 rad/s under a 0.36 rad/s setpoint, setpoints arriving on
+        # time). Re-anchor at the arm once the setpoint is moving faster than
+        # arm_follow_moving_speed (rad/s, worst joint), the arm makes less
+        # than arm_follow_ratio of the commanded progress, the lead is past
         # arm_follow_lead (rad) — normal tracking lag in the air is 10-40
         # mrad — and all three have held for arm_follow_seconds.
         self.declare_parameter("arm_follow_lead", 0.05)
         self.declare_parameter("arm_follow_moving_speed", 0.01)
-        self.declare_parameter("arm_follow_still_speed", 0.005)
+        self.declare_parameter("arm_follow_ratio", 0.3)
         self.declare_parameter("arm_follow_seconds", 0.25)
+        # The setpoint's lead clamp in the air, rad; arm_stream_max_lead stays
+        # the clamp on the wall, where the setpoint leads the plate by design.
+        # Bounds how far ahead a setpoint can wind before the guard acts: at
+        # 0.2 it was 0.2 rad of lurch waiting (10-08 10:59). The highest air
+        # lead seen while following is ~40 mrad (0.6 rad/s in the return).
+        self.declare_parameter("arm_stream_max_lead_air", 0.1)
         # SCHED_FIFO priority for the streamer's tick and pipe threads; 0 leaves
         # them at the process's normal priority. Below ur_ros2_control's
         # controller manager (50). See arm_streamer._realtime for why: 16:57 on
         # 2026-10-07 still had 50-130 ms setpoint gaps from a CPU at load 45
         # with this process tree at nice 19.
         self.declare_parameter("arm_streamer_rt_priority", 40)
-        # When the solve goes quiet, the streamer brings the arm to rest at
-        # this deceleration (rad/s^2, worst joint) instead of holding it at the
-        # measurement on the spot — 27 such stops in the 16:57 sweep, up to 60
-        # rad/s^2 each. 0 restores the hard hold. Matches arm_accel_max.
-        self.declare_parameter("arm_stale_decel", 2.0)
+        # How fast the streamer lets the arm's velocity change, rad/s^2 (worst
+        # joint): every new solve's velocity is reached on this ramp, and a
+        # solve that goes quiet is a ramp to rest. The solve runs at ~6 Hz on
+        # the robot, and applied as steps its answers were 14-20 rad/s^2 in
+        # the air (10-08 10:59); held at the measurement, its stalls were up
+        # to 60 (10-07 16:57). 0 restores both: steps, and a hard hold.
+        # Matches arm_accel_max.
+        self.declare_parameter("arm_stream_accel", 2.0)
         # --- The GPR press (real robot only) ----------------------------------
         # Regulate CONTACT FORCE on the wall-normal axis instead of a standoff
         # distance, so the GPR wheel actually touches. This is our own admittance
@@ -1535,9 +1545,10 @@ class WholeBodySweepNode(Node):
                     stream_period_max_factor=self.stream_period_max_factor,
                     follow_lead=float(p("arm_follow_lead").value),
                     follow_moving_speed=float(p("arm_follow_moving_speed").value),
-                    follow_still_speed=float(p("arm_follow_still_speed").value),
+                    follow_ratio=float(p("arm_follow_ratio").value),
                     follow_seconds=float(p("arm_follow_seconds").value),
-                    stale_decel=float(p("arm_stale_decel").value),
+                    accel=float(p("arm_stream_accel").value),
+                    air_max_lead=float(p("arm_stream_max_lead_air").value),
                     rt_priority=int(p("arm_streamer_rt_priority").value)))
         else:
             self.arm_stream = ArmStream(

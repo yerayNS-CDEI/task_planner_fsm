@@ -88,7 +88,7 @@ def _seeded(q=(0.1, -1.0, 1.5), **kwargs):
 # What the in-process stream did, unchanged
 # ----------------------------------------------------------------------
 def test_a_velocity_is_integrated_over_the_measured_tick():
-    node, core, seq, q = _seeded()
+    node, core, seq, q = _seeded(accel=0.0)
     assert node.publisher.last == pytest.approx(list(q)), "the seed goes out at once"
     core.handle(seq(VELOCITY, [0.1, 0.0, -0.2], 0.5, True), 0.0)
     core.tick(0.01)
@@ -98,8 +98,8 @@ def test_a_velocity_is_integrated_over_the_measured_tick():
 
 
 def test_with_no_decel_a_stale_velocity_holds_once_at_the_arm():
-    """stale_decel=0 is the old behaviour, kept as the fallback."""
-    node, core, seq, q = _seeded(stale_decel=0.0)
+    """accel=0 is the old behaviour (steps, hard hold), kept as the fallback."""
+    node, core, seq, q = _seeded(accel=0.0)
     core.handle(seq(VELOCITY, [0.2, 0.0, 0.0], 0.1, True), 0.0)
     core.tick(0.01)
     moved = len(node.publisher.sent)
@@ -125,38 +125,69 @@ def _velocities(node):
 def test_a_stale_velocity_is_brought_to_rest_not_cut():
     """16:57 on 2026-10-07: 27 solve stalls in one sweep, each a hold at the
     measurement on the spot — a stop from full speed in one tick, up to 60
-    rad/s^2 in the return. Now the velocity comes down at stale_decel along
-    the same path, and the stream goes quiet once it is at rest."""
+    rad/s^2 in the return. Now the velocity comes down at accel along the
+    same path, and the stream goes quiet once it is at rest."""
     decel, v0 = 2.0, np.array([0.4, -0.2, 0.0])
-    node, core, seq, q = _seeded(stale_decel=decel)
-    core.handle(seq(VELOCITY, list(v0), 0.05, True), 0.0)
+    node, core, seq, q = _seeded(accel=decel)
     t = 0.0
-    for _ in range(int(0.05 / DT)):                  # trusted for 50 ms
+    for _ in range(40):                              # the solve, fresh every tick
+        core.handle(seq(VELOCITY, list(v0), 0.05, True), t)
         t += DT
         core.tick(t)
+        core.measured(np.array(node.publisher.last), core.v_out.copy())  # it follows
+    assert core.v_out == pytest.approx(v0), "at the solve's velocity before it stops"
     start = len(node.publisher.sent) - 1
     for _ in range(60):                              # then 0.6 s with nothing new
         t += DT
         core.tick(t)
+        core.measured(np.array(node.publisher.last), core.v_out.copy())  # it follows
     v = _velocities(node)[start:]
     peak = np.max(np.abs(v), axis=1)
     assert np.all(np.diff(peak) >= -decel * DT * 1.01 - 1e-9), "no step down"
-    assert peak[-1] == pytest.approx(0.0, abs=1e-9), "at rest"
+    assert peak[-1] <= decel * DT * 1.01, "the last tick before quiet is the last ramp step"
+    assert float(np.max(np.abs(core.v_out))) == pytest.approx(0.0, abs=1e-9), "at rest"
     direction = v[np.argmax(peak > 0.05)]
     assert direction / np.linalg.norm(direction) == pytest.approx(v0 / np.linalg.norm(v0)), (
         "slowed along the path it was on")
     travel = np.array(node.publisher.last) - np.array(node.publisher.sent[start])
-    expect = 0.4 ** 2 / (2 * decel)
-    assert abs(travel[0]) == pytest.approx(expect, rel=0.1), "v^2 / 2a of extra travel"
+    stop = 0.4 ** 2 / (2 * decel)                    # v^2 / 2a, 0.04 rad
+    assert stop * 0.9 <= abs(travel[0]) <= stop + 0.4 * 0.05 + 1e-9, (
+        "the ramp's v^2 / 2a, plus at most the trust horizon at speed")
     n = len(node.publisher.sent)
     core.tick(t + DT)
     assert len(node.publisher.sent) == n, "quiet once at rest"
     assert any("No control solution" in m for m in node.logs)
 
 
+def test_each_new_solve_velocity_is_reached_on_a_ramp_not_a_step():
+    """10-08 10:59: the solve ran at ~6 Hz, and each answer moved the velocity
+    by up to ~0.16 rad/s, which the stream applied in one tick — 14-20 rad/s^2
+    in the air."""
+    accel = 2.0
+    node, core, seq, q = _seeded(accel=accel)
+    t = 0.0
+    for k in range(60):
+        if k % 16 == 0:                              # a solve every 160 ms
+            v = [0.16 * (k // 16 + 1), 0.0, -0.08 * (k // 16 + 1)]
+            core.handle(seq(VELOCITY, v, 0.5, True), t)
+        t += DT
+        core.tick(t)
+        core.measured(np.array(node.publisher.last), core.v_out.copy())
+    dv = np.abs(np.diff(_velocities(node), axis=0)).max(axis=1)
+    assert dv.max() <= accel * DT * 1.01 + 1e-12, f"a step of {dv.max():.3f} rad/s in one tick"
+    assert core.v_out == pytest.approx([0.64, 0.0, -0.32]), "and it gets there"
+
+
+def test_with_no_accel_the_solve_velocity_is_stepped():
+    node, core, seq, q = _seeded(accel=0.0)
+    core.handle(seq(VELOCITY, [0.3, 0.0, 0.0], 0.5, True), 0.0)
+    core.tick(DT)
+    assert core.v_out == pytest.approx([0.3, 0.0, 0.0])
+
+
 def test_after_a_stale_velocity_the_stream_ramps_back_up():
     decel = 2.0
-    node, core, seq, q = _seeded(stale_decel=decel)
+    node, core, seq, q = _seeded(accel=decel)
     core.handle(seq(VELOCITY, [0.4, 0.0, 0.0], 0.05, True), 0.0)
     t = 0.0
     for _ in range(40):                              # trusted, then stale to rest
@@ -227,6 +258,50 @@ def test_an_arm_that_stops_following_in_the_air_is_re_anchored():
     assert any("stopped following" in m for m in node.logs)
 
 
+def test_an_arm_creeping_under_its_setpoint_is_caught_early_and_restarted_gently():
+    """10-08 11:03:33: setpoints on time at 0.36 rad/s, the UR creeping at
+    0.02-0.05. The old guard waited for "still" (< 5 mrad/s), so the setpoint
+    wound to 0.2 rad first, and the restart handed a stopped arm 0.36 rad/s in
+    one tick (30 rad/s^2). Now: lagging progress trips it, the air lead clamp
+    bounds the wind-up, and the restart ramps from the arm's own velocity."""
+    accel = 2.0
+    node, core, seq, q = _seeded(accel=accel, air_max_lead=0.1)
+    arm, t, v_arm = q.astype(float).copy(), 0.0, np.array([0.03, 0.0, 0.0])
+    leads, restart, commanded, anchored = [], None, [], []
+    while t < 1.5:
+        core.handle(seq(VELOCITY, [0.36, 0.0, 0.0], 0.5, True), t)
+        t += DT
+        arm = arm + v_arm * DT
+        core.measured(arm, v_arm)
+        n = core.reanchors
+        core.tick(t)
+        leads.append(core.lead())
+        commanded.append(core.v_out.copy())
+        anchored.append(core.reanchors > n)
+        if anchored[-1] and restart is None:
+            restart = core.v_out.copy()
+    assert core.reanchors >= 1, "creeping is not following"
+    assert max(leads) <= 0.1 + 1e-9, "never wound past the air lead clamp"
+    assert restart == pytest.approx(v_arm), "restarted from what the arm is doing"
+    # The commanded velocity ramps everywhere; at a re-anchor it drops to the
+    # arm's own (no step for the arm), and climbs from there on the ramp.
+    dv = np.abs(np.diff(np.array(commanded), axis=0)).max(axis=1)
+    rising = ~np.array(anchored[1:])
+    assert dv[rising].max() <= accel * DT * 1.01 + 1e-9, "no step up, after the re-anchor included"
+
+
+def test_the_air_lead_clamp_is_for_the_air_only():
+    """On the wall the setpoint leads the pressed plate by design."""
+    node, core, seq, q = _seeded(air_max_lead=0.05, max_lead=0.2)
+    core.handle(seq(VELOCITY, [0.5, 0.0, 0.0], 5.0, False), 0.0)
+    for k in range(1, 100):
+        core.tick(k * DT)
+    assert core.lead() > 0.05, "pressing: max_lead"
+    core.handle(seq(VELOCITY, [0.5, 0.0, 0.0], 5.0, True), 1.0)
+    core.tick(1.0 + DT)
+    assert core.lead() <= 0.05 + 1e-9, "in the air: air_max_lead"
+
+
 def test_the_guard_waits_out_the_normal_start_of_a_motion():
     """From rest the arm lags its setpoint for a moment; that is not a stall."""
     _, core, seq, q = _seeded()
@@ -288,8 +363,8 @@ def _remote():
     config = dict(node_name="test_arm_streamer", use_sim_time=False,
                   joint_states_topic="/test_arm_streamer/joint_states",
                   stream_rate=RATE, stream_period_max_factor=50.0, follow_lead=0.05,
-                  follow_moving_speed=0.01, follow_still_speed=0.005, follow_seconds=0.25,
-                  stale_decel=2.0, rt_priority=40)
+                  follow_moving_speed=0.01, follow_ratio=0.3, follow_seconds=0.25,
+                  accel=2.0, air_max_lead=0.1, rt_priority=40)
     return RemoteArmStream(_LogNode(), JOINTS, topic="/test_arm_streamer/commands",
                            max_lead=0.2, config=config)
 

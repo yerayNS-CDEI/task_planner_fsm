@@ -18,8 +18,8 @@ the part arriving late.
 So the stream moves out. This module is three pieces:
 
 * :class:`StreamCore` — the tick itself: integrate the last trusted velocity,
-  and when it goes stale bring it to rest at ``stale_decel`` (it was a hard
-  hold; see :meth:`StreamCore.tick`), plus one new guard, below. Plain Python,
+  reaching each new one on a ramp at ``accel`` and ramping to rest when it goes
+  stale (see :meth:`StreamCore.tick`), plus one new guard, below. Plain Python,
   so it is tested without a process.
 * :func:`run` — the process: its own interpreter, its own rclpy context, one
   timer and one ``/joint_states`` subscription on a single-threaded executor,
@@ -53,10 +53,13 @@ pendant, speed scaling at 100 %, the F/T reading free air. The setpoint wound
 up to the full ``max_lead`` (0.2 rad) over 2.6 s, until a hold re-seeded it at
 the measurement and the arm moved off again at once. A setpoint wound 0.2 rad
 ahead of an arm that might start following it at any moment is a lurch waiting
-to happen. So in the air, when the setpoint is moving, the arm is not, and the
-gap has grown past ``follow_lead`` for ``follow_seconds``, the integrator is
-re-anchored at the measurement and carries on from there. Off on the wall: a
-press holds the plate still against a setpoint that leads it by design.
+to happen. So in the air, when the setpoint is moving, the arm makes less than
+``follow_ratio`` of that progress, and the gap has grown past ``follow_lead``
+for ``follow_seconds``, the integrator is re-anchored at the measurement and
+ramps up again from the arm's own velocity; ``air_max_lead`` bounds how far it
+can wind meanwhile. It happened again on 2026-10-08 11:03:33, with setpoints
+arriving on time. Off on the wall: a press holds the plate still against a
+setpoint that leads it by design.
 """
 
 import os
@@ -97,8 +100,8 @@ class StreamCore:
 
     def __init__(self, node, joint_names, topic=None, max_lead=0.2, stream_rate=100.0,
                  stream_period_max_factor=50.0, follow_lead=0.05,
-                 follow_moving_speed=0.01, follow_still_speed=0.005, follow_seconds=0.25,
-                 stale_decel=2.0):
+                 follow_moving_speed=0.01, follow_ratio=0.3, follow_seconds=0.25,
+                 accel=2.0, air_max_lead=0.1):
         self.stream = ArmStream(node, joint_names, mode=POSITION, topic=topic,
                                 max_lead=max_lead)
         self.logger = node.get_logger()
@@ -107,20 +110,24 @@ class StreamCore:
         self.stream_period_max_factor = float(stream_period_max_factor)
         self.follow_lead = float(follow_lead)
         self.follow_moving_speed = float(follow_moving_speed)
-        self.follow_still_speed = float(follow_still_speed)
+        self.follow_ratio = float(follow_ratio)
         self.follow_seconds = float(follow_seconds)
-        # rad/s^2, worst joint. 0 restores the hard hold at the measurement.
-        self.stale_decel = float(stale_decel)
+        # rad/s^2, worst joint: how fast the integrated velocity may change.
+        # 0 = no ramp: velocities are stepped and a stale one is a hard hold.
+        self.accel = float(accel)
+        # The lead clamp in the air, rad (0 = use max_lead everywhere). On the
+        # wall the setpoint leads the plate by design and keeps max_lead.
+        self.max_lead = float(max_lead)
+        self.air_max_lead = float(air_max_lead)
 
         self.qdot = None            # the velocity being integrated, or None
         self.qdot_stamp = None      # when it arrived, on the streamer's clock
         self.max_age = None         # how long it stays trusted, s
         self.in_air = False
         self.stale = False          # latched while the velocity is stale
-        # The velocity actually being integrated while it differs from qdot:
-        # slowing to rest on a stale one, or ramping back up after it. None
-        # in normal streaming, when it is qdot itself.
-        self.v_ramp = None
+        # The velocity actually being integrated: qdot reached at ``accel``.
+        # None = at rest (after a seed or a hold).
+        self.v_out = None
         self.stream_stamp = None
         self.tick_period = 0.0
         self.q = None               # measured, controller order
@@ -171,13 +178,26 @@ class StreamCore:
         self.qdot_stamp = None
         self.stream_stamp = None
         self.stale = False
-        self.v_ramp = None
+        self.v_out = None
         self.still_since = None
 
     # ------------------------------------------------------------------
     def tick(self, now):
-        """One stream tick: what sweep_node's _stream_locked did, plus the
-        follow guard, and a stale velocity brought to rest instead of cut."""
+        """One stream tick: integrate the solve's velocity, reached at ``accel``.
+
+        Every change of velocity is a ramp, not only the stops. 2026-10-08
+        10:59: the solve ran at ~6 Hz and each answer could move the velocity
+        by up to ~0.16 rad/s (the solve's own bound is clamped at 4 nominal
+        periods), which the stream used to apply in one 10 ms tick — 14-20
+        rad/s^2 in the air against the 2 commanded. A ramp at accel turns each
+        into a 10-80 ms slope; at pressing speeds (mrad/s) it is invisible.
+
+        A stale velocity — the solve has stopped, or its messages have — is a
+        ramp to zero along the same path, then quiet: the controller holds the
+        last setpoint. It used to be a hold at the measurement on the spot, a
+        stop from full speed in one tick (16:57 on 2026-10-07: up to 60
+        rad/s^2). At 0.4 rad/s and 2 rad/s^2 it is 0.04 rad more travel.
+        """
         if self.qdot is None or self.qdot_stamp is None:
             return
         nominal = 1.0 / self.stream_rate
@@ -187,63 +207,72 @@ class StreamCore:
         self.tick_period = elapsed
         self.stream_stamp = now
 
-        if now - self.qdot_stamp > self.max_age:
-            # The solve has stopped, or its messages have. It used to be a hold
-            # at the measurement, on the spot, and that is a hard stop: on
-            # 2026-10-07 (16:57) the solve went quiet for 0.1-0.4 s 27 times in
-            # one sweep and every one braked the arm from whatever it was doing
-            # to nothing in a tick — up to 60 rad/s^2 in the return. Instead
-            # the velocity is brought to rest at stale_decel, along the same
-            # path; then the stream goes quiet and the controller holds the
-            # last setpoint. At 0.4 rad/s and 2 rad/s^2 that is 0.04 rad more
-            # travel; at pressing speeds it is nothing.
-            if not self.stale:
-                self.stale = True
-                self.v_ramp = self.qdot.copy() if self.v_ramp is None else self.v_ramp
-                self.logger.error(
-                    f"No control solution for {now - self.qdot_stamp:.2f}s: bringing the "
-                    f"arm to rest rather than streaming on with the last velocity it "
-                    f"was given.")
-                if self.stale_decel <= 0.0:
-                    self.v_ramp = np.zeros(self.n)
-                    self.stream.hold(self.q)
-                    return
-            peak = float(np.max(np.abs(self.v_ramp)))
-            if peak <= 1e-9:
+        stale = now - self.qdot_stamp > self.max_age
+        if stale and not self.stale:
+            self.stale = True
+            self.logger.error(
+                f"No control solution for {now - self.qdot_stamp:.2f}s: bringing the "
+                f"arm to rest rather than streaming on with the last velocity it "
+                f"was given.")
+            if self.accel <= 0.0:
+                self.v_out = None
+                self.stream.hold(self.q)
                 return
-            self.v_ramp = self.v_ramp * (max(0.0, peak - self.stale_decel * dt) / peak)
-            self.stream.send(self.v_ramp, dt, self.q)
-            return
-
-        if self.stale:
+        elif not stale and self.stale:
             self.stale = False
             self.logger.warn("Control solutions are arriving again; resuming.")
-        v = self.qdot
-        if self.v_ramp is not None:
-            # Back up to the solve's velocity at the same rate it was brought
-            # down at, rather than in one step.
-            step = max(self.stale_decel, 0.0) * dt
-            if step <= 0.0:
-                self.v_ramp = None
-            else:
-                self.v_ramp = np.clip(self.qdot, self.v_ramp - step, self.v_ramp + step)
-                if np.allclose(self.v_ramp, self.qdot, atol=1e-9):
-                    self.v_ramp = None
-                else:
-                    v = self.v_ramp
-        self._follow_guard(now, v)
-        self.stream.send(v, dt, self.q)
+        if stale and self.accel <= 0.0:
+            return
 
-    def _follow_guard(self, now, v):
-        """Re-anchor at the arm when, in the air, it has stopped following."""
+        self._ramp(np.zeros(self.n) if stale else self.qdot, dt)
+        if stale and float(np.max(np.abs(self.v_out))) <= 1e-9:
+            return                                   # at rest: leave it quiet
+        self.stream.max_lead = (self.air_max_lead if self.in_air and self.air_max_lead > 0.0
+                                else self.max_lead)
+        if not stale:
+            self._follow_guard(now)
+        self.stream.send(self.v_out, dt, self.q)
+
+    def _ramp(self, target, dt):
+        """Move v_out toward ``target`` by at most accel*dt on the worst joint.
+
+        The whole change is scaled, not clipped per joint, so a ramp keeps the
+        direction the arm is moving in — a stop is a stop along the path.
+        """
+        v0 = np.zeros(self.n) if self.v_out is None else self.v_out
+        target = np.asarray(target, dtype=float)
+        if self.accel <= 0.0:
+            self.v_out = target.copy()
+            return
+        delta = target - v0
+        peak = float(np.max(np.abs(delta)))
+        step = self.accel * dt
+        if peak > step:
+            delta = delta * (step / peak)
+        self.v_out = v0 + delta
+
+    def _follow_guard(self, now):
+        """Re-anchor at the arm when, in the air, it has stopped following.
+
+        "Stopped following" is the arm making less than ``follow_ratio`` of the
+        commanded progress, not the arm standing still: 10:59 on 2026-10-08 it
+        crept at 0.02-0.05 rad/s under a 0.36 rad/s setpoint, which the old
+        still-below-5-mrad/s test missed until the setpoint had wound up to the
+        full 0.2 rad. After a re-anchor the stream restarts from the velocity
+        the arm actually has and ramps up from there, instead of handing a
+        stationary arm the full velocity in one tick (the 30 rad/s^2 that run
+        ended its return with).
+        """
         if (not self.in_air or self.q is None or self.qd is None
                 or self.stream.command is None):
             self.still_since = None
             return
         lead = float(np.max(np.abs(self.stream.command - self.q)))
-        moving = float(np.max(np.abs(v))) > self.follow_moving_speed
-        still = float(np.max(np.abs(self.qd))) < self.follow_still_speed
-        if not (moving and still and lead > self.follow_lead):
+        speed = float(np.linalg.norm(self.v_out))
+        moving = float(np.max(np.abs(self.v_out))) > self.follow_moving_speed
+        progress = float(self.qd @ self.v_out) / speed if speed > 1e-12 else 0.0
+        lagging = progress < self.follow_ratio * speed
+        if not (moving and lagging and lead > self.follow_lead):
             self.still_since = None
             return
         if self.still_since is None:
@@ -252,12 +281,13 @@ class StreamCore:
         if now - self.still_since < self.follow_seconds:
             return
         self.stream.reset(self.q)
+        self.v_out = self.qd.copy()
         self.still_since = None
         self.reanchors += 1
         self.logger.warn(
             f"The arm stopped following its setpoint ({lead * 1000:.0f} mrad behind, "
-            f"standing still for {self.follow_seconds:.2f}s): re-anchoring the stream "
-            f"at the arm (#{self.reanchors}).")
+            f"{progress:.3f} of {speed:.3f} rad/s for {self.follow_seconds:.2f}s): "
+            f"re-anchoring the stream at the arm (#{self.reanchors}).")
 
     def lead(self):
         if self.stream.command is None or self.q is None:
@@ -293,9 +323,10 @@ def run(conn, status, config):
         stream_period_max_factor=config["stream_period_max_factor"],
         follow_lead=config["follow_lead"],
         follow_moving_speed=config["follow_moving_speed"],
-        follow_still_speed=config["follow_still_speed"],
+        follow_ratio=config.get("follow_ratio", 0.3),
         follow_seconds=config["follow_seconds"],
-        stale_decel=config.get("stale_decel", 2.0))
+        accel=config.get("accel", 2.0),
+        air_max_lead=config.get("air_max_lead", 0.1))
     lock = threading.Lock()
     priority = int(config.get("rt_priority", 0))
     parent = os.getppid()
