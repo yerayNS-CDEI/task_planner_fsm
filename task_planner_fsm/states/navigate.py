@@ -7,6 +7,7 @@ from ..utils.costmap_utils import (
     publish_wall_segment_markers,
     set_arm_footprint_enabled,
 )
+from ..utils.wall_geometry import sweep_ends
 import rclpy
 import rclpy.time
 from rclpy.action import ActionClient
@@ -129,13 +130,12 @@ class NavigateToTarget(State):
                         return  # wall entirely unreachable -> error set
                     self._target_clamped = True
 
-            if math.dist(target_point[:2], wall_data[0][:2]) <= math.dist(
-                target_point[:2], wall_data[1][:2]
-            ):
-                other_point = wall_data[1]
-            else:
-                other_point = wall_data[0]
-            
+            # Face the far end of the sweep. Taken from the recorded start end, not
+            # from the clamped target: that can sit nearer the far end.
+            _, other_point = sweep_ends(
+                wall_data, ctx.get("target_scan_start_end"), target_point
+            )
+
             # Orientation
             dx = other_point[0] - target_point[0]
             dy = other_point[1] - target_point[1]

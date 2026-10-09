@@ -67,6 +67,26 @@ def left_scan_endpoint(scan_line, inward_normal):
     return p0 if proj0 <= proj1 else p1
 
 
+def sweep_ends(scan_line, start_end, fallback_point):
+    """Return ``(near_end, far_end)`` of ``scan_line`` for the sweep direction.
+
+    ``start_end`` is the scan-line end the sweep starts from
+    (ctx['target_scan_start_end']: the left end on a wall's first line, flipped on
+    each serpentine line). It is the only reliable source: the base's current
+    target point is clamped to the reachable segments, and once the unreachable
+    stretch at the start end is longer than half the line, that point lies nearer
+    the FAR end. Guessing near/far from it then reverses the sweep and puts the
+    wall on the robot's right (wall 2, 2026-10-08).
+
+    Falls back to the end nearest ``fallback_point`` when ``start_end`` is None.
+    """
+    p0, p1 = scan_line[0], scan_line[1]
+    ref = start_end if start_end is not None else fallback_point
+    d0 = math.hypot(ref[0] - p0[0], ref[1] - p0[1])
+    d1 = math.hypot(ref[0] - p1[0], ref[1] - p1[1])
+    return (p0, p1) if d0 <= d1 else (p1, p0)
+
+
 def build_wall_data(p1, p2, offset: float = 0.6, scan_lines_z=None, outward_normal=None):
     """Build scan geometry for one wall.
 
