@@ -105,6 +105,15 @@ def test_a_later_unseat_and_reseat_does_not_restart_the_camera(state):
     assert [c[0] for c in state._hs.calls].count("start_line") == 1
 
 
+def test_the_cross_polarized_pass_samples_no_camera(state):
+    """Same spot, same camera as the upright pass: the samples would be
+    duplicates. The GPR still gets its clock — that pass is FOR the GPR."""
+    state._cross_pol_pass = True
+    _status(state, _ctx(), "running: seated")
+    assert state._hs.calls == []
+    assert state._gpr.calls == ["arm"]
+
+
 def test_the_camera_off_costs_nothing(state):
     state._hs = _SamplerStub(enabled=False)
     _status(state, _ctx(), "running: seated")
