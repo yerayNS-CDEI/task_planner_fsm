@@ -185,6 +185,23 @@ def test_turned_off_each_segment_is_swept_once(state, node):
     assert state.scan_swept
 
 
+@pytest.mark.parametrize("over, starts_at", [
+    ({}, "far"),                                              # segment order
+    ({"scan_wall_cross_pol_order": "line"}, "near"),
+    ({"scan_wall_cross_pol": False}, "far"),
+])
+def test_the_next_line_starts_where_the_robot_ends(state, node, over, starts_at):
+    """Normally the next line starts from the far end (serpentine). In "line"
+    order the rolled sweeps bring the robot back to where the line began, and
+    flipping would cost a transit along the whole wall."""
+    near, far = (1.0, 2.0, 1.5), (4.0, 2.0, 1.5)
+    state._sweep_from, state._sweep_to = near, far
+    ctx = ctx_for(node, **over)
+    _run_line(state, ctx)
+    assert state.scan_swept
+    assert ctx["target_scan_start_end"] == (far if starts_at == "far" else near)
+
+
 def test_an_unknown_order_falls_back_to_the_default(state, node):
     ctx = ctx_for(node, scan_wall_cross_pol_order="sideways")
     assert state._cross_pol_order(ctx) == "segment"
