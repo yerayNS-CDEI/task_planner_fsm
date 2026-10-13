@@ -2322,7 +2322,14 @@ class ScanWall(State):
         # sweeps back toward the opposite wall end (serpentine).
         if self._last_swept_point is not None:
             ctx["target_scan_point"] = tuple(self._last_swept_point)
-        ctx["target_scan_start_end"] = self._sweep_to
+        # The next line starts from the wall end the robot is at: the far one,
+        # unless the rolled sweeps ran in "line" order and brought it back to
+        # where this line began — then flipping would cost a transit along the
+        # whole wall. Either direction is safe after the first line: the base
+        # heading is fixed there (scan_heading_yaw), and a reversed line parks
+        # the chassis turned round, like every rolled sweep.
+        rolled_back = cross_pol and self._cross_pol_order(ctx) == "line"
+        ctx["target_scan_start_end"] = self._sweep_from if rolled_back else self._sweep_to
 
         # Advance to the next horizontal line on this wall. more_lines drives
         # both the self-loop and whether this was the last line of the wall.
