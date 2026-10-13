@@ -218,13 +218,19 @@ def sweep_tangent(m_hat, sweep_dir):
     return t / norm
 
 
-def plate_orientation_target(m_hat, up=(0.0, 0.0, 1.0)):
-    """Desired plate rotation: +Z into the wall, +Y up, +X = Y x Z.
+def plate_orientation_target(m_hat, up=(0.0, 0.0, 1.0), roll=0.0):
+    """Desired plate rotation: +Z into the wall, +Y up, +X = Y x Z, then rolled
+    ``roll`` rad about that +Z.
 
     Mirrors ``wall_parallel_controller``'s parallelism + roll compensation, but
     as an absolute target the whole-body QP can servo to, rather than an
     incremental IK setpoint. Returns a 3x3 world rotation matrix, or ``None``
     when the surface normal is (degenerately) vertical.
+
+    ``roll`` is for a plate that sweeps rotated on purpose (the cross-polarized
+    GPR pass, -pi/2). It has to be the roll the plate actually arrived with:
+    the target is absolute, so any other value is an orientation error the
+    alignment task drives the plate round to undo.
     """
     z = np.asarray(m_hat, dtype=float)
     z = z / np.linalg.norm(z)
@@ -234,4 +240,8 @@ def plate_orientation_target(m_hat, up=(0.0, 0.0, 1.0)):
         return None
     y = y / norm
     x = np.cross(y, z)
-    return np.column_stack((x / np.linalg.norm(x), y, z))
+    R = np.column_stack((x / np.linalg.norm(x), y, z))
+    if roll:
+        c, s = math.cos(roll), math.sin(roll)
+        R = R @ np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    return R

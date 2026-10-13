@@ -92,6 +92,13 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("seg_start", [0.0, 0.0, 0.0])
         self.declare_parameter("seg_end", [0.0, 0.0, 0.0])
         self.declare_parameter("row_z", float("nan"))     # NaN -> hold the height we start at
+        # Roll of the plate about the wall normal that the alignment task holds,
+        # rad: 0 is plate +Y up. The FSM's cross-polarized GPR pass unfolds the
+        # arm with the plate rolled -pi/2 ('unfolded_fsm_xpol') and passes that
+        # here. It must match the roll the plate arrives with — the target is
+        # absolute, so a 0 here would have the sweep turn the plate back upright
+        # during the approach and never call a rolled contact seated.
+        self.declare_parameter("plate_roll", 0.0)
         # 0.045 m/s (2026-09-22). 0.03 was where the base could be trusted
         # to hold contact; the 15:58 segment then ran at 23.6 mm/s mean with
         # the travel authority pinned at 1.00, zero releases and the force
@@ -1229,6 +1236,7 @@ class WholeBodySweepNode(Node):
         self.seg_start = np.array(p("seg_start").value, dtype=float)
         self.seg_end = np.array(p("seg_end").value, dtype=float)
         self.row_z = float(p("row_z").value)
+        self.plate_roll = float(p("plate_roll").value)
         self.standoff = float(p("standoff").value)
         self.arrive_tolerance = float(p("arrive_tolerance").value)
         self.map_frame = str(p("map_frame").value)
@@ -2677,7 +2685,7 @@ class WholeBodySweepNode(Node):
         # because the press needs it first: it decides whether the arm is
         # quiet enough to tare against and whether the contact is seated
         # enough for the base to sweep on.
-        R_target = plate_orientation_target(m_hat)
+        R_target = plate_orientation_target(m_hat, roll=self.plate_roll)
         if R_target is None:
             self._strike("sensed surface normal is vertical")
             return
