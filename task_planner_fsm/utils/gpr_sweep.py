@@ -129,6 +129,12 @@ class GprSweep:
         self._measurement_name = None
         self._measurement_t0 = None   # time.time() of the last /measurement/start
         self._segment = None          # (wall_index, line_idx, seg_idx)
+        # "copol" / "xpol" when each line is swept twice, plate upright then
+        # rolled (ScanWall's cross-polarized pass); None for a single sweep.
+        # Goes into the key and the measurement name, which would otherwise be
+        # the same for both passes and unpack the second export over the first.
+        self._polarization = None
+        self._plate_roll_deg = 0.0
         self._record = None           # open manifest row
         self._pub = None
         self._timer = None
@@ -190,13 +196,19 @@ class GprSweep:
     # ------------------------------------------------------------------
     # Segment lifecycle
     # ------------------------------------------------------------------
-    def open_measurement(self, ctx, wall_index, line_idx, seg_idx):
+    def open_measurement(self, ctx, wall_index, line_idx, seg_idx,
+                         polarization=None, plate_roll_deg=0.0):
         """Connect and open this segment's LINE_SCAN measurement, early -- well
         before the plate travels, so a probe/app problem surfaces before the arm
         is on the wall and the line start later meets a settled measurement.
-        Returns None, or the reason the scan must abort (the caller fails the
-        state; ``abort`` cleans up)."""
+        ``polarization`` ("copol" / "xpol") tells the two sweeps of a line
+        apart; ``plate_roll_deg`` is the plate's roll about the wall normal,
+        recorded so the processing can place the antenna. Returns None, or the
+        reason the scan must abort (the caller fails the state; ``abort``
+        cleans up)."""
         self._segment = (wall_index, int(line_idx), int(seg_idx))
+        self._polarization = polarization
+        self._plate_roll_deg = float(plate_roll_deg)
         self._seated = None
         ok, reason = self.bridge_ready(ctx)
         if not ok:
@@ -374,7 +386,8 @@ class GprSweep:
 
     def _measurement_name_for(self):
         _, line_idx, seg_idx = self._segment
-        return f"scan_wall line {line_idx + 1} seg {seg_idx + 1}"
+        name = f"scan_wall line {line_idx + 1} seg {seg_idx + 1}"
+        return f"{name} {self._polarization}" if self._polarization else name
 
     def _line_info(self, ctx):
         """GET /measurement/line as {started, finished, scans, length, index},
@@ -538,7 +551,7 @@ class GprSweep:
                 f"[{self.name}] GPR export failed (HTTP {result['status']}); the "
                 f"traces stay on the app under '{self._measurement_name}'.")
             return result
-        key = gpr_manifest.line_key(*self._segment)
+        key = gpr_manifest.line_key(*self._segment, polarization=self._polarization)
         try:
             exports_dir = sensor_paths.gpr_session_dir(ctx) / "exports"
             exports_dir.mkdir(parents=True, exist_ok=True)
@@ -799,6 +812,8 @@ class GprSweep:
             "seg_end": _pt(seg_end),
             "frame": frame,
             "measurement_name": self._measurement_name_for(),
+            "polarization": self._polarization,
+            "plate_roll_deg": round(self._plate_roll_deg, 2),
             "sweep": sweep,
             "arm_sweep": False,
             "probe_active": False,

@@ -22,11 +22,18 @@ def utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def line_key(wall_index, line_idx, seg_idx):
-    """Stable, filesystem-safe name for one GPR line: ``w02_l01_s00``."""
+def line_key(wall_index, line_idx, seg_idx, polarization=None):
+    """Stable, filesystem-safe name for one GPR line: ``w02_l01_s00``, or
+    ``w02_l01_s00_xpol`` when the line is swept once per polarization.
+
+    Both passes carry a suffix ("copol" / "xpol"), not just the second: files
+    are matched to lines by the key appearing in their name, and a bare
+    ``w02_l01_s00`` is inside ``w02_l01_s00_xpol``.
+    """
     def _fmt(prefix, value):
         return f"{prefix}{int(value):02d}" if value is not None else f"{prefix}xx"
-    return "_".join((_fmt("w", wall_index), _fmt("l", line_idx), _fmt("s", seg_idx)))
+    key = "_".join((_fmt("w", wall_index), _fmt("l", line_idx), _fmt("s", seg_idx)))
+    return f"{key}_{polarization}" if polarization else key
 
 
 def append_gpr_line(ctx, row):
@@ -40,7 +47,8 @@ def append_gpr_line(ctx, row):
     path = paths.gpr_manifest_path(ctx)
     record = dict(row)
     record.setdefault("key", line_key(
-        row.get("wall_index"), row.get("line_idx"), row.get("seg_idx")))
+        row.get("wall_index"), row.get("line_idx"), row.get("seg_idx"),
+        polarization=row.get("polarization")))
     record["t_written"] = utc_now()
     try:
         os.makedirs(path.parent, exist_ok=True)

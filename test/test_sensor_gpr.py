@@ -144,6 +144,31 @@ def test_scans_match_lines_by_name_first_then_by_time(tmp_path):
     assert pairs["GP8800_0009"] is None              # every line is taken
 
 
+def test_the_two_polarizations_of_a_line_get_their_own_keys():
+    """Both passes are suffixed: files are matched by the key appearing in their
+    name, and a bare w02_l01_s00 is inside w02_l01_s00_xpol."""
+    co = manifest.line_key(2, 1, 0, polarization="copol")
+    x = manifest.line_key(2, 1, 0, polarization="xpol")
+    assert (co, x) == ("w02_l01_s00_copol", "w02_l01_s00_xpol")
+    assert co not in x and x not in co
+    assert manifest.line_key(2, 1, 0) == "w02_l01_s00"       # one pass: unchanged
+
+
+def test_each_polarization_scan_matches_its_own_line():
+    lines = [
+        {"key": "w02_l01_s00_copol", "measurement_name": "scan_wall line 2 seg 1 copol",
+         "t_start_epoch": 100},
+        {"key": "w02_l01_s00_xpol", "measurement_name": "scan_wall line 2 seg 1 xpol",
+         "t_start_epoch": 200},
+    ]
+    files = [
+        {"stem": "w02_l01_s00_xpol_scan_wall_line_2_seg_1_xpol", "mtime": 250, "sgy": "x"},
+        {"stem": "w02_l01_s00_copol_scan_wall_line_2_seg_1_copol", "mtime": 150, "sgy": "c"},
+    ]
+    pairs = {f["sgy"]: ln["key"] for f, ln in gpr.match_files_to_lines(files, lines)}
+    assert pairs == {"x": "w02_l01_s00_xpol", "c": "w02_l01_s00_copol"}
+
+
 def test_a_scan_older_than_every_line_is_unassociated():
     pairs = gpr.match_files_to_lines([{"stem": "old", "mtime": 10, "sgy": "o"}],
                                      [{"key": "k", "t_start_epoch": 100}])

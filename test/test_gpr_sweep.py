@@ -224,6 +224,26 @@ def test_segment_runs_the_gp_api_flow_in_order_against_the_static_probe(tmp_path
     assert (incoming / "w02_l01_s00_m.sgy").is_file()
 
 
+def test_the_two_polarizations_of_a_segment_do_not_overwrite_each_other(tmp_path, http):
+    """Same wall, line and segment twice: without the polarization the second
+    export would unpack over the first under the same key."""
+    ctx = make_ctx(tmp_path)
+    gpr = GprSweep("ScanWall", None)
+    for pol, roll in (("copol", 0.0), ("xpol", -90.0)):
+        assert (gpr.open_measurement(ctx, 2, 1, 0, polarization=pol, plate_roll_deg=roll)
+                or gpr.start_line(ctx, *SEG, "map")) is None
+        gpr.end_segment(ctx)
+
+    names = [body["name"] for m, u, body in http if u.endswith("/measurement/start")]
+    assert names == ["scan_wall line 2 seg 1 copol", "scan_wall line 2 seg 1 xpol"]
+    co, x = _manifest(tmp_path)
+    assert (co["key"], co["polarization"], co["plate_roll_deg"]) == ("w02_l01_s00_copol", "copol", 0.0)
+    assert (x["key"], x["polarization"], x["plate_roll_deg"]) == ("w02_l01_s00_xpol", "xpol", -90.0)
+    incoming = tmp_path / "raw" / "gpr" / "session_test" / "incoming"
+    assert (incoming / "w02_l01_s00_copol_m.sgy").is_file()
+    assert (incoming / "w02_l01_s00_xpol_m.sgy").is_file()
+
+
 def test_a_failed_connect_refuses_the_segment_and_starts_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(gpr_sweep_mod.requests, "request",
                         lambda *a, **kw: _Resp(500, {"error": {"message": "no"}}))
