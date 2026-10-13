@@ -78,6 +78,19 @@ SCAN_POSE_TOOL_Z_ABOVE_ARM_BASE = 0.5217
 # 7-second, non-backdrivable column for.
 ARM_Z_WINDOW_M = 0.25
 
+# How far off the wall the arm's approach leaves the plate before the sweep, in
+# metres, measured by the plate's range sensors: the gap the press (force mode,
+# or the whole-body sweep's own) then closes, and the standoff a sweep without a
+# press holds. ctx["scan_wall_plate_offset"] overrides it. Every reader goes
+# through _plate_offset, so this is the one number to change.
+#
+# 0.30, not 0.20: at 0.20 the plate's collision mesh (GPR included, 0.155 m in
+# front of arm_plate_link) ends ~6.5 cm from the wall, inside the 5-10 cm the
+# collision checker's dilated 5 cm octomap puts in front of it. The approach
+# goal then collided "sometimes", the planner refused it, and the segment was
+# skipped.
+PLATE_OFFSET_M = 0.30
+
 # Cross-polarized GPR pass (ctx["scan_wall_cross_pol"], on by default): every
 # line is swept twice, once with the plate upright (co-polarized) and once with
 # it rolled about the wall normal (cross-polarized), the GPR's two modes.
@@ -459,6 +472,11 @@ class ScanWall(State):
     def _scan_pose(self):
         """The named pose the arm unfolds into for this pass."""
         return CROSS_POL_SCAN_POSE if self._cross_pol_pass else SCAN_POSE
+
+    @staticmethod
+    def _plate_offset(ctx):
+        """Plate-to-wall gap the approach leaves, m (PLATE_OFFSET_M)."""
+        return float(ctx.get("scan_wall_plate_offset", PLATE_OFFSET_M))
 
     def _plate_rise(self):
         """How far to raise the plate centre off the line on this pass, m, so the
@@ -1051,7 +1069,7 @@ class ScanWall(State):
         # plus a margin. Sized from that knob rather than fixed: raising the offset
         # without raising this would leave force_mode short of the wall, and
         # _wall_contact_ready would burn its timeout and sweep without contact.
-        press_reach = float(ctx.get("scan_wall_plate_offset", 0.20)) + 0.05
+        press_reach = self._plate_offset(ctx) + 0.05
         req.deviation_limits = [0.1, 0.1, max(0.15, press_reach), 0.1, 0.1, 0.1]
         req.damping_factor = 0.025
         req.gain_scaling = 0.5
@@ -1907,7 +1925,7 @@ class ScanWall(State):
             measured = self._plate_wall_distance(ctx)
             if measured is not None:
                 self._preapproach_standoff = measured
-            target = float(ctx.get("scan_wall_plate_offset", 0.20))
+            target = self._plate_offset(ctx)
             # The rolled pass also drops the plate by the GPR's offset here, in
             # the same planned move: the whole-body sweep would hold it there
             # anyway (row_z), but the Nav2/crawl sweeps have no height task.
@@ -1936,7 +1954,7 @@ class ScanWall(State):
             # plate is nowhere near: the sweep would drag the base along a
             # surface it cannot reach, and the standoff-jump abort would kill it
             # a second later anyway, having already claimed the segment.
-            target = float(ctx.get("scan_wall_plate_offset", 0.20))
+            target = self._plate_offset(ctx)
             tolerance = float(ctx.get("scan_wall_approach_tolerance", 0.15))
             measured = self._plate_wall_distance(ctx)
             if measured is not None and abs(measured - target) > tolerance:
@@ -2578,7 +2596,7 @@ class ScanWall(State):
             "ros2", "run", "task_planner_fsm", "wbc_sweep_controller", "--ros-args",
             "-p", f"seg_start:=[{float(seg_start[0])}, {float(seg_start[1])}, {line_z}]",
             "-p", f"seg_end:=[{float(seg_end[0])}, {float(seg_end[1])}, {line_z}]",
-            "-p", f"standoff:={float(ctx.get('scan_wall_plate_offset', 0.20))}",
+            "-p", f"standoff:={self._plate_offset(ctx)}",
             # Retreat far enough that the arm ends the sweep back in a pose the
             # planner accepts. Measured, not guessed: it is where the plate sat
             # after the last successful planned move. Floored at the transit
