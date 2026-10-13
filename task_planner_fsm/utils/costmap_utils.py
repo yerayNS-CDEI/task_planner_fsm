@@ -53,7 +53,7 @@ DEFAULT_MAX_OFFSET = 1.3
 # Override per launch with the ``min_base_standoff`` ctx/ROS param; 0 disables
 # the clamp (pure nearest-free). Always capped by arm reach: the enforced
 # distance can never exceed scan_offset + base_goal_max_offset.
-DEFAULT_MIN_STANDOFF = 0.75
+DEFAULT_MIN_STANDOFF = 0.95
 
 
 def _search_knobs(ctx) -> Tuple[int, float]:
