@@ -121,6 +121,7 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
             ctx["current_wall_index"] = selected_wall_idx
             ctx["target_scan_wall"] = selected_wall["scan_line"]
             ctx["target_scan_point"] = selected_point
+            ctx["target_scan_start_end"] = selected_point
             ctx["target_selected"] = True
 
             # Horizontal scan lines (heights) for this wall, bottom-first.
@@ -197,6 +198,7 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
                 ctx["target_scan_point"] = left_scan_endpoint(
                     selected_wall["scan_line"], selected_wall.get("inward_normal")
                 )
+                ctx["target_scan_start_end"] = ctx["target_scan_point"]
             else:
                 node.get_logger().warn(
                     f"[{self.name}] Could not infer target_scan_wall from walls_data; "

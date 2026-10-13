@@ -29,6 +29,7 @@ from controller_manager_msgs.srv import ListControllers, SwitchController
 # so the net cannot name a controller the sweep would never have displaced.
 from ..wbc.controller_switch import TRAJECTORY_CONTROLLERS as WBC_TRAJECTORY_CONTROLLERS
 from ..utils.controller_ready import TrajectoryControllerGate
+from ..utils.wall_geometry import sweep_ends
 from std_msgs.msg import String
 from ur_msgs.srv import SetForceMode
 from std_srvs.srv import Trigger
@@ -1541,15 +1542,12 @@ class ScanWall(State):
                 self.fail(ctx, "missing wall data or target point")
                 return
 
-            # Serpentine: sweep from the wall end the robot is at toward the
-            # other end. Nearest-endpoint match — the current point may be a
-            # clamped reachable-segment endpoint, not the raw wall end.
-            d0 = math.hypot(prev_target_point[0] - wall_data[0][0],
-                            prev_target_point[1] - wall_data[0][1])
-            d1 = math.hypot(prev_target_point[0] - wall_data[1][0],
-                            prev_target_point[1] - wall_data[1][1])
-            near_end, far_end = (
-                (wall_data[0], wall_data[1]) if d0 <= d1 else (wall_data[1], wall_data[0])
+            # Sweep from the recorded start end (left on the first line, flipped
+            # per line for the serpentine) toward the other end. Not the end
+            # nearest the robot: its point is clamped to the reachable segments
+            # and can lie nearer the far end, which reverses the sweep.
+            near_end, far_end = sweep_ends(
+                wall_data, ctx.get("target_scan_start_end"), prev_target_point
             )
             self._sweep_from, self._sweep_to = near_end, far_end
 
@@ -2184,6 +2182,7 @@ class ScanWall(State):
         # sweeps back toward the opposite wall end (serpentine).
         if self._last_swept_point is not None:
             ctx["target_scan_point"] = tuple(self._last_swept_point)
+        ctx["target_scan_start_end"] = self._sweep_to
 
         # Advance to the next horizontal line on this wall. more_lines drives
         # both the self-loop and whether this was the last line of the wall.
@@ -2405,6 +2404,10 @@ class ScanWall(State):
     # Absolute base-speed cap during the sweep (0.0 => no limit). Found most
     # stable at 0.05 m/s; override via ctx["sweep_speed_limit"].
     SWEEP_SPEED_LIMIT_MS = 0.05
+    # The whole-body sweep's speed along the wall when ctx["wbc_sweep_speed"]
+    # is not set. Passed to wbc/sweep_node AND used to clock the GPR, so both
+    # read it here; keep it equal to sweep_node's own sweep_speed default.
+    WBC_SWEEP_SPEED_MS = 0.030
     # Relaxed progress checker so a sub-0.1 m/s sweep is not aborted as "no
     # progress" (must move SWEEP_PROGRESS_RADIUS_M within SWEEP_PROGRESS_TIME_S).
     SWEEP_PROGRESS_RADIUS_M = 0.10
@@ -2615,7 +2618,7 @@ class ScanWall(State):
         cmd += [
             # The fallback has to track wbc/sweep_node's own default, or the
             # node's is dead code: this is always passed.
-            "-p", f"sweep_speed:={float(ctx.get('wbc_sweep_speed', 0.045))}",
+            "-p", f"sweep_speed:={float(ctx.get('wbc_sweep_speed', self.WBC_SWEEP_SPEED_MS))}",
             "-p", f"status_topic:={ctx.get('wbc_status_topic', self.WBC_STATUS_TOPIC)}",
             # Everything in the loop — control period, data ages, the sweep
             # deadline — ticks on the node's clock. Gazebo runs well below
@@ -2719,7 +2722,7 @@ class ScanWall(State):
     def _arm_gpr_triggers(self, ctx, seg_start, seg_end):
         """Plate on the wall and about to travel: start the GPR's clock."""
         if self._wbc_enabled(ctx):
-            speed = float(ctx.get("wbc_sweep_speed", 0.045))
+            speed = float(ctx.get("wbc_sweep_speed", self.WBC_SWEEP_SPEED_MS))
         elif bool(ctx.get("sweep_use_crawl", False)):
             speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
         else:

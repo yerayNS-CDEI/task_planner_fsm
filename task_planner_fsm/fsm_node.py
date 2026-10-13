@@ -900,6 +900,7 @@ class RobotFSMNode(Node):
             self.ctx["target_scan_point"] = left_scan_endpoint(
                 selected_line, selected_wall.get("inward_normal")
             )
+            self.ctx["target_scan_start_end"] = self.ctx["target_scan_point"]
 
     def _prompt_phase1_target(self):
         walls_data = self.ctx.get("walls_data", [])
@@ -919,6 +920,7 @@ class RobotFSMNode(Node):
         self.ctx["current_wall_index"] = wall_idx
         self.ctx["target_scan_wall"] = target_scan_wall
         self.ctx["target_scan_point"] = target_scan_point
+        self.ctx["target_scan_start_end"] = target_scan_point
         self.ctx["current_wall_scan_lines"] = list(
             walls_data[wall_idx].get("scan_lines_z") or [target_scan_wall[0][2]]
         )
