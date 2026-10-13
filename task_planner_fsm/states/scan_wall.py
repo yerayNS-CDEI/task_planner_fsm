@@ -111,6 +111,17 @@ ARM_Z_WINDOW_M = 0.25
 # much so the antenna sweeps the same line as the co-polarized pass.
 CROSS_POL_PLATE_ROLL = -math.pi / 2
 SCAN_POSE = "unfolded_fsm"
+# When the rolled sweeps run (ctx["scan_wall_cross_pol_order"]):
+#   "segment"  each segment upright, then straight back over it rolled, then the
+#              next segment. The two polarizations of a stretch are recorded
+#              seconds apart; costs one extra (folded) transit of roughly the
+#              segment's length per segment.
+#   "line"     every segment of the line upright, then the line back again
+#              rolled, last segment first. The least base travel; the two
+#              polarizations of a stretch are a whole line apart.
+# Identical on a line of one segment.
+CROSS_POL_ORDERS = ("segment", "line")
+CROSS_POL_ORDER_DEFAULT = "segment"
 CROSS_POL_SCAN_POSE = "unfolded_fsm_xpol"
 
 # Where the GPR touches the wall, plate x/y, m. Same point as wbc/sweep_node.py's
@@ -224,8 +235,18 @@ class ScanWall(State):
         #   press_prepare    alignment controller + force-mode press
         #   press_settle     wait for the FT sensor to confirm wall contact
         #   sweep_wait       the actual scan
-        self._segments = None        # [((sx,sy,z),(ex,ey,z)), ...] robot-end first
+        # The line's sweeps, in the order they run: [((sx,sy,z),(ex,ey,z)), ...],
+        # robot-end first. The reachable segments, plus — with the cross-
+        # polarized pass on — each one's rolled sweep, queued once its upright
+        # sweep has succeeded (see _queue_cross_sweeps). _seg_idx indexes it.
+        self._segments = None
         self._seg_idx = 0
+        # Per sweep: (index of its segment in _line_segments, rolled?). What the
+        # GPR line is named after, so both polarizations of a segment carry its
+        # own number whatever order they run in.
+        self._sweep_info = []
+        self._line_segments = None   # the reachable segments, upright direction
+        self._seg_no = 0             # _sweep_info[_seg_idx][0], synced per tick
         self._seg_phase = "transit_clear"
         self._arm_goal_pub = None        # /arm/goal_pose publisher (created once)
         self._arm_goal_start = None      # planner wait deadline for the Z move
@@ -260,14 +281,16 @@ class ScanWall(State):
         self._sweep_from = None      # wall end the sweep starts from (robot's end)
         self._sweep_to = None        # wall end the sweep heads toward
 
-        # Cross-polarized pass (see CROSS_POL_PLATE_ROLL). The line's segments
-        # are swept upright first; then the ones that succeeded are swept again,
-        # in reverse order and direction, with the plate rolled — the base is
-        # already at the far end, and the reversal makes the park turn the
-        # chassis round so it still pushes. Hyperspectral sampling is off for
-        # it: same spot, same camera, the data would be a duplicate.
+        # Cross-polarized pass (see CROSS_POL_PLATE_ROLL and CROSS_POL_ORDERS).
+        # Every segment the upright sweep covered is swept again with the plate
+        # rolled, in reverse direction — the base is already at that end, and
+        # the reversal makes the park turn the chassis round so it still pushes.
+        # Hyperspectral sampling is off for it: same spot, same camera, the data
+        # would be a duplicate. _cross_pol_pass is the CURRENT sweep's
+        # orientation, synced from _sweep_info.
         self._cross_pol_pass = False
-        self._copol_swept = []       # segments the upright pass swept, in order
+        self._copol_swept = []       # (seg_no, start, end) the upright sweeps covered
+        self._xpol_ok = 0            # rolled sweeps covered
 
         # Sweep crawl: the active scan drags the base at a slow, constant velocity
         # over /cmd_vel instead of a Nav2 goal, so the arm's contact/alignment
@@ -380,6 +403,10 @@ class ScanWall(State):
         self._sweep_to = None
         self._cross_pol_pass = False
         self._copol_swept = []
+        self._xpol_ok = 0
+        self._sweep_info = []
+        self._line_segments = None
+        self._seg_no = 0
         self._stop_sweep_crawl(ctx)   # clear any stale timer from a re-entry
         self._stop_wbc_sweep(ctx)     # ... and any stale whole-body sweep process
         self._wbc_failure = None
@@ -468,8 +495,39 @@ class ScanWall(State):
             return None
         return "xpol" if self._cross_pol_pass else "copol"
 
+    def _cross_pol_order(self, ctx):
+        """"segment" or "line": when the rolled sweeps run (CROSS_POL_ORDERS)."""
+        order = str(ctx.get("scan_wall_cross_pol_order", CROSS_POL_ORDER_DEFAULT)).lower()
+        if order not in CROSS_POL_ORDERS:
+            ctx["node"].get_logger().warn(
+                f"[{self.name}] scan_wall_cross_pol_order={order!r} is not one of "
+                f"{CROSS_POL_ORDERS}; using {CROSS_POL_ORDER_DEFAULT!r}.",
+                throttle_duration_sec=60.0)
+            return CROSS_POL_ORDER_DEFAULT
+        return order
+
     def _pass_label(self):
         return " (cross-polarized)" if self._cross_pol_pass else ""
+
+    def _seg_label(self):
+        """'segment 2/3' of the LINE (not of the sweep list), plus the pass."""
+        total = len(self._line_segments) if self._line_segments else len(self._segments or ())
+        return f"segment {self._seg_no + 1}/{total}{self._pass_label()}"
+
+    def _sync_sweep(self):
+        """Point _seg_no / _cross_pol_pass at the sweep _seg_idx is on. A sweep
+        list built without _sweep_info (one per segment) reads as upright."""
+        if self._seg_idx < len(self._sweep_info):
+            self._seg_no, self._cross_pol_pass = self._sweep_info[self._seg_idx]
+        else:
+            self._seg_no, self._cross_pol_pass = self._seg_idx, False
+
+    def _queue_cross_sweeps(self, swept, at):
+        """Insert the rolled sweep of each (seg_no, start, end) at ``at``, in
+        order, each reversed: it starts where the upright sweep ended."""
+        for offset, (seg_no, start, end) in enumerate(swept):
+            self._segments.insert(at + offset, (end, start))
+            self._sweep_info.insert(at + offset, (seg_no, True))
 
     # ------------------------------------------------------------------
     # Arm process control (scan phase only)
@@ -962,12 +1020,25 @@ class ScanWall(State):
             ((float(seg_start[0]), float(seg_start[1])),
              (float(seg_end[0]), float(seg_end[1]))))
 
-    def _note_swept(self, seg_start, seg_end):
-        """Remember an upright-pass segment for the cross-polarized pass to
-        repeat. Only the ones that swept: a segment the upright pass could not
-        reach or finish is not worth a second, rolled attempt."""
-        if not self._cross_pol_pass:
-            self._copol_swept.append((seg_start, seg_end))
+    def _note_swept(self, ctx, seg_start, seg_end):
+        """Count a covered sweep, and queue the rolled sweep of an upright one.
+
+        Only upright sweeps that succeeded (or were already done) get a rolled
+        one: a segment the upright sweep could not reach or finish is not worth
+        a second attempt. In "segment" order it runs next; in "line" order
+        _finalize_line queues them all once the upright ones are done.
+        """
+        if self._cross_pol_pass:
+            self._xpol_ok += 1
+            return
+        entry = (self._seg_no, seg_start, seg_end)
+        self._copol_swept.append(entry)
+        if self._cross_pol_enabled(ctx) and self._cross_pol_order(ctx) == "segment":
+            self._queue_cross_sweeps([entry], at=self._seg_idx + 1)
+            ctx["node"].get_logger().info(
+                f"[{self.name}] Segment {self._seg_no + 1} co-polarized sweep covered; "
+                f"next, the same segment back with the plate rolled "
+                f"{math.degrees(CROSS_POL_PLATE_ROLL):+.0f} deg.")
 
     def _already_swept(self, ctx, seg_start, seg_end):
         """Has this stretch of wall already been swept on this line?
@@ -1581,7 +1652,9 @@ class ScanWall(State):
                 )
                 self.fail(ctx, "no reachable portion of the scan line within arm reach")
                 return
-            self._segments = segments
+            self._line_segments = list(segments)
+            self._segments = list(segments)
+            self._sweep_info = [(i, False) for i in range(len(segments))]
             self._seg_idx = 0
             self._seg_phase = "transit_clear"
             self._segments_ok = 0
@@ -1600,7 +1673,11 @@ class ScanWall(State):
             return
 
         seg_start, seg_end = self._segments[self._seg_idx]
-        seg_no, seg_total = self._seg_idx + 1, len(self._segments)
+        self._sync_sweep()
+        # Text and progress name the LINE's segment, which the rolled sweeps
+        # share with the upright ones; _pass_label says which one this is.
+        seg_no = self._seg_no + 1
+        seg_total = len(self._line_segments) if self._line_segments else len(self._segments)
 
         if self._seg_phase == "transit_clear":
             # Already covered on an earlier visit to this state? Skip it whole —
@@ -1616,7 +1693,7 @@ class ScanWall(State):
                 )
                 self._segments_ok += 1
                 self._last_swept_point = seg_end
-                self._note_swept(seg_start, seg_end)
+                self._note_swept(ctx, seg_start, seg_end)
                 self._seg_idx += 1
                 return
 
@@ -1631,7 +1708,7 @@ class ScanWall(State):
             self._transit_goal = goal_xy
             if not needed:
                 node.get_logger().info(
-                    f"[{self.name}] Base already at segment {self._seg_idx + 1} start; "
+                    f"[{self.name}] Base already at {self._seg_label()} start; "
                     f"skipping transit."
                 )
                 self._begin_park_phase(ctx)
@@ -1698,7 +1775,7 @@ class ScanWall(State):
                 # ahead is usually the column that split the line in two.
                 node.get_logger().error(
                     f"[{self.name}] Could not fold the arm; skipping segment "
-                    f"{self._seg_idx + 1} rather than transiting with it extended."
+                    f"{self._seg_label()} rather than transiting with it extended."
                 )
                 self._seg_idx += 1
                 self._seg_phase = "transit_clear"
@@ -1729,7 +1806,7 @@ class ScanWall(State):
                     self._begin_park_phase(ctx)
                     return
             node.get_logger().info(
-                f"[{self.name}] Transit to segment {self._seg_idx + 1}/{len(self._segments)} "
+                f"[{self.name}] Transit to {self._seg_label()} "
                 f"start ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) (no press)."
             )
             if not self._send_base_goal(ctx, goal_xy):
@@ -1745,7 +1822,7 @@ class ScanWall(State):
                 self._begin_park_phase(ctx)
             else:
                 node.get_logger().warn(
-                    f"[{self.name}] Transit to segment {self._seg_idx + 1} failed "
+                    f"[{self.name}] Transit to {self._seg_label()} failed "
                     f"(status={self._nav_status}); skipping this segment."
                 )
                 self._seg_idx += 1
@@ -1776,7 +1853,7 @@ class ScanWall(State):
                 # than rotating the chassis with the plate out by the wall.
                 node.get_logger().error(
                     f"[{self.name}] Could not fold the arm; skipping segment "
-                    f"{self._seg_idx + 1} rather than parking with it extended."
+                    f"{self._seg_label()} rather than parking with it extended."
                 )
                 self._seg_idx += 1
                 self._seg_phase = "transit_clear"
@@ -1830,7 +1907,7 @@ class ScanWall(State):
             if outcome == "failed":
                 node.get_logger().error(
                     f"[{self.name}] Could not unfold the arm after parking; "
-                    f"skipping segment {self._seg_idx + 1}."
+                    f"skipping {self._seg_label()}."
                 )
                 self._seg_idx += 1
                 self._seg_phase = "transit_clear"
@@ -1865,7 +1942,7 @@ class ScanWall(State):
             # here, before the arm reaches for the wall.
             err = self._gpr.open_measurement(
                 ctx, ctx.get("current_wall_index"), ctx.get("current_line_idx", 0),
-                self._seg_idx, polarization=self._polarization(ctx),
+                self._seg_no, polarization=self._polarization(ctx),
                 plate_roll_deg=math.degrees(self._plate_roll()))
             if err:
                 node.get_logger().error(f"[{self.name}] {err}; aborting scan.")
@@ -1933,7 +2010,7 @@ class ScanWall(State):
                 node.get_logger().error(
                     f"[{self.name}] Arm is {measured:.2f} m off the wall, not the "
                     f"{target:.2f} m this sweep needs — the approach did not get there. "
-                    f"Skipping segment {self._seg_idx + 1} instead of sweeping out of "
+                    f"Skipping {self._seg_label()} instead of sweeping out of "
                     f"reach (is the base parked too far from the wall?)."
                 )
                 self._gpr.abort(ctx)    # close the measurement sweep_setup opened
@@ -1966,7 +2043,7 @@ class ScanWall(State):
             else:
                 detail = "activating alignment + press for the sweep"
             node.get_logger().info(
-                f"[{self.name}] Segment {self._seg_idx + 1}/{len(self._segments)}: {detail}."
+                f"[{self.name}] {self._seg_label()}: {detail}."
             )
             # The reader has been up since the pre-approach; this is a no-op unless it
             # died. The alignment controller starts only now, with the arm already at
@@ -2043,7 +2120,7 @@ class ScanWall(State):
                 return
             goal_xy = base_standoff_goal(ctx, self.name, seg_end)
             node.get_logger().info(
-                f"[{self.name}] Sweeping segment {self._seg_idx + 1} to "
+                f"[{self.name}] Sweeping {self._seg_label()} to "
                 f"({goal_xy[0]:.2f}, {goal_xy[1]:.2f})."
             )
             if bool(ctx.get("sweep_use_crawl", False)):
@@ -2108,10 +2185,10 @@ class ScanWall(State):
                 self._segments_ok += 1
                 self._last_swept_point = seg_end
                 self._record_swept(ctx, seg_start, seg_end)
-                self._note_swept(seg_start, seg_end)
+                self._note_swept(ctx, seg_start, seg_end)
             else:
                 node.get_logger().warn(
-                    f"[{self.name}] Segment {self._seg_idx + 1} sweep did not succeed "
+                    f"[{self.name}] {self._seg_label()} sweep did not succeed "
                     f"(status={status}); skipping to the next segment."
                 )
             self._seg_idx += 1
@@ -2180,11 +2257,20 @@ class ScanWall(State):
         return False
 
     def _finalize_line(self, ctx):
-        """All segments of the current line processed. The line counts as scanned
-        when at least one segment swept; otherwise flag an error (completing
-        would silently drop the wall)."""
+        """All sweeps of the current line processed. The line counts as scanned
+        when at least one segment swept upright; otherwise flag an error
+        (completing would silently drop the wall).
+
+        In "line" order this is also where the rolled sweeps are queued: once
+        every upright sweep has run, the ones that succeeded go again rolled,
+        last first and each reversed. The robot is at the far end of the line,
+        so the first of them needs no transit, and running them backwards is
+        what makes the park turn the chassis round (park_target_phi) so the base
+        still pushes. ("segment" order queued each one already, in _note_swept.)
+        """
         node = ctx["node"]
-        if self._segments_ok == 0 and not self._cross_pol_pass:
+        n_segments = len(self._line_segments) if self._line_segments else len(self._segments)
+        if not self._copol_swept:
             node.get_logger().error(
                 f"[{self.name}] No segment of this line could be swept; the wall was "
                 f"not scanned. Flagging error instead of completing."
@@ -2192,18 +2278,26 @@ class ScanWall(State):
             ctx["error_triggered"] = True
             return
 
-        if not self._cross_pol_pass and self._cross_pol_enabled(ctx):
-            self._begin_cross_pol_pass(ctx)
+        cross_pol = self._cross_pol_enabled(ctx)
+        if cross_pol and not any(rolled for _, rolled in self._sweep_info):
+            self._queue_cross_sweeps(list(reversed(self._copol_swept)), at=len(self._segments))
+            self._seg_phase = "transit_clear"
+            node.get_logger().info(
+                f"[{self.name}] Co-polarized sweeps done; sweeping the line again with the "
+                f"plate rolled {math.degrees(CROSS_POL_PLATE_ROLL):+.0f} deg "
+                f"({len(self._copol_swept)} segment(s), reverse direction, plate "
+                f"{-gpr_height_above_plate(CROSS_POL_PLATE_ROLL):+.3f} m so the GPR stays "
+                f"on the line, no hyperspectral sampling)."
+            )
             return
-        if self._cross_pol_pass and self._segments_ok == 0:
-            # The line HAS data — the upright pass swept it — so this is not the
-            # "wall not scanned" error above. But a rolled pass that cannot sweep
-            # anything is usually systematic (the pose, the side load of casters
-            # dragged sideways), so say so loudly rather than carry on quietly.
+        if cross_pol and self._xpol_ok == 0:
+            # The line HAS data — the upright sweeps covered it — so this is not
+            # the "wall not scanned" error above. But rolled sweeps that all fail
+            # are usually systematic (the pose, the side load of casters dragged
+            # sideways), so say so loudly rather than carry on quietly.
             node.get_logger().error(
-                f"[{self.name}] The cross-polarized pass swept none of its "
-                f"{len(self._segments)} segment(s); this line has co-polarized GPR "
-                f"data only."
+                f"[{self.name}] None of the {len(self._copol_swept)} cross-polarized "
+                f"sweep(s) succeeded; this line has co-polarized GPR data only."
             )
 
         # The robot is at the last swept segment end; record it so the next line
@@ -2218,8 +2312,8 @@ class ScanWall(State):
         lines = ctx.get("current_wall_scan_lines", [])
         self.more_lines = ctx["current_line_idx"] < len(lines)
         node.get_logger().info(
-            f"[{self.name}] Line done ({self._segments_ok}/{len(self._segments)} segment(s) "
-            f"swept{self._pass_label()})."
+            f"[{self.name}] Line done ({len(self._copol_swept)}/{n_segments} segment(s) "
+            f"swept" + (f", {self._xpol_ok} cross-polarized" if cross_pol else "") + ")."
             + (
                 f" {len(lines) - ctx['current_line_idx']} more line(s) on this wall; "
                 f"will retract arm then re-enter for next height."
@@ -2230,30 +2324,6 @@ class ScanWall(State):
         # walls_left is only decremented once that phase completes (see
         # _run_post_scan), so the column retract on the last line is not skipped.
         self.scan_swept = True
-
-    def _begin_cross_pol_pass(self, ctx):
-        """Upright pass done: sweep the same ground again with the plate rolled.
-
-        The segments the upright pass swept, last first and each one reversed.
-        The robot is at the far end of the line, so the first of them needs no
-        transit; and running them backwards is what makes the park turn the
-        chassis round (park_target_phi), so the base still pushes. The plate
-        rolls in the unfold that follows every park (_after_park_phase).
-        """
-        node = ctx["node"]
-        self._cross_pol_pass = True
-        self._segments = [(end, start) for start, end in reversed(self._copol_swept)]
-        self._seg_idx = 0
-        self._seg_phase = "transit_clear"
-        self._segments_ok = 0
-        publish_wall_segment_markers(ctx, self._segments)
-        node.get_logger().info(
-            f"[{self.name}] Co-polarized pass done; sweeping the line again with the "
-            f"plate rolled {math.degrees(CROSS_POL_PLATE_ROLL):+.0f} deg "
-            f"({len(self._segments)} segment(s), reverse direction, plate "
-            f"{self._plate_rise():+.3f} m so the GPR stays on the line, no "
-            f"hyperspectral sampling)."
-        )
 
     # ------------------------------------------------------------------
     # Base goal plumbing (segment transit + sweep goals)
@@ -2811,7 +2881,7 @@ class ScanWall(State):
         axis = (dx / norm, dy / norm, 0.0) if norm > 1e-6 else None
         ident = dict(wall_index=ctx.get("current_wall_index"),
                      line_idx=ctx.get("current_line_idx", 0),
-                     seg_idx=self._seg_idx)
+                     seg_idx=self._seg_no)
         if self._hs.begin_segment(ctx, pose_fn, ref="map", world="map", **ident):
             self._hs.capture_at_start(ctx)
         self._hs.start_line(ctx, seg_start, seg_end, pose_fn, ref="map", axis=axis,

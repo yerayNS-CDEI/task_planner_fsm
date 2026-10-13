@@ -52,14 +52,47 @@ def ctx_for(node, **overrides):
     return ctx
 
 
-def _sweep_line(state, swept):
-    """The upright pass over SEG_A, SEG_B having swept ``swept`` of them."""
-    state._segments = [SEG_A, SEG_B]
-    state._seg_idx = 2
-    state._segments_ok = len(swept)
-    for seg in swept:
-        state._note_swept(*seg)
-    state._last_swept_point = state._segments[-1][1]
+def _plan(state, segments):
+    """The sweep list as _run_scan builds it right after segmentation."""
+    state._line_segments = list(segments)
+    state._segments = list(segments)
+    state._sweep_info = [(i, False) for i in range(len(segments))]
+    state._seg_idx = 0
+
+
+def _run_line(state, ctx, segments=(SEG_A, SEG_B), succeeds=lambda seg_no, rolled: True):
+    """Walk the line's sweeps the way _run_scan does — sync, skip what is
+    already swept, sweep, note, next — and finalize, until the line closes or
+    errors. Returns what was swept, in
+    order, as (segment number, rolled?, start, end)."""
+    _plan(state, segments)
+    swept = []
+    for _ in range(4 * len(segments) + 2):            # bounded: a bug must not hang
+        if state._seg_idx >= len(state._segments):
+            state._finalize_line(ctx)
+            if state.scan_swept or ctx.get("error_triggered"):
+                return swept
+            continue
+        start, end = state._segments[state._seg_idx]
+        state._sync_sweep()
+        if state._already_swept(ctx, start, end):     # transit_clear's resume skip
+            state._segments_ok += 1
+            state._last_swept_point = end
+            state._note_swept(ctx, start, end)
+            state._seg_idx += 1
+            continue
+        if succeeds(state._seg_no, state._cross_pol_pass):
+            swept.append((state._seg_no, state._cross_pol_pass, start, end))
+            state._segments_ok += 1
+            state._last_swept_point = end
+            state._record_swept(ctx, start, end)
+            state._note_swept(ctx, start, end)
+        state._seg_idx += 1
+    raise AssertionError("the line never closed")
+
+
+def _rev(seg):
+    return (seg[1], seg[0])
 
 
 # ------------------------------------------------------------- the geometry
@@ -90,80 +123,118 @@ def test_each_pass_unfolds_into_its_own_fixed_pose(state):
     assert state._plate_roll() == CROSS_POL_PLATE_ROLL
 
 
-# --------------------------------------------------------- pass sequencing
+# --------------------------------------------------------- sweep order
 
-def test_the_upright_pass_is_followed_by_the_rolled_one(state, node):
+def test_by_default_each_segment_is_swept_both_ways_before_the_next(state, node):
     ctx = ctx_for(node)
-    _sweep_line(state, [SEG_A, SEG_B])
-    state._finalize_line(ctx)
-    assert state._cross_pol_pass
-    assert not state.scan_swept, "the line closed after one pass"
-    assert ctx["current_line_idx"] == 0, "the line advanced before its second pass"
-    assert not ctx.get("error_triggered")
-    # Last first, each reversed: the robot is at the far end already.
-    assert state._segments == [(SEG_B[1], SEG_B[0]), (SEG_A[1], SEG_A[0])]
-    assert state._seg_idx == 0
-    assert state._segments_ok == 0
-    assert state._seg_phase == "transit_clear"
+    swept = _run_line(state, ctx)
+    assert [(n, r) for n, r, _, _ in swept] == [(0, False), (0, True), (1, False), (1, True)]
+    # The rolled sweep goes straight back over the segment it follows.
+    assert [(s, e) for _, _, s, e in swept] == [SEG_A, _rev(SEG_A), SEG_B, _rev(SEG_B)]
+    assert state.scan_swept and ctx["current_line_idx"] == 1
+    assert ctx["target_scan_point"] == SEG_B[0]       # where the last sweep ended
 
 
-def test_only_the_segments_the_upright_pass_swept_are_repeated(state, node):
-    _sweep_line(state, [SEG_B])
-    state._finalize_line(ctx_for(node))
-    assert state._segments == [(SEG_B[1], SEG_B[0])]
-
-
-def test_the_line_closes_after_the_rolled_pass(state, node):
-    ctx = ctx_for(node)
-    _sweep_line(state, [SEG_A, SEG_B])
-    state._finalize_line(ctx)
-    state._seg_idx = len(state._segments)
-    state._segments_ok = 2
-    state._last_swept_point = SEG_A[0]
-    state._finalize_line(ctx)
-    assert state.scan_swept
-    assert ctx["current_line_idx"] == 1
+def test_line_order_sweeps_the_line_upright_then_back_rolled(state, node):
+    ctx = ctx_for(node, scan_wall_cross_pol_order="line")
+    swept = _run_line(state, ctx)
+    assert [(n, r) for n, r, _, _ in swept] == [(0, False), (1, False), (1, True), (0, True)]
+    assert [(s, e) for _, _, s, e in swept] == [SEG_A, SEG_B, _rev(SEG_B), _rev(SEG_A)]
+    assert state.scan_swept and ctx["current_line_idx"] == 1
     assert ctx["target_scan_point"] == SEG_A[0]
 
 
-def test_a_rolled_pass_that_sweeps_nothing_keeps_the_line(state, node):
-    """The upright pass has the line's data; failing the wall would lose it."""
-    ctx = ctx_for(node)
-    _sweep_line(state, [SEG_A])
-    state._finalize_line(ctx)
-    state._seg_idx = len(state._segments)
-    state._segments_ok = 0
-    state._finalize_line(ctx)
+@pytest.mark.parametrize("order", ["segment", "line"])
+def test_a_rolled_sweep_carries_its_own_segments_number(state, node, order):
+    """The GPR line is named after the segment, so the rolled sweep of segment
+    2 must say 2 whichever order it runs in — in "line" order it is the FIRST
+    rolled sweep, which is what numbered it 1 before."""
+    swept = _run_line(state, ctx_for(node, scan_wall_cross_pol_order=order))
+    by_segment = {(n, r): (s, e) for n, r, s, e in swept}
+    assert by_segment[(1, False)] == SEG_B and by_segment[(1, True)] == _rev(SEG_B)
+    assert by_segment[(0, False)] == SEG_A and by_segment[(0, True)] == _rev(SEG_A)
+
+
+@pytest.mark.parametrize("order", ["segment", "line"])
+def test_only_segments_swept_upright_are_swept_rolled(state, node, order):
+    ctx = ctx_for(node, scan_wall_cross_pol_order=order)
+    swept = _run_line(state, ctx, succeeds=lambda n, rolled: n != 0 or rolled)
+    assert [(n, r) for n, r, _, _ in swept] == [(1, False), (1, True)]
     assert state.scan_swept
-    assert not ctx.get("error_triggered")
 
 
-def test_an_upright_pass_that_sweeps_nothing_is_still_an_error(state, node):
-    ctx = ctx_for(node)
-    _sweep_line(state, [])
-    state._finalize_line(ctx)
-    assert ctx.get("error_triggered")
-    assert not state._cross_pol_pass
+@pytest.mark.parametrize("order", ["segment", "line"])
+def test_rolled_sweeps_that_all_fail_keep_the_line(state, node, order):
+    """The upright sweeps have the line's data; failing the wall would lose it."""
+    ctx = ctx_for(node, scan_wall_cross_pol_order=order)
+    _run_line(state, ctx, succeeds=lambda n, rolled: not rolled)
+    assert state.scan_swept and not ctx.get("error_triggered")
 
 
-def test_turned_off_the_line_closes_after_one_pass(state, node):
+@pytest.mark.parametrize("order", ["segment", "line"])
+def test_upright_sweeps_that_all_fail_are_still_an_error(state, node, order):
+    ctx = ctx_for(node, scan_wall_cross_pol_order=order)
+    swept = _run_line(state, ctx, succeeds=lambda n, rolled: False)
+    assert swept == [] and ctx.get("error_triggered")
+
+
+def test_turned_off_each_segment_is_swept_once(state, node):
     ctx = ctx_for(node, scan_wall_cross_pol=False)
-    _sweep_line(state, [SEG_A, SEG_B])
-    state._finalize_line(ctx)
-    assert state.scan_swept and not state._cross_pol_pass
+    swept = _run_line(state, ctx)
+    assert [(n, r) for n, r, _, _ in swept] == [(0, False), (1, False)]
+    assert state.scan_swept
 
 
-def test_the_rolled_pass_parks_the_chassis_turned_round(state, node, monkeypatch):
-    """Reversed segments run the other way along the turret, which is what
-    turns the chassis round (park_target_phi) so the base still pushes."""
+def test_an_unknown_order_falls_back_to_the_default(state, node):
+    ctx = ctx_for(node, scan_wall_cross_pol_order="sideways")
+    assert state._cross_pol_order(ctx) == "segment"
+    swept = _run_line(state, ctx)
+    assert [(n, r) for n, r, _, _ in swept][:2] == [(0, False), (0, True)]
+
+
+@pytest.mark.parametrize("order", ["segment", "line"])
+def test_the_rolled_sweep_parks_the_chassis_turned_round(state, node, monkeypatch, order):
+    """Reversed, the rolled sweep runs the other way along the turret, which is
+    what turns the chassis round (park_target_phi) so the base still pushes."""
     monkeypatch.setattr(state, "_base_xy_yaw_map", lambda ctx: (0.0, 0.0, 0.0))
-    ctx = ctx_for(node)
-    state._segments = [SEG_A]
-    state._seg_idx = 0
+    ctx = ctx_for(node, scan_wall_cross_pol_order=order)
+    _plan(state, [SEG_A])
+    state._sync_sweep()
     assert state._park_target_for_segment(ctx) == 0.0
-    _sweep_line(state, [SEG_A])
-    state._finalize_line(ctx)
+    state._note_swept(ctx, *SEG_A)
+    state._seg_idx += 1
+    if order == "line":
+        state._finalize_line(ctx)
+    state._sync_sweep()
+    assert state._cross_pol_pass
     assert state._park_target_for_segment(ctx) == pytest.approx(math.pi)
+
+
+class _GprStub:
+    def __init__(self):
+        self.opened = []
+
+    def open_measurement(self, ctx, wall_index, line_idx, seg_idx, polarization=None,
+                         plate_roll_deg=0.0):
+        self.opened.append((seg_idx, polarization, plate_roll_deg))
+
+
+def test_the_gpr_measurement_is_named_after_the_lines_segment(state, node):
+    """Through sweep_setup itself: the rolled sweep of segment 2, first of the
+    rolled sweeps in line order, opens 's01 xpol' — not 's00'."""
+    ctx = ctx_for(node, scan_wall_cross_pol_order="line", sweep_use_wbc=True)
+    state._gpr = _GprStub()
+    state.started = True
+    _plan(state, [SEG_A, SEG_B])
+    for _ in range(2):                              # both upright sweeps covered
+        state._sync_sweep()
+        state._note_swept(ctx, *state._segments[state._seg_idx])
+        state._seg_idx += 1
+    state._finalize_line(ctx)
+    state._seg_phase = "sweep_setup"
+    state._run_scan(ctx)
+    assert state._gpr.opened == [(1, "xpol", pytest.approx(-90.0))]
+    assert state._seg_phase == "arm_approach"
 
 
 # ------------------------------------------------- the plate actually rolls
@@ -206,13 +277,19 @@ def test_the_rolled_pass_is_not_skipped_as_already_swept(state, node):
     assert state._already_swept(ctx, SEG_A[1], SEG_A[0])
 
 
-def test_a_resumed_upright_segment_is_still_repeated_rolled(state, node):
-    """Re-entry skips what was swept; the skipped segment still belongs to the
-    line, so the rolled pass must sweep it."""
-    state._note_swept(*SEG_A)
-    state._cross_pol_pass = True
-    state._note_swept(SEG_A[1], SEG_A[0])        # rolled sweeps are not repeated
-    assert state._copol_swept == [SEG_A]
+@pytest.mark.parametrize("order", ["segment", "line"])
+def test_a_resumed_line_still_gets_its_rolled_sweeps(state, node, order):
+    """Re-entry: the upright sweeps are skipped as already swept, but each still
+    belongs to the line, so its rolled sweep must run — and a rolled sweep that
+    is ALSO done is skipped in turn."""
+    ctx = ctx_for(node, scan_wall_cross_pol_order=order)
+    _run_line(state, ctx, succeeds=lambda n, rolled: not (n == 1 and rolled))
+    fresh = ScanWall("ScanWall")
+    fresh.current_line_z = state.current_line_z
+    ctx["current_line_idx"] = 0
+    redo = _run_line(fresh, ctx)
+    assert [(n, r) for n, r, _, _ in redo] == [(1, True)]
+    assert fresh.scan_swept
 
 
 # ------------------------------------------------- what the sweep is told
