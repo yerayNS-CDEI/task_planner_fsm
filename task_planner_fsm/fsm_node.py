@@ -56,12 +56,14 @@ from task_planner_fsm.states import (
     # WallDiscretization,
 )
 from task_planner_fsm.states.proc_utils import (
+    configure_remote,
     start_proc,
     stop_all,
     wait_stack_ready,
     wait_services_ready,
     ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
 )
+from task_planner_fsm.states.remote_procs import RemoteProc, SplitProc
 from task_planner_fsm.sensors import paths as sensor_paths
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
 from task_planner_fsm.utils.wall_geometry import build_wall_data, left_scan_endpoint
@@ -230,6 +232,8 @@ RESTART_KEPT_HANDLE_TYPES = (
     ActionClient,
     Timer,
     subprocess.Popen,
+    RemoteProc,
+    SplitProc,
 )
 
 
@@ -342,6 +346,11 @@ class RobotFSMNode(Node):
                 continue
             self.ctx.setdefault(pname, param.value)
             self.get_logger().info(f"[FSM] ctx param override: {pname}={param.value!r}")
+
+        # Jetson/PC2 split: -p perception_launcher:=/process_launcher sends the
+        # perception half of the stacks this FSM launches to that node's
+        # computer (see states/proc_utils.PLACEMENT). Unset: all local.
+        configure_remote(self.ctx)
 
         # Wall-detection defaults MUST be seeded before the bootstrap: when the
         # FSM starts at a state past ObjectID, the bootstrap stands in for it and

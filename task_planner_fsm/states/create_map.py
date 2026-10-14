@@ -21,7 +21,6 @@ The whole stack is torn down in ``on_exit`` before the FSM moves on.
 """
 
 import shlex
-import subprocess
 import time
 
 from ..state import State
@@ -35,6 +34,7 @@ from task_planner_fsm.states.proc_utils import (
     kill_stale_stack,
     graceful_rtabmap_save,
     SIM_STACK_PATTERNS,
+    force_kill_patterns,
 )
 
 
@@ -276,11 +276,7 @@ class CreateMap(State):
             node.get_logger().warn(
                 f"[{self.name}] Sim-stack processes still present after teardown; force-killing stragglers..."
             )
-            for pattern in SIM_STACK_PATTERNS:
-                try:
-                    subprocess.run(['pkill', '-9', '-f', pattern], timeout=2, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
+            force_kill_patterns(SIM_STACK_PATTERNS)
             wait_processes_gone(SIM_STACK_PATTERNS, timeout=10.0, node=node)
 
         # Small settle so DDS discovery clears any stale endpoints before the new
