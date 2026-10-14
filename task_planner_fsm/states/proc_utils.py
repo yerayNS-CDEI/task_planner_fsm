@@ -42,8 +42,10 @@ SIM_STACK_PATTERNS = GAZEBO_PATTERNS + SENSOR_DRIVER_PATTERNS + [
     'global_exploration.launch.py',
     'robot_state_publisher',
     'ros2_control_node',
+    # Also matches the spawners (.../lib/controller_manager/spawner). A bare
+    # 'spawner' would match the desktop's gvfsd-* --spawner helpers, so the
+    # wait for this list never finished and the pkill fallback killed them.
     'controller_manager',
-    'spawner',
     'rtabmap',
     'rgbd_odometry',
     'parameter_bridge',
