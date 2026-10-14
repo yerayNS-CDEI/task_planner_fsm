@@ -48,5 +48,6 @@ setup(
         'scripts/check_sensor_setup',
         'scripts/process_sensor_session',
         'scripts/gpr_trigger_bridge',
+        'scripts/process_launcher',
     ],
 )

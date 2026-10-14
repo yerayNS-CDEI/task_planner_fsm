@@ -1,6 +1,8 @@
 import os, signal, subprocess, atexit, signal as pysignal, time
 from typing import Dict, Iterable, List, Optional
 
+from task_planner_fsm.states.remote_procs import RemoteLauncher, RemoteProc, SplitProc
+
 # Gazebo/Ignition server processes. Kept separate because they are the most
 # stubborn to kill and are reused as a fallback in several places.
 GAZEBO_PATTERNS = [
@@ -84,21 +86,70 @@ STACK_READY_TIMEOUT_S = 300.0
 COLLISION_READY_TIMEOUT_S = 180.0
 
 
+# Jetson/PC2 split. With ``-p perception_launcher:=/process_launcher`` the
+# launches below run (partly) on the computer where that process_launcher node
+# runs; every other key stays local.
+#   split       two launches of the same command: stack:=control here (robot
+#               bringup, so the column retraction still happens here) and
+#               stack:=perception there (sensors, rtabmap, Nav2)
+#   perception  the whole launch runs there
+PLACEMENT = {
+    "mapping": "split",
+    "nav_sim": "split",
+    "explore": "perception",
+}
+
+# The launcher client, once configure_remote() found perception_launcher in ctx.
+_REMOTE: Optional[RemoteLauncher] = None
+
+
+def configure_remote(ctx: dict) -> Optional[RemoteLauncher]:
+    """Set up the perception launcher client from ``ctx["perception_launcher"]``.
+
+    Empty or missing keeps everything on this machine. Idempotent; the FSM node
+    calls it once its parameter overrides are in ctx.
+    """
+    global _REMOTE
+    launcher = str(ctx.get("perception_launcher") or "").strip()
+    if not launcher:
+        return None
+    if _REMOTE is None or _REMOTE.launcher != launcher.rstrip("/"):
+        node = ctx.get("node")
+        _REMOTE = RemoteLauncher(launcher, logger=node.get_logger() if node else None)
+        if node:
+            node.get_logger().info(
+                f"[split] Perception launches go to {launcher}: "
+                f"{', '.join(f'{k} ({v})' for k, v in PLACEMENT.items())}")
+    ctx["_remote_launcher"] = _REMOTE
+    return _REMOTE
+
+
 def stop_timeout_for(key: str) -> float:
     """Graceful-shutdown budget to give the launch registered under ``key``."""
     return ROBOT_STACK_STOP_TIMEOUT if key in ROBOT_STACK_KEYS else 10.0
+
+
+def _popen(cmd: list[str]) -> subprocess.Popen:
+    return subprocess.Popen(
+        cmd,
+        start_new_session=True,     # = setsid, mejor que preexec_fn en Py>=3.8
+        stdout=None, stderr=None,   # deja logs visibles mientras depuras
+        close_fds=True,
+    )
 
 
 def start_proc(ctx: dict, key: str, cmd: list[str]) -> None:
     procs: Dict[str, subprocess.Popen] = ctx.setdefault("_procs", {})
     if key in procs and procs[key] and procs[key].poll() is None:
         return
-    procs[key] = subprocess.Popen(
-        cmd,
-        start_new_session=True,     # = setsid, mejor que preexec_fn en Py>=3.8
-        stdout=None, stderr=None,   # deja logs visibles mientras depuras
-        close_fds=True,
-    )
+    placement = PLACEMENT.get(key) if _REMOTE is not None else None
+    if placement == "split":
+        local = _popen(list(cmd) + ["stack:=control"])
+        procs[key] = SplitProc(local, _REMOTE.start(key, list(cmd) + ["stack:=perception"]))
+    elif placement == "perception":
+        procs[key] = _REMOTE.start(key, list(cmd))
+    else:
+        procs[key] = _popen(cmd)
 
 def _force_kill_gazebo():
     """Force kill all Gazebo/Ignition processes using pkill."""
@@ -149,6 +200,16 @@ def stop_proc(ctx: dict, key: str, sig=signal.SIGINT, timeout=10.0, force_kill_p
     if not p:
         return
     node = ctx.get("node")
+    if isinstance(p, (RemoteProc, SplitProc)):
+        remote = p if isinstance(p, RemoteProc) else p.remote
+        # Perception first, so Nav2 stops commanding the base before the
+        # control half (and the column with it) goes down.
+        if remote.returncode is None:
+            remote.launcher.stop(key, timeout, force_kill_patterns)
+        if isinstance(p, RemoteProc):
+            procs.pop(key, None)
+            return
+        p = p.local
     if p.poll() is None:
         # 1) Graceful: SIGINT to the whole group -> ros2 launch shuts its
         #    children down cleanly (DDS participants deregister, rtabmap closes
@@ -236,7 +297,13 @@ def graceful_rtabmap_save(
 
     Returns True if rtabmap exited within ``timeout`` (or was not running),
     False if it was still alive when the timeout elapsed.
+
+    With the Jetson/PC2 split, rtabmap runs on the perception launcher's
+    machine, so the same save is done there first.
     """
+    if _REMOTE is not None and not _REMOTE.save_rtabmap(timeout):
+        if node:
+            node.get_logger().error("[shutdown] rtabmap on the perception computer did not confirm its save.")
     pids = _pgrep(pattern)
     if not pids:
         if node:
@@ -286,8 +353,15 @@ def wait_processes_gone(
     Used after a teardown to guarantee the previous launch is fully gone before
     the next one starts, so the new stack does not collide with orphaned nodes or
     a still-locked rtabmap database. Returns True if everything exited within
-    `timeout`, False otherwise.
+    `timeout`, False otherwise. With the Jetson/PC2 split it waits on the
+    perception computer too.
     """
+    patterns = list(patterns)
+    remote_gone = True
+    if _REMOTE is not None and not _REMOTE.cleanup(patterns, kill=False, wait_timeout=timeout):
+        remote_gone = False
+        if node:
+            node.get_logger().warn(f"Processes still running on the perception computer after {timeout}s.")
     exclude = set(exclude_pids or [])
     exclude.add(os.getpid())
     deadline = time.time() + timeout
@@ -299,7 +373,7 @@ def wait_processes_gone(
             if pid not in exclude
         })
         if not remaining:
-            return True
+            return remote_gone
         if node:
             node.get_logger().info(f"Waiting for {len(remaining)} sim-stack process(es) to exit: {remaining}")
         time.sleep(poll_interval)
@@ -324,8 +398,11 @@ def kill_stale_stack(
     guarantees a clean slate. It is a no-op when nothing matches.
 
     Defaults to ``SENSOR_DRIVER_PATTERNS`` (the resource-holding drivers); pass
-    ``SIM_STACK_PATTERNS`` for a full-stack sweep. Returns the PIDs it killed.
+    ``SIM_STACK_PATTERNS`` for a full-stack sweep. Returns the PIDs it killed
+    here; with the Jetson/PC2 split the perception computer is swept as well.
     """
+    if _REMOTE is not None:
+        _REMOTE.cleanup(patterns, kill=True)
     exclude = set(exclude_pids or [])
     exclude.add(os.getpid())
     killed: List[int] = []
@@ -347,6 +424,17 @@ def kill_stale_stack(
         # before the new drivers try to claim them.
         time.sleep(settle)
     return killed
+
+
+def force_kill_patterns(patterns: Iterable[str]) -> None:
+    """``pkill -9 -f`` every pattern here, and on the perception computer."""
+    for pattern in patterns:
+        try:
+            subprocess.run(['pkill', '-9', '-f', pattern], timeout=2, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    if _REMOTE is not None:
+        _REMOTE.cleanup(patterns, kill=True)
 
 
 def _topic_publisher_count(topic: str, timeout: float = 4.0) -> int:
