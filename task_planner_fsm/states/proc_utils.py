@@ -1,5 +1,5 @@
-import os, shlex, signal, subprocess, atexit, signal as pysignal, time
-from typing import Dict, Iterable, List, Optional
+import os, shlex, signal, subprocess, atexit, signal as pysignal, sys, threading, time
+from typing import Callable, Dict, Iterable, List, Optional
 
 from task_planner_fsm.states.remote_procs import RemoteLauncher, RemoteProc, SplitProc
 
@@ -134,6 +134,36 @@ def _popen(cmd: list[str]) -> subprocess.Popen:
     )
 
 
+def _popen_with_output(cmd: list[str], key: str, sink: Callable[[str, str], None]) -> subprocess.Popen:
+    """Like _popen, but every output line also goes to ``sink(key, line)``.
+
+    The launch's stdout and stderr are piped and drained by a thread that
+    still echoes them to our own stdout, so the launch never blocks on a full
+    pipe, whatever the sink does. A sink that raises loses that line only.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        start_new_session=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        close_fds=True, text=True, bufsize=1, errors="replace",
+    )
+
+    def pump():
+        with proc.stdout:
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                try:
+                    sink(key, line.rstrip("\n"))
+                except Exception:
+                    pass
+
+    # Joined by stop_proc, so no line is still being written at interpreter exit.
+    proc.output_thread = threading.Thread(target=pump, name=f"output-{key}", daemon=True)
+    proc.output_thread.start()
+    return proc
+
+
 # The robot-stack launches that take ``ctx["stack_launch_args"]`` (the
 # ``-p stack_launch_args:=...`` FSM parameter, a string or a list) on top of
 # their own arguments, e.g. ``cameras:=false`` for the two-machine sim test,
@@ -174,7 +204,10 @@ def start_proc(ctx: dict, key: str, cmd: list[str]) -> None:
     elif placement == "perception":
         procs[key] = _REMOTE.start(key, list(cmd))
     else:
-        procs[key] = _popen(cmd)
+        # process_launcher sets _output_sink to publish its launches' output
+        # to the FSM's computer; the FSM itself leaves the console alone.
+        sink = ctx.get("_output_sink")
+        procs[key] = _popen_with_output(cmd, key, sink) if sink else _popen(cmd)
 
 def _force_kill_gazebo():
     """Force kill all Gazebo/Ignition processes using pkill."""
@@ -326,6 +359,9 @@ def stop_proc(ctx: dict, key: str, sig=signal.SIGINT, timeout=10.0, force_kill_p
         except ProcessLookupError:
             pass
     _reap_group_stragglers(node, key, p.pid, grace=timeout)
+    output_thread = getattr(p, "output_thread", None)
+    if output_thread is not None:
+        output_thread.join(timeout=5.0)
     procs.pop(key, None)
 
 
