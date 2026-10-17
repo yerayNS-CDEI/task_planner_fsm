@@ -565,7 +565,8 @@ class ObjectID(State):
                 [
                     "ros2", "launch", "navi_wall", "move_robot.launch.py",
                     f"sim:={sim_value}", "mode:=full", "controller_type:=omni", "hybrid_sim:=false",
-                    f"robot_ip:={robot_ip}", "database_name:=rtabmap_fsm", "headless:=true",
+                    # Localize in the map CreateMap just saved (mapping_cmd).
+                    f"robot_ip:={robot_ip}", "database_name:=rtabmap", "headless:=true",
                     f"planner_backend:={planner_backend}",
                     f"use_sim_time:={sim_value}",
                     # Push out launch's own SIGKILL deadline so ros2_control survives
