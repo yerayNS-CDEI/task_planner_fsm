@@ -9,6 +9,7 @@ to whatever footprint/inflation the costmap is configured with.
 
 import math
 import os
+import subprocess
 import time
 from typing import Optional, Tuple
 
@@ -112,33 +113,72 @@ def set_arm_footprint_enabled(ctx, enabled: bool) -> None:
     )
 
 
+NO_BACKOUT_BT = "navigate_to_pose_no_backout.xml"
+# navi-wall's default tree (navigation_launch.py, custom recoveries on). The
+# no-backout variant is installed next to it.
+NAVI_WALL_DEFAULT_BT = "navigate_to_pose_w_backout_recovery.xml"
+
+
 def nav_bt_xml(ctx, state_name: str) -> str:
     """BT XML for every FSM NavigateToPose goal: the default recovery tree minus
     the base-reversing recoveries (BackOutFromObstacle and BackUp), so a wedged
     robot fails fast back to the FSM instead of reversing away from the wall.
     Override with the 'nav_bt_xml' ctx/ROS param (empty string = bt_navigator's
-    default tree, backout included). Falls back to the default tree with a
-    warning if the variant isn't installed.
+    default tree, backout included).
+
+    bt_navigator opens the file itself, so the path must exist on the computer
+    running Nav2, which with the Jetson/PC2 split is not this one. The variant
+    is therefore located next to bt_navigator's own default tree, read from its
+    default_nav_to_pose_bt_xml parameter. Falls back to the default tree with a
+    warning when that tree is not navi-wall's or bt_navigator does not answer.
     """
     override = ctx.get("nav_bt_xml")
     if override is not None:
         return str(override)
-    try:
-        from ament_index_python.packages import get_package_share_directory
-        path = os.path.join(
-            get_package_share_directory("navi_wall"),
-            "config", "behavior_trees", "navigate_to_pose_no_backout.xml",
-        )
-        if os.path.isfile(path):
-            return path
-        reason = f"{path} not found"
-    except Exception as e:
-        reason = str(e)
+    cached = ctx.get("_nav_bt_xml_resolved")
+    if cached is not None:
+        return cached
+    default = _bt_navigator_default_tree(ctx)
+    if default is None:
+        reason = f"{_bt_navigator_node(ctx)} did not report its default tree"
+    elif os.path.basename(default) != NAVI_WALL_DEFAULT_BT:
+        reason = f"bt_navigator's default tree is {default}, not navi-wall's"
+    else:
+        path = os.path.join(os.path.dirname(default), NO_BACKOUT_BT)
+        ctx["_nav_bt_xml_resolved"] = path
+        ctx["node"].get_logger().info(f"[{state_name}] Nav2 goals use {path}.")
+        return path
     ctx["node"].get_logger().warn(
         f"[{state_name}] no-backout BT unavailable ({reason}); goals will use "
         f"the default BT (BackOutFromObstacle enabled)."
     )
     return ""
+
+
+def _bt_navigator_node(ctx) -> str:
+    return str(ctx.get("nav_bt_navigator_node", "/bt_navigator"))
+
+
+def _bt_navigator_default_tree(ctx) -> Optional[str]:
+    """bt_navigator's default_nav_to_pose_bt_xml, a path on Nav2's computer.
+
+    Uses the ``ros2 param get`` CLI because the FSM node's own executor is
+    blocked inside the calling state (see ObjectID's goal-checker update).
+    """
+    try:
+        r = subprocess.run(
+            ["ros2", "param", "get", _bt_navigator_node(ctx), "default_nav_to_pose_bt_xml"],
+            capture_output=True, text=True, timeout=10.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # Prints e.g. "String value is: /path/to/tree.xml".
+    prefix = "String value is:"
+    for line in r.stdout.splitlines():
+        if line.startswith(prefix):
+            value = line[len(prefix):].strip()
+            return value or None
+    return None
 
 
 def publish_base_goal_markers(ctx, scan_xy, goal_xy, mode: str):
