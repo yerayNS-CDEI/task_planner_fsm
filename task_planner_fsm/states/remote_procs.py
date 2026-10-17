@@ -16,22 +16,33 @@ The service calls go through a private node in its own rclpy context, spun
 only for the length of each call. The FSM calls proc_utils while its own
 executor is blocked, and on Ctrl+C after rclpy's signal handler has shut the
 default context down, so the client must not depend on either.
+
+The navi_wall service types are imported only once a launcher is used, so the
+FSM still imports with a navi_wall built before they existed, as long as the
+split is off.
 """
+import importlib
 import threading
 from typing import Iterable, List, Optional
 
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 
-from navi_wall.srv import CleanupProcesses, LaunchStatus, SaveRtabmap, StartLaunch, StopLaunch
-
 # How long to wait for the launcher's services to appear before a call fails.
 SERVICE_WAIT_S = 5.0
+# The same for the status query, which the states make on every 1 Hz tick:
+# with PC2 unreachable a longer wait would stall each tick.
+STATUS_SERVICE_WAIT_S = 1.0
 # Plain queries (start, status) return at once on the launcher side.
 QUERY_TIMEOUT_S = 15.0
 # stop_proc on the launcher escalates SIGINT (timeout) -> SIGTERM (+5 s) ->
 # SIGKILL (+2 s); give the call room for the whole sequence.
 STOP_MARGIN_S = 30.0
+
+
+def _srv():
+    """The navi_wall service types, imported on first use."""
+    return importlib.import_module("navi_wall.srv")
 
 
 class RemoteLauncherError(RuntimeError):
@@ -45,6 +56,12 @@ class RemoteLauncher:
         self.launcher = launcher.rstrip("/")
         self._logger = logger
         self._lock = threading.Lock()
+        # Thread inside _call, and the client used when that thread re-enters:
+        # a SIGINT/SIGTERM handler runs on the main thread, possibly while the
+        # main thread is inside a call (a state's poll() on the 1 Hz tick), and
+        # its cleanup (stop_all -> save_rtabmap) must not wait on our own lock.
+        self._owner = None
+        self._fallback: Optional["RemoteLauncher"] = None
         self._context = None
         self._node = None
         self._executor = None
@@ -59,29 +76,42 @@ class RemoteLauncher:
         self._node = rclpy.create_node("fsm_remote_launcher_client", context=self._context)
         self._executor = SingleThreadedExecutor(context=self._context)
         self._executor.add_node(self._node)
+        srv = _srv()
         self._clients = {
             name: self._node.create_client(srv_type, f"{self.launcher}/{name}")
             for name, srv_type in (
-                ("start", StartLaunch),
-                ("stop", StopLaunch),
-                ("status", LaunchStatus),
-                ("cleanup", CleanupProcesses),
-                ("save_rtabmap", SaveRtabmap),
+                ("start", srv.StartLaunch),
+                ("stop", srv.StopLaunch),
+                ("status", srv.LaunchStatus),
+                ("cleanup", srv.CleanupProcesses),
+                ("save_rtabmap", srv.SaveRtabmap),
             )
         }
 
-    def _call(self, name: str, request, timeout: float):
+    def _call(self, name: str, request, timeout: float, service_wait: float = SERVICE_WAIT_S):
+        if self._owner == threading.get_ident():
+            # Re-entered from a signal handler on the thread already inside a
+            # call: use an independent client (own context, node, executor)
+            # instead of deadlocking on our lock, so the cleanup still reaches
+            # the launcher.
+            if self._fallback is None:
+                self._fallback = RemoteLauncher(self.launcher, self._logger)
+            return self._fallback._call(name, request, timeout, service_wait)
         with self._lock:
-            self._ensure()
-            client = self._clients[name]
-            if not client.wait_for_service(timeout_sec=SERVICE_WAIT_S):
-                raise RemoteLauncherError(f"{self.launcher}/{name} is not available")
-            future = client.call_async(request)
-            self._executor.spin_until_future_complete(future, timeout_sec=timeout)
-            if not future.done():
-                future.cancel()
-                raise RemoteLauncherError(f"{self.launcher}/{name} did not answer within {timeout:.0f} s")
-            return future.result()
+            self._owner = threading.get_ident()
+            try:
+                self._ensure()
+                client = self._clients[name]
+                if not client.wait_for_service(timeout_sec=service_wait):
+                    raise RemoteLauncherError(f"{self.launcher}/{name} is not available")
+                future = client.call_async(request)
+                self._executor.spin_until_future_complete(future, timeout_sec=timeout)
+                if not future.done():
+                    future.cancel()
+                    raise RemoteLauncherError(f"{self.launcher}/{name} did not answer within {timeout:.0f} s")
+                return future.result()
+            finally:
+                self._owner = None
 
     def _log(self, level: str, msg: str):
         # One call per severity: rclpy rejects a log call site whose severity
@@ -97,7 +127,7 @@ class RemoteLauncher:
             self._logger.info(msg)
 
     def start(self, key: str, cmd: List[str]) -> "RemoteProc":
-        req = StartLaunch.Request(key=key, cmd=list(cmd))
+        req = _srv().StartLaunch.Request(key=key, cmd=list(cmd))
         try:
             res = self._call("start", req, QUERY_TIMEOUT_S)
         except RemoteLauncherError as exc:
@@ -110,8 +140,8 @@ class RemoteLauncher:
         return RemoteProc(self, key, pid=res.pid)
 
     def stop(self, key: str, timeout: float, force_kill_patterns: Optional[Iterable[str]] = None) -> bool:
-        req = StopLaunch.Request(key=key, timeout=float(timeout),
-                                 force_kill_patterns=list(force_kill_patterns or []))
+        req = _srv().StopLaunch.Request(key=key, timeout=float(timeout),
+                                        force_kill_patterns=list(force_kill_patterns or []))
         try:
             res = self._call("stop", req, float(timeout) + STOP_MARGIN_S)
         except RemoteLauncherError as exc:
@@ -122,11 +152,13 @@ class RemoteLauncher:
 
     def status(self, key: str):
         """(known, running, return_code); raises RemoteLauncherError."""
-        res = self._call("status", LaunchStatus.Request(key=key), QUERY_TIMEOUT_S)
+        res = self._call("status", _srv().LaunchStatus.Request(key=key), QUERY_TIMEOUT_S,
+                         service_wait=STATUS_SERVICE_WAIT_S)
         return res.known, res.running, res.return_code
 
     def cleanup(self, patterns: Iterable[str], kill: bool, wait_timeout: float = 0.0) -> bool:
-        req = CleanupProcesses.Request(patterns=list(patterns), kill=kill, wait_timeout=float(wait_timeout))
+        req = _srv().CleanupProcesses.Request(patterns=list(patterns), kill=kill,
+                                              wait_timeout=float(wait_timeout))
         try:
             res = self._call("cleanup", req, float(wait_timeout) + QUERY_TIMEOUT_S)
         except RemoteLauncherError as exc:
@@ -138,7 +170,7 @@ class RemoteLauncher:
 
     def save_rtabmap(self, timeout: float) -> bool:
         try:
-            res = self._call("save_rtabmap", SaveRtabmap.Request(timeout=float(timeout)),
+            res = self._call("save_rtabmap", _srv().SaveRtabmap.Request(timeout=float(timeout)),
                              float(timeout) + QUERY_TIMEOUT_S)
         except RemoteLauncherError as exc:
             self._log("error", f"rtabmap save failed: {exc}")
@@ -147,6 +179,9 @@ class RemoteLauncher:
         return res.success
 
     def close(self):
+        if self._fallback is not None:
+            self._fallback.close()
+            self._fallback = None
         with self._lock:
             if self._context is not None and self._context.ok():
                 self._node.destroy_node()
