@@ -2,8 +2,8 @@
 
 With ``-p perception_launcher:=/process_launcher`` the FSM runs the perception
 half of the robot stack (lidars, cameras, rtabmap, Nav2) on PC2 instead of
-locally; see task_planner_fsm/process_launcher.py for the PC2 side and
-proc_utils.PLACEMENT for which launches go where.
+locally. The PC2 side is navi-wall's process_launcher (navi_wall_launcher.node);
+proc_utils.PLACEMENT says which launches go where.
 
 The objects here stand in for ``subprocess.Popen`` in ``ctx["_procs"]``, so the
 states keep checking ``ctx["_procs"][key].poll()`` as before:

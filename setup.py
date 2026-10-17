@@ -48,6 +48,5 @@ setup(
         'scripts/hyperspectral_bench',
         'scripts/check_sensor_setup',
         'scripts/process_sensor_session',
-        'scripts/process_launcher',
     ],
 )
