@@ -13,6 +13,11 @@ PC2 (started at boot) and does it for the FSM, over ROS services::
     ~/cleanup         navi_wall/srv/CleanupProcesses  kill stale drivers / wait until gone
     ~/save_rtabmap    navi_wall/srv/SaveRtabmap       SIGINT rtabmap alone, wait for the save
 
+and publishes the console output of its launches, one line per message as
+``<key>| <line>``, so the UI on the FSM's computer can show it::
+
+    ~/output          std_msgs/String
+
 Everything is done here with the FSM's own proc_utils, exactly as the FSM does
 it for local launches: process groups, the SIGINT -> SIGTERM -> SIGKILL
 escalation, and the SIGINT-only rtabmap save. Signals never cross the network,
@@ -34,6 +39,8 @@ import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import QoSProfile
+from std_msgs.msg import String
 
 from navi_wall.srv import CleanupProcesses, LaunchStatus, SaveRtabmap, StartLaunch, StopLaunch
 from task_planner_fsm.states import proc_utils
@@ -46,6 +53,9 @@ class ProcessLauncher(Node):
         # proc_utils keeps its Popen handles in ctx["_procs"] and logs through
         # ctx["node"], the same layout the FSM uses.
         self._ctx = {"node": self}
+        # Each launch's output, still echoed to this node's own stdout.
+        self._output_pub = self.create_publisher(String, "~/output", QoSProfile(depth=200))
+        self._ctx["_output_sink"] = self._publish_output
         # One start/stop at a time; status queries go through while a long stop
         # (column retraction, rtabmap save) is in progress.
         self._lock = threading.Lock()
@@ -58,6 +68,9 @@ class ProcessLauncher(Node):
         self.create_service(SaveRtabmap, "~/save_rtabmap", self._save_rtabmap, callback_group=group)
         self.get_logger().info(
             f"Ready. Accepting ros2 launch of: {self._allowed_packages()}")
+
+    def _publish_output(self, key, line):
+        self._output_pub.publish(String(data=f"{key}| {line}"))
 
     def _allowed_packages(self):
         return list(self.get_parameter("allowed_packages").value)
