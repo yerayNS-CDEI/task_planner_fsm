@@ -1,4 +1,4 @@
-import os, signal, subprocess, atexit, signal as pysignal, time
+import os, shlex, signal, subprocess, atexit, signal as pysignal, time
 from typing import Dict, Iterable, List, Optional
 
 from task_planner_fsm.states.remote_procs import RemoteLauncher, RemoteProc, SplitProc
@@ -127,11 +127,27 @@ def _popen(cmd: list[str]) -> subprocess.Popen:
     )
 
 
+# The robot-stack launches that take ``ctx["stack_launch_args"]`` (the
+# ``-p stack_launch_args:=...`` FSM parameter, a string or a list) on top of
+# their own arguments, e.g. ``cameras:=false`` for the two-machine sim test,
+# where the raw sim images would otherwise cross the network.
+STACK_LAUNCH_ARG_KEYS = {"mapping", "nav_sim"}
+
+
+def stack_launch_args(ctx: dict, key: str) -> List[str]:
+    """The extra launch arguments for ``key``'s command, if it takes them."""
+    if key not in STACK_LAUNCH_ARG_KEYS:
+        return []
+    extra = ctx.get("stack_launch_args") or []
+    return shlex.split(extra) if isinstance(extra, str) else [str(a) for a in extra]
+
+
 def start_proc(ctx: dict, key: str, cmd: list[str]) -> None:
     procs: Dict[str, subprocess.Popen] = ctx.setdefault("_procs", {})
     old = procs.get(key)
     if old is not None and old.poll() is None:
         return
+    cmd = list(cmd) + stack_launch_args(ctx, key)
     if isinstance(old, (SplitProc, RemoteProc)):
         # One half (or the remote launch) has exited. Stop whatever survived
         # before starting a fresh pair, or the old control half keeps running
