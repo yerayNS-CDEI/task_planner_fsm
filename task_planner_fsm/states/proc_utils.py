@@ -51,6 +51,13 @@ SIM_STACK_PATTERNS = GAZEBO_PATTERNS + SENSOR_DRIVER_PATTERNS + [
     'parameter_bridge',
     'ros_gz_bridge',
     'rviz2',
+    # Nav2: every server and the lifecycle manager run from
+    # /opt/ros/<distro>/lib/nav2_<package>/. An orphaned lifecycle_manager was
+    # seen ignoring SIGINT and SIGTERM, and none of the patterns above match it.
+    'lib/nav2_',
+    # navi-wall's frontier explorer (exploration.launch.py).
+    'lib/navi_wall/explore',
+    'lib/navi_wall/find_frontiers',
 ]
 
 # Launch keys whose process tree contains ros2_control -- and therefore the
@@ -199,12 +206,52 @@ def _force_kill_gazebo():
             pass
 
 def _killpg(pid: int, sig) -> bool:
-    """Signal the whole process group of `pid`. Returns False if it is gone."""
+    """Signal the process group led by `pid`. Returns False if it is gone.
+
+    Launches start in their own session (``_popen``), so the group id is the
+    launch's pid. Signalling it directly still reaches the rest of the group
+    after the launch itself has exited; os.getpgid(pid) would fail by then.
+    """
     try:
-        os.killpg(os.getpgid(pid), sig)
+        os.killpg(pid, sig)
         return True
     except (ProcessLookupError, PermissionError):
         return False
+
+
+def _group_members(pgid: int) -> List[int]:
+    try:
+        r = subprocess.run(['pgrep', '-g', str(pgid)], capture_output=True, text=True, timeout=3)
+        return [int(x) for x in r.stdout.split()]
+    except Exception:
+        return []
+
+
+def _reap_group_stragglers(node, key: str, pgid: int, grace: float) -> None:
+    """SIGKILL what is left of a launch's process group after the launch exited.
+
+    ``ros2 launch`` exits on SIGTERM without waiting for its children, so a
+    node that ignores SIGINT and SIGTERM (a deadlocked rtabmap) outlives it,
+    reparented to init, and holds its ports and database. It has had the same
+    signals as the rest of the group, so it gets `grace` seconds more and is
+    then killed.
+    """
+    members = _group_members(pgid)
+    if not members:
+        return
+    if node:
+        node.get_logger().warn(
+            f"Process '{key}': {len(members)} process(es) outlived the launch {members}; "
+            f"waiting up to {grace:.0f}s before SIGKILL..."
+        )
+    deadline = time.time() + grace
+    while members and time.time() < deadline:
+        time.sleep(0.5)
+        members = _group_members(pgid)
+    if members:
+        _killpg(pgid, signal.SIGKILL)
+        if node:
+            node.get_logger().warn(f"Process '{key}': SIGKILLed the stragglers {members}.")
 
 
 def stop_proc(ctx: dict, key: str, sig=signal.SIGINT, timeout=10.0, force_kill_patterns=None) -> None:
@@ -291,6 +338,7 @@ def stop_proc(ctx: dict, key: str, sig=signal.SIGINT, timeout=10.0, force_kill_p
                     node.get_logger().warn(f"Force kill sequence completed for '{key}'")
         except ProcessLookupError:
             pass
+    _reap_group_stragglers(node, key, p.pid, grace=timeout)
     procs.pop(key, None)
 
 
@@ -300,6 +348,49 @@ def _pgrep(pattern: str) -> List[int]:
         return [int(x) for x in r.stdout.split()]
     except Exception:
         return []
+
+
+def _rtabmap_database_path(pid: int) -> Optional[str]:
+    """``database_path`` from the parameter files on rtabmap's command line.
+
+    Launch passes node parameters as ``--params-file /tmp/launch_params_*``
+    YAML files. None when the process, the files or the key are not there.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = f.read().decode(errors="replace").split("\0")
+    except OSError:
+        return None
+    for flag, value in zip(args, args[1:]):
+        if flag != "--params-file":
+            continue
+        try:
+            import yaml
+            with open(value) as f:
+                found = _find_key(yaml.safe_load(f), "database_path")
+        except Exception:
+            continue
+        if found:
+            return str(found)
+    return None
+
+
+def _find_key(tree, key: str):
+    if isinstance(tree, dict):
+        if key in tree:
+            return tree[key]
+        for value in tree.values():
+            found = _find_key(value, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _modified_since(path: str, since: float) -> bool:
+    try:
+        return os.path.getmtime(path) >= since - 1.0
+    except OSError:
+        return False
 
 
 def graceful_rtabmap_save(
@@ -326,8 +417,9 @@ def graceful_rtabmap_save(
     ``stop_proc``'s escalation nor ``ros2 launch``'s own SIGKILL timer can kill
     rtabmap before the save completes.
 
-    Returns True if rtabmap exited within ``timeout`` (or was not running),
-    False if it was still alive when the timeout elapsed.
+    Returns True if rtabmap exited within ``timeout`` and rewrote its database
+    (or was not running), False if it was still alive when the timeout elapsed
+    or exited without writing the database (killed or crashed meanwhile).
 
     With the Jetson/PC2 split, rtabmap runs on the perception launcher's
     machine, so the same save is done there first, and both must succeed.
@@ -350,6 +442,9 @@ def graceful_rtabmap_save(
             f"[shutdown] Sending SIGINT to rtabmap SLAM (pids={pids}) and waiting "
             f"up to {timeout:.0f}s for the database save to finish..."
         )
+    # Read now: the parameter files go away with the launch.
+    databases = [db for db in (_rtabmap_database_path(pid) for pid in pids) if db]
+    signalled_at = time.time()
     for pid in pids:
         try:
             os.kill(pid, signal.SIGINT)
@@ -359,9 +454,21 @@ def graceful_rtabmap_save(
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not _pgrep(pattern):
+            # Gone is not saved: a kill or a crash also ends the process. rtabmap
+            # rewrites its database on every clean exit, mapping or localization.
+            unwritten = [db for db in databases if not _modified_since(db, signalled_at)]
+            if unwritten:
+                if node:
+                    node.get_logger().error(
+                        f"[shutdown] rtabmap SLAM exited without writing {unwritten}; "
+                        f"it was killed or crashed, so the map was not saved."
+                    )
+                return False
             if node:
                 node.get_logger().info(
-                    "[shutdown] rtabmap SLAM exited cleanly; database saved."
+                    f"[shutdown] rtabmap SLAM exited cleanly; database saved"
+                    + (f" ({', '.join(databases)})." if databases
+                       else " (database path unknown, file not checked).")
                 )
             return remote_ok
         time.sleep(poll_interval)
@@ -637,6 +744,63 @@ def wait_services_ready(
         return False
     finally:
         _destroy_readiness_clients(ctx)
+
+
+def _nav2_is_active(manager: str) -> Optional[bool]:
+    """Ask Nav2's lifecycle manager whether all of its nodes are active.
+
+    Uses the ``ros2 service call`` CLI because the FSM node's own executor is
+    blocked inside the calling state. None when the manager did not answer.
+    """
+    try:
+        r = subprocess.run(
+            ["ros2", "service", "call", f"{manager}/is_active", "std_srvs/srv/Trigger"],
+            capture_output=True, text=True, timeout=15.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if "success=True" in r.stdout:
+        return True
+    if "success=False" in r.stdout:
+        return False
+    return None
+
+
+def wait_nav2_active(
+    ctx: dict,
+    timeout: float = 60.0,
+    poll_interval: float = 2.0,
+    manager: str = "/lifecycle_manager_navigation",
+) -> bool:
+    """Block until Nav2's lifecycle manager reports every node active.
+
+    The costmap topic appears as soon as the costmap node exists, also when the
+    lifecycle manager aborted the bringup (a server missed its bond in time) and
+    left bt_navigator inactive, which rejects every goal. True once active.
+    """
+    node = ctx.get("node")
+    deadline = time.time() + timeout
+    while True:
+        state = _nav2_is_active(manager)
+        if state:
+            if node:
+                node.get_logger().info(f"[stack-ready] Nav2 is active ({manager}).")
+            return True
+        if time.time() >= deadline:
+            break
+        if node:
+            node.get_logger().info(
+                f"[stack-ready] Nav2 not active yet ({manager}: "
+                f"{'no answer' if state is None else 'inactive'})."
+            )
+        time.sleep(poll_interval)
+    if node:
+        node.get_logger().error(
+            f"[stack-ready] Nav2 did not become active within {timeout:.0f}s ({manager}). "
+            f"Its bringup was probably aborted: look for 'Failed to bring up all requested "
+            f"nodes' from the lifecycle manager on the computer running Nav2."
+        )
+    return False
 
 
 def stop_all(ctx: dict) -> None:
