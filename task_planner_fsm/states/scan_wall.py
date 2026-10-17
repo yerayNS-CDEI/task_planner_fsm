@@ -419,6 +419,10 @@ class ScanWall(State):
                         stdout=log_file,
                         stderr=log_file
                     )
+                    # Also under _procs, so proc_utils.stop_all stops it when the
+                    # FSM is interrupted mid-scan; in its own session it would
+                    # otherwise outlive the FSM (and keep the sensors' serial port).
+                    ctx.setdefault("_procs", {})[proc_key] = ctx[proc_key]
                     node.get_logger().info(
                         f"[{self.name}] '{proc_name}' activado (pid={ctx[proc_key].pid})."
                     )

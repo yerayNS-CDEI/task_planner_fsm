@@ -29,6 +29,7 @@ from ..utils.coverage_driver import CoverageConfig, CoverageDriver
 from task_planner_fsm.states.proc_utils import (
     start_proc,
     stop_proc,
+    wait_nav2_active,
     wait_stack_ready,
     wait_processes_gone,
     kill_stale_stack,
@@ -116,6 +117,13 @@ class CreateMap(State):
         )
         if not wait_stack_ready(ctx, ready_topics, timeout=ready_timeout):
             node.get_logger().error(f"[{self.name}] Mapping + nav2 stack did not become ready.")
+            ctx["error_triggered"] = True
+            self.phase = self.ERROR
+            return
+        # The costmap exists even when Nav2's bringup was aborted, and then the
+        # explorer's goals are all rejected; wait for Nav2 itself.
+        if not wait_nav2_active(ctx, timeout=float(ctx.get("create_map_nav2_active_timeout", 60.0))):
+            node.get_logger().error(f"[{self.name}] Nav2 did not become active.")
             ctx["error_triggered"] = True
             self.phase = self.ERROR
             return

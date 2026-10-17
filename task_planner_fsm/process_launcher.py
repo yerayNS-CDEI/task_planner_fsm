@@ -122,7 +122,8 @@ class ProcessLauncher(Node):
     def _save_rtabmap(self, request, response):
         timeout = request.timeout if request.timeout > 0 else 180.0
         response.success = proc_utils.graceful_rtabmap_save(node=self, timeout=timeout)
-        response.message = "rtabmap saved and exited" if response.success else "rtabmap still running"
+        response.message = ("rtabmap saved and exited" if response.success
+                            else "rtabmap did not save (still running, killed or crashed)")
         return response
 
     def stop_all(self):
