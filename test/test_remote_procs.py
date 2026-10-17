@@ -24,7 +24,6 @@ import os
 import subprocess
 import sys
 import textwrap
-import time
 from pathlib import Path
 
 import pytest
@@ -283,27 +282,3 @@ def test_the_fsm_imports_without_the_launcher_services():
     assert "imported" in result.stdout, result.stdout + result.stderr
 
 
-def test_the_launchers_launches_hand_every_output_line_to_the_sink(monkeypatch):
-    # process_launcher publishes these on ~/output for the UI on the other computer.
-    monkeypatch.setattr(proc_utils, "_REMOTE", None)
-    lines = []
-    ctx = {"_output_sink": lambda key, line: lines.append((key, line))}
-    proc_utils.start_proc(ctx, "mapping", ["sh", "-c", "echo one; echo two >&2"])
-    proc = ctx["_procs"]["mapping"]
-    assert proc.wait(timeout=5) == 0
-    proc.output_thread.join(timeout=5)
-    assert lines == [("mapping", "one"), ("mapping", "two")]
-
-
-def test_a_failing_sink_never_blocks_the_launch(monkeypatch):
-    # A launch writing more than a pipe holds must still run to the end.
-    monkeypatch.setattr(proc_utils, "_REMOTE", None)
-
-    def broken(key, line):
-        raise RuntimeError("publisher gone")
-    ctx = {"_output_sink": broken}
-    proc_utils.start_proc(ctx, "chatty", ["sh", "-c", "yes line | head -n 20000"])
-    proc = ctx["_procs"]["chatty"]
-    assert proc.wait(timeout=10) == 0
-    proc_utils.stop_proc(ctx, "chatty", timeout=1.0)  # joins the output thread
-    assert not proc.output_thread.is_alive()

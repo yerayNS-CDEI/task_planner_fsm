@@ -1,64 +1,16 @@
-import os, shlex, signal, subprocess, atexit, signal as pysignal, sys, threading, time
-from typing import Callable, Dict, Iterable, List, Optional
+import atexit, shlex, signal, signal as pysignal, subprocess, time
+from typing import Dict, Iterable, List, Optional
 
 from task_planner_fsm.states.remote_procs import RemoteLauncher, RemoteProc, SplitProc
 
-# Gazebo/Ignition server processes. Kept separate because they are the most
-# stubborn to kill and are reused as a fallback in several places.
-GAZEBO_PATTERNS = [
-    'gz sim',
-    'ign gazebo',
-    'ruby.*gz',
-    'gzserver',
-    'gz-sim',
-]
-
-# Hardware sensor drivers brought up by the mapping / navigation stack. These
-# are the most dangerous to leave orphaned: they hold exclusive OS resources
-# (the SICK multiscan UDP receiver ports 2115/2116, the Ouster TCP/UDP session,
-# the RealSense USB device). A survivor from a previous run makes the next
-# launch's driver fail to bind ("Address already in use, error 98"), which
-# silently breaks the point-cloud -> icp_odometry -> rtabmap localization chain
-# (no /rtabmap/odom, no /map, empty costmap). SIGINT is routinely ignored by
-# sick_generic_caller, so these MUST be reachable by the force-kill paths.
-SENSOR_DRIVER_PATTERNS = [
-    'sick_generic_caller',
-    'os_driver',
-    'pointcloud_concatenate_node',
-    'robot_body_filter_node',
-    'icp_odometry',
-    'rgbd_sync',
-    'realsense2_camera_node',
-]
-
-# Every process that a single move_robot.launch.py / mapping launch brings up.
-# When we tear a launch down we must remove ALL of these, otherwise orphaned
-# nodes (a second robot_state_publisher, controller_manager, rtabmap, rviz, ...)
-# collide with the next launch and the new stack never comes up cleanly.
-SIM_STACK_PATTERNS = GAZEBO_PATTERNS + SENSOR_DRIVER_PATTERNS + [
-    'move_robot.launch.py',
-    'mapping_stack.launch.py',
-    'exploration.launch.py',
-    'global_exploration.launch.py',
-    'robot_state_publisher',
-    'ros2_control_node',
-    # Also matches the spawners (.../lib/controller_manager/spawner). A bare
-    # 'spawner' would match the desktop's gvfsd-* --spawner helpers, so the
-    # wait for this list never finished and the pkill fallback killed them.
-    'controller_manager',
-    'rtabmap',
-    'rgbd_odometry',
-    'parameter_bridge',
-    'ros_gz_bridge',
-    'rviz2',
-    # Nav2: every server and the lifecycle manager run from
-    # /opt/ros/<distro>/lib/nav2_<package>/. An orphaned lifecycle_manager was
-    # seen ignoring SIGINT and SIGTERM, and none of the patterns above match it.
-    'lib/nav2_',
-    # navi-wall's frontier explorer (exploration.launch.py).
-    'lib/navi_wall/explore',
-    'lib/navi_wall/find_frontiers',
-]
+# The process mechanics (process groups, the stop escalation, the verified
+# rtabmap save, the cleanup sweeps) and the stack patterns live in navi-wall,
+# shared with process_launcher, which runs the perception half on PC2. This
+# module adds the FSM's side: which half of a stack runs where, the remote half
+# through the launcher, and the readiness checks.
+from navi_wall_launcher import procs as _local
+from navi_wall_launcher.procs import SENSOR_DRIVER_PATTERNS, SIM_STACK_PATTERNS  # noqa: F401 (states use them)
+from navi_wall_launcher.procs import popen as _popen
 
 # Launch keys whose process tree contains ros2_control -- and therefore the
 # column hardware interface, which retracts the column inside its on_deactivate.
@@ -138,45 +90,6 @@ def stop_timeout_for(key: str) -> float:
     return ROBOT_STACK_STOP_TIMEOUT if key in ROBOT_STACK_KEYS else 10.0
 
 
-def _popen(cmd: list[str]) -> subprocess.Popen:
-    return subprocess.Popen(
-        cmd,
-        start_new_session=True,     # = setsid, mejor que preexec_fn en Py>=3.8
-        stdout=None, stderr=None,   # deja logs visibles mientras depuras
-        close_fds=True,
-    )
-
-
-def _popen_with_output(cmd: list[str], key: str, sink: Callable[[str, str], None]) -> subprocess.Popen:
-    """Like _popen, but every output line also goes to ``sink(key, line)``.
-
-    The launch's stdout and stderr are piped and drained by a thread that
-    still echoes them to our own stdout, so the launch never blocks on a full
-    pipe, whatever the sink does. A sink that raises loses that line only.
-    """
-    proc = subprocess.Popen(
-        cmd,
-        start_new_session=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        close_fds=True, text=True, bufsize=1, errors="replace",
-    )
-
-    def pump():
-        with proc.stdout:
-            for line in proc.stdout:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-                try:
-                    sink(key, line.rstrip("\n"))
-                except Exception:
-                    pass
-
-    # Joined by stop_proc, so no line is still being written at interpreter exit.
-    proc.output_thread = threading.Thread(target=pump, name=f"output-{key}", daemon=True)
-    proc.output_thread.start()
-    return proc
-
-
 # The robot-stack launches that take ``ctx["stack_launch_args"]`` (the
 # ``-p stack_launch_args:=...`` FSM parameter, a string or a list) on top of
 # their own arguments, e.g. ``cameras:=false`` for the two-machine sim test,
@@ -217,94 +130,17 @@ def start_proc(ctx: dict, key: str, cmd: list[str]) -> None:
     elif placement == "perception":
         procs[key] = _REMOTE.start(key, list(cmd))
     else:
-        # process_launcher sets _output_sink to publish its launches' output
-        # to the FSM's computer; the FSM itself leaves the console alone.
-        sink = ctx.get("_output_sink")
-        procs[key] = _popen_with_output(cmd, key, sink) if sink else _popen(cmd)
-
-def _force_kill_gazebo():
-    """Force kill all Gazebo/Ignition processes using pkill."""
-    gz_patterns = [
-        'gz sim',
-        'ign gazebo',
-        'ruby.*gz',
-        'gzserver',
-        'gz-sim',
-    ]
-    
-    for pattern in gz_patterns:
-        try:
-            subprocess.run(['pkill', '-9', '-f', pattern], timeout=2, stderr=subprocess.DEVNULL)
-        except:
-            pass
-
-def _killpg(pid: int, sig) -> bool:
-    """Signal the process group led by `pid`. Returns False if it is gone.
-
-    Launches start in their own session (``_popen``), so the group id is the
-    launch's pid. Signalling it directly still reaches the rest of the group
-    after the launch itself has exited; os.getpgid(pid) would fail by then.
-    """
-    try:
-        os.killpg(pid, sig)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
-
-
-def _group_members(pgid: int) -> List[int]:
-    try:
-        r = subprocess.run(['pgrep', '-g', str(pgid)], capture_output=True, text=True, timeout=3)
-        return [int(x) for x in r.stdout.split()]
-    except Exception:
-        return []
-
-
-def _reap_group_stragglers(node, key: str, pgid: int, grace: float) -> None:
-    """SIGKILL what is left of a launch's process group after the launch exited.
-
-    ``ros2 launch`` exits on SIGTERM without waiting for its children, so a
-    node that ignores SIGINT and SIGTERM (a deadlocked rtabmap) outlives it,
-    reparented to init, and holds its ports and database. It has had the same
-    signals as the rest of the group, so it gets `grace` seconds more and is
-    then killed.
-    """
-    members = _group_members(pgid)
-    if not members:
-        return
-    if node:
-        node.get_logger().warn(
-            f"Process '{key}': {len(members)} process(es) outlived the launch {members}; "
-            f"waiting up to {grace:.0f}s before SIGKILL..."
-        )
-    deadline = time.time() + grace
-    while members and time.time() < deadline:
-        time.sleep(0.5)
-        members = _group_members(pgid)
-    if members:
-        _killpg(pgid, signal.SIGKILL)
-        if node:
-            node.get_logger().warn(f"Process '{key}': SIGKILLed the stragglers {members}.")
+        procs[key] = _popen(cmd)
 
 
 def stop_proc(ctx: dict, key: str, sig=signal.SIGINT, timeout=10.0, force_kill_patterns=None) -> None:
-    """
-    Stop a launch process *and all of its children* gracefully, escalating to
-    SIGKILL only if needed.
+    """Stop the launch registered under `key`, on whichever computer(s) it runs.
 
-    Because launches are started with ``start_new_session=True`` the Popen child
-    is the leader of its own process group, so signalling the group reaches every
-    node the launch spawned (Gazebo, controllers, rtabmap, rviz, ...). This is the
-    key difference from the previous version, which only signalled the launch
-    parent and left its children orphaned.
-
-    Args:
-        ctx: Context dictionary
-        key: Process identifier
-        sig: Initial (graceful) signal (default: SIGINT)
-        timeout: Timeout for graceful shutdown (default: 10s)
-        force_kill_patterns: Extra command patterns to ``pkill -9 -f`` as a last
-            resort if the group still has not exited.
+    A split stack's perception half is stopped first through the launcher, so
+    Nav2 stops commanding the base before the control half (and the column with
+    it) goes down. The local launch is stopped with navi_wall_launcher.procs:
+    SIGINT to its process group, SIGTERM after `timeout`, then SIGKILL and
+    ``pkill -9 -f`` of `force_kill_patterns`, and whatever outlives it.
     """
     procs = ctx.get("_procs", {})
     p = procs.get(key)
@@ -313,120 +149,15 @@ def stop_proc(ctx: dict, key: str, sig=signal.SIGINT, timeout=10.0, force_kill_p
     node = ctx.get("node")
     if isinstance(p, (RemoteProc, SplitProc)):
         remote = p if isinstance(p, RemoteProc) else p.remote
-        # Perception first, so Nav2 stops commanding the base before the
-        # control half (and the column with it) goes down.
         if remote.returncode is None:
             remote.launcher.stop(key, timeout, force_kill_patterns)
         if isinstance(p, RemoteProc):
             procs.pop(key, None)
             return
         p = p.local
-    if p.poll() is None:
-        # 1) Graceful: SIGINT to the whole group -> ros2 launch shuts its
-        #    children down cleanly (DDS participants deregister, rtabmap closes
-        #    its sqlite DB, controllers unload).
-        try:
-            if node:
-                node.get_logger().info(
-                    f"Stopping process group '{key}' (pid={p.pid}) with {sig.name}, waiting up to {timeout}s..."
-                )
-            if not _killpg(p.pid, sig):
-                p.send_signal(sig)
-            p.wait(timeout=timeout)
-            if node:
-                node.get_logger().info(f"Process '{key}' stopped cleanly")
-        except subprocess.TimeoutExpired:
-            # 2) Escalate to SIGTERM on the group.
-            if node:
-                node.get_logger().warn(
-                    f"Process '{key}' did not respond to {sig.name} after {timeout}s, sending SIGTERM to group..."
-                )
-            _killpg(p.pid, signal.SIGTERM)
-            try:
-                p.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                # 3) Last resort: SIGKILL the group, then pattern-kill stragglers.
-                if node:
-                    node.get_logger().warn(f"Process '{key}' still alive, SIGKILLing group and stragglers...")
-                _killpg(p.pid, signal.SIGKILL)
-                if force_kill_patterns:
-                    for pattern in force_kill_patterns:
-                        try:
-                            result = subprocess.run(['pkill', '-9', '-f', pattern], timeout=2,
-                                                    capture_output=True, text=True)
-                            if node:
-                                node.get_logger().info(f"pkill -9 -f '{pattern}' executed (rc={result.returncode})")
-                        except Exception as e:
-                            if node:
-                                node.get_logger().error(f"pkill failed for '{pattern}': {e}")
-                try:
-                    p.kill()
-                except Exception:
-                    pass
-                try:
-                    p.wait(timeout=2)
-                except Exception:
-                    pass
-                if node:
-                    node.get_logger().warn(f"Force kill sequence completed for '{key}'")
-        except ProcessLookupError:
-            pass
-    _reap_group_stragglers(node, key, p.pid, grace=timeout)
-    output_thread = getattr(p, "output_thread", None)
-    if output_thread is not None:
-        output_thread.join(timeout=5.0)
+    _local.stop_process(p, key, node=node, sig=sig, timeout=timeout,
+                        force_kill_patterns=force_kill_patterns)
     procs.pop(key, None)
-
-
-def _pgrep(pattern: str) -> List[int]:
-    try:
-        r = subprocess.run(['pgrep', '-f', pattern], capture_output=True, text=True, timeout=3)
-        return [int(x) for x in r.stdout.split()]
-    except Exception:
-        return []
-
-
-def _rtabmap_database_path(pid: int) -> Optional[str]:
-    """``database_path`` from the parameter files on rtabmap's command line.
-
-    Launch passes node parameters as ``--params-file /tmp/launch_params_*``
-    YAML files. None when the process, the files or the key are not there.
-    """
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            args = f.read().decode(errors="replace").split("\0")
-    except OSError:
-        return None
-    for flag, value in zip(args, args[1:]):
-        if flag != "--params-file":
-            continue
-        try:
-            import yaml
-            with open(value) as f:
-                found = _find_key(yaml.safe_load(f), "database_path")
-        except Exception:
-            continue
-        if found:
-            return str(found)
-    return None
-
-
-def _find_key(tree, key: str):
-    if isinstance(tree, dict):
-        if key in tree:
-            return tree[key]
-        for value in tree.values():
-            found = _find_key(value, key)
-            if found is not None:
-                return found
-    return None
-
-
-def _modified_since(path: str, since: float) -> bool:
-    try:
-        return os.path.getmtime(path) >= since - 1.0
-    except OSError:
-        return False
 
 
 def graceful_rtabmap_save(
@@ -435,86 +166,20 @@ def graceful_rtabmap_save(
     poll_interval: float = 1.0,
     pattern: str = 'rtabmap_slam',
 ) -> bool:
-    """SIGINT the rtabmap SLAM node alone and block until it has exited.
+    """SIGINT rtabmap alone and wait for its database save, before any teardown.
 
-    rtabmap only persists its map database (the visual-word dictionary + the
-    optimized graph) when its process receives **SIGINT** and shuts down
-    cleanly -- SIGTERM/SIGKILL skip the save entirely, leaving a database with
-    nodes/features but an empty Word table (``VWDictionary ... dict size=0`` on
-    reload), or a truncated/unopenable file. On a large (>1 GB) map this save
-    can take well over a minute on the Jetson, far longer than the ~10 s
-    escalation window used when we tear the whole launch down.
-
-    So before stopping the launch we signal *only* the SLAM node (matched by
-    ``rtabmap_slam`` in its command line -- the odometry/sync/viz nodes live in
-    ``rtabmap_odom``/``rtabmap_sync``/``rtabmap_viz`` and are left for the normal
-    teardown) and wait for the process to disappear, which is our proof the
-    database has been flushed to disk. Signalling just this pid means neither
-    ``stop_proc``'s escalation nor ``ros2 launch``'s own SIGKILL timer can kill
-    rtabmap before the save completes.
-
-    Returns True if rtabmap exited within ``timeout`` and rewrote its database
-    (or was not running), False if it was still alive when the timeout elapsed
-    or exited without writing the database (killed or crashed meanwhile).
-
-    With the Jetson/PC2 split, rtabmap runs on the perception launcher's
-    machine, so the same save is done there first, and both must succeed.
+    See navi_wall_launcher.procs.graceful_rtabmap_save. With the Jetson/PC2
+    split rtabmap runs on the perception launcher's computer, so the same save
+    is done there first, and both must succeed.
     """
     remote_ok = True
     if _REMOTE is not None and not _REMOTE.save_rtabmap(timeout):
         remote_ok = False
         if node:
             node.get_logger().error("[shutdown] rtabmap on the perception computer did not confirm its save.")
-    pids = _pgrep(pattern)
-    if not pids:
-        if node:
-            node.get_logger().info(
-                "[shutdown] No rtabmap SLAM node found; nothing to save."
-            )
-        return remote_ok
-
-    if node:
-        node.get_logger().info(
-            f"[shutdown] Sending SIGINT to rtabmap SLAM (pids={pids}) and waiting "
-            f"up to {timeout:.0f}s for the database save to finish..."
-        )
-    # Read now: the parameter files go away with the launch.
-    databases = [db for db in (_rtabmap_database_path(pid) for pid in pids) if db]
-    signalled_at = time.time()
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGINT)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not _pgrep(pattern):
-            # Gone is not saved: a kill or a crash also ends the process. rtabmap
-            # rewrites its database on every clean exit, mapping or localization.
-            unwritten = [db for db in databases if not _modified_since(db, signalled_at)]
-            if unwritten:
-                if node:
-                    node.get_logger().error(
-                        f"[shutdown] rtabmap SLAM exited without writing {unwritten}; "
-                        f"it was killed or crashed, so the map was not saved."
-                    )
-                return False
-            if node:
-                node.get_logger().info(
-                    f"[shutdown] rtabmap SLAM exited cleanly; database saved"
-                    + (f" ({', '.join(databases)})." if databases
-                       else " (database path unknown, file not checked).")
-                )
-            return remote_ok
-        time.sleep(poll_interval)
-
-    if node:
-        node.get_logger().warn(
-            f"[shutdown] rtabmap SLAM still alive after {timeout:.0f}s; proceeding "
-            f"with teardown -- the database may be incomplete."
-        )
-    return False
+    local_ok = _local.graceful_rtabmap_save(node=node, timeout=timeout,
+                                            poll_interval=poll_interval, pattern=pattern)
+    return remote_ok and local_ok
 
 
 def wait_processes_gone(
@@ -524,38 +189,17 @@ def wait_processes_gone(
     exclude_pids: Optional[Iterable[int]] = None,
     poll_interval: float = 0.5,
 ) -> bool:
-    """Block until no process matching any of `patterns` remains.
-
-    Used after a teardown to guarantee the previous launch is fully gone before
-    the next one starts, so the new stack does not collide with orphaned nodes or
-    a still-locked rtabmap database. Returns True if everything exited within
-    `timeout`, False otherwise. With the Jetson/PC2 split it waits on the
-    perception computer too.
-    """
+    """Block until no process matching `patterns` remains, here and on the
+    perception computer. See navi_wall_launcher.procs.wait_processes_gone."""
     patterns = list(patterns)
     remote_gone = True
     if _REMOTE is not None and not _REMOTE.cleanup(patterns, kill=False, wait_timeout=timeout):
         remote_gone = False
         if node:
             node.get_logger().warn(f"Processes still running on the perception computer after {timeout}s.")
-    exclude = set(exclude_pids or [])
-    exclude.add(os.getpid())
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        remaining = sorted({
-            pid
-            for pattern in patterns
-            for pid in _pgrep(pattern)
-            if pid not in exclude
-        })
-        if not remaining:
-            return remote_gone
-        if node:
-            node.get_logger().info(f"Waiting for {len(remaining)} sim-stack process(es) to exit: {remaining}")
-        time.sleep(poll_interval)
-    if node:
-        node.get_logger().warn(f"Timed out after {timeout}s waiting for processes to exit.")
-    return False
+    local_gone = _local.wait_processes_gone(patterns, timeout=timeout, node=node,
+                                            exclude_pids=exclude_pids, poll_interval=poll_interval)
+    return remote_gone and local_gone
 
 
 def kill_stale_stack(
@@ -564,51 +208,18 @@ def kill_stale_stack(
     exclude_pids: Optional[Iterable[int]] = None,
     settle: float = 1.0,
 ) -> List[int]:
-    """Force-kill lingering stack/sensor processes BEFORE launching a new stack.
-
-    Orphans from a previous run (crashed, or one whose ``ros2 launch`` was
-    Ctrl-C'd while ``sick_generic_caller`` ignored the SIGINT) keep holding the
-    SICK UDP ports 2115/2116 and the RealSense USB device. The next launch's
-    drivers then fail to bind ("Address already in use") and odometry /
-    localization silently never come up. Calling this at the start of the launch
-    guarantees a clean slate. It is a no-op when nothing matches.
-
-    Defaults to ``SENSOR_DRIVER_PATTERNS`` (the resource-holding drivers); pass
-    ``SIM_STACK_PATTERNS`` for a full-stack sweep. Returns the PIDs it killed
-    here; with the Jetson/PC2 split the perception computer is swept as well.
-    """
+    """Force-kill lingering stack/sensor processes before a new stack starts,
+    here and on the perception computer. Returns the PIDs killed here. See
+    navi_wall_launcher.procs.kill_stale_stack."""
     if _REMOTE is not None:
         _REMOTE.cleanup(patterns, kill=True)
-    exclude = set(exclude_pids or [])
-    exclude.add(os.getpid())
-    killed: List[int] = []
-    for pattern in patterns:
-        for pid in _pgrep(pattern):
-            if pid in exclude:
-                continue
-            try:
-                os.kill(pid, signal.SIGKILL)
-                killed.append(pid)
-                if node:
-                    node.get_logger().warn(
-                        f"[cleanup] Force-killed stale process pid={pid} matching '{pattern}'."
-                    )
-            except (ProcessLookupError, PermissionError):
-                pass
-    if killed and settle > 0:
-        # Give the kernel a moment to release the bound UDP sockets / USB handle
-        # before the new drivers try to claim them.
-        time.sleep(settle)
-    return killed
+    return _local.kill_stale_stack(node=node, patterns=patterns,
+                                   exclude_pids=exclude_pids, settle=settle)
 
 
 def force_kill_patterns(patterns: Iterable[str]) -> None:
     """``pkill -9 -f`` every pattern here, and on the perception computer."""
-    for pattern in patterns:
-        try:
-            subprocess.run(['pkill', '-9', '-f', pattern], timeout=2, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+    _local.force_kill_patterns(patterns)
     if _REMOTE is not None:
         _REMOTE.cleanup(patterns, kill=True)
 
