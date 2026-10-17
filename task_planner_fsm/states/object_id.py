@@ -98,6 +98,7 @@ from task_planner_fsm.states.proc_utils import (
     stop_proc,
     wait_stack_ready,
     wait_services_ready,
+    wait_nav2_active,
     wait_processes_gone,
     kill_stale_stack,
     stop_timeout_for,
@@ -619,6 +620,15 @@ class ObjectID(State):
                               force_kill_patterns=SIM_STACK_PATTERNS)
                     ctx["error_triggered"] = True
                     return False
+
+            # The topics above say nothing about Nav2: after an aborted bringup
+            # bt_navigator stays inactive and rejects every coverage goal.
+            if not wait_nav2_active(ctx, timeout=float(ctx.get("nav2_active_timeout", 60.0))):
+                node.get_logger().error(f"[{self.name}] Nav2 did not become active.")
+                stop_proc(ctx, "nav_sim", timeout=stop_timeout_for("nav_sim"),
+                          force_kill_patterns=SIM_STACK_PATTERNS)
+                ctx["error_triggered"] = True
+                return False
 
             node.get_logger().info(f"[{self.name}] Navigation + localization stack is ready.")
             return True

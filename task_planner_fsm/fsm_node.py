@@ -63,6 +63,7 @@ from task_planner_fsm.states.proc_utils import (
     stop_all,
     wait_stack_ready,
     wait_services_ready,
+    wait_nav2_active,
     COLLISION_READY_TIMEOUT_S,
     ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
     STACK_READY_TIMEOUT_S,
@@ -1233,6 +1234,12 @@ class RobotFSMNode(Node):
                         "the planner would run without collision validation."
                     )
                     return
+
+            # As in ObjectID: an aborted Nav2 bringup passes the topic checks.
+            if not wait_nav2_active(self.ctx, timeout=float(self.ctx.get("nav2_active_timeout", 60.0))):
+                self.ctx["error_triggered"] = True
+                self.get_logger().error("[FSM] Nav2 did not become active during bootstrap.")
+                return
         except Exception as exc:
             self.ctx["error_triggered"] = True
             self.get_logger().error(
