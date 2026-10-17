@@ -162,6 +162,8 @@ class StateMachine:
             f'use_sim_time:={sim_value}',
             'headless:=true',
             'mode:=full',
+            # ObjectID and the bootstrap localize in this same database.
+            'database_name:=rtabmap',
         ])
         self.ctx.setdefault('explore_cmd', [
             'ros2', 'launch', 'navi_wall', 'exploration.launch.py',

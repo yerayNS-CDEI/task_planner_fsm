@@ -996,7 +996,8 @@ class RobotFSMNode(Node):
                     f"sim:={sim_value}",
                     "mode:=full",
                     "controller_type:=omni",
-                    "database_name:=rtabmap_fsm",
+                    # The map CreateMap saves (mapping_cmd).
+                    "database_name:=rtabmap",
                     "headless:=true",
                     f"use_sim_time:={sim_value}",
                     "hybrid_sim:=false",
