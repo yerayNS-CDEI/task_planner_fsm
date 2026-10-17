@@ -11,6 +11,7 @@ review:
 - A launch left on PC2 by an earlier FSM session is stopped, not reused.
 - graceful_rtabmap_save reports a failed save on PC2.
 - The FSM imports with a navi_wall that lacks the launcher services.
+- stack_launch_args (e.g. cameras:=false) reach both halves of a split stack.
 
 No real launcher is used: the launcher client is replaced by fakes.
 
@@ -214,6 +215,25 @@ def test_a_launch_left_on_pc2_by_an_earlier_session_is_stopped_first(fake_remote
     proc_utils.start_proc(ctx, "explore", ["ros2", "launch", "navi_wall", "exploration.launch.py"])
     assert isinstance(ctx["_procs"]["explore"], remote_procs.RemoteProc)
     assert launcher.calls == [("stop", "explore"), ("start", "explore")]
+
+
+@pytest.mark.parametrize("extra", ["cameras:=false world:=x", ["cameras:=false", "world:=x"]])
+def test_stack_launch_args_reach_both_halves_of_a_stack(fake_remote, monkeypatch, extra):
+    launcher = fake_remote(start_ok=True)
+    started = []
+    monkeypatch.setattr(launcher, "start", lambda key, cmd: started.append(cmd) or
+                        remote_procs.RemoteProc(launcher, key, pid=4242))
+    monkeypatch.setattr(proc_utils, "_popen", lambda cmd: started.append(cmd) or
+                        subprocess.Popen(["true"]))
+    ctx = {"stack_launch_args": extra}
+    proc_utils.start_proc(ctx, "nav_sim", ["ros2", "launch", "navi_wall", "move_robot.launch.py"])
+    proc_utils.start_proc(ctx, "explore", ["ros2", "launch", "navi_wall", "exploration.launch.py"])
+    ctx["_procs"]["nav_sim"].local.wait()
+
+    control, perception, explore = started
+    assert control[-3:] == ["cameras:=false", "world:=x", "stack:=control"]
+    assert perception[-3:] == ["cameras:=false", "world:=x", "stack:=perception"]
+    assert explore == ["ros2", "launch", "navi_wall", "exploration.launch.py"]
 
 
 @pytest.mark.parametrize("save_ok", [True, False])
