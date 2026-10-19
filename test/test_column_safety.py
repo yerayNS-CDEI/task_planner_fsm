@@ -44,7 +44,14 @@ def phases(source):
 
 
 def targets_of(body):
-    return set(re.findall(r'self\._seg_phase = "(\w+)"', body))
+    """Phases ``body`` hands over to, directly or through _at_partition (the
+    arrival helper: unfold a folded arm first, else straight to line_column)."""
+    found = set()
+    for rhs in re.findall(r'self\._seg_phase = ([^\n]+)', body):
+        found |= set(re.findall(r'"(\w+)"', rhs))   # incl. `"a" if ... else "b"`
+    if "self._at_partition(ctx)" in body:
+        found |= {"line_column", "transit_unfold"}
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +98,8 @@ def test_a_column_that_will_not_retract_fails_rather_than_transiting(phases):
 def test_the_column_is_raised_again_after_the_base_arrives(phases):
     """Otherwise the sweep would run at the retracted height."""
     assert "line_column" in targets_of(phases["transit_wait"])
+    # A transit that folded the arm unfolds it first, then raises the column.
+    assert "line_column" in targets_of(phases["transit_unfold_wait"])
     assert "self.column.command(node, ctx, target_h)" in phases["line_column"]
 
 
@@ -124,3 +133,33 @@ def test_the_arm_is_folded_before_the_column_retract(phases):
     reaching_retract = {name for name, body in phases.items()
                         if "transit_column" in targets_of(body)}
     assert reaching_retract == {"transit"}
+
+
+# ---------------------------------------------------------------------------
+# Folding between reachable segments
+# ---------------------------------------------------------------------------
+
+def test_a_fold_completes_before_the_column_drops_and_the_base_moves(phases):
+    """transit_recenter -> transit_fold -> transit_fold_wait -> transit ->
+    transit_column -> transit_send: the fold is settled before the retract."""
+    assert "transit_fold" in targets_of(phases["transit_recenter"])
+    assert targets_of(phases["transit_fold"]) <= {"transit_fold_wait", "transit_clear"}
+    assert "transit" in targets_of(phases["transit_fold_wait"])
+    assert "_named_pose_settled" in phases["transit_fold_wait"]
+
+
+def test_a_fold_that_fails_never_reaches_the_base_move(phases):
+    """An arm stuck between out and folded must not ride a transit: the
+    failure skips the partition instead of falling through to `transit`."""
+    body = phases["transit_fold_wait"]
+    failed = body[body.index('status == "failed"'):]
+    assert failed.index("_skip_partition") < failed.index('self._seg_phase = "transit"')
+
+
+def test_a_partition_is_never_swept_with_the_arm_folded(phases):
+    """After a folded transit the only way on is through the unfold."""
+    assert "transit_unfold_wait" in targets_of(phases["transit_unfold"])
+    body = phases["transit_unfold_wait"]
+    failed = body[body.index('status == "failed"'):]
+    assert failed.index("_skip_partition") < failed.index('self._seg_phase = "line_column"')
+

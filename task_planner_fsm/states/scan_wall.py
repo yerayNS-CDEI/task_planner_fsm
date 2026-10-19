@@ -68,6 +68,11 @@ SCAN_POSE_TOOL_Z_ABOVE_ARM_BASE = 0.5217
 # lead-in leg puts the plate on the line height itself.
 ARM_Z_WINDOW_M = 0.25
 
+# The named pose the arm folds into before the base moves to a different
+# reachable segment (between partitions of the SAME segment it stays unfolded,
+# only re-centred).
+FOLDED_POSE = "folded_fsm"
+
 
 class ScanWall(State):
     def __init__(self, name):
@@ -251,6 +256,13 @@ class ScanWall(State):
         # controller reports active. Re-armed after every send.
         self._controller_gate = TrajectoryControllerGate()
 
+        # Arm folded for a transit to another reachable segment (FOLDED_POSE);
+        # unfolded again once the base has arrived.
+        self._arm_folded = False
+        # Reachable segment (index into current_wall_segments) of the partition
+        # the base last stood at; a transit to a different one folds the arm.
+        self._last_source = None
+
         # Hyperspectral: sampled on the same plate travel as the GPR triggers,
         # but two orders of magnitude coarser (10 cm vs 0.5 cm) because one
         # sample is a service round-trip plus an integration time, not a pulse.
@@ -323,6 +335,8 @@ class ScanWall(State):
         self._hs.stop_timer(ctx)      # clear any stale timer, hyperspectral
         self._ee_frame = None
         self._controller_gate.reset()
+        self._arm_folded = False
+        self._last_source = None
         ctx["error_triggered"] = False
 
         self.column.reset()
@@ -810,6 +824,33 @@ class ScanWall(State):
         # Re-arm so the next named pose checks again: a sweep in between can
         # drop the program or hold the controller.
         self._controller_gate.reset()
+        return "wait"
+
+    def _named_pose_settled(self, ctx):
+        """"done" / "failed" / "wait" for a named-pose move.
+
+        Unlike ``_arm_goal_settled`` this reports failure instead of swallowing
+        it. A Z-clearance nudge that does not happen is survivable; a fold, an
+        unfold or a roll that does not happen is not -- the base would move with
+        the arm out, or a partition would be swept folded, or the "rolled" pass
+        would be recorded with the plate upright.
+        """
+        node = ctx["node"]
+        timeout = float(ctx.get("scan_wall_named_pose_timeout_s", 180.0))
+        now = time.time()
+        if self._arm_goal_start is None:
+            self._arm_goal_start = now
+        if ctx.get("planner_goal_failed"):
+            ctx["planner_goal_failed"] = False
+            node.get_logger().error(f"[{self.name}] Planner could not reach the pose.")
+            return "failed"
+        if ctx.get("execution_status") is True:
+            ctx["execution_status"] = False
+            return "done"
+        if now - self._arm_goal_start >= timeout:
+            node.get_logger().error(
+                f"[{self.name}] Arm pose did not complete within {timeout:.0f}s.")
+            return "failed"
         return "wait"
 
     def _arm_goal_settled(self, ctx):
@@ -1571,6 +1612,78 @@ class ScanWall(State):
         """Fixed frame of the wall geometry and sweep goals (``scan_world_frame``)."""
         return world_frame(ctx)
 
+    # ------------------------------------------------------------------
+    # Folding between reachable segments
+    # ------------------------------------------------------------------
+    def _partition_source(self, ctx):
+        """Index of the reachable segment the current partition was cut from."""
+        sources = ctx.get("current_wall_partition_sources") or []
+        return sources[self._seg_idx] if self._seg_idx < len(sources) else None
+
+    def _fold_before_transit(self, ctx):
+        """Fold the arm for the coming transit?
+
+        Between partitions of the SAME reachable segment the base only strafes a
+        partition length along clear wall, so the arm stays unfolded and is just
+        re-centred. Moving to a DIFFERENT segment crosses whatever split the line
+        -- an obstacle, a gap, a corner -- or comes from NavigateToTarget's
+        approach pose, so the arm folds first and unfolds once the base has
+        arrived. ``scan_wall_fold_between_segments`` False keeps the re-centre
+        everywhere.
+        """
+        if not bool(ctx.get("scan_wall_fold_between_segments", True)):
+            return False
+        source = self._partition_source(ctx)
+        return self._last_source is None or source is None or source != self._last_source
+
+    def _partition_transit_plan(self, ctx):
+        """How the base reaches the current partition's scan pose (arm sweep).
+
+        Returns ``(kind, goal_xy, goal_yaw, yaw_err)`` with ``kind`` one of
+        "parked" (scan_wall_assume_parked: never drive), "no_pose" (partition
+        has no scan pose), "here" (already there) or "go".
+        """
+        if self._assume_parked(ctx):
+            return "parked", None, None, None
+        pose = (self._scan_poses or [None] * len(self._segments))[self._seg_idx]
+        if pose is None:
+            return "no_pose", None, None, None
+        goal_xy, goal_yaw = (pose[0], pose[1]), pose[2]
+        # Skipping needs BOTH position and heading: a parked arm sweep depends on
+        # facing the wall square-on, and the base could be at the right spot at a
+        # completely different heading. Compared in the map frame --
+        # ctx["base_position"] is odom and would be off by map->odom. The yaw
+        # tolerance defaults to NavigateToTarget's own convergence tolerance: the
+        # skip test cannot demand a heading more accurate than navigation
+        # delivers, or partition 1 re-transits every time.
+        skip_tol = float(ctx.get("segment_transit_skip_tol", 0.4))
+        yaw_tol = float(
+            ctx.get("partition_scan_yaw_tol", ctx.get("nav_yaw_tolerance", 0.25))
+        )
+        here = self._base_xy_yaw_map(ctx)
+        if here is not None:
+            yaw_err = abs(atan2(sin(here[2] - goal_yaw), cos(here[2] - goal_yaw)))
+            if (math.hypot(here[0] - goal_xy[0], here[1] - goal_xy[1]) <= skip_tol
+                    and yaw_err <= yaw_tol):
+                return "here", goal_xy, goal_yaw, yaw_err
+        return "go", goal_xy, goal_yaw, None
+
+    def _at_partition(self, ctx):
+        """The base stands at the current partition: unfold if the transit
+        folded the arm, else raise the column for the sweep."""
+        self._last_source = self._partition_source(ctx)
+        # The column was lowered for a transit (or never moved for a skipped
+        # one); line_column re-sizes it for this partition's height either way.
+        self.column_commanded = False
+        self._seg_phase = "transit_unfold" if self._arm_folded else "line_column"
+
+    def _skip_partition(self, ctx, why):
+        ctx["node"].get_logger().error(f"[{self.name}] {why}; skipping this partition.")
+        self._line_idx = 0
+        ctx["current_line_idx"] = 0
+        self._seg_idx += 1
+        self._seg_phase = "transit_clear"
+
     def _assume_parked(self, ctx):
         """True when the base is taken to be AT its scan pose already, by fiat.
 
@@ -1856,6 +1969,11 @@ class ScanWall(State):
             # retry budget is refreshed -- a partition abandoned for some other
             # reason must not spend the next one's re-tries.
             self._transit_retries = 0
+            if self._arm_folded:
+                # Folded for a transit that then failed: the plate is nowhere
+                # near the wall and its ranges read nothing useful.
+                self._seg_phase = "transit_recenter"
+                return
             # Pull the plate back before ANY base motion. The arm has been stretched
             # out since the pre-approach, and the transit slides the whole robot
             # sideways along the wall — at the gap the previous sweep left (roughly
@@ -1920,6 +2038,11 @@ class ScanWall(State):
             if not self._use_arm_sweep(ctx):
                 self._seg_phase = "transit"
                 return
+            kind = self._partition_transit_plan(ctx)[0]
+            if kind == "go" and self._fold_before_transit(ctx):
+                # A different reachable segment: fold rather than re-centre.
+                self._seg_phase = "transit" if self._arm_folded else "transit_fold"
+                return
             self.set_activity(
                 ctx,
                 f"Centring the arm before moving to segment {seg_no}/{seg_total}",
@@ -1941,7 +2064,74 @@ class ScanWall(State):
                 return
             self._arm_goal_start = None
             self._recenter_future = None
+            self._arm_folded = False      # a re-centre from folded unfolds it
             self._seg_phase = "transit"
+            return
+
+        if self._seg_phase == "transit_fold":
+            self.set_activity(
+                ctx,
+                f"Folding the arm before moving to segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            outcome = self._send_named_pose(ctx, FOLDED_POSE)
+            if outcome == "wait":
+                return
+            if outcome == "skip":
+                return self._skip_partition(
+                    ctx, f"Could not fold the arm before the transit to partition {seg_no}")
+            self._arm_goal_start = None
+            self._seg_phase = "transit_fold_wait"
+            return
+
+        if self._seg_phase == "transit_fold_wait":
+            status = self._named_pose_settled(ctx)
+            if status == "wait":
+                return
+            self._arm_goal_start = None
+            if status == "failed":
+                # Never move the base with the arm somewhere between out and
+                # folded: that is the situation folding exists to prevent.
+                return self._skip_partition(
+                    ctx, f"The fold before the transit to partition {seg_no} did not complete")
+            self._arm_folded = True
+            node.get_logger().info(
+                f"[{self.name}] Arm folded: partition {seg_no} is on another reachable "
+                f"segment, the base moves with the arm in."
+            )
+            self._seg_phase = "transit"
+            return
+
+        if self._seg_phase == "transit_unfold":
+            self.set_activity(
+                ctx,
+                f"Unfolding the arm at segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            outcome = self._send_named_pose(ctx, self._unfolded_pose_name(ctx))
+            if outcome == "wait":
+                return
+            if outcome == "skip":
+                return self._skip_partition(
+                    ctx, f"Could not unfold the arm at partition {seg_no}")
+            self._arm_goal_start = None
+            self._seg_phase = "transit_unfold_wait"
+            return
+
+        if self._seg_phase == "transit_unfold_wait":
+            status = self._named_pose_settled(ctx)
+            if status == "wait":
+                return
+            self._arm_goal_start = None
+            if status == "failed":
+                return self._skip_partition(
+                    ctx, f"The unfold at partition {seg_no} did not complete; a folded "
+                         f"arm cannot reach the wall")
+            self._arm_folded = False
+            self.column_commanded = False
+            self._seg_phase = "line_column"
             return
 
         if self._seg_phase == "transit":
@@ -1966,28 +2156,29 @@ class ScanWall(State):
             # the base at its arrived standoff; here the standoff is the point of
             # the goal) and no separate park correction afterwards.
             arm_sweep = self._use_arm_sweep(ctx)
-            if arm_sweep and self._assume_parked(ctx):
-                # The base is at its scan pose by fiat (bench run on a
-                # hand-parked robot); never drive it. Same hand-off as the
-                # geometric skip below: no transit means the column was never
-                # lowered, so line_column is a no-op unless nesting moved on.
-                node.get_logger().info(
-                    f"[{self.name}] scan_wall_assume_parked: treating the base's "
-                    f"current pose as partition {seg_no}'s scan pose; no transit."
-                )
-                self.column_commanded = False
-                self._seg_phase = "line_column"
-                return
             if arm_sweep:
-                pose = (self._scan_poses or [None] * len(self._segments))[self._seg_idx]
-                if pose is None:
+                kind, goal_xy, goal_yaw, yaw_err = self._partition_transit_plan(ctx)
+                if kind == "parked":
+                    # The base is at its scan pose by fiat (bench run on a
+                    # hand-parked robot); never drive it.
+                    node.get_logger().info(
+                        f"[{self.name}] scan_wall_assume_parked: treating the base's "
+                        f"current pose as partition {seg_no}'s scan pose; no transit."
+                    )
+                    return self._at_partition(ctx)
+                if kind == "no_pose":
                     node.get_logger().warn(
                         f"[{self.name}] Partition {seg_no} has no scan pose; skipping."
                     )
                     self._seg_idx += 1
                     self._seg_phase = "transit_clear"
                     return
-                goal_xy, goal_yaw = (pose[0], pose[1]), pose[2]
+                if kind == "here":
+                    node.get_logger().info(
+                        f"[{self.name}] Base already at partition {seg_no} scan pose "
+                        f"(yaw err {yaw_err:.3f} rad); skipping transit."
+                    )
+                    return self._at_partition(ctx)
             else:
                 goal_yaw = None
                 goal_xy = base_standoff_goal(ctx, self.name, seg_start)
@@ -1995,37 +2186,8 @@ class ScanWall(State):
                     ctx, self.name, goal_xy, (pos.x, pos.y) if pos is not None else None
                 )
 
-            if arm_sweep:
-                # Skipping needs BOTH position and heading here. The base-driven
-                # sweep only cared about position (it re-parked afterwards), but a
-                # parked arm sweep depends on facing the wall square-on, and the
-                # base could be at the right spot left over from a previous
-                # partition at a completely different heading. Compared in the map
-                # frame — ctx["base_position"] is odom and would be off by map->odom.
-                here = self._base_xy_yaw_map(ctx)
-                # Defaults to NavigateToTarget's own convergence tolerance rather
-                # than something tighter: the skip test cannot demand a heading
-                # more accurate than navigation is able to deliver, or partition 1
-                # re-transits every time despite the base already standing on its
-                # scan pose — the exact trip this approach exists to avoid.
-                yaw_tol = float(
-                    ctx.get("partition_scan_yaw_tol", ctx.get("nav_yaw_tolerance", 0.25))
-                )
-                if here is not None:
-                    yaw_err = abs(atan2(sin(here[2] - goal_yaw), cos(here[2] - goal_yaw)))
-                    if math.hypot(here[0] - goal_xy[0], here[1] - goal_xy[1]) <= skip_tol \
-                            and yaw_err <= yaw_tol:
-                        node.get_logger().info(
-                            f"[{self.name}] Base already at partition {seg_no} scan pose "
-                            f"(yaw err {yaw_err:.3f} rad); skipping transit."
-                        )
-                        # No transit happened, so the column was never lowered;
-                        # line_column is a no-op unless nesting has moved on to a
-                        # different height.
-                        self.column_commanded = False
-                        self._seg_phase = "line_column"
-                        return
-            elif pos is not None and math.hypot(pos.x - goal_xy[0], pos.y - goal_xy[1]) <= skip_tol:
+            if (not arm_sweep and pos is not None
+                    and math.hypot(pos.x - goal_xy[0], pos.y - goal_xy[1]) <= skip_tol):
                 node.get_logger().info(
                     f"[{self.name}] Base already at segment {self._seg_idx + 1} start; "
                     f"skipping transit."
@@ -2163,10 +2325,9 @@ class ScanWall(State):
                         return
                     # The column was lowered for the transit, so it always has to
                     # be raised to this partition's scan height before sweeping --
-                    # in both modes, not only when nesting.
-                    self.column_commanded = False
-                    self._seg_phase = "line_column"
-                    return
+                    # in both modes, not only when nesting. A folded arm unfolds
+                    # first.
+                    return self._at_partition(ctx)
                 self._parker.reset()
                 self._seg_phase = "park"
             else:
