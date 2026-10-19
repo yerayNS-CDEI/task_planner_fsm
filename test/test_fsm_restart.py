@@ -261,6 +261,7 @@ def run_ctx():
         "last_state": None,
         "fsm_start_wall_time": 100.0,
         "fsm_stop_after": "ScanWall",
+        "geometry_reconstruction_wall_file_path": "/walls/detected_walls.yaml",
         "scan_line_offset": 0.6,      # a -p override
         "_fsm_status": {},
     }
@@ -314,16 +315,34 @@ def test_reset_drops_the_run_keeps_live_data_and_handles_in_place():
     assert ctx["fsm_run_index"] == 2
 
 
-def test_reset_keeps_the_wall_clock_unless_the_detector_runs_again():
+def test_reset_keeps_the_wall_clock_unless_the_detector_runs_again(monkeypatch):
+    backups = []
+    monkeypatch.setattr(fsm_node, "wall_detection_enabled", lambda ctx: True)
+    monkeypatch.setattr(fsm_node, "backup_previous_walls",
+                        lambda path, started: backups.append((path, started)) or "backup")
     ctx, baseline, _ = run_ctx()
     node = fake_node(ctx=ctx, baseline=baseline)
     node._reset_ctx_for_restart("GeometryReconstruction")
     # The detected_walls.yaml of this session must still pass the staleness guard.
     assert ctx["fsm_start_wall_time"] == 100.0
+    assert backups == []
 
     assert "ObjectID" in RESTART_REDETECT_STATES
     node._reset_ctx_for_restart("ObjectID")
     assert ctx["fsm_start_wall_time"] > 100.0
+    # The previous walls are kept before the detector overwrites them.
+    assert backups == [("/walls/detected_walls.yaml", ctx["fsm_start_wall_time"])]
+    assert ctx["wall_file_backup"] == "backup"
+
+
+def test_redetect_without_wall_detection_backs_nothing_up(monkeypatch):
+    monkeypatch.setattr(fsm_node, "wall_detection_enabled", lambda ctx: False)
+    monkeypatch.setattr(fsm_node, "backup_previous_walls",
+                        lambda path, started: pytest.fail("no backup expected"))
+    ctx, baseline, _ = run_ctx()
+    node = fake_node(ctx=ctx, baseline=baseline)
+    node._reset_ctx_for_restart("ObjectID")
+    assert "wall_file_backup" not in ctx
 
 
 # ---------------------------------------------------------------------------

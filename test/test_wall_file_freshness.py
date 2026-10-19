@@ -16,7 +16,13 @@ import time
 
 import pytest
 
-from task_planner_fsm.machine import WALL_RUN_DIR, wall_file_path
+from task_planner_fsm import machine
+from task_planner_fsm.machine import (
+    backup_previous_walls,
+    seed_wall_detection_ctx,
+    wall_detection_enabled,
+    wall_file_path,
+)
 from task_planner_fsm.states.geometry_reconstruction import GeometryReconstruction
 
 
@@ -130,7 +136,19 @@ def test_a_file_that_appears_while_waiting_is_accepted(state, tmp_path):
     ctx = make_ctx(started_ago_s=10.0)
     path = str(tmp_path / "detected_walls.yaml")
     assert state._wall_file_is_fresh(ctx, path) is False
-    write_walls(tmp_path, -1.0)
+    write_walls(tmp_path, -3.0)
+    assert state._wall_file_is_fresh(ctx, path) is True
+
+
+def test_a_file_still_being_rewritten_is_not_read_yet(state, tmp_path):
+    """wall_detection_node saves before /map arrives (normals unchecked) and
+    again right after re-orienting them; a read in between could scan the
+    wrong side of a wall."""
+    ctx = make_ctx(started_ago_s=10.0)
+    path = write_walls(tmp_path, -0.05)          # the first of the two saves
+    assert state._wall_file_is_fresh(ctx, path) is False
+    assert ctx.get("error_triggered") is not True
+    os.utime(path, (time.time() - 3.0, time.time() - 3.0))   # settled
     assert state._wall_file_is_fresh(ctx, path) is True
 
 
@@ -152,21 +170,99 @@ def test_override_expands_user(state):
 
 
 # ---------------------------------------------------------------------------
-# The run path must stay out of the install space -- that was the whole bug
+# One walls file per environment, in navi-wall's SOURCE rgb_detections/
 # ---------------------------------------------------------------------------
 
-def test_run_path_is_absolute_and_outside_the_install_space():
+@pytest.fixture
+def detections_dir(tmp_path, monkeypatch):
+    d = tmp_path / "src" / "navi-wall" / "rgb_detections"
+    d.mkdir(parents=True)
+    monkeypatch.setattr(machine, "navi_wall_detections_dir", lambda: str(d))
+    return d
+
+
+def test_walls_live_in_the_source_folder_not_the_install_space(detections_dir):
+    """2026-09-30: a colcon build copied a stale source file over the detector's
+    output in share/, and the next run scanned the wrong wall."""
     for sim in (True, False):
         path = wall_file_path(sim)
-        assert os.path.isabs(path)
+        assert os.path.dirname(path) == str(detections_dir)
         assert os.sep + "install" + os.sep not in path
-        assert "rgb_detections" not in path
 
 
-def test_sim_and_real_runs_use_different_files():
+def test_sim_and_real_runs_use_different_files(detections_dir):
     assert wall_file_path(True) != wall_file_path(False)
-    assert wall_file_path(True).startswith(WALL_RUN_DIR)
-    assert wall_file_path(False).startswith(WALL_RUN_DIR)
+    assert wall_file_path(False).endswith("detected_walls.yaml")
+
+
+def test_no_source_checkout_means_no_path(monkeypatch):
+    monkeypatch.setattr(machine, "navi_wall_detections_dir", lambda: None)
+    assert wall_file_path(False) is None
+    with pytest.raises(RuntimeError, match="geometry_reconstruction_wall_file_path"):
+        seed_wall_detection_ctx({"sim": False})
+
+
+@pytest.mark.parametrize("navi_wall_value", [True, False])
+def test_the_switch_is_navi_walls_detect_walls(monkeypatch, navi_wall_value):
+    """The UI cannot pass FSM parameters, so the switch lives in navi-wall's
+    wall_detection_params.yaml, which its launch files also default to."""
+    monkeypatch.setattr(machine, "navi_wall_detect_walls", lambda: navi_wall_value)
+    ctx = {}
+    assert wall_detection_enabled(ctx) is navi_wall_value
+    assert ctx["wall_detection"] is navi_wall_value     # pinned for the whole run
+
+
+def test_the_installed_params_file_has_the_switch():
+    """navi_wall_detect_walls() silently defaults to true; make sure it is
+    actually reading a key that exists."""
+    import yaml
+    from ament_index_python.packages import get_package_share_directory
+    path = os.path.join(get_package_share_directory("navi_wall"), "config",
+                        "wall_detection_params.yaml")
+    params = yaml.safe_load(open(path))["wall_detection_node"]["ros__parameters"]
+    assert isinstance(params["detect_walls"], bool)
+
+
+def test_detection_on_waits_for_this_runs_walls(detections_dir):
+    ctx = {"sim": False, "wall_detection": True}
+    seed_wall_detection_ctx(ctx)
+    assert ctx["geometry_reconstruction_require_fresh_walls"] is True
+    assert "detect_walls:=true" in ctx["wall_detection_cmd"]
+    assert f"wall_file_path:={wall_file_path(False)}" in ctx["wall_detection_cmd"]
+
+
+def test_detection_off_reads_the_saved_walls_without_waiting(detections_dir):
+    ctx = {"sim": False, "wall_detection": False}
+    seed_wall_detection_ctx(ctx)
+    assert ctx["geometry_reconstruction_require_fresh_walls"] is False
+    assert "detect_walls:=false" in ctx["wall_detection_cmd"]
+
+
+def test_detection_keeps_the_previous_list(detections_dir):
+    walls = detections_dir / "detected_walls.yaml"
+    walls.write_text("walls: [old]\n")
+    old = time.time() - 3600
+    os.utime(walls, (old, old))
+    ctx = {"sim": False, "wall_detection": True}
+    seed_wall_detection_ctx(ctx)
+    backup = detections_dir / "detected_walls.prev.yaml"
+    assert ctx["wall_file_backup"] == str(backup)
+    assert backup.read_text() == "walls: [old]\n"
+
+
+def test_no_backup_without_detection(detections_dir):
+    walls = detections_dir / "detected_walls.yaml"
+    walls.write_text("walls: [old]\n")
+    seed_wall_detection_ctx({"sim": False, "wall_detection": False})
+    assert not (detections_dir / "detected_walls.prev.yaml").exists()
+
+
+def test_a_file_written_this_run_is_not_backed_up(tmp_path):
+    """Its content is this run's detection; copying it would overwrite the
+    previous run's list with the new one."""
+    path = write_walls(tmp_path, -5.0)
+    assert backup_previous_walls(path, started=time.time() - 10.0) is None
+    assert backup_previous_walls(str(tmp_path / "missing.yaml"), time.time()) is None
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +328,12 @@ def test_timeout_points_at_the_cloud_topic_when_the_detector_is_alive(state, tmp
 # ---------------------------------------------------------------------------
 # The detector's path must be forwarded all the way down the launch chain
 # ---------------------------------------------------------------------------
+
+def test_nav_sim_launch_forwards_the_detection_flag():
+    """The stack must run the detector exactly when the FSM waits for one."""
+    src = open("task_planner_fsm/fsm_node.py").read()
+    assert "wall_detection:={'true' if wall_detection_enabled(self.ctx) else 'false'}" in src
+
 
 def test_nav_sim_launch_forwards_the_walls_path():
     """Regression: move_robot.launch.py starts wall_detection_node itself. Without

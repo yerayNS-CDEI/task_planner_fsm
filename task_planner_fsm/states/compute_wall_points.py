@@ -86,8 +86,10 @@ class ComputeWallPoints(State):
         if not self.started:
             available_walls = self._build_available_walls(ctx)
             print(f"[{self.name}] Available walls:")
+            # Detected walls come first, in file order, so their number here is
+            # the "W#" label both RViz marker sets draw over them.
             for i, (source, (p1, p2), _n) in enumerate(available_walls, 1):
-                tag = "[map]" if source == "detected" else "[predefined]"
+                tag = f"W{i} [map]" if source == "detected" else "[predefined]"
                 print(f"  {i}: {tag} p1={p1}, p2={p2}")
 
             try:
@@ -129,11 +131,16 @@ class ComputeWallPoints(State):
             self.started = True
 
             node.get_logger().info(f"[{self.name}] Selected scan lines:")
-            for idx, wall in enumerate(walls_data, 1):
+            for idx, (sel, wall) in enumerate(zip(selected_indices, walls_data), 1):
                 s_start, s_end = wall["scan_line"]
                 heights = ", ".join(f"{z:.3f}" for z in wall["scan_lines_z"])
+                # Name the wall that was picked, not just its place in the
+                # selection: "Wall 1" alone hid a pick of the wrong wall.
+                source, (p1, p2), _n = available_walls[sel - 1]
+                picked = f"W{sel}" if source == "detected" else f"predefined #{sel}"
                 node.get_logger().info(
-                    f"  Wall {idx}: {s_start} -> {s_end} | "
+                    f"  Wall {idx} = {picked} ({p1[0]:.2f}, {p1[1]:.2f}) -> "
+                    f"({p2[0]:.2f}, {p2[1]:.2f}), scan line {s_start} -> {s_end} | "
                     f"{len(wall['scan_lines_z'])} line(s) at z=[{heights}]"
                 )
 
