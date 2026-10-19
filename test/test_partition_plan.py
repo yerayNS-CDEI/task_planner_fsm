@@ -146,6 +146,15 @@ def test_line_order_breaks_an_exact_tie_toward_the_first_endpoint():
     assert sweep_line_order(WALL, midpoint) == (WALL[0], WALL[1])
 
 
+def test_line_order_follows_the_recorded_start_end_not_the_clamped_target():
+    """A scan start clamped past the line's midpoint (most of the near end
+    unreachable) lies nearer the FAR end; the recorded start end still wins,
+    so the sweep is not reversed."""
+    clamped = (3.0, -1.0, 1.0)
+    assert sweep_line_order(WALL, clamped) == (WALL[1], WALL[0])
+    assert sweep_line_order(WALL, clamped, start_end=WALL[0]) == (WALL[0], WALL[1])
+
+
 # ---------------------------------------------------------------------------
 # plan_wall_partitions
 # ---------------------------------------------------------------------------

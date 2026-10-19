@@ -21,6 +21,8 @@ gap at the seam where one sweep ends and the next begins.
 import math
 from typing import List, Sequence, Tuple
 
+from .wall_geometry import sweep_ends
+
 Point3 = Tuple[float, float, float]
 Segment = Tuple[Point3, Point3]
 
@@ -185,8 +187,8 @@ def partition_centre_and_tangent(
     return centre, tangent
 
 
-def sweep_line_order(wall_data, target_point) -> Tuple[Point3, Point3]:
-    """Order a wall's two scan-line endpoints as ``(near, far)`` from ``target_point``.
+def sweep_line_order(wall_data, target_point, start_end=None) -> Tuple[Point3, Point3]:
+    """Order a wall's two scan-line endpoints as ``(near, far)``.
 
     The serpentine rule: sweep away from the end the robot is already at, so
     consecutive line heights meet end to end instead of driving back down the
@@ -197,15 +199,15 @@ def sweep_line_order(wall_data, target_point) -> Tuple[Point3, Point3]:
     approach the scan pose of what ScanWall considers the *last* partition, and
     ScanWall would immediately transit the whole wall to get back.
 
-    ``target_point`` need not lie on the line -- it is usually a clamped
-    reachable-segment endpoint -- so the nearer end is chosen by distance rather
-    than by projecting onto the line.
+    The start comes from ``start_end`` (ctx['target_scan_start_end'], recorded
+    where the wall is selected and flipped per serpentine line), see
+    :func:`~task_planner_fsm.utils.wall_geometry.sweep_ends`. Only without it is
+    the end nearest ``target_point`` taken -- and that guess is unsafe:
+    ``target_point`` is usually a clamped reachable-segment endpoint, and once
+    the unreachable stretch at the start end is longer than half the line it
+    lies nearer the FAR end, reversing the sweep.
     """
-    d0 = math.hypot(target_point[0] - wall_data[0][0],
-                    target_point[1] - wall_data[0][1])
-    d1 = math.hypot(target_point[0] - wall_data[1][0],
-                    target_point[1] - wall_data[1][1])
-    return (wall_data[0], wall_data[1]) if d0 <= d1 else (wall_data[1], wall_data[0])
+    return sweep_ends(wall_data, start_end, target_point)
 
 
 def next_backoff_length(current: float, backoff: float, min_len: float):

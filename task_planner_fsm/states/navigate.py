@@ -442,7 +442,9 @@ class NavigateToTarget(State):
         helper ScanWall uses, so partition 1 here IS partition 1 there.
         """
         node = ctx["node"]
-        near_end, far_end = sweep_line_order(wall_data, target_point)
+        near_end, far_end = sweep_line_order(
+            wall_data, target_point, ctx.get("target_scan_start_end")
+        )
         plan = plan_wall_partitions(ctx, self.name, near_end, far_end)
         if plan is None:
             node.get_logger().warn(

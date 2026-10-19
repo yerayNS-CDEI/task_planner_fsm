@@ -2418,7 +2418,9 @@ class ScanWall(State):
             # other end. Shared with NavigateToTarget — it orders the line the
             # same way to pick which partition to approach, and the two must not
             # disagree or its approach pose belongs to a different partition.
-            near_end, far_end = sweep_line_order(wall_data, prev_target_point)
+            near_end, far_end = sweep_line_order(
+                wall_data, prev_target_point, ctx.get("target_scan_start_end")
+            )
             self._sweep_from, self._sweep_to = near_end, far_end
 
             # Keep a FIXED base heading for the whole wall (computed on the first
@@ -3320,6 +3322,7 @@ class ScanWall(State):
         # sweeps back toward the opposite wall end (serpentine).
         if self._last_swept_point is not None:
             ctx["target_scan_point"] = tuple(self._last_swept_point)
+        ctx["target_scan_start_end"] = self._sweep_to
 
         # Advance to the next horizontal line on this wall. more_lines drives
         # both the self-loop and whether this was the last line of the wall.
