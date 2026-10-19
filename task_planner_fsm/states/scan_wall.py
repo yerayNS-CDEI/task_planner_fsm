@@ -1,6 +1,7 @@
 from ..state import State
 from ..utils.chassis_parking import ChassisParker
 from ..utils.column_control import ColumnController
+from ..utils.controller_ready import TrajectoryControllerGate
 from ..utils.gpr_sweep import GprSweep
 from ..utils.hyperspectral_sampler import HyperspectralSampler
 from ..utils.costmap_utils import (
@@ -229,6 +230,11 @@ class ScanWall(State):
         self._gpr = GprSweep(name, self)
         self._ee_frame = None               # cached map->EE frame name
 
+        # A named pose sent while the External Control program is still starting
+        # is rejected ("Controller is not running."); hold it until a trajectory
+        # controller reports active. Re-armed after every send.
+        self._controller_gate = TrajectoryControllerGate()
+
         # Hyperspectral: sampled on the same plate travel as the GPR triggers,
         # but two orders of magnitude coarser (10 cm vs 0.5 cm) because one
         # sample is a service round-trip plus an integration time, not a pulse.
@@ -300,6 +306,7 @@ class ScanWall(State):
         self._gpr.abort(ctx)          # close anything a previous entry left open
         self._hs.stop_timer(ctx)      # clear any stale timer, hyperspectral
         self._ee_frame = None
+        self._controller_gate.reset()
         ctx["error_triggered"] = False
 
         self.column.reset()
@@ -766,6 +773,12 @@ class ScanWall(State):
             self._recenter_future = None
             return "sent"
 
+        # A pose sent while the External Control program is still starting is
+        # rejected with "Controller is not running." -- and the program takes
+        # longer to come up with the pendant speed slider turned down. Hold the
+        # request until a trajectory controller reports active.
+        if not self._controller_gate.ready(node):
+            return "wait"
         if not self.position_client.service_is_ready():
             node.get_logger().warn(
                 f"[{self.name}] Waiting for /send_position to send '{pose_name}'..."
@@ -778,6 +791,9 @@ class ScanWall(State):
         ctx["execution_status"] = False
         ctx["planner_goal_failed"] = False
         self._recenter_future = self.position_client.call_async(request)
+        # Re-arm so the next named pose checks again: a sweep in between can
+        # drop the program or hold the controller.
+        self._controller_gate.reset()
         return "wait"
 
     def _arm_goal_settled(self, ctx):
@@ -1289,6 +1305,8 @@ class ScanWall(State):
         if not self.pose_reached:
             # Step 1a: send the named pose.
             if not self.pose_sent:
+                if not self._controller_gate.ready(node):
+                    return
                 if not self.position_client.service_is_ready():
                     node.get_logger().warn(f"[{self.name}] Waiting for /send_position service...")
                     return
@@ -1306,6 +1324,7 @@ class ScanWall(State):
                 ctx["planner_goal_failed"] = False
                 self.pose_future = self.position_client.call_async(request)
                 self.pose_sent = True
+                self._controller_gate.reset()
                 return
 
             # Step 1b: confirm the service accepted the request.
@@ -3338,12 +3357,15 @@ class ScanWall(State):
             if not self.position_client.service_is_ready():
                 node.get_logger().warn(f"[{self.name}] Waiting for /send_position service (retract)...")
                 return
+            if not self._controller_gate.ready(node):
+                return
             pose_name = self._unfolded_pose_name(ctx)
             request = SendPosition.Request()
             request.position_name = pose_name
             ctx["execution_status"] = False
             ctx["planner_goal_failed"] = False
             self.retract_future = self.position_client.call_async(request)
+            self._controller_gate.reset()
             self.retract_pose_sent = True
             node.get_logger().info(
                 f"[{self.name}] Re-sending {pose_name} pose to retract arm from wall."
