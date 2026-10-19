@@ -181,3 +181,11 @@ def test_the_plate_is_retracted_before_it_rolls(phases, clear, pose):
     # The named-pose move happens only in the pose phase.
     assert "_send_named_pose" not in body
     assert "_send_named_pose" in phases[pose]
+
+
+def test_every_retract_after_a_sweep_assumes_contact(phases):
+    """After a pressed sweep the plate's ranges read below their valid floor.
+    A retract that treats that as "no reading" skips itself, and the column
+    then moves with the plate against the wall."""
+    for phase in ("line_change", "xpol_clear", "unroll_clear"):
+        assert "contact_default=True" in phases[phase], phase

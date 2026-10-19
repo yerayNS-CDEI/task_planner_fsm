@@ -2557,10 +2557,15 @@ class ScanWall(State):
             )
             # Defaults to the approach standoff: retracting any less only for
             # arm_approach to back off the rest afterwards is a wasted move.
+            # This always follows a sweep, so a missing reading means the plate
+            # is still pressed against the wall (its ranges below their valid
+            # floor), exactly as in transit_clear -- not "unknown", which waited
+            # 15 s and then moved the column without retracting at all.
             outcome = self._send_arm_to_clearance(
                 ctx,
                 float(ctx.get("scan_wall_line_change_plate_offset",
                               self._approach_standoff(ctx))),
+                contact_default=True,
                 retract_only=True,
             )
             if outcome == "wait":
