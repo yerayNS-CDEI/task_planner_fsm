@@ -322,7 +322,7 @@ def test_sweep_goal_and_axis_follow_the_world_frame(state):
     assert state._axis_in_frame(ctx, "odom", (0.0, 1.0)) == (0.0, 1.0, 0.0)
     # ...and no silent fallback to map: without TF, another frame is a None.
     assert state._axis_in_frame(ctx, "arm_base", (0.0, 1.0)) is None
-    assert state._gpr_trigger_frame(make_ctx(scan_world_frame="odom",
+    assert state._plate_travel_frame(make_ctx(scan_world_frame="odom",
                                              sweep_use_arm=False)) == "odom"
 
 

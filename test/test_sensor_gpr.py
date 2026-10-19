@@ -144,6 +144,31 @@ def test_scans_match_lines_by_name_first_then_by_time(tmp_path):
     assert pairs["GP8800_0009"] is None              # every line is taken
 
 
+def test_the_two_polarizations_of_a_line_get_their_own_keys():
+    """Both passes are suffixed: files are matched by the key appearing in their
+    name, and a bare w02_l01_s00 is inside w02_l01_s00_xpol."""
+    co = manifest.line_key(2, 1, 0, polarization="copol")
+    x = manifest.line_key(2, 1, 0, polarization="xpol")
+    assert (co, x) == ("w02_l01_s00_copol", "w02_l01_s00_xpol")
+    assert co not in x and x not in co
+    assert manifest.line_key(2, 1, 0) == "w02_l01_s00"       # one pass: unchanged
+
+
+def test_each_polarization_scan_matches_its_own_line():
+    lines = [
+        {"key": "w02_l01_s00_copol", "measurement_name": "scan_wall line 2 seg 1 copol",
+         "t_start_epoch": 100},
+        {"key": "w02_l01_s00_xpol", "measurement_name": "scan_wall line 2 seg 1 xpol",
+         "t_start_epoch": 200},
+    ]
+    files = [
+        {"stem": "w02_l01_s00_xpol_scan_wall_line_2_seg_1_xpol", "mtime": 250, "sgy": "x"},
+        {"stem": "w02_l01_s00_copol_scan_wall_line_2_seg_1_copol", "mtime": 150, "sgy": "c"},
+    ]
+    pairs = {f["sgy"]: ln["key"] for f, ln in gpr.match_files_to_lines(files, lines)}
+    assert pairs == {"x": "w02_l01_s00_xpol", "c": "w02_l01_s00_copol"}
+
+
 def test_a_scan_older_than_every_line_is_unassociated():
     pairs = gpr.match_files_to_lines([{"stem": "old", "mtime": 10, "sgy": "o"}],
                                      [{"key": "k", "t_start_epoch": 100}])
@@ -267,58 +292,4 @@ def test_the_summary_is_written_per_scan_like_the_registry(tmp_path, monkeypatch
     assert [e["key"] for e in gpr.load_summary(tmp_path / "out")["entries"]] == ["a", "b"]
 
 
-# ----------------------------------------------------------------------
-# ScanWall writes the manifest
-# ----------------------------------------------------------------------
-class _FakeLogger:
-    def __init__(self):
-        self.lines = []
-
-    def info(self, msg, **kw):
-        self.lines.append(("info", msg))
-
-    def warn(self, msg, **kw):
-        self.lines.append(("warn", msg))
-
-    def error(self, msg, **kw):
-        self.lines.append(("error", msg))
-
-
-class _FakeNode:
-    def __init__(self):
-        self.logger = _FakeLogger()
-
-    def get_logger(self):
-        return self.logger
-
-    def destroy_timer(self, timer):
-        pass
-
-
-def test_scan_wall_records_one_manifest_row_per_swept_segment(tmp_path):
-    """Opened when the triggers arm (once per segment sweep), closed when they
-    stop; the row carries the map-frame segment and the probe's measurement name."""
-    from task_planner_fsm.states.scan_wall import ScanWall
-
-    state = ScanWall("ScanWall")
-    ctx = {"node": _FakeNode(), "sensor_data_dir": str(tmp_path), "sensor_session_id": "s9",
-           "current_wall_index": 4, "current_line_idx": 1}
-    state._seg_idx = 2
-    state.gpr_line_active = True
-    state._gpr_trigger_count = 37
-    state._gpr_trigger_travel = 0.1845
-    state._open_gpr_line_record(ctx, (1.0, 2.0, 1.1), (1.0, 4.5, 1.1))
-    assert state._gpr_line_record["measurement_name"] == "scan_wall line 2 seg 3"
-    state._stop_gpr_triggers(ctx, log_summary=False)      # closes the record
-    state._stop_gpr_triggers(ctx, log_summary=False)      # idempotent: no second row
-
-    rows = manifest.read_gpr_lines(paths.gpr_manifest_path(ctx))
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["key"] == "w04_l01_s02"
-    assert row["seg_start"] == [1.0, 2.0, 1.1] and row["seg_end"] == [1.0, 4.5, 1.1]
-    assert row["frame"] == "map"
-    assert row["probe_active"] is True
-    assert row["trigger_count"] == 37 and row["travel_m"] == 0.1845
-    assert row["t_stop_epoch"] >= row["t_start_epoch"]
-    assert not any(level == "warn" for level, _ in ctx["node"].logger.lines)
+# ScanWall's manifest rows are GprSweep's on this branch: test/test_gpr_sweep.py.

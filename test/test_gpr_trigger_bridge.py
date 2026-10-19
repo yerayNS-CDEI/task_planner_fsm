@@ -1,4 +1,4 @@
-"""ScanWall's gate on the GPR trigger bridge, and the bridge's own ACK/PONG
+"""GprSweep's gate on the GPR trigger bridge, and the bridge's own ACK/PONG
 bookkeeping (the part that decides what ``~/status`` reports).
 
 The bridge is exercised without rclpy: the object is built with ``__new__``
@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from task_planner_fsm.states.scan_wall import ScanWall
+from task_planner_fsm.utils.gpr_sweep import GprSweep
 from task_planner_fsm.gpr_trigger_bridge import GprTriggerBridge
 
 
@@ -37,7 +37,7 @@ class _Node:
 
 
 # ----------------------------------------------------------------------
-# ScanWall gate
+# GprSweep gate
 # ----------------------------------------------------------------------
 def make_ctx(**over):
     ctx = {"node": _Node(), "gpr_trigger_enabled": True}
@@ -47,22 +47,27 @@ def make_ctx(**over):
 
 @pytest.fixture
 def state():
-    return ScanWall("ScanWall")
+    return GprSweep("ScanWall", None)
 
 
 def test_gate_is_open_when_not_required(state):
     # Default: sim / bench without the board. No status at all must still pass.
-    assert state._gpr_trigger_bridge_ready(make_ctx()) == (True, "")
+    assert state.bridge_ready(make_ctx()) == (True, "")
 
 
 def test_gate_is_open_when_triggers_disabled(state):
     ctx = make_ctx(gpr_trigger_enabled=False, gpr_trigger_bridge_required=True)
-    assert state._gpr_trigger_bridge_ready(ctx) == (True, "")
+    assert state.bridge_ready(ctx) == (True, "")
+
+
+def test_gate_is_open_when_the_probe_runs_on_its_own_wheel(state):
+    ctx = make_ctx(gpr_trigger_publish=False, gpr_trigger_bridge_required=True)
+    assert state.bridge_ready(ctx) == (True, "")
 
 
 def test_gate_needs_a_status(state):
     ctx = make_ctx(gpr_trigger_bridge_required=True)
-    ok, reason = state._gpr_trigger_bridge_ready(ctx)
+    ok, reason = state.bridge_ready(ctx)
     assert not ok and "gpr_trigger_bridge running" in reason
 
 
@@ -72,7 +77,7 @@ def test_gate_rejects_a_stale_status(state):
         gpr_trigger_bridge_status={"alive": True},
         gpr_trigger_bridge_status_stamp=time.time() - 10.0,
     )
-    ok, reason = state._gpr_trigger_bridge_ready(ctx)
+    ok, reason = state.bridge_ready(ctx)
     assert not ok and "old" in reason
 
 
@@ -82,7 +87,7 @@ def test_gate_rejects_a_dead_receiver(state):
         gpr_trigger_bridge_status={"alive": False, "receiver": "10.0.0.5:5005", "last_rx_age_s": 7.5},
         gpr_trigger_bridge_status_stamp=time.time(),
     )
-    ok, reason = state._gpr_trigger_bridge_ready(ctx)
+    ok, reason = state.bridge_ready(ctx)
     assert not ok and "10.0.0.5:5005" in reason
 
 
@@ -92,21 +97,24 @@ def test_gate_passes_a_live_receiver(state):
         gpr_trigger_bridge_status={"alive": True},
         gpr_trigger_bridge_status_stamp=time.time(),
     )
-    assert state._gpr_trigger_bridge_ready(ctx) == (True, "")
+    assert state.bridge_ready(ctx) == (True, "")
 
 
-def test_arming_fails_the_state_on_a_dead_bridge(state):
+def test_a_dead_bridge_refuses_the_segment_before_anything_starts(state):
+    # Checked before the probe is touched or the sweep node launched: once the
+    # plate is seated, refusing would mean aborting mid-press.
     ctx = make_ctx(
         gpr_trigger_bridge_required=True,
         gpr_trigger_bridge_status={"alive": False, "receiver": "x", "last_rx_age_s": 9},
         gpr_trigger_bridge_status_stamp=time.time(),
+        gpr_enabled=True,
     )
-    state._seg_idx = 0
-    state._open_gpr_line_record = lambda *a, **kw: None
-    state._start_gpr_triggers(ctx, (0.0, 0.0, 1.0), (1.0, 0.0, 1.0))
-    assert ctx["error_triggered"] is True
-    assert "not answering" in ctx["error_reason"]
-    assert state._gpr_trigger_timer is None
+    reason = state.open_measurement(ctx, 0, 0, 0)
+    assert "not answering" in reason
+    assert not state.measurement_active and not state.armed
+    # ... and again at the line start, in case it died during the approach.
+    reason = state.start_line(ctx, (0.0, 0.0, 1.0), (1.0, 0.0, 1.0), "map")
+    assert "not answering" in reason
 
 
 # ----------------------------------------------------------------------

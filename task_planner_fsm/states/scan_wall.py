@@ -1,10 +1,8 @@
 from ..state import State
 from ..utils.chassis_parking import ChassisParker
 from ..utils.column_control import ColumnController
+from ..utils.gpr_sweep import GprSweep
 from ..utils.hyperspectral_sampler import HyperspectralSampler
-from ..sensors import manifest as gpr_manifest
-from ..sensors import gpr as gpr_export
-from ..sensors import paths as sensor_paths
 from ..utils.costmap_utils import (
     COSTMAP_WAIT_TIMEOUT_S,
     base_standoff_goal,
@@ -33,15 +31,12 @@ import rclpy.time
 from arm_control.srv import SendPosition
 from ur_msgs.srv import SetForceMode
 from std_srvs.srv import Trigger
-from std_msgs.msg import UInt32
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter as ParameterMsg, ParameterValue, ParameterType
 import subprocess, os, signal
 import math
-import zipfile
 from math import atan2, sin, cos
 import time
-import requests
 
 # Validity window (m) for each of the six plate ranges, in the publish order of
 # arm_control's arduino_sensors(_sim): [C/U1, A/U2, B/U3] ultrasonic then
@@ -226,53 +221,12 @@ class ScanWall(State):
         self._ft_zero_future = None
         self._ft_zero_start = None
 
-        # GPR (GP Proceq8800) HTTP API: connect + run a LINE_SCAN measurement
-        # while the wheel is pressed against the wall. Real robot only (mirrors
-        # force_mode gating); ctx overrides allow bench testing. See gpr_api memory.
-        self.gpr_base_url = "http://192.168.1.239:9000"
-        self.gpr_serial = "GP88-007-0081"
-        # Static IP of the probe. Sent with /probe/connect so the connection
-        # completes without the operator accepting it on the GP App (iPad).
-        self.gpr_ip = "192.168.1.99"
-        self.gpr_timeout = 30.0
-        # Export of the finished line (between line/stop and measurement/stop,
-        # per the GP API flow chart): POST /measurement/export/raw answers with
-        # a zip of the measurement (SEG-Y + CSV sidecar + JSON), which is kept
-        # in the session folder and unpacked into data/raw/gpr/incoming for
-        # SensorDataProcessing. ``gpr_export_enabled`` (ctx) turns it off.
-        self.gpr_export_path = "/measurement/export/raw"
-        # After line/stop: how long to wait for GET /measurement/line to report
-        # the line finished, the pause before the export, and the pause before
-        # the one retry an export failure gets (ctx overrides of the same name).
-        self.gpr_line_finish_timeout_s = 5.0
-        self.gpr_export_delay_s = 1.0
-        self.gpr_export_retry_delay_s = 2.0
-        self.gpr_measurement_active = False
-        self.gpr_line_active = False
-        self._gpr_measurement_name = None   # name given to the open measurement
-
-        # GPR encoder trigger: the probe normally clocks its traces off an encoder
-        # wheel that has to roll on the wall, which is hard to keep in contact even
-        # when the plate is at the right standoff. A fake encoder replaces it, and
-        # the computer decides when to pulse it: one trigger per
-        # ``gpr_trigger_distance_m`` of SENSOR-PLATE travel, measured against
-        # whichever body actually carries the plate (arm_base for an arm sweep,
-        # map for a base-driven one — see _gpr_trigger_frame). Sampled by its own timer
-        # during the sweep, because the FSM itself only ticks at 1 Hz — far too
-        # coarse for a 5 mm spacing at the sweep speed. See _gpr_trigger_tick.
-        self._gpr_trigger_pub = None
-        self._gpr_trigger_timer = None
-        self._gpr_trigger_last_xyz = None   # previous plate sample (map frame)
-        self._gpr_trigger_axis = None       # unit sweep direction, in the ref frame
-        self._gpr_trigger_ref = "map"       # frame the plate travel is measured in
-        self._gpr_trigger_residual = 0.0    # travel not yet converted to a trigger
-        self._gpr_trigger_travel = 0.0      # total plate travel this segment
-        self._gpr_trigger_count = 0         # triggers fired this segment
-        self._gpr_trigger_tf_warned = False
-        # The line currently being scanned, for the GPR manifest (see
-        # _open_gpr_line_record): what SensorDataProcessing needs to put a
-        # hyperbola found "0.8 m along the scan" back onto the wall.
-        self._gpr_line_record = None
+        # GPR (GP8800): the HTTP API flow, the plate-travel trigger sampler and
+        # the line manifest, shared with the whole-body strategy. ScanWall only
+        # decides WHEN each step happens: the measurement opens before the
+        # press, the line starts once the plate is pressed, the triggers arm on
+        # the executor's "sweep" feedback. See utils/gpr_sweep.py.
+        self._gpr = GprSweep(name, self)
         self._ee_frame = None               # cached map->EE frame name
 
         # Hyperspectral: sampled on the same plate travel as the GPR triggers,
@@ -343,10 +297,8 @@ class ScanWall(State):
         self._press_settle_start = None
         self._ft_zero_future = None
         self._ft_zero_start = None
-        self.gpr_measurement_active = False
-        self.gpr_line_active = False
-        self._stop_gpr_triggers(ctx, log_summary=False)   # clear any stale timer
-        self._hs.stop_timer(ctx)                          # ditto, hyperspectral
+        self._gpr.abort(ctx)          # close anything a previous entry left open
+        self._hs.stop_timer(ctx)      # clear any stale timer, hyperspectral
         self._ee_frame = None
         ctx["error_triggered"] = False
 
@@ -360,7 +312,7 @@ class ScanWall(State):
 
         # Same check the sweep makes before arming the triggers, but here it
         # costs nothing: better to fail at the door than after the approach.
-        ok, reason = self._gpr_trigger_bridge_ready(ctx)
+        ok, reason = self._gpr.bridge_ready(ctx)
         if not ok:
             node.get_logger().error(f"[{self.name}] {reason}; not starting the scan.")
             return self.fail(ctx, reason)
@@ -1093,603 +1045,18 @@ class ScanWall(State):
         return False
 
     # ------------------------------------------------------------------
-    # GPR (GP Proceq8800) HTTP API — real robot only
+    # Plate travel: the frame and direction both sensors measure along
     # ------------------------------------------------------------------
-    def _gpr_enabled(self, ctx):
-        """On by default for the real robot (the probe is on the robot network at
-        ``gpr_base_url``), off in sim. The ``gpr_enabled`` ctx flag overrides
-        either way (bench testing, or scanning without the probe)."""
-        return bool(ctx.get("gpr_enabled", not bool(ctx.get("sim", False))))
-
-    def _gpr_request(self, ctx, method, path, json_body=None):
-        """Issue one GPR HTTP request (blocking). Returns the response, or None on
-        a connection/timeout error. Any 2xx is success (starts return 200, stops
-        return 204); errors carry a ``{"error":{"code","message"}}`` body."""
-        node = ctx["node"]
-        base_url = ctx.get("gpr_base_url", self.gpr_base_url).rstrip("/")
-        url = f"{base_url}{path}"
-        try:
-            resp = requests.request(
-                method, url, json=json_body,
-                timeout=ctx.get("gpr_timeout", self.gpr_timeout),
-            )
-        except requests.exceptions.RequestException as e:
-            node.get_logger().error(f"[{self.name}] GPR {method} {path} failed: {e}")
-            return None
-        ctype = resp.headers.get("Content-Type", "")
-        if "json" in ctype or ctype.startswith("text/") or not resp.content:
-            body = resp.text.strip()[:200]
-        else:
-            body = f"{len(resp.content)} bytes of {ctype.split(';')[0]}"
-        if resp.status_code >= 400:
-            node.get_logger().error(
-                f"[{self.name}] GPR {method} {path} -> HTTP {resp.status_code}: {body}"
-            )
-        else:
-            node.get_logger().info(
-                f"[{self.name}] GPR {method} {path} -> HTTP {resp.status_code}"
-                + (f": {body}" if body else "")
-            )
-        return resp
-
-    @staticmethod
-    def _gpr_ok(resp, *also_ok):
-        """True when the request went through and the app answered 2xx (or one
-        of ``also_ok``). None (transport failure) is never OK."""
-        return resp is not None and (resp.status_code < 400 or resp.status_code in also_ok)
-
-    @staticmethod
-    def _gpr_data(resp):
-        """The ``data`` object of a GP API response (or the bare object when the
-        app answers without the wrapper, as the swagger shows for some
-        endpoints), or None."""
-        if resp is None or not resp.content:
-            return None
-        try:
-            payload = resp.json()
-        except ValueError:
-            return None
-        if not isinstance(payload, dict):
-            return None
-        data = payload.get("data")
-        return data if isinstance(data, dict) else payload
-
-    def _gpr_connect(self, ctx, abort=True):
-        """Connect to the probe. 200 = connected, 406 = already connected (both OK).
-        Measurement calls 403 unless connected first, so a failure here aborts the
-        scan (a sweep with no GPR data is pointless) -- unless ``abort`` is off,
-        for the export retry, where the sweep is already done.
-
-        The body carries the probe's static ``ip`` as well as its serial: without
-        the IP the connection request has to be accepted manually on the GP App
-        (iPad) before this returns, which would break the autonomous scan.
-        """
-        node = ctx["node"]
-        serial = ctx.get("gpr_serial", self.gpr_serial)
-        gpr_ip = ctx.get("gpr_ip", self.gpr_ip)
-        body = {"serialNumber": serial, "ip": gpr_ip}
-        node.get_logger().info(
-            f"[{self.name}] GPR: connecting to probe {serial} at {gpr_ip}."
-        )
-        self.set_activity(ctx, "Connecting to the GPR probe", publish=True)
-        resp = self._gpr_request(ctx, "POST", "/probe/connect", body)
-        if self._gpr_ok(resp, 406):
-            node.get_logger().info(f"[{self.name}] GPR probe connected.")
-            return True
-        if abort:
-            node.get_logger().error(f"[{self.name}] GPR probe connection failed; aborting scan.")
-            self.fail(ctx, "GPR probe connection failed")
-        else:
-            node.get_logger().warn(f"[{self.name}] GPR probe re-connect failed.")
-        return False
-
-    def _gpr_measurement_name_for(self, ctx):
-        """Name the probe is asked to file this segment's measurement under."""
-        line_no = ctx.get("current_line_idx", 0) + 1
-        return f"scan_wall line {line_no} seg {self._seg_idx + 1}"
-
-    def _gpr_start_measurement(self, ctx):
-        """Connect to the probe and create the LINE_SCAN measurement.
-
-        Called once per segment BEFORE the press starts, so the measurement is
-        open and verified by the time the plate touches the wall; the line
-        itself starts later (``_gpr_start_line``), which also keeps the two calls
-        apart on the app. Any failure aborts the scan via ``error_triggered``
-        (a sweep with no GPR data is pointless).
-        """
-        if not self._gpr_enabled(ctx):
-            return
-        node = ctx["node"]
-        if self.gpr_measurement_active:
-            node.get_logger().warn(
-                f"[{self.name}] GPR: a measurement is still open "
-                f"({self._gpr_measurement_name}); stopping it before starting a new one."
-            )
-            self._gpr_finish_line(ctx)
-        if not self._gpr_connect(ctx):
-            return
-        name = self._gpr_measurement_name_for(ctx)
-        body = {"type": "LINE_SCAN", "name": name}
-        self.set_activity(ctx, "Starting the GPR line-scan measurement", publish=True)
-        resp = self._gpr_request(ctx, "POST", "/measurement/start", body)
-        if not self._gpr_ok(resp):
-            node.get_logger().error(f"[{self.name}] GPR start measurement failed; aborting scan.")
-            self.fail(ctx, "GPR failed to start the measurement")
-            return
-        # Keep the name WE asked for. The app's reply is not reliable: on the
-        # 2026-09-17 run it echoed the previous measurement's name ("seg 1" for
-        # segment 2) while the export it later produced carried the right one.
-        echoed = (self._gpr_data(resp) or {}).get("name")
-        if echoed and echoed != name:
-            node.get_logger().warn(
-                f"[{self.name}] GPR app named the measurement '{echoed}' "
-                f"(asked for '{name}'); recording the requested name."
-            )
-        self._gpr_measurement_name = name
-        self.gpr_measurement_active = True
-        node.get_logger().info(
-            f"[{self.name}] GPR measurement '{self._gpr_measurement_name}' open; "
-            f"the line starts once the plate is on the wall."
-        )
-
-    def _gpr_start_line(self, ctx):
-        """Start the scan line. Called once per segment when the plate is pressed
-        on the wall and about to move. Refuses to start unless the connect and
-        measurement/start calls before it both succeeded (that is what
-        ``gpr_measurement_active`` means); a failed line/start aborts the scan."""
-        if not self._gpr_enabled(ctx):
-            return
-        node = ctx["node"]
-        if not self.gpr_measurement_active:
-            node.get_logger().error(
-                f"[{self.name}] GPR: line start requested with no open measurement; "
-                f"aborting scan."
-            )
-            self.fail(ctx, "GPR line start requested without a measurement")
-            return
-        if self.gpr_line_active:
-            return
-        self.set_activity(ctx, "Starting the GPR scan line", publish=True)
-        resp = self._gpr_request(ctx, "POST", "/measurement/line/start")
-        if not self._gpr_ok(resp):
-            node.get_logger().error(f"[{self.name}] GPR start line failed; aborting scan.")
-            self.fail(ctx, "GPR failed to start the scan line")
-            return
-        self.gpr_line_active = True
-        node.get_logger().info(f"[{self.name}] GPR line started.")
-
-    def _gpr_export(self, ctx):
-        """Pull the finished line off the app and hand it to the processing.
-
-        ``POST /measurement/export/raw`` answers with a zip of the whole
-        measurement (one line here): ``<name>_<stamp>/<name>.sgy`` + ``.csv`` +
-        ``.json``. The zip is kept under the session's ``exports/`` folder and
-        its members are unpacked flat into the session's own ``incoming/``
-        prefixed with this line's key, which is how SensorDataProcessing ties
-        the scan back to the segment (see sensors/gpr.py). Per session, not the
-        shared inbox: that one is read by every mission, and yesterday's
-        ``w00_l00_s00`` was being matched to today's segment 1.
-
-        Returns a dict for the line manifest: ``ok``, HTTP status, the zip and
-        the files written. Best-effort: the traces stay on the app whatever
-        this returns, so a failure is logged and recorded, not fatal.
-        """
-        node = ctx["node"]
-        path = str(ctx.get("gpr_export_path", self.gpr_export_path))
-        self.set_activity(ctx, "Exporting the GPR line", publish=True)
-        resp = self._gpr_request(ctx, "POST", path)
-        result = {
-            "ok": False,
-            "status": None if resp is None else int(resp.status_code),
-            "measurement_name": self._gpr_measurement_name,
-        }
-        if not self._gpr_ok(resp):
-            node.get_logger().warn(
-                f"[{self.name}] GPR export failed (HTTP {result['status']}); the "
-                f"traces stay on the app under '{self._gpr_measurement_name}'."
-            )
-            return result
-        key = gpr_manifest.line_key(
-            ctx.get("current_wall_index"), ctx.get("current_line_idx", 0), self._seg_idx
-        )
-        try:
-            exports_dir = sensor_paths.gpr_session_dir(ctx) / "exports"
-            exports_dir.mkdir(parents=True, exist_ok=True)
-            zip_path = exports_dir / f"{key}_{time.strftime('%Y%m%d_%H%M%S')}.zip"
-            zip_path.write_bytes(resp.content)
-            result["zip"] = str(zip_path)
-            files = gpr_export.unpack_export(
-                zip_path, sensor_paths.gpr_session_incoming_dir(ctx), key
-            )
-        except (OSError, zipfile.BadZipFile) as e:
-            result["error"] = str(e)
-            node.get_logger().error(
-                f"[{self.name}] GPR export downloaded but could not be stored/unpacked: {e}"
-            )
-            return result
-        result["ok"] = True
-        result["files"] = files
-        if not any(f.lower().endswith((".sgy", ".segy")) for f in files):
-            node.get_logger().warn(
-                f"[{self.name}] GPR export {zip_path.name} holds no .sgy; nothing "
-                f"for the processing to pick up."
-            )
-        else:
-            node.get_logger().info(
-                f"[{self.name}] GPR line exported: {len(resp.content)} bytes -> "
-                f"{zip_path.name}, {len(files)} file(s) unpacked into "
-                f"{sensor_paths.gpr_session_incoming_dir(ctx)}."
-            )
-        return result
-
-    def _gpr_wait_line_finished(self, ctx):
-        """After line/stop, poll GET /measurement/line until the app reports the
-        line finished (or the timeout). Returns what the app said about the line
-        -- ``started``/``finished``/``scans``/``length`` -- for the manifest, or
-        None if it never answered. The 2026-09-16 run had an export come back 403
-        right after a 204 on the stop, and two exports with almost no traces;
-        this is the check (and the number) that tells the two apart.
-        """
-        node = ctx["node"]
-        timeout = float(ctx.get("gpr_line_finish_timeout_s", self.gpr_line_finish_timeout_s))
-        deadline = time.time() + timeout
-        info = None
-        while True:
-            data = self._gpr_data(self._gpr_request(ctx, "GET", "/measurement/line"))
-            if data is not None:
-                info = {k: data.get(k) for k in ("started", "finished", "scans", "length", "index")}
-                if info["finished"] or not info["started"]:
-                    node.get_logger().info(
-                        f"[{self.name}] GPR line finished: {info['scans']} scans over "
-                        f"{info['length']} (app units)."
-                    )
-                    return info
-            if time.time() >= deadline:
-                node.get_logger().warn(
-                    f"[{self.name}] GPR line not reported finished within {timeout:.0f} s "
-                    f"(last: {info}); exporting anyway."
-                )
-                return info
-            time.sleep(0.5)
-
-    def _gpr_finish_line(self, ctx):
-        """Segment end: stop the line, confirm it stopped, export it, then stop
-        the measurement -- the order the GP API flow chart prescribes.
-        Best-effort: failures are logged (and the line status + export outcome
-        go into the open line record) but the sweep is already done, so nothing
-        aborts. Guarded by the flags so it is a safe no-op when nothing was
-        started.
-
-        The export gets one retry after ``gpr_export_retry_delay_s``; a 403
-        (the app's "not connected to a probe") re-connects first.
-
-        A transport failure on the first call means the app is unreachable, so
-        the remaining calls are skipped rather than each waiting out its
-        timeout; the flags are cleared regardless so the next segment starts
-        clean.
-        """
-        if not self._gpr_enabled(ctx):
-            return
-        node = ctx["node"]
-        if not (self.gpr_line_active or self.gpr_measurement_active):
-            return
-        reachable = True
-        if self.gpr_line_active:
-            self.set_activity(ctx, "Stopping the GPR scan line", publish=True)
-            resp = self._gpr_request(ctx, "POST", "/measurement/line/stop")
-            self.gpr_line_active = False
-            reachable = resp is not None
-            if not self._gpr_ok(resp):
-                node.get_logger().warn(f"[{self.name}] GPR line stop failed.")
-            if reachable:
-                line_info = self._gpr_wait_line_finished(ctx)
-                if self._gpr_line_record is not None:
-                    self._gpr_line_record["probe_line"] = line_info
-            if reachable and bool(ctx.get("gpr_export_enabled", True)):
-                time.sleep(float(ctx.get("gpr_export_delay_s", self.gpr_export_delay_s)))
-                export = self._gpr_export(ctx)
-                if not export["ok"]:
-                    retry_delay = float(
-                        ctx.get("gpr_export_retry_delay_s", self.gpr_export_retry_delay_s)
-                    )
-                    node.get_logger().warn(
-                        f"[{self.name}] GPR export: retrying once in {retry_delay:.0f} s."
-                    )
-                    time.sleep(retry_delay)
-                    if export["status"] == 403:
-                        self._gpr_connect(ctx, abort=False)
-                    first = export
-                    export = self._gpr_export(ctx)
-                    export["first_attempt"] = {
-                        k: first.get(k) for k in ("status", "error") if k in first
-                    }
-                if self._gpr_line_record is not None:
-                    self._gpr_line_record["export"] = export
-        if self.gpr_measurement_active:
-            self.gpr_measurement_active = False
-            if not reachable:
-                node.get_logger().error(
-                    f"[{self.name}] GPR app unreachable; leaving measurement "
-                    f"'{self._gpr_measurement_name}' open on the app."
-                )
-            else:
-                self.set_activity(ctx, "Stopping the GPR measurement", publish=True)
-                resp = self._gpr_request(ctx, "POST", "/measurement/stop")
-                if self._gpr_ok(resp):
-                    node.get_logger().info(
-                        f"[{self.name}] GPR measurement '{self._gpr_measurement_name}' stopped."
-                    )
-                else:
-                    node.get_logger().warn(f"[{self.name}] GPR measurement stop failed.")
-        self._gpr_measurement_name = None
-
-    # ------------------------------------------------------------------
-    # GPR fake-encoder trigger — one pulse per X cm of sensor-plate travel
-    # ------------------------------------------------------------------
-    # Distance the plate must travel between two triggers. 0.5 cm by default;
-    # override with ctx/ROS param ``gpr_trigger_distance_m``.
-    GPR_TRIGGER_DISTANCE_M = 0.005
-    # Sampling rate of the plate pose. Must be well above
-    # sweep_speed / trigger_distance (0.05 m/s / 0.005 m = 10 Hz) so the trigger
-    # position is quantised to a fraction of the spacing; 50 Hz => ~1 mm.
-    GPR_TRIGGER_RATE_HZ = 50.0
-    # Per-sample deadband: displacement below this is TF jitter, not motion, and
-    # is left on the anchor rather than added to the travel (a 1 mm/s numerical
-    # drift would otherwise fire a spurious trigger every 5 s while parked).
-    GPR_TRIGGER_MIN_STEP_M = 0.0005
-    # Per-sample sanity cap: a jump larger than this is a localisation/TF
-    # discontinuity, not plate travel. Re-anchor instead of firing a burst.
-    GPR_TRIGGER_MAX_JUMP_M = 0.05
-    # Log every Nth trigger at info (0.5 cm spacing means ~200 per metre, so
-    # logging each one would drown the console); the rest go to debug.
-    GPR_TRIGGER_LOG_EVERY = 20
-
-    # A bridge status older than this means the gpr_trigger_bridge node is
-    # gone (it publishes once a second); one that is fresh but says
-    # alive=false means the ESP32 stopped answering.
-    GPR_TRIGGER_BRIDGE_MAX_AGE_S = 3.0
-
-    def _gpr_trigger_enabled(self, ctx):
-        """Whether to emit distance triggers during the sweep.
-
-        Deliberately independent of ``_gpr_enabled``: the triggers are what we
-        want to watch on the topic/log while validating the spacing, even when
-        the probe itself is off.
-        """
-        return bool(ctx.get("gpr_trigger_enabled", True))
-
-    def _gpr_trigger_bridge_required(self, ctx):
-        """Whether a sweep must not start unless the ESP32 fake encoder is
-        answering. Off by default so sim runs and bench tests without the board
-        keep working (the triggers still go out on the topic); switch it on with
-        the ``gpr_trigger_bridge_required`` ctx/ROS param on the real robot, where
-        a sweep the GPR never clocked is a wasted wall."""
-        return self._gpr_trigger_enabled(ctx) and bool(
-            ctx.get("gpr_trigger_bridge_required", False)
-        )
-
-    def _gpr_trigger_bridge_ready(self, ctx):
-        """(ok, reason) from the last gpr_trigger_bridge status (see
-        fsm_node.gpr_trigger_bridge_status_callback). ok is True whenever the
-        bridge is not required, so callers can gate unconditionally."""
-        if not self._gpr_trigger_bridge_required(ctx):
-            return True, ""
-        status = ctx.get("gpr_trigger_bridge_status")
-        stamp = ctx.get("gpr_trigger_bridge_status_stamp")
-        topic = ctx.get("gpr_trigger_bridge_status_topic", "/gpr_trigger_bridge/status")
-        if not isinstance(status, dict) or stamp is None:
-            return False, f"no GPR trigger bridge status on '{topic}' (is gpr_trigger_bridge running?)"
-        age = time.time() - float(stamp)
-        if age > self.GPR_TRIGGER_BRIDGE_MAX_AGE_S:
-            return False, f"GPR trigger bridge status is {age:.1f}s old (node stopped?)"
-        if not status.get("alive"):
-            return False, (
-                f"GPR trigger receiver {status.get('receiver', '?')} is not answering "
-                f"(last reply {status.get('last_rx_age_s', '?')}s ago)"
-            )
-        return True, ""
-
-    def _start_gpr_triggers(self, ctx, seg_start=None, seg_end=None):
-        """Arm the distance-trigger sampler for the segment sweep that is about to
-        start, and fire the d = 0 trigger at the segment start. Counters restart
-        per segment, which is also per GPR line scan, so a segment of length L
-        yields floor(L / spacing) + 1 triggers.
-
-        ``seg_start``/``seg_end`` give the direction the plate is about to travel
-        along the wall; the tick measures progress along it (see _gpr_trigger_tick).
-        Falls back to the fixed sweep heading when they are not given (or when the
-        segment is degenerate) — only a guard: every caller passes the segment it
-        is about to sweep, and on a zero-length segment the plate does not travel
-        anyway (the wall heading is fixed per wall, so on a serpentine line swept
-        the other way it would point backwards).
-        """
-        self._stop_gpr_triggers(ctx, log_summary=False)   # never two timers
-        # Opened here, not in _gpr_start_line: this is called exactly once per
-        # segment sweep with the segment it is about to sweep, and is written
-        # whether or not the probe is enabled. Sealed by _stop_gpr_triggers,
-        # written by _close_gpr_line_record once the export outcome is known.
-        self._open_gpr_line_record(ctx, seg_start, seg_end)
-        if not self._gpr_trigger_enabled(ctx):
-            return
-        node = ctx["node"]
-        # The plate is about to travel: every trigger from here on is a trace
-        # the GPR either records or loses. Abort rather than sweep blind
-        # (on_exit cancels the sweep goal / stops the base).
-        ok, reason = self._gpr_trigger_bridge_ready(ctx)
-        if not ok:
-            node.get_logger().error(f"[{self.name}] {reason}; aborting scan.")
-            return self.fail(ctx, reason)
-        axis_xy = self._sweep_axis(seg_start, seg_end)
-        if axis_xy is None:
-            sweep_yaw = 2.0 * atan2(self._sweep_qz, self._sweep_qw)
-            axis_xy = (cos(sweep_yaw), sin(sweep_yaw))
-        ref = self._gpr_trigger_frame(ctx)
-        axis = self._axis_in_frame(ctx, ref, axis_xy)
-        if axis is None:
-            world = self._world_frame(ctx)
-            node.get_logger().warn(
-                f"[{self.name}] GPR triggers: cannot express the sweep direction in "
-                f"'{ref}' (no {ref}<-{world} transform); measuring in {world} instead."
-            )
-            ref = world
-            axis = (axis_xy[0], axis_xy[1], 0.0)
-        self._gpr_trigger_ref = ref
-        self._gpr_trigger_axis = axis
-        if self._gpr_trigger_pub is None:
-            self._gpr_trigger_pub = node.create_publisher(
-                UInt32, str(ctx.get("gpr_trigger_topic", "/gpr/trigger")), 50
-            )
-        self._gpr_trigger_residual = 0.0
-        self._gpr_trigger_travel = 0.0
-        self._gpr_trigger_count = 0
-        self._gpr_trigger_tf_warned = False
-        # Anchor on the current plate pose (full timeout: this runs once, off the
-        # FSM tick, and TF has to be there before the sweep is worth starting).
-        self._gpr_trigger_last_xyz = self._lookup_plate_xyz(ctx, ref)
-        rate = max(1.0, float(ctx.get("gpr_trigger_rate_hz", self.GPR_TRIGGER_RATE_HZ)))
-        # Sub-Nyquist sampling would quantise the triggers into bursts; warn rather
-        # than silently mis-space them. Each sweep route carries the plate at its
-        # own speed, so read the knob that actually governs this one.
-        if self._use_arm_sweep(ctx):
-            speed = float(ctx.get("sweep_speed_mps", 0.05))
-        elif bool(ctx.get("sweep_use_crawl", False)):
-            speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
-        else:
-            speed = float(ctx.get("sweep_speed_limit", self.SWEEP_SPEED_LIMIT_MS))
-        speed = speed or self.SWEEP_SPEED_LIMIT_MS   # 0.0 means "uncapped"
-        spacing = self._gpr_trigger_spacing(ctx)
-        if rate < 2.0 * speed / spacing:
-            node.get_logger().warn(
-                f"[{self.name}] GPR trigger sampling at {rate:.0f} Hz is coarse for "
-                f"{spacing * 100.0:.2f} cm spacing at {speed:.3f} m/s; triggers will "
-                f"come in bursts. Raise gpr_trigger_rate_hz."
-            )
-        self._gpr_trigger_timer = node.create_timer(
-            1.0 / rate, lambda: self._gpr_trigger_tick(ctx)
-        )
-        node.get_logger().info(
-            f"[{self.name}] GPR triggers armed: one every {spacing * 100.0:.2f} cm of "
-            f"plate travel measured in '{ref}', sampled at {rate:.0f} Hz on "
-            f"'{ctx.get('gpr_trigger_topic', '/gpr/trigger')}'."
-        )
-        # The start of the sweep is itself a trigger position (d = 0), so trace #1
-        # sits at the segment start and every later one a whole spacing along it.
-        if self._gpr_trigger_last_xyz is not None:
-            self._emit_gpr_trigger(ctx)
-        else:
-            node.get_logger().warn(
-                f"[{self.name}] GPR triggers: no {ref}->plate transform yet; the d=0 "
-                f"trigger fires on the first pose the sampler gets."
-            )
-
-    def _stop_gpr_triggers(self, ctx, log_summary=True, close_record=True):
-        """Disarm the sampler (segment sweep finished, or state left).
-
-        The line record is sealed here (the plate stopping IS the end of the
-        line) and normally written too. ``close_record=False`` leaves it open
-        for the caller to add the export outcome and close itself.
-        """
-        self._seal_gpr_line_record()
-        if close_record:
-            self._close_gpr_line_record(ctx)
-        timer = getattr(self, "_gpr_trigger_timer", None)
-        if timer is not None:
-            timer.cancel()
-            ctx["node"].destroy_timer(timer)
-            self._gpr_trigger_timer = None
-            self._gpr_trigger_axis = None
-            self._gpr_trigger_ref = "map"
-            if log_summary:
-                ctx["node"].get_logger().info(
-                    f"[{self.name}] GPR triggers: {self._gpr_trigger_count} fired over "
-                    f"{self._gpr_trigger_travel:.3f} m of plate travel."
-                )
-        self._gpr_trigger_last_xyz = None
-
-    # ------------------------------------------------------------------
-    # GPR line manifest -- one row per line scanned, for the post-processing
-    # ------------------------------------------------------------------
-    def _open_gpr_line_record(self, ctx, seg_start, seg_end):
-        """Remember what the post-processing will need about this line.
-
-        The probe keeps the traces and the export carries no robot pose, so the
-        segment geometry (map frame), the measurement name the probe was given
-        and the wall-clock window are the only handles for tying an exported
-        ``.sgy`` back to a place on the wall. Written regardless of whether the
-        probe is enabled: a file copied over by hand still deserves a position.
-        """
-        line_idx = int(ctx.get("current_line_idx", 0))
-
-        def _pt(p):
-            return None if p is None else [round(float(v), 4) for v in p]
-
-        self._gpr_line_record = {
-            "wall_index": ctx.get("current_wall_index"),
-            "line_idx": line_idx,
-            "seg_idx": self._seg_idx,
-            "seg_start": _pt(seg_start),
-            "seg_end": _pt(seg_end),
-            "frame": self._world_frame(ctx),
-            "measurement_name": self._gpr_measurement_name or self._gpr_measurement_name_for(ctx),
-            "arm_sweep": bool(self._use_arm_sweep(ctx)),
-            "probe_active": bool(self.gpr_line_active),
-            "t_start": gpr_manifest.utc_now(),
-            "t_start_epoch": round(time.time(), 3),
-        }
-
-    def _seal_gpr_line_record(self):
-        """Stamp the end of the line (time, trigger stats) on the open record.
-        Idempotent: the first call wins, so a later close keeps the moment the
-        plate actually stopped rather than when the export finished."""
-        record = self._gpr_line_record
-        if record is None or "t_stop" in record:
-            return
-        record.update({
-            "probe_active": record["probe_active"] or bool(self.gpr_line_active),
-            "t_stop": gpr_manifest.utc_now(),
-            "t_stop_epoch": round(time.time(), 3),
-            "trigger_count": int(self._gpr_trigger_count),
-            "travel_m": round(float(self._gpr_trigger_travel), 4),
-        })
-
-    def _close_gpr_line_record(self, ctx):
-        """Append the open line record to the manifest (no-op if none is open)."""
-        record = self._gpr_line_record
-        if record is None:
-            return
-        self._seal_gpr_line_record()
-        self._gpr_line_record = None
-        path = gpr_manifest.append_gpr_line(ctx, record)
-        if path is None:
-            ctx["node"].get_logger().warn(
-                f"[{self.name}] could not write the GPR line manifest; this "
-                f"line's scan will not be placed on the wall."
-            )
-
-    def _gpr_trigger_spacing(self, ctx):
-        """Configured trigger spacing in metres (never zero/negative)."""
-        spacing = float(ctx.get("gpr_trigger_distance_m", self.GPR_TRIGGER_DISTANCE_M))
-        if spacing <= 0.0:
-            ctx["node"].get_logger().warn(
-                f"[{self.name}] gpr_trigger_distance_m={spacing} is not positive; "
-                f"falling back to {self.GPR_TRIGGER_DISTANCE_M} m."
-            )
-            return self.GPR_TRIGGER_DISTANCE_M
-        return spacing
-
-    def _gpr_trigger_frame(self, ctx):
-        """Frame the plate travel is measured against.
+    def _plate_travel_frame(self, ctx):
+        """Frame the plate travel is measured against, for the GPR triggers and
+        the hyperspectral sampler alike.
 
         Explicit ``gpr_trigger_reference_frame`` wins. Otherwise it follows the
         sweep route, because the two move the plate with different bodies: an arm
         sweep runs with the base parked, so ``arm_base`` measures the plate off
         the joint states alone and keeps odometry and localisation drift out of
-        the trigger spacing entirely; a base-driven sweep moves the arm base
-        itself, where only a world frame sees the travel at all.
-
-        Setting it to ``arm_base`` for a base-driven sweep would measure almost no
-        travel; setting it to ``map`` for an arm sweep works but inherits the
-        localisation noise this parameter exists to avoid.
+        the spacing entirely; a base-driven sweep moves the arm base itself,
+        where only a world frame sees the travel at all.
         """
         ref = ctx.get("gpr_trigger_reference_frame")
         if ref:
@@ -1753,116 +1120,6 @@ class ScanWall(State):
             return None
         return (dx / norm, dy / norm)
 
-    def _gpr_trigger_tick(self, ctx):
-        """Timer callback: accumulate how far the plate has advanced along the
-        sweep and fire a trigger for every whole ``gpr_trigger_distance_m``.
-
-        Advance is measured as the SIGNED projection of the plate displacement
-        onto the sweep axis, both expressed in ``self._gpr_trigger_ref`` — the same
-        thing the encoder wheel would roll off as it tracks along the wall. Using the raw 3-D path length instead would let
-        TF jitter accumulate as phantom travel (a random walk never cancels once
-        you take its magnitude), firing triggers with the robot standing still;
-        projected, perpendicular noise drops out and along-axis noise averages to
-        zero. The axis is always set while the sampler is armed; the path-length
-        branch below is only a guard for a sampler ticking without one.
-
-        The residual carries across samples, so triggers stay on a fixed distance
-        grid however irregular the sampling is; one sample spanning several
-        spacings fires several triggers. Motion backwards along the axis holds the
-        triggers instead of firing them, so re-covered ground is not re-triggered
-        beyond one spacing of hysteresis.
-        """
-        node = ctx["node"]
-        xyz = self._lookup_plate_xyz(ctx, self._gpr_trigger_ref, timeout_s=0.0)
-        if xyz is None:
-            if not self._gpr_trigger_tf_warned:
-                node.get_logger().warn(
-                    f"[{self.name}] GPR triggers: {self._gpr_trigger_ref}->plate "
-                    f"transform unavailable; no triggers until it returns."
-                )
-                self._gpr_trigger_tf_warned = True
-            return
-        self._gpr_trigger_tf_warned = False
-
-        last = self._gpr_trigger_last_xyz
-        if last is None:
-            # Late anchor (TF was not up when the sampler was armed): this pose is
-            # the sweep's d = 0 position, so it carries the first trigger.
-            self._gpr_trigger_last_xyz = xyz
-            if self._gpr_trigger_count == 0:
-                self._emit_gpr_trigger(ctx)
-            return
-
-        axis = self._gpr_trigger_axis
-        if axis is None:
-            step = math.dist(xyz, last)
-        else:
-            step = ((xyz[0] - last[0]) * axis[0]
-                    + (xyz[1] - last[1]) * axis[1]
-                    + (xyz[2] - last[2]) * axis[2])
-
-        min_step = float(ctx.get("gpr_trigger_min_step_m", self.GPR_TRIGGER_MIN_STEP_M))
-        if abs(step) < min_step:
-            # Below the noise floor: keep the old anchor so real slow motion still
-            # accumulates across ticks instead of being discarded sample by sample.
-            return
-        max_jump = float(ctx.get("gpr_trigger_max_jump_m", self.GPR_TRIGGER_MAX_JUMP_M))
-        if abs(step) > max_jump:
-            node.get_logger().warn(
-                f"[{self.name}] GPR triggers: plate pose jumped {step:.3f} m in one "
-                f"sample (> {max_jump:.3f} m); re-anchoring without firing."
-            )
-            self._gpr_trigger_last_xyz = xyz
-            return
-
-        self._gpr_trigger_last_xyz = xyz
-        self._gpr_trigger_travel += step
-        self._gpr_trigger_residual += step
-        spacing = self._gpr_trigger_spacing(ctx)
-        # A retreat (a Nav2 recovery, say) only ever costs one spacing: without the
-        # clamp, backing up 1 m would leave a 1 m dead zone with no triggers while
-        # the sweep re-covers that ground.
-        if self._gpr_trigger_residual < -spacing:
-            self._gpr_trigger_residual = -spacing
-        # Integer grid rather than a subtract-while loop: at an exact multiple
-        # (0.04 m of travel at 0.005 m spacing) repeated subtraction leaves
-        # 4.9999...e-3 and silently drops the last trigger.
-        pending = int(math.floor(self._gpr_trigger_residual / spacing + 1e-9))
-        if pending <= 0:
-            return
-        self._gpr_trigger_residual -= pending * spacing
-        for _ in range(pending):
-            self._emit_gpr_trigger(ctx)
-
-    def _emit_gpr_trigger(self, ctx):
-        """Fire one trigger: a message on ``gpr_trigger_topic`` carrying the
-        trigger index within this segment, plus a log line.
-
-        The hardware hop is deliberately not here. The gpr_trigger_bridge node
-        subscribes to the topic and sends one UDP datagram per message to the
-        ESP32 fake encoder (ESP32/GPR_RX_FINALE.ino), which clocks the GPR; the
-        sweep is gated on the bridge's link status instead
-        (_gpr_trigger_bridge_ready). Keeping the publish here means sim and
-        bench runs work with nothing plugged in, and this callback -- on the
-        50 Hz trigger timer -- never waits on the Wi-Fi.
-        """
-        node = ctx["node"]
-        self._gpr_trigger_count += 1
-        if self._gpr_trigger_pub is not None:
-            msg = UInt32()
-            msg.data = self._gpr_trigger_count
-            self._gpr_trigger_pub.publish(msg)
-        text = (
-            f"[{self.name}] GPR trigger #{self._gpr_trigger_count} "
-            f"(plate travel {self._gpr_trigger_travel:.3f} m, line "
-            f"{ctx.get('current_line_idx', 0) + 1}, segment {self._seg_idx + 1})"
-        )
-        every = int(ctx.get("gpr_trigger_log_every", self.GPR_TRIGGER_LOG_EVERY))
-        if every > 0 and self._gpr_trigger_count % every == 0:
-            node.get_logger().info(text)
-        else:
-            node.get_logger().debug(text)
-
     # ------------------------------------------------------------------
     # Hyperspectral sampling
     # ------------------------------------------------------------------
@@ -1924,7 +1181,7 @@ class ScanWall(State):
     def _hyperspectral_frame_and_axis(self, ctx, seg_start, seg_end):
         """``(ref, axis)`` for the segment: the GPR trigger frame and the sweep
         direction expressed in it, falling back to the world frame."""
-        ref = self._gpr_trigger_frame(ctx)
+        ref = self._plate_travel_frame(ctx)
         axis_xy = self._sweep_axis(seg_start, seg_end)
         if axis_xy is None:
             sweep_yaw = 2.0 * atan2(self._sweep_qz, self._sweep_qw)
@@ -3083,9 +2340,14 @@ class ScanWall(State):
             # plate is pressed and about to move, so nothing before that is
             # recorded as scan data -- and a probe/app problem surfaces here,
             # before the press, rather than with the arm already on the wall.
-            self._gpr_start_measurement(ctx)
-            if ctx.get("error_triggered"):
-                return
+            err = self._gpr.open_measurement(
+                ctx, ctx.get("current_wall_index"), int(ctx.get("current_line_idx", 0)),
+                self._seg_idx,
+            )
+            if err:
+                node.get_logger().error(f"[{self.name}] {err}; aborting scan.")
+                self._gpr.abort(ctx)
+                return self.fail(ctx, err)
 
             # Real robot: press the GPR against the wall for this segment sweep
             # (sim has no force_mode controller -> no-op).
@@ -3131,9 +2393,14 @@ class ScanWall(State):
             # Starting the line on the executor's "sweep" feedback instead (the
             # old way) left the first tick of every sweep unrecorded and, worse,
             # let the arm move before the line was known to be running.
-            self._gpr_start_line(ctx)
-            if ctx.get("error_triggered"):
-                return
+            err = self._gpr.start_line(
+                ctx, seg_start, seg_end, self._world_frame(ctx),
+                sweep="arm" if self._use_arm_sweep(ctx) else "base",
+            )
+            if err:
+                node.get_logger().error(f"[{self.name}] {err}; aborting scan.")
+                self._gpr.abort(ctx)
+                return self.fail(ctx, err)
 
             self.set_activity(
                 ctx,
@@ -3180,7 +2447,7 @@ class ScanWall(State):
                 return
             # Plate is on the wall and the base is moving: start clocking the GPR
             # with one trigger per gpr_trigger_distance_m of plate travel.
-            self._start_gpr_triggers(ctx, seg_start, seg_end)
+            self._arm_gpr_triggers(ctx, seg_start, seg_end)
             self._start_hyperspectral(ctx, seg_start, seg_end)
             self._seg_phase = "sweep_wait"
             return
@@ -3207,15 +2474,14 @@ class ScanWall(State):
                 # "already armed", so the flag is explicit.
                 if self._sweep_scanning and not self._sweep_samplers_armed:
                     self._sweep_samplers_armed = True
-                    self._start_gpr_triggers(ctx, seg_start, seg_end)
+                    self._arm_gpr_triggers(ctx, seg_start, seg_end)
                     self._start_hyperspectral(ctx, seg_start, seg_end)
                 # The executor owns the sweep's own watchdogs and reports one
                 # outcome; everything after it here is unchanged.
                 if self._sweep_result is None:
                     return
-                # The plate has stopped scanning. The line record stays open
-                # until the probe has exported the line (below).
-                self._stop_gpr_triggers(ctx, close_record=False)
+                # The plate has stopped scanning; the GPR line is stopped and
+                # exported below, before the press is released.
                 self._hs.stop_line(ctx)
                 succeeded, reason, detail = self._sweep_result
                 self._sweep_result = None
@@ -3239,9 +2505,6 @@ class ScanWall(State):
                     return
                 status = self._nav_status
                 self._stop_sweep_crawl(ctx, publish_stop=True)   # ensure base is stopped
-                # No triggers once the plate stops moving; the line record waits
-                # for the export outcome (below).
-                self._stop_gpr_triggers(ctx, close_record=False)
                 self._hs.stop_line(ctx)
                 self._restore_sweep_speed(ctx)   # clear the slow-sweep cap for the next transit
             # Release hardware/process state first (safety), regardless of outcome.
@@ -3255,8 +2518,8 @@ class ScanWall(State):
                 self._set_trajectory_bridge_hold(ctx, False)
             # GPR: stop the line, export it, stop the measurement -- before the
             # press is released, so the probe is still on the wall for the stop.
-            self._gpr_finish_line(ctx)
-            self._close_gpr_line_record(ctx)   # now carries the export outcome
+            # Disarms the triggers, seals and writes the line record.
+            self._gpr.end_segment(ctx)
             self._stop_force_mode(ctx)      # release the press before the arm retracts
             # Keep the reader running: the next segment's transit_clear needs the
             # plate distance to retract the arm before the base moves. Only the
@@ -3304,6 +2567,22 @@ class ScanWall(State):
             self._seg_idx += 1
             self._seg_phase = "transit_clear"
             return
+
+    def _arm_gpr_triggers(self, ctx, seg_start, seg_end):
+        """Start clocking the GPR: the plate's pose now is d = 0. The segment
+        is given in the world frame; the travel is measured in the plate-travel
+        frame (arm_base for an arm sweep, with the base parked)."""
+        if self._use_arm_sweep(ctx):
+            speed = float(ctx.get("sweep_speed_mps", 0.05))
+        elif bool(ctx.get("sweep_use_crawl", False)):
+            speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
+        else:
+            speed = float(ctx.get("sweep_speed_limit", self.SWEEP_SPEED_LIMIT_MS))
+        speed = speed or self.SWEEP_SPEED_LIMIT_MS   # 0.0 means "uncapped"
+        self._gpr.arm_triggers(
+            ctx, self._world_frame(ctx), seg_start, seg_end, speed,
+            measure_frame=self._plate_travel_frame(ctx),
+        )
 
     def _finalize_line(self, ctx):
         """All segments of the current line processed. The line counts as scanned
@@ -4132,13 +3411,11 @@ class ScanWall(State):
         ## running GPR measurement, release force mode (real) and stop sensor +
         ## alignment nodes.
         self._stop_sweep_crawl(ctx, publish_stop=True)
-        self._stop_gpr_triggers(ctx, log_summary=False, close_record=False)
         self._hs.abort(ctx)   # disarm, close the open segment, persist metrics
         self._restore_sweep_speed(ctx)
         self._cancel_sweep_goal(ctx)
         self._set_trajectory_bridge_hold(ctx, False)   # never leave the arm stack muted
-        self._gpr_finish_line(ctx)         # stop line, export, stop measurement
-        self._close_gpr_line_record(ctx)
+        self._gpr.abort(ctx)               # stop line, export, stop measurement, record
         self._stop_force_mode(ctx)
         self._stop_arm_processes(ctx)
 

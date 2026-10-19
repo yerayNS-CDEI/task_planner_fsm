@@ -70,7 +70,7 @@ def state():
 def test_samplers_arm_once_per_sweep(state, triggers):
     ctx = make_ctx(gpr_trigger_enabled=triggers)
     calls = {"triggers": 0, "hs": 0}
-    state._start_gpr_triggers = lambda *a, **kw: calls.__setitem__("triggers", calls["triggers"] + 1)
+    state._arm_gpr_triggers = lambda *a, **kw: calls.__setitem__("triggers", calls["triggers"] + 1)
     state._start_hyperspectral = lambda *a, **kw: calls.__setitem__("hs", calls["hs"] + 1)
 
     for _ in range(5):
@@ -128,6 +128,8 @@ def test_the_first_hyperspectral_sample_is_taken_at_contact_before_the_sweep(sta
     state._set_trajectory_bridge_hold = lambda _ctx, held: None
     state._send_sweep_goal = lambda _ctx, s, e, lead_in_only=False: (order.append("sweep_goal"), True)[1]
     state._hyperspectral_frame_and_axis = lambda _ctx, s, e: ("arm_base", (0.0, 1.0, 0.0))
+    state._gpr = types.SimpleNamespace(
+        start_line=lambda *a, **kw: order.append("gpr_line"))
     state._hs = types.SimpleNamespace(
         enabled=lambda _ctx: True,
         begin_segment=lambda _ctx, pose_fn, **kw: (order.append(("begin", kw["seg_idx"])), True)[1],
@@ -140,6 +142,8 @@ def test_the_first_hyperspectral_sample_is_taken_at_contact_before_the_sweep(sta
 
     assert order[:2] == [("begin", 0), "sample_0"]
     assert "sweep_goal" in order and order.index("sample_0") < order.index("sweep_goal")
+    # The GPR line runs before anything moves laterally.
+    assert order.index("gpr_line") < order.index("sweep_goal")
     assert "timer_armed" not in order            # that waits for the sweep feedback
     assert state._seg_phase == "sweep_wait"
 
