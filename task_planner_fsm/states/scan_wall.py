@@ -52,6 +52,22 @@ PLATE_SENSOR_VALID_HI = (3.90, 3.90, 3.90, 0.258, 0.258, 0.258)
 # reader publishes at ~5 Hz, so anything older means it died or was stopped.
 PLATE_DISTANCE_MAX_AGE_S = 3.0
 
+# Where 'arm_tool0' sits above 'arm_base_link' in the scanning pose, in metres.
+# A constant of the POSE, not of the moment: the column and the base move the
+# arm MOUNT, never this offset -- which is exactly why the column target is
+# derived from the mount and this number, and not from wherever the tool
+# happens to be when the tick fires. FK over the URDF at unfolded_fsm's joints
+# gives 0.5217 m; unfolded_front_fsm's tool sits 0.1 mm higher in
+# position_sender_node's pose table (0.51959 vs 0.51949), so one value serves
+# both of base placement's scanning poses.
+SCAN_POSE_TOOL_Z_ABOVE_ARM_BASE = 0.5217
+
+# How far the arm alone carries the tool off that nominal height while holding
+# the scanning posture, in metres. Only height OUTSIDE this window is worth
+# waking a 7-second, non-backdrivable column for; inside it the executor's
+# lead-in leg puts the plate on the line height itself.
+ARM_Z_WINDOW_M = 0.25
+
 
 class ScanWall(State):
     def __init__(self, name):
@@ -1259,34 +1275,100 @@ class ScanWall(State):
                 continue
         return None
 
-    def _lookup_ee_world_z(self, ctx):
-        """Return the current end-effector height in the world frame, or None."""
-        xyz = self._lookup_plate_xyz(ctx, self._world_frame(ctx))
-        return None if xyz is None else xyz[2]
+    def _lookup_arm_base_z(self, ctx):
+        """Map-frame height of the arm MOUNT, or None if TF cannot answer yet.
+
+        The mount, not the tool: 'arm_base_link' does not move when the arm
+        folds, so this number is the same whatever pose the arm is holding when
+        the tick happens to fire. That is the whole point -- the tool's height
+        is a property of the arm's configuration, and the column must not be
+        sized from it.
+
+        No timeout, deliberately: tf2's Python wait busy-sleeps, and on this
+        node's single-threaded executor that blocks the very callbacks that
+        deliver transforms. Read what is in the buffer and let the caller retry
+        on the next tick.
+        """
+        tf_buffer = ctx.get("tf_buffer")
+        if tf_buffer is None:
+            return None
+        frame = str(ctx.get("arm_root_frame", "arm_base_link"))
+        try:
+            tf = tf_buffer.lookup_transform(self._world_frame(ctx), frame, rclpy.time.Time())
+        except Exception:
+            return None
+        return float(tf.transform.translation.z)
 
     def _column_target_for_line(self, ctx, line_z):
-        """Column extension that places the EE at the map-frame ``line_z``.
+        """Column extension for the row at map-frame ``line_z``.
 
-        The column raises the arm 1:1, so the required extension is the current
-        column height plus the gap between the desired line z and the EE's
-        current map-frame height (measured via TF while the arm is in the
-        unfolded_fsm pose). Falls back to the static mapping if TF is missing.
+        None means "inputs not in yet, ask again next tick" -- never a guess. An
+        assumed column height moves a non-backdrivable 7-second axis to the
+        wrong place, and an assumed mount height decides the wrong thing about
+        reach.
+
+        The column is the OUTER loop: it exists for the height the arm cannot
+        cover by itself. So the height the arm can cover is subtracted first,
+        and only the excess becomes column travel; the executor's lead-in then
+        puts the plate on the line. Sizing the column by the gap between the
+        line and wherever the tool currently is (as this used to) hands it the
+        arm's own workspace as well, and makes the answer depend on the pose
+        the arm happened to hold when the tick fired.
         """
         node = ctx["node"]
-        column_current = float(ctx.get("column_current_height", 0.0))
-        ee_z = self._lookup_ee_world_z(ctx)
-        if ee_z is None:
-            node.get_logger().warn(
-                f"[{self.name}] EE transform unavailable; using static column mapping."
-            )
-            return self.column.height_for_line_z(line_z)
 
-        target = column_current + (float(line_z) - ee_z)
+        column_current = ctx.get("column_current_height")
+        if column_current is None:
+            node.get_logger().warn(
+                f"[{self.name}] Column height unknown: no 'column_joint' in /joint_states yet.",
+                throttle_duration_sec=5.0,
+            )
+            return None
+        column_current = float(column_current)
+
+        arm_base_z = self._lookup_arm_base_z(ctx)
+        if arm_base_z is None:
+            node.get_logger().warn(
+                f"[{self.name}] Arm mount height unknown: no "
+                f"{self._world_frame(ctx)} -> arm_base_link transform yet.",
+                throttle_duration_sec=5.0,
+            )
+            return None
+
+        tool_offset = float(ctx.get("scan_wall_scan_pose_tool_z", SCAN_POSE_TOOL_Z_ABOVE_ARM_BASE))
+        window = abs(float(ctx.get("scan_wall_arm_z_window", ARM_Z_WINDOW_M)))
+
+        row_z = float(line_z)
+
+        # Where the tool WILL be for this row, at the current column height,
+        # once the arm is in the scanning pose. Not where it is now.
+        tool_z = arm_base_z + tool_offset
+        gap = row_z - tool_z
+        sized_for = f"line z={line_z:.3f}m"
+
+        if abs(gap) <= window:
+            node.get_logger().info(
+                f"[{self.name}] Column stays at {column_current:.3f}m: {sized_for} is "
+                f"{gap:+.3f}m from the scanning pose's tool height ({tool_z:.3f}m), inside the "
+                f"arm's own +/-{window:.2f}m window."
+            )
+            return column_current
+
+        excess = math.copysign(abs(gap) - window, gap)
+        target = column_current + excess
         clamped = max(self.column.column_min_height_m, min(target, self.column.column_max_height_m))
         node.get_logger().info(
-            f"[{self.name}] Column calc: line_z={line_z:.3f}m, EE_z={ee_z:.3f}m, "
-            f"column_now={column_current:.3f}m -> target={target:.3f}m (clamped {clamped:.3f}m)."
+            f"[{self.name}] Column calc: {sized_for}, arm mount={arm_base_z:.3f}m, "
+            f"scanning-pose tool={tool_z:.3f}m, gap={gap:+.3f}m beyond the +/-{window:.2f}m arm "
+            f"window by {excess:+.3f}m, column_now={column_current:.3f}m -> target={target:.3f}m "
+            f"(clamped {clamped:.3f}m)."
         )
+        if abs(clamped - target) > 1e-6:
+            node.get_logger().warn(
+                f"[{self.name}] Column travel is capped at [{self.column.column_min_height_m:.2f}, "
+                f"{self.column.column_max_height_m:.2f}]m, so line z={line_z:.3f}m stays "
+                f"{abs(target - clamped):.3f}m outside the arm's window."
+            )
         return clamped
 
     # ------------------------------------------------------------------
@@ -1364,6 +1446,8 @@ class ScanWall(State):
         # --- Phase 2: arm motion finished — now move the column. ---
         if not self.column_commanded:
             target_h = self._column_target_for_line(ctx, self.current_line_z)
+            if target_h is None:
+                return                    # inputs not in yet; ask again next tick
             node.get_logger().info(
                 f"[{self.name}] Arm settled; commanding column to {target_h:.3f}m "
                 f"for line z={self.current_line_z:.3f}m."
@@ -2158,6 +2242,8 @@ class ScanWall(State):
             # the column to travel, so no unfolded_fsm re-pose is needed here.
             if not self.column_commanded:
                 target_h = self._column_target_for_line(ctx, self.current_line_z)
+                if target_h is None:
+                    return                # inputs not in yet; ask again next tick
                 node.get_logger().info(
                     f"[{self.name}] Column to {target_h:.3f}m for line "
                     f"z={self.current_line_z:.3f}m; base stays at partition {seg_no}."

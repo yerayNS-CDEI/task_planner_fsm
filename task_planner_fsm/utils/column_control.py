@@ -39,14 +39,6 @@ class ColumnController:
         # Physical / tuning parameters (mirrors ExhaustiveScan defaults).
         self.column_min_height_m = 0.0
         self.column_max_height_m = 0.9
-        # Highest map-frame z the EE reaches at column=0 in the unfolded pose.
-        # Column extension is only needed for line heights above this. This is a
-        # MAP-FRAME (ground) z, so it must include the arm-base mounting height:
-        # arm_base_link sits ~0.78 m above base_link (0.05 m column_joint origin +
-        # 0.73 m column_link->arm_base_link mount) plus ~1.1 m of upward arm reach
-        # from arm_base_link in this pose => ~1.88 m. Used only as the fallback
-        # when the EE TF lookup fails; the TF path measures ee_z in map directly.
-        self.arm_reachable_z_max = 1.88
         self.column_tolerance_m = 0.01
         self.column_wait_timeout_s = 40.0
         self.column_move_time_s = 7.0
@@ -83,18 +75,10 @@ class ColumnController:
             f"[{self.name}] Column control configured for real robot via {self.column_command_topic}"
         )
 
-    # ------------------------------------------------------------------
-    # Height mapping
-    # ------------------------------------------------------------------
-    def height_for_line_z(self, line_z: float) -> float:
-        """Map a map-frame line height to a clamped column-extension target.
-
-        The column raises the arm base, so it is only extended for line heights
-        the arm cannot reach at column=0. Below ``arm_reachable_z_max`` the
-        column stays retracted. This offset is the main tuning knob (see plan).
-        """
-        required_height = max(0.0, float(line_z) - self.arm_reachable_z_max)
-        return max(self.column_min_height_m, min(required_height, self.column_max_height_m))
+    # NOTE: no line-z -> height mapping lives here. Choosing the height needs the
+    # arm's own vertical window and a live mount height, which is state-specific;
+    # ScanWall._column_target_for_line owns it. This class only commands a height
+    # and reports when the axis got there.
 
     # ------------------------------------------------------------------
     # Commanding
