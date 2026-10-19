@@ -1613,6 +1613,58 @@ class ScanWall(State):
         return world_frame(ctx)
 
     # ------------------------------------------------------------------
+    # Swept memory (survives re-entry into this state)
+    # ------------------------------------------------------------------
+    # on_enter clears _segments and _seg_idx, so without this a state retry would
+    # re-sweep ground already covered. The record lives in ctx for exactly that
+    # reason. Keyed by (wall, line height): a different height is a genuinely
+    # different scan line.
+    def _swept_key(self, ctx, z=None):
+        if z is None:
+            z = self.current_line_z
+            if z is None:
+                z = self._resolve_current_line_z(ctx)
+        return (int(ctx.get("current_wall_index") or 0), round(float(z), 3))
+
+    def _record_swept(self, ctx, seg_start, seg_end):
+        store = ctx.setdefault("scan_wall_swept_segments", {})
+        store.setdefault(self._swept_key(ctx), []).append(
+            ((float(seg_start[0]), float(seg_start[1])),
+             (float(seg_end[0]), float(seg_end[1]))))
+
+    def _already_swept(self, ctx, seg_start, seg_end, z=None):
+        """Has this stretch of wall already been swept at this height?
+
+        Matched with a tolerance and unordered: a re-entry re-plans against a
+        costmap that has moved on, and may pick the opposite direction, which
+        reverses the partition without changing the ground it covers.
+        """
+        if not ctx.get("scan_wall_resume", True):
+            return False
+        tol = float(ctx.get("scan_wall_resume_tolerance", 0.25))
+        s = (float(seg_start[0]), float(seg_start[1]))
+        e = (float(seg_end[0]), float(seg_end[1]))
+        for done_s, done_e in ctx.get("scan_wall_swept_segments", {}).get(
+                self._swept_key(ctx, z=z), []):
+            for a, b in ((done_s, done_e), (done_e, done_s)):
+                if (math.hypot(s[0] - a[0], s[1] - a[1]) <= tol
+                        and math.hypot(e[0] - b[0], e[1] - b[1]) <= tol):
+                    return True
+        return False
+
+    def _partition_fully_swept(self, ctx, seg_start, seg_end):
+        """Every height of this partition already swept?
+        Then there is no reason to drive the base to it at all."""
+        if not ctx.get("scan_wall_resume", True):
+            return False
+        if self._nest_lines(ctx):
+            heights = self._line_heights(ctx)
+        else:
+            z = self.current_line_z
+            heights = [z if z is not None else self._resolve_current_line_z(ctx)]
+        return all(self._already_swept(ctx, seg_start, seg_end, z=z) for z in heights)
+
+    # ------------------------------------------------------------------
     # Folding between reachable segments
     # ------------------------------------------------------------------
     def _partition_source(self, ctx):
@@ -1969,6 +2021,13 @@ class ScanWall(State):
             # retry budget is refreshed -- a partition abandoned for some other
             # reason must not spend the next one's re-tries.
             self._transit_retries = 0
+            if self._use_arm_sweep(ctx) and self._partition_fully_swept(ctx, seg_start, seg_end):
+                node.get_logger().info(
+                    f"[{self.name}] Partition {seg_no}/{seg_total} already swept at every "
+                    f"height on an earlier entry; skipping it."
+                )
+                self._seg_idx += 1
+                return
             if self._arm_folded:
                 # Folded for a transit that then failed: the plate is nowhere
                 # near the wall and its ranges read nothing useful.
@@ -2450,6 +2509,14 @@ class ScanWall(State):
             # transit crawling for no reason (ARM_SWEEP_PLAN §7.C).
             if not self._use_arm_sweep(ctx) and not bool(ctx.get("sweep_use_crawl", False)):
                 self._apply_sweep_speed(ctx)
+            if self._use_arm_sweep(ctx) and self._already_swept(ctx, seg_start, seg_end):
+                node.get_logger().info(
+                    f"[{self.name}] Partition {seg_no} at z="
+                    f"{float(self.current_line_z or 0.0):.3f}m was already swept on an "
+                    f"earlier entry; not sweeping it again."
+                )
+                return self._advance_after_sweep(
+                    ctx, True, "", seg_start, seg_end, True, skipped=True)
             self._seg_phase = "arm_approach"
             return
 
@@ -2794,45 +2861,9 @@ class ScanWall(State):
             self._stop_arm_processes(ctx, keep_sensors=True)
             time.sleep(2)   # delay to avoid errors in the arm goals
 
-            if status == GoalStatus.STATUS_SUCCEEDED:
-                self._segments_ok += 1
-                self._last_swept_point = seg_end
-            else:
-                # "Too long for the arm" is recoverable: re-cut this partition's
-                # SEGMENT shorter and sweep it again, rather than dropping that
-                # stretch of wall (ARM_SWEEP_PLAN §7.B). _shorten_failed_partition
-                # rewinds _seg_idx itself when it succeeds.
-                if arm_sweep and self._shorten_failed_partition(ctx, reason):
-                    self._line_idx = 0
-                    self._seg_phase = "transit_clear"
-                    return
-                node.get_logger().warn(
-                    f"[{self.name}] Segment {self._seg_idx + 1} sweep did not succeed "
-                    f"(status={status}); skipping to the next segment."
-                )
-
-            # Nesting (§8): sweep every height at this base stop before moving the
-            # base. A height that fails moves to the NEXT HEIGHT, not away from the
-            # partition -- §8.2's failure isolation: losing one line must not cost
-            # the whole stretch of wall.
-            if self._nest_lines(ctx):
-                heights = self._line_heights(ctx)
-                if self._line_idx + 1 < len(heights):
-                    self._line_idx += 1
-                    ctx["current_line_idx"] = self._line_idx
-                    node.get_logger().info(
-                        f"[{self.name}] Partition {self._seg_idx + 1}: on to height "
-                        f"{self._line_idx + 1}/{len(heights)} "
-                        f"(z={heights[self._line_idx]:.3f}m). Base stays parked."
-                    )
-                    self._seg_phase = "line_change"
-                    return
-                self._line_idx = 0
-                ctx["current_line_idx"] = 0
-
-            self._seg_idx += 1
-            self._seg_phase = "transit_clear"
-            return
+            return self._advance_after_sweep(
+                ctx, status == GoalStatus.STATUS_SUCCEEDED, reason, seg_start, seg_end,
+                arm_sweep)
 
     def _arm_gpr_triggers(self, ctx, seg_start, seg_end):
         """Start clocking the GPR: the plate's pose now is d = 0. The segment
@@ -2849,6 +2880,60 @@ class ScanWall(State):
             ctx, self._world_frame(ctx), seg_start, seg_end, speed,
             measure_frame=self._plate_travel_frame(ctx),
         )
+
+    def _advance_after_sweep(self, ctx, ok, reason, seg_start, seg_end, arm_sweep,
+                             skipped=False):
+        """Book the sweep that just ended (or was found already done) and pick
+        what comes next: the next height at this base stop, or the next
+        partition."""
+        node = ctx["node"]
+        seg_no = self._seg_idx + 1
+        # This sweep's executor feedback must not arm the samplers of whatever
+        # reaches sweep_wait next without a sweep of its own (a column that did
+        # not reach its height): only a new goal sets them.
+        self._sweep_scanning = False
+        self._sweep_samplers_armed = False
+        if ok:
+            if not skipped:
+                self._record_swept(ctx, seg_start, seg_end)
+            self._segments_ok += 1
+            self._last_swept_point = seg_end
+        else:
+            # "Too long for the arm" is recoverable: re-cut this partition's
+            # SEGMENT shorter and sweep it again, rather than dropping that
+            # stretch of wall (ARM_SWEEP_PLAN §7.B). _shorten_failed_partition
+            # rewinds _seg_idx itself when it succeeds.
+            if arm_sweep and self._shorten_failed_partition(ctx, reason):
+                self._line_idx = 0
+                self._seg_phase = "transit_clear"
+                return
+            node.get_logger().warn(
+                f"[{self.name}] Segment {seg_no} sweep did not succeed; "
+                f"skipping to the next segment."
+            )
+
+        # Nesting (§8): sweep every height at this base stop before moving the
+        # base. A height that fails moves to the NEXT HEIGHT, not away from the
+        # partition -- §8.2's failure isolation: losing one line must not cost
+        # the whole stretch of wall.
+        if self._nest_lines(ctx):
+            heights = self._line_heights(ctx)
+            if self._line_idx + 1 < len(heights):
+                self._line_idx += 1
+                ctx["current_line_idx"] = self._line_idx
+                node.get_logger().info(
+                    f"[{self.name}] Partition {seg_no}: on to height "
+                    f"{self._line_idx + 1}/{len(heights)} "
+                    f"(z={heights[self._line_idx]:.3f}m). Base stays parked."
+                )
+                self._seg_phase = "line_change"
+                return
+            self._line_idx = 0
+            ctx["current_line_idx"] = 0
+
+        # Next partition.
+        self._seg_idx += 1
+        self._seg_phase = "transit_clear"
 
     def _finalize_line(self, ctx):
         """All segments of the current line processed. The line counts as scanned
