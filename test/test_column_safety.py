@@ -163,3 +163,21 @@ def test_a_partition_is_never_swept_with_the_arm_folded(phases):
     failed = body[body.index('status == "failed"'):]
     assert failed.index("_skip_partition") < failed.index('self._seg_phase = "line_column"')
 
+
+# ---------------------------------------------------------------------------
+# Cross-polarized pass: off the wall before anything rolls
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("clear, pose", [("xpol_clear", "xpol_pose"),
+                                         ("unroll_clear", "unroll_pose")])
+def test_the_plate_is_retracted_before_it_rolls(phases, clear, pose):
+    """Under force mode the executor leaves the plate on the wall; the roll (and
+    the un-roll) is a planned named-pose move that must not start from there."""
+    body = phases[clear]
+    assert "_send_arm_to_clearance(" in body
+    assert "retract_only=True" in body and "contact_default=True" in body
+    assert pose in targets_of(body)
+    assert pose in targets_of(phases[clear + "_wait"])
+    # The named-pose move happens only in the pose phase.
+    assert "_send_named_pose" not in body
+    assert "_send_named_pose" in phases[pose]
