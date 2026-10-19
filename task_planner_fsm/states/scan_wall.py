@@ -52,6 +52,19 @@ PLATE_SENSOR_VALID_HI = (3.90, 3.90, 3.90, 0.258, 0.258, 0.258)
 # reader publishes at ~5 Hz, so anything older means it died or was stopped.
 PLATE_DISTANCE_MAX_AGE_S = 3.0
 
+# How much further off the wall than the sweep standoff (sweep_scan_standoff_m,
+# 0.20 m) the arm's approach leaves the plate, in metres
+# (ctx["sweep_approach_retract_m"]): an approach at 0.30 m. At 0.20 m the
+# plate's collision mesh (GPR included, 0.155 m in front of arm_plate_link)
+# ends ~6.5 cm from the wall, inside the 5-10 cm the collision checker's
+# dilated 5 cm octomap puts in front of it, so the planned approach was refused
+# "sometimes" and the partition skipped (seen on the whole-body side, 76fa525).
+# At 0.30 m the mesh is ~16.5 cm clear. Force mode closes the gap on the robot
+# (its Z reach is sized from the approach); in simulation the executor's
+# lead-in closes it on the way to the partition start, and its post-sweep
+# retract backs off the same margin.
+SWEEP_APPROACH_RETRACT_M = 0.10
+
 # Where 'arm_tool0' sits above 'arm_base_link' in the scanning pose, in metres.
 # A constant of the POSE, not of the moment: the column and the base move the
 # arm MOUNT, never this offset -- which is exactly why the column target is
@@ -531,7 +544,7 @@ class ScanWall(State):
             # Under Force Mode the executor ignores it entirely and sweeps in the
             # plane the press established.
             "-p", f"scan_standoff_m:={float(ctx.get('sweep_scan_standoff_m', 0.20))}",
-            "-p", f"approach_retract_m:={float(ctx.get('sweep_approach_retract_m', 0.0))}",
+            "-p", f"approach_retract_m:={self._approach_retract(ctx)}",
             "-p", f"max_traverse_m:={float(ctx.get('sweep_max_traverse_m', 1.10))}",
             # Diagnostic only. Once force mode has the plate on the wall the
             # executor sweeps from that contact pose rather than nudging it back
@@ -730,13 +743,13 @@ class ScanWall(State):
         contact forces, and on the robot means scrubbing the GPR wheel across a
         surface it is not measuring.
 
-        ``sweep_approach_retract_m`` is 0 by default: on the robot the margin only
-        widened the gap force mode then had to press through (0.40 m against a
-        0.25 m Z deviation limit), and the lateral move is now made BEFORE the
-        press, so it needs no extra clearance of its own. Raise it to put the
-        approach plane back outside the sweep plane -- for the no-press path, where
-        nothing holds the plate off the wall, that margin is also the executor's
-        post-sweep retract.
+        ``sweep_approach_retract_m`` defaults to SWEEP_APPROACH_RETRACT_M (0.10),
+        for an approach at 0.30 m: clear of the band the dilated octomap puts in
+        front of the wall, where the planned approach was refused. Force mode's
+        Z reach is sized from this distance (_build_force_mode_request), so the
+        press still gets to the wall. For the no-press path, where nothing holds
+        the plate off the wall, the margin is also the executor's post-sweep
+        retract.
 
         Keyed off ``sweep_scan_standoff_m`` in arm-sweep mode so raising the sweep
         standoff carries the approach out with it; the legacy base-driven path
@@ -745,7 +758,12 @@ class ScanWall(State):
         base = (float(ctx.get("sweep_scan_standoff_m", 0.20))
                 if self._use_arm_sweep(ctx)
                 else float(ctx.get("scan_wall_plate_offset", 0.20)))
-        return base + float(ctx.get("sweep_approach_retract_m", 0.0))
+        return base + self._approach_retract(ctx)
+
+    @staticmethod
+    def _approach_retract(ctx):
+        """Approach margin beyond the sweep standoff, m (SWEEP_APPROACH_RETRACT_M)."""
+        return float(ctx.get("sweep_approach_retract_m", SWEEP_APPROACH_RETRACT_M))
 
     def _send_arm_to_clearance(self, ctx, target, contact_default=False,
                                retract_only=False):
@@ -967,24 +985,15 @@ class ScanWall(State):
         req.speed_limits.linear.z = 0.1
         # The Z deviation limit is what the press is allowed to travel, so it must
         # cover the gap the arm's approach deliberately leaves plus a margin.
-        # Sized from the knob rather than fixed: raising the offset without raising
-        # this would leave force_mode short of the wall, and _wall_contact_ready
-        # would burn its timeout and sweep without contact.
-        press_reach = float(ctx.get("scan_wall_plate_offset", 0.20)) + 0.05
+        # Sized from the approach that actually ran rather than fixed: a gap
+        # wider than the limit leaves force_mode short of the wall, and
+        # _wall_contact_ready would burn its timeout and sweep without contact.
+        # (ARM_SWEEP_PLAN §7.C kept this a deliberate decision; the 0.30 m
+        # approach, SWEEP_APPROACH_RETRACT_M, is that decision.)
+        approach = (self._approach_standoff(ctx) if self._use_arm_sweep(ctx)
+                    else float(ctx.get("scan_wall_plate_offset", 0.20)))
+        press_reach = approach + 0.05
         req.deviation_limits = [0.1, 0.1, max(0.15, press_reach), 0.1, 0.1, 0.1]
-        # ...and in arm-sweep mode the approach standoff is a DIFFERENT knob, so
-        # check rather than assume. ARM_SWEEP_PLAN §7.C says not to raise the
-        # deviation limits automatically -- log it and let the press force /
-        # standoff be retuned deliberately in one campaign.
-        approach = self._approach_standoff(ctx) if self._use_arm_sweep(ctx) else press_reach
-        if approach > req.deviation_limits[2]:
-            ctx["node"].get_logger().warn(
-                f"[{self.name}] Force mode may not reach the wall: the arm approaches "
-                f"at {approach:.2f} m but the Z deviation limit is only "
-                f"{req.deviation_limits[2]:.2f} m. Lower sweep_scan_standoff_m / "
-                f"sweep_approach_retract_m, or raise the limit deliberately — do not "
-                f"expect contact on hardware as configured."
-            )
         req.damping_factor = 0.025
         req.gain_scaling = 0.5
         return req
@@ -2546,9 +2555,12 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
+            # Defaults to the approach standoff: retracting any less only for
+            # arm_approach to back off the rest afterwards is a wasted move.
             outcome = self._send_arm_to_clearance(
                 ctx,
-                float(ctx.get("scan_wall_line_change_plate_offset", 0.20)),
+                float(ctx.get("scan_wall_line_change_plate_offset",
+                              self._approach_standoff(ctx))),
                 retract_only=True,
             )
             if outcome == "wait":
