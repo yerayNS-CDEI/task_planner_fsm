@@ -1838,24 +1838,66 @@ class ScanWall(State):
         if pose is None:
             return "no_pose", None, None, None
         goal_xy, goal_yaw = (pose[0], pose[1]), pose[2]
-        # Skipping needs BOTH position and heading: a parked arm sweep depends on
-        # facing the wall square-on, and the base could be at the right spot at a
-        # completely different heading. Compared in the map frame --
-        # ctx["base_position"] is odom and would be off by map->odom. The yaw
-        # tolerance defaults to NavigateToTarget's own convergence tolerance: the
-        # skip test cannot demand a heading more accurate than navigation
-        # delivers, or partition 1 re-transits every time.
-        skip_tol = float(ctx.get("segment_transit_skip_tol", 0.4))
-        yaw_tol = float(
-            ctx.get("partition_scan_yaw_tol", ctx.get("nav_yaw_tolerance", 0.25))
-        )
+        # The same test the base has to pass after a transit
+        # (_transit_arrival_ok): standoff, along-wall position and heading,
+        # each against its own tolerance. One 0.4 m radius used to accept
+        # NavigateToTarget's pose 0.15 m too far from the wall (simulation,
+        # 2026-10-20), and partition 1 was swept from there -- while the
+        # standoff is exactly what sizes the arm's reach. Compared in the map
+        # frame; ctx["base_position"] is odom and would be off by map->odom.
+        err = self._scan_pose_error(ctx, pose)
+        if err is not None:
+            if err["ok"]:
+                return "here", goal_xy, goal_yaw, err["yaw"]
+            return "go", goal_xy, goal_yaw, None
+        # No wall normal to split the error along: the plain radius test.
         here = self._base_xy_yaw_map(ctx)
         if here is not None:
             yaw_err = abs(atan2(sin(here[2] - goal_yaw), cos(here[2] - goal_yaw)))
-            if (math.hypot(here[0] - goal_xy[0], here[1] - goal_xy[1]) <= skip_tol
+            yaw_tol = float(
+                ctx.get("partition_scan_yaw_tol", ctx.get("nav_yaw_tolerance", 0.25))
+            )
+            if (math.hypot(here[0] - goal_xy[0], here[1] - goal_xy[1])
+                    <= float(ctx.get("segment_transit_skip_tol", 0.4))
                     and yaw_err <= yaw_tol):
                 return "here", goal_xy, goal_yaw, yaw_err
         return "go", goal_xy, goal_yaw, None
+
+    def _scan_pose_error(self, ctx, target):
+        """How far the base is from scan pose ``target`` (x, y, yaw), split
+        into the wall frame: ``{"normal", "along", "yaw", "ok", "why"}``, or
+        None when the base pose or the wall normal is unknown.
+
+        The standoff (wall-normal) sets the arm's reach and is held to
+        partition_standoff_tol; the along-wall position only has to be close
+        enough for the executor's lead-in and gets the loose tolerance. The
+        heading is checked too -- a parked arm sweep is only symmetric about
+        the base centreline if the base is square to the wall. The yaw
+        tolerance defaults to NavigateToTarget's own convergence tolerance: no
+        test can demand a heading more accurate than navigation delivers.
+        """
+        pose = self._base_xy_yaw_map(ctx)
+        axes = wall_axes(ctx)
+        if pose is None or target is None or axes is None:
+            return None
+        (nx, ny), (tx, ty) = axes
+        ex, ey = target[0] - pose[0], target[1] - pose[1]
+        e_n, e_t = ex * nx + ey * ny, ex * tx + ey * ty
+        yaw_err = abs(atan2(sin(pose[2] - target[2]), cos(pose[2] - target[2])))
+        tol_n = float(ctx.get("partition_standoff_tol", self.PARTITION_STANDOFF_TOL_M))
+        tol_t = float(ctx.get("partition_transit_arrive_tol",
+                              self.PARTITION_ALONG_WALL_TOL_M))
+        yaw_tol = float(
+            ctx.get("partition_scan_yaw_tol", ctx.get("nav_yaw_tolerance", 0.25))
+        )
+        why = ", ".join(
+            part for part in (
+                f"standoff off by {e_n:+.3f} m (> {tol_n:.2f})" if abs(e_n) > tol_n else "",
+                f"along-wall off by {e_t:+.3f} m (> {tol_t:.2f})" if abs(e_t) > tol_t else "",
+                f"heading off by {yaw_err:.3f} rad (> {yaw_tol:.2f})" if yaw_err > yaw_tol else "",
+            ) if part
+        )
+        return {"normal": e_n, "along": e_t, "yaw": yaw_err, "ok": not why, "why": why}
 
     def _at_partition(self, ctx):
         """The base stands at the current partition: unfold if the transit
@@ -3716,48 +3758,29 @@ class ScanWall(State):
         is square to the wall.
         """
         node = ctx["node"]
-        pose = self._base_xy_yaw_map(ctx)
         target = (self._scan_poses or [None] * len(self._segments))[self._seg_idx]
-        axes = wall_axes(ctx)
-        if pose is None or target is None or axes is None:
+        err = self._scan_pose_error(ctx, target)
+        if err is None:
             node.get_logger().warn(
                 f"[{self.name}] Cannot verify the partition {seg_no} scan pose "
-                f"({'no base pose' if pose is None else 'no wall normal' if axes is None else 'no scan pose'}); "
-                f"trusting the transit and sweeping from here."
+                f"(no base pose, wall normal or scan pose); trusting the transit "
+                f"and sweeping from here."
             )
             return True
-
-        (nx, ny), (tx, ty) = axes
-        ex, ey = target[0] - pose[0], target[1] - pose[1]
-        e_n, e_t = ex * nx + ey * ny, ex * tx + ey * ty
-        yaw_err = abs(atan2(sin(pose[2] - target[2]), cos(pose[2] - target[2])))
-        tol_n = float(ctx.get("partition_standoff_tol", self.PARTITION_STANDOFF_TOL_M))
-        tol_t = float(ctx.get("partition_transit_arrive_tol",
-                              self.PARTITION_ALONG_WALL_TOL_M))
-        yaw_tol = float(
-            ctx.get("partition_scan_yaw_tol", ctx.get("nav_yaw_tolerance", 0.25))
-        )
-        if abs(e_n) <= tol_n and abs(e_t) <= tol_t and yaw_err <= yaw_tol:
+        if err["ok"]:
             node.get_logger().info(
                 f"[{self.name}] Partition {seg_no} scan pose verified: standoff "
-                f"error {e_n:+.3f} m, along-wall {e_t:+.3f} m, yaw {yaw_err:.3f} rad."
+                f"error {err['normal']:+.3f} m, along-wall {err['along']:+.3f} m, "
+                f"yaw {err['yaw']:.3f} rad."
             )
             self._transit_retries = 0
             return True
 
         max_retries = int(ctx.get("partition_transit_max_retries",
                                   self.PARTITION_TRANSIT_MAX_RETRIES))
-        # Say which axis failed. "Off the scan pose" was the old level of detail
-        # and it is exactly what made this take a field trip to diagnose: a
-        # standoff miss and an along-wall miss have different causes and different
-        # consequences for the sweep.
-        why = ", ".join(
-            part for part in (
-                f"standoff off by {e_n:+.3f} m (> {tol_n:.2f})" if abs(e_n) > tol_n else "",
-                f"along-wall off by {e_t:+.3f} m (> {tol_t:.2f})" if abs(e_t) > tol_t else "",
-                f"heading off by {yaw_err:.3f} rad (> {yaw_tol:.2f})" if yaw_err > yaw_tol else "",
-            ) if part
-        )
+        # Say which axis failed: a standoff miss and an along-wall miss have
+        # different causes and different consequences for the sweep.
+        why = err["why"]
         if self._transit_retries < max_retries:
             self._transit_retries += 1
             node.get_logger().warn(

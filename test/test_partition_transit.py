@@ -261,3 +261,30 @@ def test_missing_inputs_do_not_block_the_scan(state):
     ctx = make_ctx(wall_inward_normals=[])
     assert arrival(state, ctx, pose=(1.0, 0.0, 0.0)) is True
     assert any("Cannot verify" in w for w in ctx["node"].get_logger().warnings)
+
+
+# ---------------------------------------------------------------------------
+# "Already there" uses the same per-axis test as the arrival check
+# ---------------------------------------------------------------------------
+
+def skip_kind(state, ctx, pose, target=(1.0, 0.0, 0.0)):
+    state._segments = [None]
+    state._seg_idx = 0
+    state._scan_poses = [target]
+    state._base_xy_yaw_map = lambda _ctx: pose
+    return state._partition_transit_plan(ctx)[0]
+
+
+def test_a_base_too_far_from_the_wall_is_not_already_there(state):
+    """Simulation, 2026-10-20: NavigateToTarget's pose 0.15 m off the standoff
+    passed the old 0.4 m radius and partition 1 was swept from it."""
+    ctx = make_ctx()
+    assert skip_kind(state, ctx, pose=(0.85, 0.0, 0.0)) == "go"
+    assert skip_kind(state, ctx, pose=(1.02, 0.12, 0.0)) == "here"
+    assert skip_kind(state, ctx, pose=(1.0, 0.0, 0.6)) == "go"
+
+
+def test_without_a_wall_normal_the_skip_falls_back_to_the_radius(state):
+    ctx = make_ctx(wall_inward_normals=[])
+    assert skip_kind(state, ctx, pose=(0.85, 0.0, 0.0)) == "here"
+    assert skip_kind(state, ctx, pose=(0.5, 0.0, 0.0)) == "go"
