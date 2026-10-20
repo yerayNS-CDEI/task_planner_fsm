@@ -53,16 +53,23 @@ PLATE_SENSOR_VALID_HI = (3.90, 3.90, 3.90, 0.258, 0.258, 0.258)
 PLATE_DISTANCE_MAX_AGE_S = 3.0
 
 # How much further off the wall than the sweep standoff (sweep_scan_standoff_m,
-# 0.20 m) the arm's approach leaves the plate, in metres
-# (ctx["sweep_approach_retract_m"]): an approach at 0.30 m. At 0.20 m the
-# plate's collision mesh (GPR included, 0.155 m in front of arm_plate_link)
-# ends ~6.5 cm from the wall, inside the 5-10 cm the collision checker's
-# dilated 5 cm octomap puts in front of it, so the planned approach was refused
-# "sometimes" and the partition skipped (seen on the whole-body side, 76fa525).
-# At 0.30 m the mesh is ~16.5 cm clear. Force mode closes the gap on the robot
-# (its Z reach is sized from the approach); in simulation the executor's
-# lead-in closes it on the way to the partition start, and its post-sweep
-# retract backs off the same margin.
+# 0.20 m) the arm's planned approach stops, AT MOST, in metres
+# (ctx["sweep_approach_retract_m"]): the approach closes on the wall to 0.30 m
+# and never pulls back toward it. At 0.20 m the plate's collision mesh (GPR
+# included, 0.155 m in front of arm_plate_link) ends ~6.5 cm from the wall,
+# inside the 5-10 cm the collision checker's dilated 5 cm octomap puts in front
+# of it, so the planned approach was refused "sometimes" and the partition
+# skipped (seen on the whole-body side, 76fa525). At 0.30 m the mesh is ~16.5 cm
+# clear. Force mode closes the gap on the robot (its Z reach is sized from
+# this); in simulation the executor's lead-in closes it on the way to the
+# partition start.
+#
+# A ceiling, not a target: at the partition standoff (1.15 m) the scanning pose
+# itself already leaves the plate ~0.25 m off the wall, and moving it back to
+# 0.30 m pulls the wrist into the mast the arm planner keeps clear ("wrist_3
+# position is INSIDE ENVIRONMENT OBSTACLE: Cylinder r=0.4 m", 2026-10-20). Nor
+# does anything retract TO it: the retracts after a sweep go to the sweep
+# standoff (_retract_standoff).
 SWEEP_APPROACH_RETRACT_M = 0.10
 
 # Where 'arm_tool0' sits above 'arm_base_link' in the scanning pose, in metres.
@@ -91,20 +98,13 @@ ARM_Z_WINDOW_M = 0.25
 # named pose ('<scanning pose>_xpol' in arm_control's position_sender_node),
 # never "the current pose + 90 deg": every partition then rolls the plate the
 # same way, and the cable and collision check done once on that pose covers all
-# of them. The plate is always pulled back off the wall (SCAN_WALL_ROLL_CLEARANCE_M)
-# before it is rolled or un-rolled.
+# of them. The plate is always pulled back off the wall (_roll_clearance) before
+# it is rolled or un-rolled.
 #
 # -pi/2 because it puts the GPR ABOVE the plate centre (+8 cm), and the plate is
 # lowered by that much so the antenna sweeps the same line as the upright pass.
 CROSS_POL_PLATE_ROLL = -math.pi / 2
 CROSS_POL_POSE_SUFFIX = "_xpol"
-
-# Plate-to-wall gap the arm retracts to before the plate is rolled or un-rolled
-# (ctx["scan_wall_roll_clearance_m"]). Under force mode the executor leaves the
-# plate ON the wall when the sweep ends, and a named-pose move from there drags
-# the GPR wheel across the surface. 0.30 m also keeps the plate's collision mesh
-# clear of the band the dilated octomap puts in front of the wall.
-SCAN_WALL_ROLL_CLEARANCE_M = 0.30
 
 # The named pose the arm folds into before the base moves to a different
 # reachable segment (between partitions of the SAME segment it stays unfolded,
@@ -544,7 +544,11 @@ class ScanWall(State):
             # Under Force Mode the executor ignores it entirely and sweeps in the
             # plane the press established.
             "-p", f"scan_standoff_m:={float(ctx.get('sweep_scan_standoff_m', 0.20))}",
-            "-p", f"approach_retract_m:={self._approach_retract(ctx)}",
+            # No retract leg after a sweep: from a partition end, a straight
+            # pull-back with the plate's orientation held curls the arm into the
+            # plate, and the executor checks no collisions (seen in simulation,
+            # 2026-10-20). The FSM's own retracts are planned.
+            "-p", f"approach_retract_m:={float(ctx.get('sweep_executor_retract_m', 0.0))}",
             "-p", f"max_traverse_m:={float(ctx.get('sweep_max_traverse_m', 1.10))}",
             # Diagnostic only. Once force mode has the plate on the wall the
             # executor sweeps from that contact pose rather than nudging it back
@@ -744,12 +748,11 @@ class ScanWall(State):
         surface it is not measuring.
 
         ``sweep_approach_retract_m`` defaults to SWEEP_APPROACH_RETRACT_M (0.10),
-        for an approach at 0.30 m: clear of the band the dilated octomap puts in
-        front of the wall, where the planned approach was refused. Force mode's
-        Z reach is sized from this distance (_build_force_mode_request), so the
-        press still gets to the wall. For the no-press path, where nothing holds
-        the plate off the wall, the margin is also the executor's post-sweep
-        retract.
+        for an approach that stops at 0.30 m at most: clear of the band the
+        dilated octomap puts in front of the wall, where the planned approach was
+        refused. The arm_approach only ever closes on the wall to it, never
+        backs off to it. Force mode's Z reach is sized from this distance
+        (_build_force_mode_request), so the press still gets to the wall.
 
         Keyed off ``sweep_scan_standoff_m`` in arm-sweep mode so raising the sweep
         standoff carries the approach out with it; the legacy base-driven path
@@ -760,13 +763,19 @@ class ScanWall(State):
                 else float(ctx.get("scan_wall_plate_offset", 0.20)))
         return base + self._approach_retract(ctx)
 
+    def _retract_standoff(self, ctx):
+        """Plate-to-wall gap the arm retracts to after a sweep, m: the sweep
+        standoff, which the scanning pose can always reach. See
+        SWEEP_APPROACH_RETRACT_M for why not the approach's 0.30 m."""
+        return float(ctx.get("sweep_scan_standoff_m", 0.20))
+
     @staticmethod
     def _approach_retract(ctx):
         """Approach margin beyond the sweep standoff, m (SWEEP_APPROACH_RETRACT_M)."""
         return float(ctx.get("sweep_approach_retract_m", SWEEP_APPROACH_RETRACT_M))
 
     def _send_arm_to_clearance(self, ctx, target, contact_default=False,
-                               retract_only=False):
+                               retract_only=False, advance_only=False):
         """Move the plate so it ends up ``target`` metres off the wall.
 
         Returns "sent" once a goal is out, "skip" when the move is unnecessary or
@@ -776,6 +785,8 @@ class ScanWall(State):
         whole purpose is to clear the wall should never close on it, whatever the
         arithmetic says -- and the arithmetic can say so, because the standoff
         knobs are independent and drift apart when one is retuned.
+        ``advance_only`` is the mirror image, for the approach: it never backs
+        the plate off toward the robot.
 
         With ``contact_default`` the plate is assumed to be ON the wall when no
         reading is usable — true after a force-mode press, where the ranges sit
@@ -818,6 +829,13 @@ class ScanWall(State):
                 f"[{self.name}] Plate already {d:.3f} m off the wall, further out "
                 f"than the {target:.2f} m clearance target; leaving it there rather "
                 f"than moving {advance:+.3f} m back toward the wall."
+            )
+            return "skip"
+        if advance_only and advance < 0.0:
+            node.get_logger().info(
+                f"[{self.name}] Plate already {d:.3f} m off the wall, closer than "
+                f"the {target:.2f} m approach standoff; leaving it there rather "
+                f"than pulling it {-advance:.3f} m back toward the robot."
             )
             return "skip"
         max_step = float(ctx.get("scan_wall_arm_z_max_step", 0.6))
@@ -1722,8 +1740,9 @@ class ScanWall(State):
         return str(ctx.get("scan_wall_xpol_pose") or name + CROSS_POL_POSE_SUFFIX)
 
     def _roll_clearance(self, ctx):
-        """Plate-to-wall gap to retract to before rolling or un-rolling, m."""
-        return float(ctx.get("scan_wall_roll_clearance_m", SCAN_WALL_ROLL_CLEARANCE_M))
+        """Plate-to-wall gap to retract to before rolling or un-rolling, m
+        (default: the sweep standoff)."""
+        return float(ctx.get("scan_wall_roll_clearance_m", self._retract_standoff(ctx)))
 
     # ------------------------------------------------------------------
     # Swept memory (survives re-entry into this state)
@@ -2169,12 +2188,11 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            # In arm-sweep mode the executor's own retract leg has already left the
-            # plate at the approach standoff, so use that same number here. Using a
-            # separate knob made the two drift apart the moment the sweep standoff
-            # was retuned, and this move then pushed the plate 10 cm back TOWARD the
-            # wall before transit_recenter folded the arm away anyway.
-            target = (self._approach_standoff(ctx) if self._use_arm_sweep(ctx)
+            # In arm-sweep mode back to the sweep standoff: the plate sits there
+            # after a no-press sweep (simulation), so this is then a no-op, and
+            # after a press it clears the wall by the gap the sweep was planned
+            # at. Further back would pull the wrist into the mast keep-out.
+            target = (self._retract_standoff(ctx) if self._use_arm_sweep(ctx)
                       else float(ctx.get("scan_wall_transit_plate_offset", 0.20)))
             # After a sweep the plate sits against the wall with its ranges below
             # their valid floor, so a missing reading there means "in contact", not
@@ -2555,8 +2573,7 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            # Defaults to the approach standoff: retracting any less only for
-            # arm_approach to back off the rest afterwards is a wasted move.
+            # Defaults to the sweep standoff, like every retract after a sweep.
             # This always follows a sweep, so a missing reading means the plate
             # is still pressed against the wall (its ranges below their valid
             # floor), exactly as in transit_clear -- not "unknown", which waited
@@ -2564,7 +2581,7 @@ class ScanWall(State):
             outcome = self._send_arm_to_clearance(
                 ctx,
                 float(ctx.get("scan_wall_line_change_plate_offset",
-                              self._approach_standoff(ctx))),
+                              self._retract_standoff(ctx))),
                 contact_default=True,
                 retract_only=True,
             )
@@ -2681,9 +2698,14 @@ class ScanWall(State):
             # that has always worked -- and the lateral traverse to the partition
             # start is the executor's, in the lead_in phase below, where the plate
             # is already extended and well clear of the column.
+            #
+            # Toward the wall only, in arm-sweep mode: when the scanning pose
+            # already leaves the plate closer than the approach standoff, it
+            # stays there -- moving it back would pull the wrist into the mast.
             target = (self._approach_standoff(ctx) if self._use_arm_sweep(ctx)
                       else float(ctx.get("scan_wall_plate_offset", 0.20)))
-            outcome = self._send_arm_to_clearance(ctx, target)
+            outcome = self._send_arm_to_clearance(
+                ctx, target, advance_only=self._use_arm_sweep(ctx))
             if outcome == "wait":
                 return
             if outcome == "sent":
