@@ -62,6 +62,28 @@ class ArmUnfolding(State):
                     ctx["error_triggered"] = True
                     return
 
+        # Arm-sweep wall scans take the arm over FOLDED, and ScanWall unfolds it
+        # once, after the base stands at the first partition's scan pose.
+        # Unfolding here bought unfold -> fold -> unfold whenever NavigateToTarget
+        # stopped outside that pose's tolerance (2026-10-20: 0.22 m off after
+        # the in-place turn), because ScanWall folds the arm for the correction.
+        # Only when the arm is KNOWN folded (ArmFolding set arm_folded): a
+        # checkpoint start or a re-entry with the arm out still unfolds here.
+        # Floor and ceiling scans (phases 2 and 3) always unfold here. The
+        # dashboard play above has already run: it starts the UR program and
+        # has nothing to do with arm position.
+        if (ctx.get("scan_phase") == 1
+                and bool(ctx.get("sweep_use_arm", True))
+                and ctx.get("arm_folded") is True
+                and not bool(ctx.get("arm_unfolding_force_unfold", False))):
+            node.get_logger().info(
+                f"[{self.name}] Wall scan: leaving the arm folded; ScanWall unfolds "
+                f"it once the base is at the first partition's scan pose."
+            )
+            ctx["unfolding_success"] = True
+            self.movement_done = True
+            return
+
         # The dashboard play only starts the External Control program; the
         # driver's controller_stopper re-activates the trajectory controller a
         # second or so later. A goal sent before that is rejected with
@@ -144,6 +166,7 @@ class ArmUnfolding(State):
         if exec_status is True:
             # Movement completed successfully
             self.movement_done = True
+            ctx["arm_folded"] = False
             ctx["execution_status"] = False  # Reset for next state
             node.get_logger().info(f"[{self.name}] Position {unfolded_pose_name(ctx)} reached. Movement complete.")
         elif exec_status is False or exec_status is None:

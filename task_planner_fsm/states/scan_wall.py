@@ -1515,6 +1515,21 @@ class ScanWall(State):
         """
         node = ctx["node"]
 
+        # --- Phase 0: handed over folded (ArmUnfolding, arm-sweep wall scans).
+        # Keep it folded: the first partition's transit unfolds it once the base
+        # stands at the scan pose -- or right away, through the same strict
+        # unfold, when no transit is needed. ---
+        if (not self.pose_reached and not self.pose_sent
+                and self._use_arm_sweep(ctx) and ctx.get("arm_folded") is True):
+            self.current_line_z = self._resolve_current_line_z(ctx)
+            self._arm_folded = True
+            self.pose_reached = True
+            node.get_logger().info(
+                f"[{self.name}] Pre-approach for line z={self.current_line_z:.3f}m: "
+                f"the arm comes folded and stays folded until the base is at "
+                f"partition 1's scan pose."
+            )
+
         # --- Phase 1: send the arm to the unfolded_fsm pose and wait for it. ---
         if not self.pose_reached:
             # Step 1a: send the named pose.
@@ -1568,7 +1583,8 @@ class ScanWall(State):
             if ctx.get("execution_status") is True:
                 ctx["execution_status"] = False
                 self.pose_reached = True
-                node.get_logger().info(f"[{self.name}] Arm at unfolded_fsm pose.")
+                self._note_arm_folded(ctx, False)
+                node.get_logger().info(f"[{self.name}] Arm at the scanning pose.")
             else:
                 if not self.preapproach_verbose:
                     node.get_logger().info(f"[{self.name}] Waiting for arm to reach pre-approach pose...")
@@ -1898,6 +1914,12 @@ class ScanWall(State):
             ) if part
         )
         return {"normal": e_n, "along": e_t, "yaw": yaw_err, "ok": not why, "why": why}
+
+    def _note_arm_folded(self, ctx, folded):
+        """Record whether the arm is folded, here and in ctx (which ArmFolding
+        and ArmUnfolding read and write too)."""
+        self._arm_folded = bool(folded)
+        ctx["arm_folded"] = bool(folded)
 
     def _at_partition(self, ctx):
         """The base stands at the current partition: unfold if the transit
@@ -2281,10 +2303,17 @@ class ScanWall(State):
             if not self._use_arm_sweep(ctx):
                 self._seg_phase = "transit"
                 return
+            if self._arm_folded:
+                # Folded already (handed over folded, or a transit that failed):
+                # no re-centre, which would unfold it through a wait that
+                # swallows failures. The base moves -- or not -- with the arm in,
+                # and the arrival unfolds it through the strict check.
+                self._seg_phase = "transit"
+                return
             kind = self._partition_transit_plan(ctx)[0]
             if kind == "go" and self._fold_before_transit(ctx):
                 # A different reachable segment: fold rather than re-centre.
-                self._seg_phase = "transit" if self._arm_folded else "transit_fold"
+                self._seg_phase = "transit_fold"
                 return
             self.set_activity(
                 ctx,
@@ -2307,7 +2336,6 @@ class ScanWall(State):
                 return
             self._arm_goal_start = None
             self._recenter_future = None
-            self._arm_folded = False      # a re-centre from folded unfolds it
             self._seg_phase = "transit"
             return
 
@@ -2338,10 +2366,13 @@ class ScanWall(State):
                 # folded: that is the situation folding exists to prevent.
                 return self._skip_partition(
                     ctx, f"The fold before the transit to partition {seg_no} did not complete")
-            self._arm_folded = True
+            self._note_arm_folded(ctx, True)
             node.get_logger().info(
-                f"[{self.name}] Arm folded: partition {seg_no} is on another reachable "
-                f"segment, the base moves with the arm in."
+                f"[{self.name}] Arm folded: "
+                + (f"the base moves from NavigateToTarget's pose to partition {seg_no}"
+                   if self._last_source is None else
+                   f"partition {seg_no} is on another reachable segment")
+                + ", with the arm in."
             )
             self._seg_phase = "transit"
             return
@@ -2372,7 +2403,7 @@ class ScanWall(State):
                 return self._skip_partition(
                     ctx, f"The unfold at partition {seg_no} did not complete; a folded "
                          f"arm cannot reach the wall")
-            self._arm_folded = False
+            self._note_arm_folded(ctx, False)
             self.column_commanded = False
             self._seg_phase = "line_column"
             return
@@ -4064,6 +4095,7 @@ class ScanWall(State):
             if ctx.get("execution_status") is True:
                 ctx["execution_status"] = False
                 self.arm_retracted = True
+                self._note_arm_folded(ctx, False)
                 node.get_logger().info(f"[{self.name}] Arm retracted from wall.")
             else:
                 if not self.retract_verbose:

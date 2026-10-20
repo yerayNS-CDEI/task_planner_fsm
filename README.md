@@ -733,6 +733,7 @@ does with none of them set.
 | `scan_wall_roll_clearance_m` | sweep standoff (`0.20`) | Plate-to-wall gap the arm retracts to before the plate is rolled or turned upright again (under force mode the sweep ends with the plate on the wall) |
 | `scan_wall_xpol_pose` | `<scanning pose>_xpol` | Named pose for the rolled pass (`unfolded_front_fsm_xpol` / `unfolded_fsm_xpol` in arm_control's position_sender_node) |
 | `scan_wall_fold_between_segments` | `true` | Fold the arm (`folded_fsm`) before a transit to a different reachable segment, and unfold it on arrival. Between partitions of the same segment the arm stays out, only re-centred |
+| `arm_unfolding_force_unfold` | `false` | Arm-sweep wall scans: ArmUnfolding leaves an arm it knows is folded (ArmFolding ran) folded, and ScanWall unfolds it once, after the base is at the first partition's scan pose. `true` unfolds in ArmUnfolding as before |
 | `scan_wall_named_pose_timeout_s` | `180` | Budget for a fold, unfold or roll; one that fails or times out skips the partition (fold/unfold) or the rolled pass (roll) |
 | `scan_wall_scan_pose_tool_z` / `scan_wall_arm_z_window` | `0.5217` / `0.25` | The column is sized from the arm MOUNT: the scanning pose's tool sits this far above `arm_base_link`, and only height beyond the arm's own +/- window moves the column (sized for both passes' heights) |
 | `scan_wall_resume` / `scan_wall_resume_tolerance` | `true` / `0.25` | Remember swept partitions per wall, height and pass in ctx, so a re-entry of ScanWall skips what was already swept |
