@@ -1623,7 +1623,11 @@ class ScanWall(State):
             self._start_sweep_executor(ctx)
 
         self.preapproach_done = True
-        node.get_logger().info(f"[{self.name}] Pre-approach complete. Arm in scanning position.")
+        node.get_logger().info(
+            f"[{self.name}] Pre-approach complete. "
+            + ("Arm folded; it unfolds once the base is at partition 1's scan pose."
+               if self._arm_folded else "Arm in scanning position.")
+        )
 
     # ------------------------------------------------------------------
     # Main tick
