@@ -79,3 +79,10 @@ def test_retracts_after_a_sweep_go_to_the_sweep_standoff(state):
     assert state._retract_standoff({}) == pytest.approx(0.20)
     assert state._roll_clearance({}) == pytest.approx(0.20)
     assert state._roll_clearance({"scan_wall_roll_clearance_m": 0.15}) == pytest.approx(0.15)
+
+
+def test_the_simulated_base_parks_further_from_the_wall():
+    from task_planner_fsm.utils.costmap_utils import partition_base_standoff
+    assert partition_base_standoff({}) == pytest.approx(1.15)
+    assert partition_base_standoff({"sim": True}) == pytest.approx(1.30)
+    assert partition_base_standoff({"sim": True, "partition_base_standoff_m": 1.2}) == pytest.approx(1.2)

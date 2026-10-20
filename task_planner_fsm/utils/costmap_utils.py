@@ -73,10 +73,28 @@ DEFAULT_SCAN_LINE_OFFSET = 0.6
 # further out than the number said.
 DEFAULT_PARTITION_BASE_STANDOFF = 1.15
 
+# The same, in simulation. At 1.15 m Gazebo's scanning pose leaves the plate
+# ~0.25 m off the wall, inside the 0.30 m approach ceiling, so the moves sized
+# off the wall run the wrist toward the mast keep-out (refused: "wrist_3
+# position is INSIDE ENVIRONMENT OBSTACLE") and the scan stalls on them. 1.30 m
+# is where partition 1 actually ran on 2026-10-20: the plate ~0.40 m off at the
+# scanning pose, the approach closing it to 0.30 m and the lead-in to the
+# 0.20 m sweep standoff, nothing refused. partition_base_standoff_m still
+# overrides either.
+DEFAULT_PARTITION_BASE_STANDOFF_SIM = 1.30
+
 
 def _scan_line_offset(ctx) -> float:
     """Distance (m) from the wall face to the scan line the partitions lie on."""
     return max(0.0, float(ctx.get("wall_scan_line_offset_m", DEFAULT_SCAN_LINE_OFFSET)))
+
+
+def partition_base_standoff(ctx) -> float:
+    """Base-centre distance from the wall face for a partition scan pose (m):
+    ``partition_base_standoff_m``, else the real-robot or simulation default."""
+    default = (DEFAULT_PARTITION_BASE_STANDOFF_SIM if bool(ctx.get("sim", False))
+               else DEFAULT_PARTITION_BASE_STANDOFF)
+    return float(ctx.get("partition_base_standoff_m", default))
 
 
 def _partition_standoff(ctx, state_name: str) -> Tuple[float, float]:
@@ -86,7 +104,7 @@ def _partition_standoff(ctx, state_name: str) -> Tuple[float, float]:
     measures with a tape; the geometry needs the push from the partition centre,
     which sits ``scan_offset`` closer to the wall than the base ever goes.
     """
-    standoff = float(ctx.get("partition_base_standoff_m", DEFAULT_PARTITION_BASE_STANDOFF))
+    standoff = partition_base_standoff(ctx)
     scan_offset = _scan_line_offset(ctx)
     push = standoff - scan_offset
     if push < 0.0:

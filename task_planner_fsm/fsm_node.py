@@ -69,8 +69,8 @@ from task_planner_fsm.states.proc_utils import (
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
 from task_planner_fsm.utils.costmap_utils import (
     DEFAULT_NAV_BASE_FRAME,
-    DEFAULT_PARTITION_BASE_STANDOFF,
     DEFAULT_SCAN_LINE_OFFSET,
+    partition_base_standoff,
     world_frame,
 )
 from task_planner_fsm.utils.wall_geometry import (
@@ -1064,9 +1064,7 @@ class RobotFSMNode(Node):
             )
         frame, (x, y, yaw) = found
 
-        standoff = float(
-            self.ctx.get("partition_base_standoff_m", DEFAULT_PARTITION_BASE_STANDOFF)
-        )
+        standoff = partition_base_standoff(self.ctx)
         offset = float(self.ctx.get("wall_scan_line_offset_m", DEFAULT_SCAN_LINE_OFFSET))
         max_len = float(self.ctx.get("partition_max_length_m", 0.8))
         length = float(self.ctx.get("bootstrap_wall_length_m", max_len))
