@@ -293,9 +293,14 @@ class RobotFSMNode(Node):
         # TF checks will still work correctly by using rclpy.time.Time() which
         # automatically gets the latest available transform regardless of time source.
         
-        # TF2 buffer and listener for transform checks
+        # TF2 buffer and listener for transform checks. The listener gets a node
+        # and thread of its own: on this node, /tf was only taken in between the
+        # state machine's callbacks, so the buffer fell seconds behind while a
+        # state was busy, and ScanWall placed the arm's approach goal from a pose
+        # read mid-unfold (2026-10-21). Passing None (not self) keeps the FSM
+        # node itself on the main executor only.
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, None, spin_thread=True)
 
         # FSM telemetry publishers
         current_qos = QoSProfile(depth=1)
