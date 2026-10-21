@@ -58,6 +58,15 @@ PLATE_SENSOR_VALID_HI = (3.90, 3.90, 3.90, 0.258, 0.258, 0.258)
 # reader publishes at ~5 Hz, so anything older means it died or was stopped.
 PLATE_DISTANCE_MAX_AGE_S = 3.0
 
+# Oldest arm_base->arm_tool0 transform (s) an arm move may be placed from.
+# robot_state_publisher republishes it at the joint-state rate (~100 Hz), so an
+# older one means this process's TF view lags the arm. On 2026-10-21 it lagged
+# ~5 s, the approach goal was placed from a pose read mid-unfold, and the plate
+# ended up rotated ~28 deg and 0.4-0.5 m off the wall. Wait up to
+# TOOL_POSE_WAIT_S for a current pose rather than move from an old one.
+TOOL_POSE_MAX_AGE_S = 0.5
+TOOL_POSE_WAIT_S = 5.0
+
 # How much further off the wall than the sweep standoff (sweep_scan_standoff_m,
 # 0.20 m) the arm's planned approach stops, AT MOST, in metres
 # (ctx["sweep_approach_retract_m"]): the approach closes on the wall to 0.30 m
@@ -246,6 +255,7 @@ class ScanWall(State):
         self._arm_goal_start = None      # planner wait deadline for the Z move
         self._recenter_future = None     # /send_position call for the pre-transit re-pose
         self._plate_wait_start = None    # bounded wait for the first plate reading
+        self._tf_wait_start = None       # bounded wait for a current arm TF
         self._segments_ok = 0        # segments actually swept on this line
         self._last_swept_point = None
         self._nav_status = None      # set by _on_nav_result / rejection / crawl tick
@@ -387,6 +397,7 @@ class ScanWall(State):
         self._arm_goal_start = None
         self._recenter_future = None
         self._plate_wait_start = None
+        self._tf_wait_start = None
         self._segments_ok = 0
         self._last_swept_point = None
         self._nav_status = None
@@ -676,9 +687,11 @@ class ScanWall(State):
         return sum(valid) / len(valid)
 
     def _tool0_pose(self, ctx):
-        """(translation, rotation) of the plate TCP in the arm planning frame, or
-        None. Read from TF rather than /end_effector_pose: that topic ticks at 1 Hz
-        and goes stale, which is exactly why wall_parallel_controller reads TF too.
+        """(translation, rotation, age_s) of the plate TCP in the arm planning
+        frame, or None. Read from TF rather than /end_effector_pose: that topic
+        ticks at 1 Hz and goes stale, which is exactly why wall_parallel_controller
+        reads TF too. age_s is how old the transform is on the real robot, None in
+        sim (this node runs on wall time while TF carries sim time there).
         """
         tf_buffer = ctx.get("tf_buffer")
         if tf_buffer is None:
@@ -698,7 +711,39 @@ class ScanWall(State):
                 f"[{self.name}] {base_frame}->{tool_frame} lookup failed: {e}"
             )
             return None
-        return tf.transform.translation, tf.transform.rotation
+        age_s = None
+        if not bool(ctx.get("sim", False)):
+            stamp = rclpy.time.Time.from_msg(tf.header.stamp)
+            age_s = (ctx["node"].get_clock().now() - stamp).nanoseconds / 1e9
+        return tf.transform.translation, tf.transform.rotation, age_s
+
+    def _tool_pose_current(self, ctx):
+        """Whether an arm move may be placed from the TF pose now: "ok" when it
+        is current (TOOL_POSE_MAX_AGE_S), "wait" for up to TOOL_POSE_WAIT_S while
+        it is not, then "skip" (logged) rather than move from a stale pose."""
+        node = ctx["node"]
+        pose = self._tool0_pose(ctx)
+        age_s = pose[2] if pose is not None else None
+        if pose is None or (age_s is not None and age_s > TOOL_POSE_MAX_AGE_S):
+            now = time.time()
+            age_txt = "unavailable" if pose is None else f"{age_s:.2f} s old"
+            if self._tf_wait_start is None:
+                self._tf_wait_start = now
+                node.get_logger().warn(
+                    f"[{self.name}] Arm TF is {age_txt}; waiting up to "
+                    f"{TOOL_POSE_WAIT_S:.0f}s for a current pose before moving the arm."
+                )
+                return "wait"
+            if now - self._tf_wait_start < TOOL_POSE_WAIT_S:
+                return "wait"
+            node.get_logger().error(
+                f"[{self.name}] Arm TF still {age_txt} after {TOOL_POSE_WAIT_S:.0f}s; "
+                f"not moving the arm from a stale pose."
+            )
+            self._tf_wait_start = None
+            return "skip"
+        self._tf_wait_start = None
+        return "ok"
 
     @staticmethod
     def _tool_z_axis(q):
@@ -731,7 +776,7 @@ class ScanWall(State):
                 f"[{self.name}] No arm TF available; cannot place the Z goal."
             )
             return False
-        p, q = pose
+        p, q, _age_s = pose
         zx, zy, zz = self._tool_z_axis(q)
 
         if self._arm_goal_pub is None:
@@ -844,6 +889,13 @@ class ScanWall(State):
                 return "skip"
 
         self._plate_wait_start = None
+
+        # The goal is placed from the arm's TF pose, so that pose must be current
+        # (see TOOL_POSE_MAX_AGE_S): wait for it rather than move from an old one.
+        tf_state = self._tool_pose_current(ctx)
+        if tf_state != "ok":
+            return tf_state
+
         advance = d - float(target)
         if retract_only and advance > 0.0:
             node.get_logger().info(
@@ -1819,7 +1871,7 @@ class ScanWall(State):
         if pose is None:
             node.get_logger().warn(f"[{self.name}] No arm TF available; cannot roll in place.")
             return False
-        p, q = pose
+        p, q, _age_s = pose
         half = roll / 2.0
         rz_w, rz_z = math.cos(half), math.sin(half)
         # q * Rz(roll): rotate about the plate's OWN Z (body frame).
@@ -3341,7 +3393,11 @@ class ScanWall(State):
                 progress_current=seg_no,
                 progress_total=seg_total,
             )
-            if not self._send_arm_roll_goal(ctx, CROSS_POL_PLATE_ROLL):
+            # Placed from the TF pose like the Z moves, so from a current one.
+            tf_state = self._tool_pose_current(ctx)
+            if tf_state == "wait":
+                return
+            if tf_state != "ok" or not self._send_arm_roll_goal(ctx, CROSS_POL_PLATE_ROLL):
                 self._seg_phase = "xpol_pose"      # through the named pose instead
                 return
             self._arm_goal_start = None

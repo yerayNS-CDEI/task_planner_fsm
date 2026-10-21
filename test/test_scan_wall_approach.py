@@ -32,7 +32,10 @@ class _Node:
 
 @pytest.fixture
 def state():
-    return ScanWall("ScanWall")
+    state = ScanWall("ScanWall")
+    # A current arm TF pose: arm moves are placed from it (1842a78).
+    state._tool0_pose = lambda ctx: (object(), object(), None)
+    return state
 
 
 def test_the_approach_leaves_the_plate_thirty_centimetres_off(state):

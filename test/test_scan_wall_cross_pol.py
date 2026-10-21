@@ -285,7 +285,7 @@ def test_the_in_place_roll_turns_the_plate_about_its_own_normal(state):
     q0 = R.from_euler("xyz", [0.3, -1.1, 0.7])
     x, y, z, w = q0.as_quat()
     p = SimpleNamespace(x=0.5, y=-0.4, z=0.6)
-    state._tool0_pose = lambda ctx: (p, SimpleNamespace(x=x, y=y, z=z, w=w))
+    state._tool0_pose = lambda ctx: (p, SimpleNamespace(x=x, y=y, z=z, w=w), None)
     state._arm_goal_pub = _Pub()
     ctx = make_ctx()
     from builtin_interfaces.msg import Time
@@ -301,6 +301,28 @@ def test_the_in_place_roll_turns_the_plate_about_its_own_normal(state):
     assert (msg.pose.position.x, msg.pose.position.y, msg.pose.position.z) == (0.5, -0.4, 0.6)
     assert got.apply([0, 0, 1]) == pytest.approx(q0.apply([0, 0, 1]))
     assert ctx["execution_status"] is False and ctx["planner_goal_failed"] is False
+
+
+def test_the_roll_waits_for_a_current_arm_pose_then_gives_up_on_a_stale_one(state, monkeypatch):
+    """The roll is placed from the TF pose like the approach (1842a78): a stale
+    one is waited out for up to TOOL_POSE_WAIT_S, then the roll is not placed
+    and xpol_roll goes through the named pose instead."""
+    now = [100.0]
+    monkeypatch.setattr(scan_wall_mod.time, "time", lambda: now[0])
+    ctx = make_ctx()
+    age = [2.0]
+    state._tool0_pose = lambda ctx: (object(), object(), age[0])
+    assert state._tool_pose_current(ctx) == "wait"
+    now[0] += scan_wall_mod.TOOL_POSE_WAIT_S - 0.1
+    assert state._tool_pose_current(ctx) == "wait"
+    now[0] += 0.2
+    assert state._tool_pose_current(ctx) == "skip"
+    age[0] = 0.05
+    assert state._tool_pose_current(ctx) == "ok"
+    age[0] = None                                    # sim: no age to judge
+    assert state._tool_pose_current(ctx) == "ok"
+    state._tool0_pose = lambda ctx: None
+    assert state._tool_pose_current(ctx) == "wait"
 
 
 def test_the_retract_for_the_roll_never_reaches_behind_the_scanning_pose(state):
