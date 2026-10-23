@@ -168,8 +168,28 @@ def test_a_partition_is_never_swept_with_the_arm_folded(phases):
 # Cross-polarized pass: off the wall before anything rolls
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("clear, pose", [("xpol_clear", "xpol_pose"),
-                                         ("unroll_clear", "unroll_pose")])
+def test_the_plate_is_retracted_twice_before_it_rolls(phases):
+    """First to the sweep standoff (always reachable), then best effort further
+    for the in-place roll; only then does anything roll, in place or through
+    the named pose."""
+    first = phases["xpol_clear"]
+    assert "_send_arm_to_clearance(" in first
+    assert "retract_only=True" in first and "contact_default=True" in first
+    assert targets_of(first) - {"sent"} <= {"xpol_clear_wait", "xpol_clear_far"}
+    assert targets_of(phases["xpol_clear_wait"]) == {"xpol_clear_far"}
+    far = phases["xpol_clear_far"]
+    assert "_send_arm_to_clearance(" in far and "retract_only=True" in far
+    assert targets_of(far) - {"sent"} <= {"xpol_clear_far_wait", "xpol_roll", "xpol_pose"}
+    assert targets_of(phases["xpol_clear_far_wait"]) == {"xpol_roll"}
+    for phase in ("xpol_clear", "xpol_clear_wait", "xpol_clear_far", "xpol_clear_far_wait"):
+        assert "_send_named_pose" not in phases[phase]
+        assert "_send_arm_roll_goal" not in phases[phase]
+    assert "_send_arm_roll_goal" in phases["xpol_roll"]
+    # A refused in-place roll falls back to the named pose, never sweeps unrolled.
+    assert "xpol_pose" in targets_of(phases["xpol_roll_wait"])
+
+
+@pytest.mark.parametrize("clear, pose", [("unroll_clear", "unroll_pose")])
 def test_the_plate_is_retracted_before_it_rolls(phases, clear, pose):
     """Under force mode the executor leaves the plate on the wall; the roll (and
     the un-roll) is a planned named-pose move that must not start from there."""

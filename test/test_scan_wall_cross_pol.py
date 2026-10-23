@@ -266,3 +266,54 @@ def test_the_column_covers_only_what_the_arm_cannot(column_state):
                        scan_wall_cross_pol=False)
     assert column_state._column_target_for_line(no_xpol, 1.80) == pytest.approx(
         (1.80 - tool_z) - 0.25)
+
+
+# ---------------------------------------------------------------------------
+# Rolling in place
+# ---------------------------------------------------------------------------
+
+class _Pub:
+    def __init__(self):
+        self.sent = []
+
+    def publish(self, msg):
+        self.sent.append(msg)
+
+
+def test_the_in_place_roll_turns_the_plate_about_its_own_normal(state):
+    from scipy.spatial.transform import Rotation as R
+    q0 = R.from_euler("xyz", [0.3, -1.1, 0.7])
+    x, y, z, w = q0.as_quat()
+    p = SimpleNamespace(x=0.5, y=-0.4, z=0.6)
+    state._tool0_pose = lambda ctx: (p, SimpleNamespace(x=x, y=y, z=z, w=w))
+    state._arm_goal_pub = _Pub()
+    ctx = make_ctx()
+    from builtin_interfaces.msg import Time
+    ctx["node"].get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: Time()))
+    assert state._send_arm_roll_goal(ctx, CROSS_POL_PLATE_ROLL)
+    (msg,) = state._arm_goal_pub.sent
+    o = msg.pose.orientation
+    got = R.from_quat([o.x, o.y, o.z, o.w])
+    want = q0 * R.from_euler("z", CROSS_POL_PLATE_ROLL)
+    assert (got.inv() * want).magnitude() == pytest.approx(0.0, abs=1e-9)
+    # Same position, same plate normal: only the roll about it changed.
+    assert (msg.pose.position.x, msg.pose.position.y, msg.pose.position.z) == (0.5, -0.4, 0.6)
+    assert got.apply([0, 0, 1]) == pytest.approx(q0.apply([0, 0, 1]))
+    assert ctx["execution_status"] is False and ctx["planner_goal_failed"] is False
+
+
+def test_the_retract_for_the_roll_never_reaches_behind_the_scanning_pose(state):
+    ctx = make_ctx()
+    assert state._roll_in_place_clearance(ctx) == pytest.approx(0.30)   # sim: room to spare
+    state._scan_pose_gap = 0.25                                          # robot's 1.15 m standoff
+    assert state._roll_in_place_clearance(ctx) == pytest.approx(0.25)
+    state._scan_pose_gap = 0.12
+    assert state._roll_in_place_clearance(ctx) == pytest.approx(0.20)   # never under the first retract
+    assert state._roll_in_place_clearance(
+        make_ctx(scan_wall_roll_in_place_clearance_m=0.22)) == pytest.approx(0.22)
+
+
+def test_the_roll_in_place_can_be_turned_off(state):
+    assert state._roll_in_place_enabled(make_ctx())
+    assert not state._roll_in_place_enabled(make_ctx(scan_wall_roll_in_place=False))

@@ -20,7 +20,7 @@ from ..utils.wall_approach import unfolded_pose_name
 from arm_control.action import SweepLine
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import SpeedLimit
-from geometry_msgs.msg import Point, PoseStamped, Twist
+from geometry_msgs.msg import Point, PoseStamped, Quaternion, Twist
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Bool
 from rclpy.action import ActionClient
@@ -315,6 +315,10 @@ class ScanWall(State):
         # progress is the rolled one, back over the partition just swept upright.
         self._xpol = False
         self._xpol_ok = 0            # rolled sweeps completed on this line
+        # Plate-to-wall gap measured at the scanning pose, before the upright
+        # pass's approach: how far back the arm demonstrably reaches here, which
+        # bounds the retract before an in-place roll (_roll_clearance).
+        self._scan_pose_gap = None
         # Arm folded for a transit to another reachable segment (FOLDED_POSE);
         # unfolded again once the base has arrived.
         self._arm_folded = False
@@ -396,6 +400,7 @@ class ScanWall(State):
         self._controller_gate.reset()
         self._xpol = False
         self._xpol_ok = 0
+        self._scan_pose_gap = None
         self._arm_folded = False
         self._last_source = None
         ctx["error_triggered"] = False
@@ -1731,6 +1736,12 @@ class ScanWall(State):
         """Sweep every partition a second time with the plate rolled. On by default."""
         return bool(ctx.get("scan_wall_cross_pol", True))
 
+    @staticmethod
+    def _roll_in_place_enabled(ctx):
+        """Roll the plate where it is after the upright sweep (default), rather
+        than through the named ``_xpol`` pose."""
+        return bool(ctx.get("scan_wall_roll_in_place", True))
+
     def _plate_roll(self):
         """Roll about the wall normal the plate sweeps at on this pass, rad."""
         return CROSS_POL_PLATE_ROLL if self._xpol else 0.0
@@ -1763,6 +1774,61 @@ class ScanWall(State):
         """Plate-to-wall gap to retract to before rolling or un-rolling, m
         (default: the sweep standoff)."""
         return float(ctx.get("scan_wall_roll_clearance_m", self._retract_standoff(ctx)))
+
+    def _roll_in_place_clearance(self, ctx):
+        """Gap for the in-place roll, m: the approach standoff (0.30 m, clear of
+        the band the dilated octomap puts in front of the wall, where a goal at
+        0.20 m was refused "sometimes"), but never further back than the gap the
+        scanning pose itself left at this partition -- behind that the wrist
+        heads for the mast keep-out (at the robot's 1.15 m standoff the
+        scanning pose leaves only ~0.25 m). Never less than _roll_clearance."""
+        override = ctx.get("scan_wall_roll_in_place_clearance_m")
+        if override is not None:
+            return float(override)
+        target = self._approach_standoff(ctx)
+        if self._scan_pose_gap is not None:
+            target = min(target, self._scan_pose_gap)
+        return max(target, self._roll_clearance(ctx))
+
+    def _send_arm_roll_goal(self, ctx, roll):
+        """Roll the plate ``roll`` rad about its own normal, in place: a
+        /arm/goal_pose at the tool's current position with its orientation
+        rotated about tool0 Z. tool0 lies on the wrist_3 axis, so the planner's
+        nearest IK solution is the same arm configuration with wrist_3 turned --
+        nothing else moves. Planned and collision-checked like the Z moves, and
+        reported on the same execution_status / planner_goal_failed pair.
+        Returns True once published."""
+        node = ctx["node"]
+        pose = self._tool0_pose(ctx)
+        if pose is None:
+            node.get_logger().warn(f"[{self.name}] No arm TF available; cannot roll in place.")
+            return False
+        p, q = pose
+        half = roll / 2.0
+        rz_w, rz_z = math.cos(half), math.sin(half)
+        # q * Rz(roll): rotate about the plate's OWN Z (body frame).
+        rolled = Quaternion(
+            x=q.x * rz_w + q.y * rz_z,
+            y=q.y * rz_w - q.x * rz_z,
+            z=q.z * rz_w + q.w * rz_z,
+            w=q.w * rz_w - q.z * rz_z,
+        )
+        if self._arm_goal_pub is None:
+            topic = str(ctx.get("arm_goal_pose_topic", "/arm/goal_pose"))
+            self._arm_goal_pub = node.create_publisher(PoseStamped, topic, 10)
+        msg = PoseStamped()
+        msg.header.frame_id = str(ctx.get("arm_base_frame", "arm_base"))
+        msg.header.stamp = node.get_clock().now().to_msg()
+        msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = p.x, p.y, p.z
+        msg.pose.orientation = rolled
+        ctx["execution_status"] = False
+        ctx["planner_goal_failed"] = False
+        self._arm_goal_pub.publish(msg)
+        node.get_logger().info(
+            f"[{self.name}] Rolling the plate {math.degrees(roll):+.0f} deg in place at "
+            f"({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) in {msg.header.frame_id}."
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Swept memory (survives re-entry into this state)
@@ -2781,6 +2847,12 @@ class ScanWall(State):
             # stays there -- moving it back would pull the wrist into the mast.
             target = (self._approach_standoff(ctx) if self._use_arm_sweep(ctx)
                       else float(ctx.get("scan_wall_plate_offset", 0.20)))
+            if not self._xpol:
+                # The arm is at the scanning pose: remember how far back it
+                # reaches here, for the in-place roll's retract.
+                gap = self._plate_wall_distance(ctx)
+                if gap is not None:
+                    self._scan_pose_gap = gap
             outcome = self._send_arm_to_clearance(
                 ctx, target, advance_only=self._use_arm_sweep(ctx))
             if outcome == "wait":
@@ -3114,14 +3186,75 @@ class ScanWall(State):
             if outcome == "wait":
                 return
             self._arm_goal_start = None
-            self._seg_phase = "xpol_clear_wait" if outcome == "sent" else "xpol_pose"
+            self._seg_phase = "xpol_clear_wait" if outcome == "sent" else "xpol_clear_far"
             return
 
         if self._seg_phase == "xpol_clear_wait":
             if not self._arm_goal_settled(ctx):
                 return
             self._arm_goal_start = None
-            self._seg_phase = "xpol_pose"
+            self._seg_phase = "xpol_clear_far"
+            return
+
+        if self._seg_phase == "xpol_clear_far":
+            # Off the wall by the sweep standoff already (a reach the arm always
+            # has); now, best effort, further back for the in-place roll, so its
+            # goal sits clear of the octomap band. A refused move leaves the
+            # plate where the first retract put it.
+            if not self._roll_in_place_enabled(ctx):
+                self._seg_phase = "xpol_pose"
+                return
+            outcome = self._send_arm_to_clearance(
+                ctx, self._roll_in_place_clearance(ctx), retract_only=True)
+            if outcome == "wait":
+                return
+            self._arm_goal_start = None
+            self._seg_phase = "xpol_clear_far_wait" if outcome == "sent" else "xpol_roll"
+            return
+
+        if self._seg_phase == "xpol_clear_far_wait":
+            if not self._arm_goal_settled(ctx):
+                return
+            self._arm_goal_start = None
+            self._seg_phase = "xpol_roll"
+            return
+
+        if self._seg_phase == "xpol_roll":
+            # Roll where the plate is: it already stands at the end of the
+            # partition, which is where the rolled sweep starts. Going through
+            # the named pose instead re-centred the arm only for the lead-in to
+            # cross half a partition back.
+            self.set_activity(
+                ctx,
+                f"Rolling the sensor plate in place for segment {seg_no}/{seg_total}{pass_label}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            if not self._send_arm_roll_goal(ctx, CROSS_POL_PLATE_ROLL):
+                self._seg_phase = "xpol_pose"      # through the named pose instead
+                return
+            self._arm_goal_start = None
+            self._seg_phase = "xpol_roll_wait"
+            return
+
+        if self._seg_phase == "xpol_roll_wait":
+            status = self._named_pose_settled(ctx)
+            if status == "wait":
+                return
+            self._arm_goal_start = None
+            if status == "failed":
+                node.get_logger().warn(
+                    f"[{self.name}] In-place roll refused or incomplete; rolling through "
+                    f"'{self._scan_pose_name(ctx)}' instead."
+                )
+                self._seg_phase = "xpol_pose"
+                return
+            node.get_logger().info(
+                f"[{self.name}] Plate rolled {math.degrees(CROSS_POL_PLATE_ROLL):+.0f} deg in "
+                f"place; sweeping partition {seg_no} back cross-polarized, the plate "
+                f"{abs(self._plate_rise()) * 100:.0f} cm lower so the GPR stays on the line."
+            )
+            self._seg_phase = "sweep_setup"
             return
 
         if self._seg_phase == "xpol_pose":
