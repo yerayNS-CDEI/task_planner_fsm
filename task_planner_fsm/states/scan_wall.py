@@ -2701,17 +2701,16 @@ class ScanWall(State):
             return
 
         if self._seg_phase == "line_change":
-            # Between heights at ONE base stop the base does not move, so the plate
-            # only has to clear the wall enough for the COLUMN to travel -- much
-            # less than the transit case, which exists to stop the plate being
-            # dragged sideways while the whole robot slides (§8.2). Its own knob so
-            # it can be tried at the scan standoff, where this retract and the
-            # following arm_approach both collapse to no-ops.
+            # Between two heights at ONE base stop. The column must not travel
+            # with the arm stretched out to the end of the partition (simulation,
+            # 2026-10-23: raised 0.31 m with the plate 0.20 m off the wall), so:
+            # retract off the wall, back into the scanning pose -- which also
+            # turns a rolled plate upright again -- and only then the column.
             heights = self._line_heights(ctx)
             self.current_line_z = heights[self._line_idx]
             self.set_activity(
                 ctx,
-                f"Raising the column to height {self._line_idx + 1}/{len(heights)} "
+                f"Retracting the arm before height {self._line_idx + 1}/{len(heights)} "
                 f"at wall segment {seg_no}/{seg_total}{pass_label}",
                 progress_current=seg_no,
                 progress_total=seg_total,
@@ -2720,7 +2719,7 @@ class ScanWall(State):
             # This always follows a sweep, so a missing reading means the plate
             # is still pressed against the wall (its ranges below their valid
             # floor), exactly as in transit_clear -- not "unknown", which waited
-            # 15 s and then moved the column without retracting at all.
+            # 15 s and then moved on without retracting at all.
             outcome = self._send_arm_to_clearance(
                 ctx,
                 float(ctx.get("scan_wall_line_change_plate_offset",
@@ -2730,17 +2729,45 @@ class ScanWall(State):
             )
             if outcome == "wait":
                 return
-            if outcome == "sent":
-                self._arm_goal_start = None
-                self._seg_phase = "line_change_wait"
-                return
-            self._seg_phase = "line_column"
+            self._arm_goal_start = None
+            self._seg_phase = "line_change_wait" if outcome == "sent" else "line_change_pose"
             return
 
         if self._seg_phase == "line_change_wait":
             if not self._arm_goal_settled(ctx):
                 return
             self._arm_goal_start = None
+            self._seg_phase = "line_change_pose"
+            return
+
+        if self._seg_phase == "line_change_pose":
+            self.set_activity(
+                ctx,
+                f"Re-centring the arm before the column moves at segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            outcome = self._send_named_pose(ctx, self._scan_pose_name(ctx))
+            if outcome == "wait":
+                return
+            if outcome == "skip":
+                return self._skip_partition(
+                    ctx, f"Could not re-centre the arm for the next height at partition {seg_no}")
+            self._arm_goal_start = None
+            self._seg_phase = "line_change_pose_wait"
+            return
+
+        if self._seg_phase == "line_change_pose_wait":
+            status = self._named_pose_settled(ctx)
+            if status == "wait":
+                return
+            self._arm_goal_start = None
+            if status == "failed":
+                # Never move the column with the arm somewhere out there.
+                return self._skip_partition(
+                    ctx, f"The arm did not reach the scanning pose for the next height "
+                         f"at partition {seg_no}")
+            self.column_commanded = False
             self._seg_phase = "line_column"
             return
 
@@ -2749,9 +2776,9 @@ class ScanWall(State):
                 self.current_line_z = self._line_heights(ctx)[self._line_idx]
             elif self.current_line_z is None:
                 self.current_line_z = self._resolve_current_line_z(ctx)
-            # The only motion between heights. The arm keeps its pose; §8.2
-            # confirmed on hardware that the plate standoff is enough clearance for
-            # the column to travel, so no unfolded_fsm re-pose is needed here.
+            # The only base-stop motion between heights. Every route here leaves
+            # the arm in the scanning pose first (line_change, a transit's
+            # re-centre or unfold), never stretched out along the partition.
             if not self.column_commanded:
                 target_h = self._column_target_for_line(ctx, self.current_line_z)
                 if target_h is None:
@@ -3296,54 +3323,6 @@ class ScanWall(State):
             self._seg_phase = "sweep_setup"
             return
 
-        if self._seg_phase == "unroll_clear":
-            # Back upright before the next height. Off the wall first, as for
-            # the roll.
-            self.set_activity(
-                ctx,
-                f"Retracting the plate before turning it upright at segment {seg_no}/{seg_total}",
-                progress_current=seg_no,
-                progress_total=seg_total,
-            )
-            outcome = self._send_arm_to_clearance(
-                ctx, self._roll_clearance(ctx), contact_default=True, retract_only=True)
-            if outcome == "wait":
-                return
-            self._arm_goal_start = None
-            self._seg_phase = "unroll_clear_wait" if outcome == "sent" else "unroll_pose"
-            return
-
-        if self._seg_phase == "unroll_clear_wait":
-            if not self._arm_goal_settled(ctx):
-                return
-            self._arm_goal_start = None
-            self._seg_phase = "unroll_pose"
-            return
-
-        if self._seg_phase == "unroll_pose":
-            outcome = self._send_named_pose(ctx, self._scan_pose_name(ctx))
-            if outcome == "wait":
-                return
-            if outcome == "skip":
-                return self._skip_partition(
-                    ctx, f"Could not turn the plate upright at partition {seg_no}")
-            self._arm_goal_start = None
-            self._seg_phase = "unroll_pose_wait"
-            return
-
-        if self._seg_phase == "unroll_pose_wait":
-            status = self._named_pose_settled(ctx)
-            if status == "wait":
-                return
-            self._arm_goal_start = None
-            if status == "failed":
-                return self._skip_partition(
-                    ctx, f"The plate did not return upright at partition {seg_no}")
-            # Already clear of the wall: no line_change retract needed.
-            self.column_commanded = False
-            self._seg_phase = "line_column"
-            return
-
     def _arm_gpr_triggers(self, ctx, seg_start, seg_end):
         """Start clocking the GPR: the plate's pose now is d = 0. The segment
         is given in the world frame; the travel is measured in the plate-travel
@@ -3419,11 +3398,9 @@ class ScanWall(State):
                 )
                 self._seg_phase = "xpol_clear"
                 return
-            # Nothing was rolled: carry on as after a rolled sweep, minus the unroll.
+            # Nothing to roll for: on to the next height or partition.
             self._xpol = False
-            rolled = False
         else:
-            rolled = self._xpol
             self._xpol = False
 
         # Nesting (§8): sweep every height at this base stop before moving the
@@ -3440,9 +3417,9 @@ class ScanWall(State):
                     f"{self._line_idx + 1}/{len(heights)} "
                     f"(z={heights[self._line_idx]:.3f}m). Base stays parked."
                 )
-                # A rolled plate goes back upright first; that retract also
-                # clears the wall for the column, so line_change is not needed.
-                self._seg_phase = "unroll_clear" if rolled else "line_change"
+                # Retract and re-centre (a rolled plate turns upright on the
+                # way) before the column moves.
+                self._seg_phase = "line_change"
                 return
             self._line_idx = 0
             ctx["current_line_idx"] = 0

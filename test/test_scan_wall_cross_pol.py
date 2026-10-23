@@ -86,7 +86,7 @@ def test_each_height_is_swept_upright_then_rolled_before_the_column_moves(state)
     _after(state, ctx)                                    # height 1, rolled
     assert not state._xpol
     assert state._line_idx == 1 and ctx["current_line_idx"] == 1
-    assert state._seg_phase == "unroll_clear"             # upright again before height 2
+    assert state._seg_phase == "line_change"              # retract + upright pose before height 2
 
     state.current_line_z = 1.4
     _after(state, ctx)                                    # height 2, upright
@@ -105,13 +105,13 @@ def test_a_failed_upright_sweep_gets_no_rolled_pass(state):
     assert state._seg_phase == "line_change" and state._line_idx == 1
 
 
-def test_a_failed_rolled_sweep_keeps_the_upright_one_and_still_unrolls(state):
+def test_a_failed_rolled_sweep_keeps_the_upright_one_and_still_turns_upright(state):
     ctx = make_ctx()
     _after(state, ctx)
     _after(state, ctx, ok=False, reason="ik_unreachable")
     assert state._segments_ok == 1 and state._xpol_ok == 0
     # Never re-cut a partition the upright pass already covered.
-    assert state._seg_idx == 0 and state._seg_phase == "unroll_clear"
+    assert state._seg_idx == 0 and state._seg_phase == "line_change"
 
 
 def test_without_cross_pol_heights_follow_each_other_directly(state):

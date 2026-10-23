@@ -189,23 +189,35 @@ def test_the_plate_is_retracted_twice_before_it_rolls(phases):
     assert "xpol_pose" in targets_of(phases["xpol_roll_wait"])
 
 
-@pytest.mark.parametrize("clear, pose", [("unroll_clear", "unroll_pose")])
-def test_the_plate_is_retracted_before_it_rolls(phases, clear, pose):
-    """Under force mode the executor leaves the plate on the wall; the roll (and
-    the un-roll) is a planned named-pose move that must not start from there."""
-    body = phases[clear]
+def test_between_heights_the_arm_retracts_and_recentres_before_the_column(phases):
+    """Simulation, 2026-10-23: the column rose 0.31 m with the arm stretched to
+    the partition end and the plate 0.20 m off the wall. line_change now
+    retracts, goes back to the scanning pose (turning a rolled plate upright on
+    the way), and only then hands over to the column."""
+    body = phases["line_change"]
     assert "_send_arm_to_clearance(" in body
     assert "retract_only=True" in body and "contact_default=True" in body
-    assert pose in targets_of(body)
-    assert pose in targets_of(phases[clear + "_wait"])
-    # The named-pose move happens only in the pose phase.
     assert "_send_named_pose" not in body
-    assert "_send_named_pose" in phases[pose]
+    assert targets_of(body) - {"sent"} == {"line_change_wait", "line_change_pose"}
+    assert targets_of(phases["line_change_wait"]) == {"line_change_pose"}
+    assert "_send_named_pose" in phases["line_change_pose"]
+    settled = phases["line_change_pose_wait"]
+    assert "_named_pose_settled" in settled
+    failed = settled[settled.index('status == "failed"'):]
+    assert failed.index("_skip_partition") < failed.index('self._seg_phase = "line_column"')
+
+
+def test_the_column_is_only_moved_from_the_scanning_pose(phases):
+    """Every way into line_column comes out of a named scanning pose: the
+    height change's re-centre, a transit's unfold or re-centre (arrival goes
+    through _at_partition), or the transit skip right after one of those."""
+    reaching = {name for name, body in phases.items() if "line_column" in targets_of(body)}
+    assert reaching == {"line_change_pose_wait", "transit_unfold_wait", "transit", "transit_wait"}
 
 
 def test_every_retract_after_a_sweep_assumes_contact(phases):
     """After a pressed sweep the plate's ranges read below their valid floor.
     A retract that treats that as "no reading" skips itself, and the column
     then moves with the plate against the wall."""
-    for phase in ("line_change", "xpol_clear", "unroll_clear"):
+    for phase in ("line_change", "xpol_clear"):
         assert "contact_default=True" in phases[phase], phase
