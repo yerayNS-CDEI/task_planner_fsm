@@ -473,7 +473,7 @@ class _GprStub:
         self.armed = False
         self.calls = []
 
-    def arm_triggers(self, ctx, ref, seg_start, seg_end, speed):
+    def arm_triggers(self, ctx, ref, seg_start, seg_end, speed, travel_frame=None):
         self.armed = True
         self.calls.append(("arm", ref, seg_start, speed))
 

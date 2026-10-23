@@ -385,6 +385,34 @@ def test_the_sweep_travels_the_segment_and_reports_success():
     assert robot.tip()[1, 3] - start_y == pytest.approx(length, abs=0.05)
 
 
+def test_the_segment_is_fixed_in_odom_once_at_startup():
+    """2026-10-22: tracked in map, each map->odom correction (2-6 cm, ~0.7/s
+    in localization) moved the line, the plate and the base mid-sweep. The
+    segment arrives in map and is brought into odom once, before the sweep."""
+    node = _node((1.0, 2.0, 1.2), (3.0, 2.0, 1.2))
+    lookups = []
+
+    class _Tf:
+        def lookup_transform(self, target, source, stamp):
+            lookups.append((target, source))
+            half = math.pi / 4.0                 # map is odom turned 90 deg, shifted
+            return SimpleNamespace(transform=SimpleNamespace(
+                translation=SimpleNamespace(x=0.5, y=-1.0, z=0.0),
+                rotation=SimpleNamespace(x=0.0, y=0.0, z=math.sin(half), w=math.cos(half))))
+
+    node.tf_buffer = _Tf()
+    assert node.world_frame == "odom" and not node._segment_anchored
+    assert node._anchor_segment()
+    assert lookups == [("odom", "map")]
+    np.testing.assert_allclose(node.seg_start, [-1.5, 0.0, 1.2], atol=1e-9)
+    np.testing.assert_allclose(node.seg_end, [-1.5, 2.0, 1.2], atol=1e-9)
+    # Once: the readiness check does not convert it again, and every pose it
+    # reads is looked up in odom.
+    assert "TF map->odom" not in " ".join(node._missing_inputs())
+    assert lookups.count(("odom", "map")) == 1
+    assert all(target == "odom" for target, _ in lookups)
+
+
 def test_the_plate_is_backed_off_the_wall_before_the_arm_is_handed_back():
     """A sweep ends with the plate centimetres off the wall, and everything
     downstream needs it further out — the FSM's Cartesian retraction has to be

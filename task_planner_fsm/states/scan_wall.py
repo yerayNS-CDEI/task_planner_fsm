@@ -2501,7 +2501,10 @@ class ScanWall(State):
             speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
         else:
             speed = float(ctx.get("sweep_speed_limit", self.SWEEP_SPEED_LIMIT_MS))
-        self._gpr.arm_triggers(ctx, "map", seg_start, seg_end, speed)
+        # Travel measured in odom, as the WBC sweep tracks it: in localization
+        # each map->odom correction (2-6 cm, ~0.7/s) read as a plate jump and
+        # was dropped, ~1 m of a 7.1 m sweep on 2026-10-22.
+        self._gpr.arm_triggers(ctx, "map", seg_start, seg_end, speed, travel_frame="odom")
 
     def _start_hyperspectral(self, ctx, seg_start, seg_end):
         """Plate seated and about to travel: sample #0 here, then one capture per

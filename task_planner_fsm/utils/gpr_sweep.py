@@ -228,19 +228,19 @@ class GprSweep:
         self._record["probe_active"] = True
         return None
 
-    def arm_triggers(self, ctx, ref_frame, seg_start, seg_end, speed_mps):
+    def arm_triggers(self, ctx, ref_frame, seg_start, seg_end, speed_mps, travel_frame=None):
         """Start clocking the probe: the plate's pose NOW is d = 0 and fires the
         first trigger; every later one is a whole spacing further along the
-        segment. ``ref_frame`` is what the plate travel is measured in -- the
-        world frame for a sweep that moves the base (``gpr_trigger_reference_frame``
-        overrides)."""
+        segment. ``ref_frame`` is the frame the segment is given in, and what
+        the plate travel is measured in unless ``travel_frame`` names another
+        (``gpr_trigger_reference_frame`` overrides both)."""
         if self._record is not None:
             self._record["t_armed_epoch"] = round(time.time(), 3)
         if not self.triggers_enabled(ctx):
             return
         self._stop_timer(ctx, log_summary=False)
         node = ctx["node"]
-        ref = str(ctx.get("gpr_trigger_reference_frame") or ref_frame)
+        ref = str(ctx.get("gpr_trigger_reference_frame") or travel_frame or ref_frame)
         axis = self._axis_in_frame(ctx, ref, ref_frame, self._sweep_axis(seg_start, seg_end))
         if axis is None:
             self._log(ctx).warn(

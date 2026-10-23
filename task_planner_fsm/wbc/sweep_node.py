@@ -195,6 +195,14 @@ class WholeBodySweepNode(Node):
 
         # --- Frames and I/O --------------------------------------------------
         self.declare_parameter("map_frame", "map")
+        # The frame the sweep runs in. seg_start/seg_end arrive in map_frame and
+        # are brought into it once, at startup; every pose is looked up in it
+        # from then on. odom, not map: in localization RTAB-Map corrects
+        # map->odom ~0.7 times a second by 2-6 cm, in bursts of 10-33 cm near
+        # the end of a wall (2026-10-22), and each correction moved the plate,
+        # the base and the sensed wall by as much mid-sweep. Set it to
+        # map_frame for the old behaviour.
+        self.declare_parameter("tracking_frame", "odom")
         self.declare_parameter("base_frame", "turret_footprint")
         # The chain root doubles as the TF frame for the arm mount, so the model
         # and the measurement can never disagree about which frame that is. Note
@@ -1429,6 +1437,8 @@ class WholeBodySweepNode(Node):
         self.standoff = float(p("standoff").value)
         self.arrive_tolerance = float(p("arrive_tolerance").value)
         self.map_frame = str(p("map_frame").value)
+        self.world_frame = str(p("tracking_frame").value) or self.map_frame
+        self._segment_anchored = self.world_frame == self.map_frame
         self.base_frame = str(p("base_frame").value)
         self.arm_root_link = str(p("arm_root_link").value)
         self.arm_tip_link = str(p("arm_tip_link").value)
@@ -2180,7 +2190,7 @@ class WholeBodySweepNode(Node):
         if self._field_from is msg:
             return self.obstacle_field
 
-        frame = msg.header.frame_id or self.map_frame
+        frame = msg.header.frame_id or self.world_frame
         segment = self._segment_in(frame)
         try:
             data = np.asarray(msg.data, dtype=np.int16).reshape(
@@ -2202,14 +2212,14 @@ class WholeBodySweepNode(Node):
         pushing the base while some innocent patch of floor went unguarded. So a
         failed transform drops the mask rather than guessing.
         """
-        if frame == self.map_frame:
+        if frame == self.world_frame:
             return (self.seg_start[:2], self.seg_end[:2])
         try:
             tf = self.tf_buffer.lookup_transform(
-                frame, self.map_frame, rclpy.time.Time())
+                frame, self.world_frame, rclpy.time.Time())
         except Exception:
             self.get_logger().warn(
-                f"No TF {self.map_frame}->{frame}; sweeping without the wall mask, "
+                f"No TF {self.world_frame}->{frame}; sweeping without the wall mask, "
                 f"so the scanned wall itself may push the base away.",
                 throttle_duration_sec=10.0)
             return None
@@ -2217,6 +2227,32 @@ class WholeBodySweepNode(Node):
         R = _quat_to_matrix(np.array([q.x, q.y, q.z, q.w]))[:2, :2]
         shift = np.array([t.x, t.y])
         return (R @ self.seg_start[:2] + shift, R @ self.seg_end[:2] + shift)
+
+    def _anchor_segment(self):
+        """Bring seg_start/seg_end from map_frame into the tracking frame, once.
+
+        After this the segment is fixed in the tracking frame: later map->odom
+        corrections no longer move the line under the plate. False (and the
+        segment left alone) while TF cannot say.
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.world_frame, self.map_frame, rclpy.time.Time())
+        except Exception:
+            return False
+        t, q = tf.transform.translation, tf.transform.rotation
+        R = _quat_to_matrix(np.array([q.x, q.y, q.z, q.w]))
+        shift = np.array([t.x, t.y, t.z])
+        start, end = self.seg_start.copy(), self.seg_end.copy()
+        self.seg_start = R @ self.seg_start + shift
+        self.seg_end = R @ self.seg_end + shift
+        self._segment_anchored = True
+        self.get_logger().info(
+            f"Segment fixed in '{self.world_frame}': ({start[0]:.2f}, {start[1]:.2f}) -> "
+            f"({end[0]:.2f}, {end[1]:.2f}) in '{self.map_frame}' is "
+            f"({self.seg_start[0]:.2f}, {self.seg_start[1]:.2f}) -> "
+            f"({self.seg_end[0]:.2f}, {self.seg_end[1]:.2f}).")
+        return True
 
     def _avoidance_rows(self, n_arm):
         """Barrier rows for this cycle, or empty when there is nothing to avoid."""
@@ -2246,7 +2282,7 @@ class WholeBodySweepNode(Node):
             self.closest_obstacle = float("inf")
             return empty
 
-        frame = self.costmap_msg.header.frame_id or self.map_frame
+        frame = self.costmap_msg.header.frame_id or self.world_frame
         pose = self._lookup(self.base_frame, source_frame=frame)
         if pose is None:
             self.get_logger().warn(
@@ -2410,10 +2446,12 @@ class WholeBodySweepNode(Node):
             n_valid = int((np.isfinite(d) & (d > VALID_LO) & (d < VALID_HI)).sum())
             if n_valid < MIN_VALID_SENSORS:
                 missing.append(f"valid plate ranges ({n_valid}/6)")
+        if not self._segment_anchored and not self._anchor_segment():
+            missing.append(f"TF {self.map_frame}->{self.world_frame}")
         if self._mount_pose() is None:
-            missing.append(f"TF {self.map_frame}->{self.arm_root_link}")
+            missing.append(f"TF {self.world_frame}->{self.arm_root_link}")
         if self._base_pose() is None:
-            missing.append(f"TF {self.map_frame}->{self.base_frame}")
+            missing.append(f"TF {self.world_frame}->{self.base_frame}")
         if (self.avoid and self.costmap_msg is None
                 and bool(self.get_parameter("avoid_require_costmap").value)):
             missing.append("costmap")
@@ -2633,7 +2671,7 @@ class WholeBodySweepNode(Node):
     def _lookup(self, target_frame, source_frame=None):
         try:
             tf = self.tf_buffer.lookup_transform(
-                source_frame or self.map_frame, target_frame, rclpy.time.Time())
+                source_frame or self.world_frame, target_frame, rclpy.time.Time())
         except Exception:
             return None
         t = tf.transform.translation
@@ -2658,7 +2696,7 @@ class WholeBodySweepNode(Node):
         return T
 
     def _tip_pose(self):
-        """4x4 pose of the plate tip in the map frame, or None if inputs are missing."""
+        """4x4 pose of the plate tip in the tracking frame, or None if inputs are missing."""
         T_mount = self._mount_pose()
         q_arm = self._arm_positions()
         if T_mount is None or q_arm is None or self.chain is None:
@@ -2666,7 +2704,7 @@ class WholeBodySweepNode(Node):
         return T_mount @ self.chain.fk(q_arm)
 
     def _base_pose(self):
-        """(yaw, xy) of the TURRET AXIS in the map frame.
+        """(yaw, xy) of the TURRET AXIS in the tracking frame.
 
         ``turret_footprint`` is the ground projection of ``turret_link``, i.e. of
         the axis the base rotates about and the point sim_controller's twist
