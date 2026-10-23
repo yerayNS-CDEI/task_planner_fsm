@@ -12,6 +12,7 @@ A ROS2 Finite State Machine (FSM) package that orchestrates complete autonomous 
 - [FSM States](#fsm-states)
 - [Workflow](#workflow)
 - [Checkpoint Resume (Debugging)](#checkpoint-resume-debugging)
+- [Omni Base Demo](#omni-base-demo-expo-choreography)
 - [Key Features](#key-features)
 - [Important Notes](#important-notes)
 - [Troubleshooting](#troubleshooting)
@@ -717,6 +718,48 @@ the non-ROS way to do the same.
 | `scan_wall_post_sweep_settle_s` | `2.0` | Pause after every sweep before the next arm goal (was a blocking sleep) |
 
 ---
+
+## Omni Base Demo (expo choreography)
+
+`omni_demo` drives a fixed choreography that shows off the omnidirectional base,
+centred on wherever the robot stands (2 x 2 m of free floor with the defaults).
+It runs with the robot stack already up (Full Robot or the FSM) and is started
+from the UI's **Demo** tab, or by hand:
+
+```bash
+ros2 run task_planner_fsm omni_demo                                  # cross + square
+ros2 run task_planner_fsm omni_demo --ros-args -p "behaviours:=[cross,square,figure8,orbit]"
+ros2 run task_planner_fsm omni_demo --ros-args -p preflight_only:=true   # checks + RViz, no motion
+rviz2 -d $(ros2 pkg prefix task_planner_fsm)/share/task_planner_fsm/rviz/omni_demo.rviz
+```
+
+| Behaviour | Motion (turret heading) |
+|---|---|
+| `cross` | forward/back, left/right, forward-left diagonal out and back (fixed) |
+| `square` | clockwise square centred on the start, `square_laps` laps, stop at each corner (fixed) |
+| `figure8` | figure-of-eight through the start, lobes left and right (fixed) |
+| `orbit` | back off `orbit_radius`, circle the start clockwise, back in (faces the centre) |
+
+The robot parks first (chassis in line with the turret), runs the selected
+behaviours in that order, returns to the start pose between them, and parks
+again at the end. Before moving it requires the arm folded (`folded_fsm`) and a
+local costmap with nothing within robot radius + `safety_margin` of the path;
+while moving, an obstacle near the robot pauses it. The joystick, a latched
+`/emergency_stop`, `/omni_demo/abort` or Ctrl+C stop the robot where it is and
+end the demo (exit code 2): it does not return or park.
+
+Commands go to twist_mux's navigation channel (`/cmd_vel`), so do not run it
+while Nav2 or the FSM is driving the base. Distances, speed, laps and pauses are
+parameters (see the module docstring in `task_planner_fsm/omni_demo.py`).
+
+**Reversing and sim_controller's pull compensation.** In pull (chassis driving
+backwards) sim_controller mirrors the sideways part of every command. A position
+servo's corrections then push the wrong way and the robot circles its target
+(`test_without_undoing_pull_compensation_reversing_legs_circle`). The demo sends
+its commands through the inverse of that map (`undo_pull_compensation`, using the
+`base_footprint` -> `turret_footprint` TF), so on reversing legs the chassis
+turns round under the turret instead. Any other closed-loop `/cmd_vel` servo on
+this base meets the same problem.
 
 ## Key Features
 
