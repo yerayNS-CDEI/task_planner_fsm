@@ -585,6 +585,22 @@ def test_a_retreat_that_meets_a_rising_force_holds_the_arm_and_fails():
     assert node.press_force < 40.0, "it should trip near the 20 N rise, not ride it up"
 
 
+def test_a_retreat_still_pressed_on_the_wall_is_not_the_air_for_the_streamer():
+    """2026-10-23 11:22: the retreat counted as the air with 50-112 N on the
+    plate, so the streamer's follow guard re-anchored every 0.6 s and its
+    restarts drove the plate into the wall."""
+    node = _press_node()
+    node.phase = "retreat"
+    contact = node.press.contact_force + node.press.bias
+    node.press_force = contact + 40.0
+    assert node._plate_on_wall(), "pressed in the retreat: the guard stays off"
+    node.press_force = contact - 1.0
+    assert not node._plate_on_wall(), "off the wall in the retreat: the air again"
+    node.phase = "return"
+    node.press_force = contact + 40.0
+    assert not node._plate_on_wall(), "the return's force reading drifts; the air clamp covers it"
+
+
 def test_a_retreat_that_unloads_the_wheel_is_not_stopped():
     """The normal case: the force falls from wherever the sweep left it."""
     node, robot = _retreating()

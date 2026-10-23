@@ -262,6 +262,13 @@ class StreamCore:
         the arm actually has and ramps up from there, instead of handing a
         stationary arm the full velocity in one tick (the 30 rad/s^2 that run
         ended its return with).
+
+        Only the part of the arm's velocity that goes WITH the command, and no
+        more of it than was commanded: on 2026-10-23 11:22:51 the arm was
+        springing back toward the wall (-0.63 of the commanded progress), the
+        restart took that velocity over as the command, and the stream drove
+        the plate into the wall three times. Moving against the command, the
+        restart is from rest.
         """
         if (not self.in_air or self.q is None or self.qd is None
                 or self.stream.command is None):
@@ -281,7 +288,8 @@ class StreamCore:
         if now - self.still_since < self.follow_seconds:
             return
         self.stream.reset(self.q)
-        self.v_out = self.qd.copy()
+        along = float(np.clip(progress, 0.0, speed))
+        self.v_out = self.v_out * (along / speed)
         self.still_since = None
         self.reanchors += 1
         self.logger.warn(

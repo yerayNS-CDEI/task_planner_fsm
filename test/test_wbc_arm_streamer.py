@@ -323,6 +323,33 @@ def test_the_guard_leaves_an_arm_that_is_moving_alone():
     assert core.reanchors == 0
 
 
+def _reanchor_with_arm_velocity(v_arm, commanded=(0.2, 0.0, 0.0)):
+    """Stall the arm under ``commanded`` until the guard re-anchors, with the
+    arm reporting ``v_arm`` (while staying put, as one pinned by a wall does)."""
+    _, core, seq, q = _seeded(accel=0.0)
+    core.handle(seq(VELOCITY, list(commanded), 5.0, True), 0.0)
+    t = 0.0
+    while core.reanchors == 0 and t < 2.0:
+        t += DT
+        core.measured(q, np.array(v_arm, dtype=float))
+        core.tick(t)
+    assert core.reanchors == 1
+    return core
+
+
+def test_a_restart_never_takes_over_an_arm_moving_against_the_command():
+    """2026-10-23 11:22:51: the arm sprang back toward the wall at -0.63 of the
+    commanded progress, the restart adopted that velocity, and the stream drove
+    the plate into the wall three times."""
+    core = _reanchor_with_arm_velocity([-0.13, 0.05, 0.0])
+    assert core.v_out == pytest.approx(np.zeros(3)), "against the command: restart from rest"
+
+
+def test_a_restart_keeps_only_the_arm_motion_that_goes_with_the_command():
+    core = _reanchor_with_arm_velocity([0.03, 0.04, -0.02])
+    assert core.v_out == pytest.approx([0.03, 0.0, 0.0]), "the along-command part, nothing sideways"
+
+
 def test_losing_the_sweep_controller_holds_at_the_arm_and_exits():
     node, core, seq, q = _seeded()
     core.handle(seq(VELOCITY, [0.2, 0.0, 0.0], 1.0, True), 0.0)

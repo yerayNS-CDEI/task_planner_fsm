@@ -4305,6 +4305,22 @@ class WholeBodySweepNode(Node):
         """
         return self.phase == "sweep" and self.press is not None and self.press.loaded
 
+    def _plate_on_wall(self):
+        """Is the plate pressed against something, for the streamer's follow guard?
+
+        The sweep's own test, plus the retreat while the live force still reads
+        a contact: the retreat starts pressed, and the press itself is not
+        updated outside the sweep. On 2026-10-23 the retreat counted as the air
+        with 50-112 N on the plate, so the guard re-anchored the stream every
+        0.6 s against a wall the arm could not leave. Not in the return, whose
+        tool-frame force drifts by tens of N with nothing touching; the air
+        lead clamp bounds the setpoint there.
+        """
+        if self._in_contact():
+            return True
+        return (self.phase == "retreat" and self.press is not None
+                and self.press_force - self.press.bias >= self.press.contact_force)
+
     def _stale_inputs(self, now):
         stale = []
         if self.joint_stamp is None or now - self.joint_stamp > self.max_data_age:
@@ -4467,7 +4483,7 @@ class WholeBodySweepNode(Node):
                 # this velocity (the same horizon _stream_locked holds on) and
                 # whether its follow guard applies: the air only, never a press.
                 self.arm_stream.velocity(qdot, self._arm_command_max_age(),
-                                         not self._in_contact())
+                                         not self._plate_on_wall())
                 self.stream_cycle_period = self.arm_stream.tick_period()
 
         self._publish_diagnostics(now, u_qp, u)
