@@ -3184,3 +3184,101 @@ def test_a_latch_left_over_from_a_phase_does_not_fire_after_it():
     node.obstacle_phase = None
     node._obstacle_step(1000.1, node.surface.distance)
     assert node.obstacle_phase is None and node.obstacle_events == 0
+
+
+def _hit_node():
+    """A node pressing in contact, with the F/T watch armed and cmd_vel captured."""
+    node = _rough_wall_run(wheel=lambda c: 0.0, along=lambda c: 1.0, cycles=100)
+    assert node.press.touched and node.obstacle_frame is not None
+    published = []
+    node.cmd_vel_pub.publish = lambda msg: published.append(
+        (msg.linear.x, msg.linear.y, msg.angular.z))
+    return node, published
+
+
+def _load(node, along, wheel):
+    """Set the F/T to ``along`` N against the travel and ``wheel`` N tared."""
+    R, t_hat = node.obstacle_frame
+    node.wrench = np.concatenate(((R.T @ (-along * t_hat))[:2], np.zeros(3)))
+    node.press_force = node.press.bias + wheel
+
+
+def test_the_hard_hit_trigger_catches_a_bump_the_friction_allowance_hides():
+    """2026-10-13: the bumps pushed mostly INTO the plate, ~0.55x along it, so
+    the excess over friction stayed under 6 N while the wheel went past 50 —
+    one line ended at 54 N with no trigger at all. Wheel >= 25 N with real
+    force along the wall is a hit; the base is stopped on the spot."""
+    node, published = _hit_node()
+    _load(node, along=14.0, wheel=30.0)              # excess 14 - 0.4 * 30 = 2 N
+    dwell = float(node.get_parameter("obstacle_hit_dwell").value)
+    t0 = 1000.0
+    node._watch_obstacle(t0)
+    node._watch_obstacle(t0 + 0.5 * dwell)
+    assert node.obstacle_latched is None and not published
+    node._watch_obstacle(t0 + dwell + 0.001)
+    assert node.obstacle_latched is not None
+    assert published == [(0.0, 0.0, 0.0)], "the base is stopped by the watch itself"
+
+
+def test_a_hard_landing_alone_does_not_trip_the_hard_hit():
+    """10-09 15:27:57: 28 N on the wheel with 2.5 N along the wall is a landing,
+    the press's to relieve, not an obstacle."""
+    node, published = _hit_node()
+    _load(node, along=2.5, wheel=30.0)
+    for k in range(20):
+        node._watch_obstacle(1000.0 + 0.01 * k)
+    assert node.obstacle_latched is None and not published
+
+
+def test_relieve_backs_off_at_the_press_speed_when_that_is_faster():
+    """Until 2026-10-13 a relieve replaced the press's overload retreat (up to
+    press_retreat_v_max) with a flat obstacle_retract_speed: half speed at the
+    peak of a hit."""
+    node, _ = _hit_node()
+    node.obstacle_phase = "relieve"
+    node.obstacle_hit_progress = node.progress
+    node.obstacle_contact_distance = node.surface.distance
+    node.press.force = 40.0                          # loaded
+    retract = float(node.get_parameter("obstacle_retract_speed").value)
+    distance = node.surface.distance
+    assert node._obstacle_motion(distance, 1.0, v_press=-0.02)[0] == pytest.approx(-0.02)
+    assert node._obstacle_motion(distance, 1.0, v_press=-0.002)[0] == pytest.approx(-retract)
+    assert node._obstacle_motion(distance, 1.0)[0] == pytest.approx(-retract)
+
+
+def test_a_bump_that_loads_the_wheel_more_than_the_wall_is_passed_under_the_limit():
+    """The 2026-10-13 bump: ~7 N per mm driven into it, and only ~0.55 N along
+    the wall per N on the wheel. The watch (here once a cycle, on the robot
+    on every F/T sample) has to catch it on the hard-hit trigger, stop the
+    base at once and back off fast enough that the press never reaches its
+    limit; the base never moves on the cycle the latch is taken."""
+    node = _press_node(press_tare_seconds=0.0)
+    robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    node.wrench_bias = np.zeros(5)
+    edge, peak, latched_at = 1.0, [], []
+
+    def on_cycle(cycle):
+        T = robot.tip()
+        y = float((T[:3, 3] + T[:3, :3] @ CONTACT_POINT)[1])
+        into = max(0.0, edge - y) if robot.contact_gap() < 0.02 and y > edge - 0.05 else 0.0
+        bump = min(80.0, 7000.0 * into)
+        node.wrench = np.concatenate(((T[:3, :3].T @ np.array([0.0, 0.55 * bump, 0.0]))[:2],
+                                      np.zeros(3)))
+        node.press_force = robot.press_force() + bump
+        peak.append(node.press_force)
+        if node.obstacle_frame is not None:
+            node._watch_obstacle(node._now())
+            if node.obstacle_latched is not None and not latched_at:
+                latched_at.append(cycle)
+
+    forces, travel = _press_run(node, robot, cycles=900, on_cycle=on_cycle)
+    limit = float(node.get_parameter("press_force_limit").value)
+    assert node.pending_status in (None, "succeeded"), node.pending_status
+    assert node.obstacle_events >= 1 and latched_at
+    assert travel[latched_at[0]] == 0.0, "the base stops on the cycle the latch is taken"
+    # 0.8x: at this harness's steady 50 Hz the excess trigger alone gets
+    # there too, at ~43 N (31 N with the hard-hit trigger); the robot's
+    # 12-25 Hz loop is what turned that margin into 50-75 N.
+    assert max(peak) < 0.8 * limit, f"the wheel saw {max(peak):.1f} N"

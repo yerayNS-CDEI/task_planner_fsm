@@ -460,6 +460,22 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("obstacle_friction", 0.4)        # x wheel force
         self.declare_parameter("obstacle_torque", 0.0)          # Nm, tared; 0 = off
         self.declare_parameter("obstacle_dwell", 0.06)          # s
+        # The HARD-HIT trigger, beside the excess one (_watch_obstacle only):
+        # the wheel at obstacle_hit_force or more AND at least
+        # obstacle_hit_along against the travel, for obstacle_hit_dwell.
+        # The friction allowance above was set on the bar, which pushed back
+        # along the wall at ~1-1.2x the wheel force. The bumps of the 2026-10-13
+        # wall push mostly INTO the plate, ~0.55x along it, so the excess sat
+        # near 5 N while the wheel went 10 -> 55 N: one line ended at 54 N
+        # with no trigger at all, the others caught too late. 25 N is 2.5x
+        # the press target, which pressing never holds while dragging along
+        # the wall. Replayed over every bag with a tare (13 lines, ~1400 s
+        # pressing): it catches those hits 160-190 ms earlier, matches the
+        # excess trigger within +/-50 ms on every bar and bump, and adds one
+        # catch — a real snag on 10-09 17:31 the press rode through.
+        self.declare_parameter("obstacle_hit_force", 25.0)      # N on the wheel
+        self.declare_parameter("obstacle_hit_along", 8.0)       # N against the travel
+        self.declare_parameter("obstacle_hit_dwell", 0.02)      # s
         # Freed: the wheel unloaded and the along-wall force below this.
         self.declare_parameter("obstacle_clear_force", 2.5)     # N
         # How the arm frees the plate. Base stopped throughout.
@@ -1473,6 +1489,7 @@ class WholeBodySweepNode(Node):
         # trigger it has latched for the next cycle as (resistance N, wheel N).
         self.obstacle_frame = None
         self.obstacle_fast_since = None
+        self.obstacle_hit_since = None      # the hard-hit trigger's own dwell
         self.obstacle_latched = None
         self.obstacle_hit_progress = 0.0    # plate progress where it was caught
         self.obstacle_contact_distance = 0.0  # sensed distance when caught
@@ -2969,7 +2986,7 @@ class WholeBodySweepNode(Node):
         base_speed = None
         if self.press is not None and self.obstacle_phase is not None:
             v_normal, speed, base_speed = self._obstacle_motion(
-                distance, min(remaining, reachable))
+                distance, min(remaining, reachable), v_press=v_normal)
             self._set_contact(False)
             # Stopped, or crawling past, on purpose: not a stall. The phases
             # carry their own bounds (obstacle_relieve_timeout, the clearance
@@ -3753,7 +3770,13 @@ class WholeBodySweepNode(Node):
         it: the plate frame and travel direction are the last cycle's, which
         at 16-24 Hz is a few mm of travel and no measurable turn. The same
         excess and dwell as the per-cycle check in _obstacle_step, which stays
-        as it was; this one only gets there sooner.
+        as it was; this one only gets there sooner. Plus the hard-hit trigger
+        (obstacle_hit_force), which only lives here.
+
+        On a latch the base is stopped HERE, not a control cycle later: at
+        the 12-16 Hz the loop ran on 2026-10-13 that cycle was 60-80 ms of
+        30 mm/s into a bump stiffening at ~7 N/mm. The loop then keeps it at
+        zero (see the base clamp before cmd_vel is published).
         """
         p = self.get_parameter
         press = self.press
@@ -3763,18 +3786,31 @@ class WholeBodySweepNode(Node):
                 or not press.touched or press.state == TARE
                 or not bool(p("obstacle_handling").value)):
             self.obstacle_fast_since = None
+            self.obstacle_hit_since = None
             return
         resistance = self._lateral_load(*frame)[0]
         wheel = max(0.0, self.press_force - press.bias)
         excess = resistance - float(p("obstacle_friction").value) * wheel
-        if excess < float(p("obstacle_force").value):
+        hit = (wheel >= float(p("obstacle_hit_force").value)
+               and resistance >= float(p("obstacle_hit_along").value))
+        latch = False
+        if excess >= float(p("obstacle_force").value):
+            if self.obstacle_fast_since is None:
+                self.obstacle_fast_since = now
+            latch = now - self.obstacle_fast_since >= float(p("obstacle_dwell").value)
+        else:
             self.obstacle_fast_since = None
-            return
-        if self.obstacle_fast_since is None:
-            self.obstacle_fast_since = now
-        if now - self.obstacle_fast_since >= float(p("obstacle_dwell").value):
+        if hit:
+            if self.obstacle_hit_since is None:
+                self.obstacle_hit_since = now
+            latch = latch or now - self.obstacle_hit_since >= float(p("obstacle_hit_dwell").value)
+        else:
+            self.obstacle_hit_since = None
+        if latch:
             self.obstacle_latched = (resistance, wheel)
             self.obstacle_fast_since = None
+            self.obstacle_hit_since = None
+            self.cmd_vel_pub.publish(Twist())
 
     def _obstacle_step(self, now, distance):
         """Detect an obstacle and step relieve -> pass -> pressing again.
@@ -3902,16 +3938,22 @@ class WholeBodySweepNode(Node):
         # and fire again the moment the plate lands past it.
         self.obstacle_latched = None
         self.obstacle_fast_since = None
+        self.obstacle_hit_since = None
         self.get_logger().warn(message)
 
-    def _obstacle_motion(self, distance, speed_cap):
+    def _obstacle_motion(self, distance, speed_cap, v_press=None):
         """(v_normal, plate speed along the wall, base speed) while an obstacle
         is being handled. + v_normal = toward the wall.
 
         Relieve: the base stands still and the ARM does everything — pulls
         the plate off the wall to the clearance standoff and, while the edge
         is still loaded, slides it back along the wall by at most
-        obstacle_unhook_distance, slowly, to unhook it.
+        obstacle_unhook_distance, slowly, to unhook it. While loaded it backs
+        off at obstacle_retract_speed or at ``v_press``, the press's own
+        command this cycle, whichever is faster: over the soft limit the
+        press retreats at up to press_retreat_v_max (2 cm/s at the hard
+        limit), and until 2026-10-13 a relieve REPLACED that with a flat
+        1 cm/s, backing off at half speed exactly at the peak of a hit.
 
         Pass: base and plate together at obstacle_pass_speed, the plate held
         at the clearance standoff by its ranges — so a protrusion that comes
@@ -3926,7 +3968,10 @@ class WholeBodySweepNode(Node):
             retract = float(p("obstacle_retract_speed").value)
             loaded = (press.force >= press.release_force
                       or resistance >= float(p("obstacle_clear_force").value))
-            v_normal = -retract if loaded else _clamp(k * (distance - target), retract)
+            if loaded:
+                v_normal = -retract if v_press is None else min(-retract, float(v_press))
+            else:
+                v_normal = _clamp(k * (distance - target), retract)
             unhooked = self.obstacle_hit_progress - self.progress
             tip = 0.0
             if loaded and unhooked < float(p("obstacle_unhook_distance").value):
@@ -4139,6 +4184,13 @@ class WholeBodySweepNode(Node):
         dt = float(min(max(elapsed, nominal),
                        self.control_period_max_factor * nominal))
         u = slew_limit(u, self.u_prev, self.accel_max, dt)
+        if (self.obstacle_phase == "relieve" or self.obstacle_latched is not None) and self.press is not None:
+            # An obstacle stops the base at once, not down the base_accel_max
+            # ramp: _watch_obstacle has already published zero, and a ramped
+            # command from this cycle would start it again for one more cycle.
+            # A latch this cycle's _obstacle_step has not seen yet counts too.
+            u = np.array(u, dtype=float)
+            u[:3] = 0.0
         self.u_prev = u
 
         # Captured before command_stamp is overwritten below: the diagnostics
