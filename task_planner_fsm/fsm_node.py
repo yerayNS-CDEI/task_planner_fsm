@@ -1332,6 +1332,11 @@ class RobotFSMNode(Node):
         # setdefault: -p hyperspectral_processing_enabled:=false still wins, for
         # re-running only the GPR half over an existing session.
         self.ctx.setdefault("hyperspectral_processing_enabled", True)
+        # Likewise for GPR (probe flag off or not), and only here is the shared
+        # inbox of hand-copied exports read: in a live mission its line names
+        # would be mistaken for the mission's own.
+        self.ctx.setdefault("gpr_processing_enabled", True)
+        self.ctx.setdefault("gpr_read_shared_inbox", True)
         self.ctx.setdefault("fsm_stop_after", "SensorDataProcessing")
         self.get_logger().info(
             f"[FSM Bootstrap] Offline run: no robot stack; the FSM finishes after "
