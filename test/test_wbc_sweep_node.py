@@ -18,6 +18,7 @@ import pytest
 
 rclpy = pytest.importorskip("rclpy")
 
+from geometry_msgs.msg import Twist  # noqa: E402
 from std_msgs.msg import Float64  # noqa: E402
 
 from task_planner_fsm.wbc.admittance import PRESS, SEEK                 # noqa: E402
@@ -509,6 +510,148 @@ def test_a_failed_sweep_still_backs_the_plate_off():
 
     assert node.status.startswith("failed")
     assert WALL_X - robot.tip()[0, 3] > 0.30
+
+
+def _retreat_cycles(node, robot, cycles, on_cycle):
+    """Drive the retreat one cycle at a time, ``on_cycle`` after the wiring."""
+    commands = {}
+    _capture(node, commands)
+    clock = _install_clock(node)
+    for cycle in range(cycles):
+        if node.status != "running":
+            break
+        _wire(node, robot)
+        on_cycle(cycle)
+        commands.clear()
+        _cycle(node, robot, commands, clock)
+
+
+def _retreating(**overrides):
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.0, 0.0), retreat_standoff=0.40, **overrides)
+    robot = _start_state(node.chain)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    _run(node, robot, cycles=200)
+    node.finish("failed", "a made-up reason")
+    assert node.phase == "retreat"
+    return node, robot
+
+
+def test_a_retreat_that_meets_a_rising_force_holds_the_arm_and_fails():
+    """2026-10-13 17:45: the base drifted into the wall during the retreat and
+    the wheel force went 32 -> 127 N while the arm kept going. Backing off can
+    only unload the wheel, so a force that rises instead stops it."""
+    node, robot = _retreating()
+    held = []
+    node.arm_stream.hold = lambda q=None: held.append(q)
+
+    def pushed(cycle):
+        node.press_force = 1.0 * cycle             # 50 N/s, from nothing
+
+    _retreat_cycles(node, robot, 200, pushed)
+
+    assert node.phase == "done"
+    assert node.status.startswith("failed: a made-up reason; retreat stopped")
+    assert "rose" in node.status
+    assert held, "the arm must be held, not left streaming"
+    assert node.press_force < 40.0, "it should trip near the 20 N rise, not ride it up"
+
+
+def test_a_retreat_that_unloads_the_wheel_is_not_stopped():
+    """The normal case: the force falls from wherever the sweep left it."""
+    node, robot = _retreating()
+
+    def unloading(cycle):
+        node.press_force = max(0.0, 45.0 - 2.0 * cycle) + 1.5 * math.sin(cycle)
+
+    _retreat_cycles(node, robot, 3000, unloading)
+
+    assert node.status == "failed: a made-up reason"
+    assert WALL_X - robot.tip()[0, 3] > 0.30
+
+
+def test_a_one_sample_force_spike_does_not_stop_the_retreat():
+    node, robot = _retreating()
+
+    def spike(cycle):
+        node.press_force = 60.0 if cycle == 30 else 2.0
+
+    _retreat_cycles(node, robot, 3000, spike)
+
+    assert node.status == "failed: a made-up reason"
+
+
+def test_a_base_driven_while_stopped_ends_the_sweep():
+    """2026-10-13 17:45 again, from the other end: the wheels turned at
+    10-20 mm/s for seconds with this node commanding zero. Nothing it knows
+    about the plate holds once the base is not where it put it."""
+    node, robot = _retreating()
+    held = []
+    node.arm_stream.hold = lambda q=None: held.append(q)
+
+    def driven(cycle):
+        # 0.12 rad/s on 0.125 m wheels = 15 mm/s, the incident's speed.
+        node.joint_velocities = {"drivewhl_l_joint": 0.12, "drivewhl_r_joint": 0.12,
+                                 "turret_joint": 0.0}
+
+    _retreat_cycles(node, robot, 200, driven)
+
+    assert node.phase == "done"
+    assert node.status.startswith("failed: the base is moving (+15 mm/s")
+    assert held
+
+
+def test_the_base_watchdog_waits_out_the_stop_and_ignores_a_park():
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.0, 0.0))
+    clock = _install_clock(node)
+    node.joint_velocities = {"drivewhl_l_joint": 0.2, "drivewhl_r_joint": 0.2,
+                             "turret_joint": 0.0}
+    node._publish_base(Twist())
+    t0 = clock()
+
+    # Still inside the grace after the stop: the base is allowed to coast.
+    clock.advance(0.5)
+    assert node._watch_base(clock()) is None
+    clock.advance(0.6)
+    assert node._watch_base(clock()) is None          # past the grace: dwell starts
+    clock.advance(0.3)
+    assert node._watch_base(clock()) is not None      # ... and runs out
+
+    # A park turns the wheels on purpose.
+    node.parking_active = True
+    node.base_moving_since = None
+    clock.advance(1.0)
+    assert node._watch_base(clock()) is None
+
+    # A base the node is DRIVING is not a runaway, whatever the wheels do.
+    node.parking_active = False
+    moving = Twist()
+    moving.linear.x = 0.03
+    node._publish_base(moving)
+    clock.advance(2.0)
+    assert node._watch_base(clock()) is None
+
+    # And a stopped base with only wheel noise on it stays quiet.
+    node._publish_base(Twist())
+    node.joint_velocities = {"drivewhl_l_joint": 0.03, "drivewhl_r_joint": -0.02,
+                             "turret_joint": 0.002}
+    clock.advance(3.0)
+    node._watch_base(clock())
+    clock.advance(0.5)
+    assert node._watch_base(clock()) is None
+    assert clock() - t0 > 5.0
+
+
+def test_the_setpoint_lead_on_the_wall_stays_inside_the_urs_accept_window():
+    """A setpoint more than 40 mrad from the arm can latch the UR into
+    ignoring every command (external_control.urscript, targetWithinLimits),
+    and that is as true pressing as in the air."""
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, 1.0, 0.0))
+    assert node.arm_stream.max_lead == pytest.approx(0.035)
+    q = np.zeros(6)
+    node.arm_stream.reset(q)
+    sent = node.arm_stream.send(np.full(6, 2.0), 0.1, q)    # 0.2 rad asked for
+    assert np.max(np.abs(np.asarray(sent) - q)) <= 0.035 + 1e-12
 
 
 def test_the_arm_is_returned_to_the_configuration_the_planner_left_it_in():

@@ -58,7 +58,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32MultiArray, Float64MultiArray, String
+from std_msgs.msg import Bool, Float32MultiArray, Float64MultiArray, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .admittance import PRESS, SEEK, TARE, AdmittancePress
@@ -142,6 +142,24 @@ class WholeBodySweepNode(Node):
         # elbow angle (radians, magnitude, joint index 2) the retreat stops
         # where it is and hands over to the return, which is joint-space.
         self.declare_parameter("retreat_fold_limit", math.radians(160.0))
+        # The retreat pulls the plate AWAY from the wall, so the wheel force
+        # can only fall while it runs. If it rises instead, something other
+        # than this node is pushing the plate in — on 2026-10-13 17:45 the
+        # base drifted with a zero command and the force went 32 -> 127 N over
+        # eight seconds of retreat, then the arm, re-anchoring, struck the wall
+        # at up to 162 N. So: the press-axis force, low-passed over
+        # retreat_force_tau (s) at the F/T rate, may not rise more than
+        # retreat_force_rise (N) above the lowest it has been this retreat for
+        # retreat_force_dwell (s); past that the arm is held where it is and
+        # handed back, and the sweep reports failed. 0 disables. Replayed over
+        # every retreat of 10-07 to 10-15: normal rise <= 8.8 N, 14.2 N once
+        # (10-09 19:07, backing off a bump hit at 51 N); 10-13 17:45 rises
+        # 89.6 N and trips 1 s into its retreat, eight before the strikes.
+        # The return is not guarded: the wrist reorients there and the tool
+        # frame reading drifts by tens of N with nothing touching.
+        self.declare_parameter("retreat_force_rise", 20.0)
+        self.declare_parameter("retreat_force_tau", 0.1)
+        self.declare_parameter("retreat_force_dwell", 0.15)
         # Arm configuration to finish in, normally the unfolded pose the FSM's
         # planner last placed the arm in. Retreating along the normal alone
         # cannot leave the arm somewhere the planner will accept: too little and
@@ -205,10 +223,20 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("arm_command_topic", "")
         self.declare_parameter("arm_stream_controller", "")
         # How far the integrated setpoint may lead the measured joint before it
-        # is clamped. Sized off the servo lag at these speeds (~0.5 rad/s into a
-        # ~30 ms lag is ~0.015 rad), so this is an order of magnitude of
-        # headroom and only bites when the arm is genuinely not following.
-        self.declare_parameter("arm_stream_max_lead", 0.2)
+        # is clamped — on the WALL; the air has arm_stream_max_lead_air. Sized
+        # off the servo lag at these speeds (~0.5 rad/s into a ~30 ms lag is
+        # ~0.015 rad), so it only bites when the arm is genuinely not following.
+        #
+        # 35 mrad, not the 0.2 it was, for the same reason as the air clamp
+        # below: a setpoint more than 40 mrad from the arm can latch the UR into
+        # ignoring every command, and a press is no safer a place for that than
+        # the air. On 2026-10-13 17:45 the on-wall lead grew 7 -> 55 mrad in the
+        # last 3 s before the failure, and the retreat that followed re-anchored
+        # every 0.6 s and struck the wall at up to 162 N. A press does not need
+        # the room: over every pressing sample of 10-07 to 10-15 the lead was
+        # p50 < 1 mrad and p99 2-34 mrad; only that run went past 35 (16% of
+        # its samples).
+        self.declare_parameter("arm_stream_max_lead", 0.035)
         # Stream the position setpoints from a process of their own (see
         # wbc/arm_streamer.py): in this one the stream shared an interpreter
         # with the solve and reached the arm 24 ms apart at the median and up
@@ -229,7 +257,7 @@ class WholeBodySweepNode(Node):
         self.declare_parameter("arm_follow_ratio", 0.3)
         self.declare_parameter("arm_follow_seconds", 0.25)
         # The setpoint's lead clamp in the air, rad; arm_stream_max_lead stays
-        # the clamp on the wall, where the setpoint leads the plate by design.
+        # the clamp on the wall (the same 35 mrad since 2026-10-15).
         # 35 mrad because of how the UR takes a setpoint (ur_client_library
         # external_control.urscript, targetWithinLimits): a command more than
         # 40 mrad (20 rad/s x 2 ms) from the last one it ACCEPTED is rejected
@@ -976,7 +1004,7 @@ class WholeBodySweepNode(Node):
         # COMMANDED travel) has read high by its inverse. Time the arm should
         # have been moving is not a gap to protect against; the velocity is
         # still trusted or the stream would be holding. The backstops for a
-        # genuinely huge tick are unchanged: arm_stream_max_lead (0.2 rad) on
+        # genuinely huge tick are unchanged: arm_stream_max_lead (35 mrad) on
         # the setpoint and the acceleration bound on the velocity behind it.
         self.declare_parameter("stream_period_max_factor", 50.0)
         # When the stream stops believing the velocity it is integrating, as a
@@ -1009,7 +1037,7 @@ class WholeBodySweepNode(Node):
         # Being late is the cheaper mistake, because it is bounded by something
         # else: the run-on is arm_qdot_max * the age, so even 250 ms of it is
         # 0.125 rad, and ArmStream clamps the setpoint to arm_stream_max_lead
-        # (0.2 rad) of the measured arm regardless. What this must catch is a
+        # (35 mrad) of the measured arm regardless. What this must catch is a
         # solve that has stopped for good, and that is seconds, not tens of
         # milliseconds.
         self.declare_parameter("arm_command_max_age_factor", 5.0)
@@ -1333,6 +1361,28 @@ class WholeBodySweepNode(Node):
         # These are loose enough to be invisible in normal operation — the
         # reference velocities are tenths of a unit — and only bite on steps.
         self.declare_parameter("base_accel_max", [0.3, 0.3, 0.6])   # m/s^2, m/s^2, rad/s^2
+        # The base watchdog: this node has commanded the base to a stop, so the
+        # base must BE stopped. Once the published twist has been zero for
+        # base_watchdog_grace (s), a wheel-odometry translation over
+        # base_watchdog_speed (m/s) or a turret rate over
+        # base_watchdog_turret_rate (rad/s), held for base_watchdog_dwell (s),
+        # means something else is driving it — a joystick taking over through
+        # twist_mux, or a fault below the mux — and nothing this node computes
+        # about where the plate is can be trusted. It holds the arm, stops,
+        # and reports failed. 0 speed disables. Ignored while sim_controller
+        # reports a park (parking_active_topic), which turns the wheels on
+        # purpose. Over every bag of 10-02 to 10-15 a stopped base read <= 5.5
+        # mm/s and <= 0.003 rad/s; it fires on 10-13 17:45 (twice: 18 mm/s a
+        # minute before the incident, then the incident), 10-13 15:59 (64 mm/s
+        # in a retreat), 10-09 19:32 (turret 0.22 rad/s in a retreat) and
+        # 10-02 14:08 (67 mm/s) — all with the sweep commanding zero.
+        self.declare_parameter("base_watchdog_speed", 0.008)
+        self.declare_parameter("base_watchdog_turret_rate", 0.008)
+        self.declare_parameter("base_watchdog_grace", 1.0)
+        self.declare_parameter("base_watchdog_dwell", 0.25)
+        self.declare_parameter("base_wheel_joints", ["drivewhl_l_joint", "drivewhl_r_joint"])
+        self.declare_parameter("base_wheel_radius", 0.125)          # m
+        self.declare_parameter("parking_active_topic", "/sim_controller/parking_active")
         self.declare_parameter("arm_accel_max", 2.0)                # rad/s^2
         # How fast the ARM's acceleration may change, rad/s^3; 0 disables. The
         # acceleration bound alone lets a joint go from coasting to the full
@@ -1453,6 +1503,12 @@ class WholeBodySweepNode(Node):
         self.joint_positions = {}
         self.joint_velocities = {}
         self.joint_stamp = None
+        # Base watchdog (see base_watchdog_speed): since when the twist this
+        # node publishes has been zero (None while it is not), since when the
+        # base has been moving anyway, and whether sim_controller is parking.
+        self.base_zero_since = None
+        self.base_moving_since = None
+        self.parking_active = False
         # Filled each cycle when diagnostics are on: how long the solve took,
         # and the answer it gave before the publish path touched it.
         self.solve_seconds = 0.0
@@ -1599,6 +1655,18 @@ class WholeBodySweepNode(Node):
         self.pending_status = None
         self.retreat_deadline = 0.0
         self.retreat_R_hold = None
+        # Retreat force guard (see retreat_force_rise), fed at the F/T rate
+        # from the wrench callback and at the loop rate from _retreat_step, so
+        # under a lock: the filtered force, its stamp, the lowest it has been
+        # this retreat, since when it has been over the allowed rise, and the
+        # (force, rise) that tripped it, for _retreat_step to act on.
+        self._retreat_lock = threading.Lock()
+        self.retreat_force = None
+        self.retreat_force_stamp = None
+        self.retreat_force_min = None
+        self.retreat_rise_since = None
+        self.retreat_force_tripped = None
+        self.retreat_fed_by_wrench = False
         self.return_deadline = 0.0
         self.brake_deadline = 0.0
         # A typed-but-unset parameter RAISES on .value rather than returning
@@ -1782,6 +1850,11 @@ class WholeBodySweepNode(Node):
         if self.avoid:
             self.create_subscription(
                 OccupancyGrid, str(p("costmap_topic").value), self._on_costmap, 1,
+                callback_group=self.io_group)
+        if str(p("parking_active_topic").value):
+            # Latched by sim_controller, so the QoS has to match to hear it.
+            self.create_subscription(
+                Bool, str(p("parking_active_topic").value), self._on_parking_active, latched,
                 callback_group=self.io_group)
         # Republished, not just latched: the FSM may subscribe after we start.
         self.create_timer(0.5, self._publish_status, callback_group=self.io_group)
@@ -2002,10 +2075,96 @@ class WholeBodySweepNode(Node):
                                 msg.wrench.torque.x, msg.wrench.torque.y], dtype=float)
         self.wrench_stamp = self._now()
         self._watch_obstacle(self.wrench_stamp)
+        if self.phase == "retreat":
+            self._watch_retreat(self.wrench_stamp, self.press_force)
+            with self._retreat_lock:
+                self.retreat_fed_by_wrench = True
 
     def _on_costmap(self, msg):
         self.costmap_msg = msg
         self.costmap_stamp = self._now()
+
+    def _on_parking_active(self, msg):
+        self.parking_active = bool(msg.data)
+
+    def _publish_base(self, twist):
+        """Every base command leaves through here, so the watchdog knows when
+        the base was last told to stop (see base_watchdog_speed)."""
+        if twist.linear.x == 0.0 and twist.linear.y == 0.0 and twist.angular.z == 0.0:
+            if self.base_zero_since is None:
+                self.base_zero_since = self._now()
+        else:
+            self.base_zero_since = None
+        self.cmd_vel_pub.publish(twist)
+
+    def _base_motion(self):
+        """(translation m/s from wheel odometry, turret rate rad/s), or None
+        while the joint states do not carry the wheels' velocities."""
+        wheels = list(self.get_parameter("base_wheel_joints").value)
+        velocities = self.joint_velocities
+        if not wheels or any(name not in velocities for name in wheels):
+            return None
+        radius = float(self.get_parameter("base_wheel_radius").value)
+        translation = radius * float(np.mean([velocities[name] for name in wheels]))
+        return translation, float(velocities.get(self.turret_joint, 0.0))
+
+    def _watch_base(self, now):
+        """The base watchdog: a reason to stop if the base is moving while this
+        node has it stopped, else None. See base_watchdog_speed."""
+        p = self.get_parameter
+        speed_limit = float(p("base_watchdog_speed").value)
+        motion = self._base_motion()
+        if (speed_limit <= 0.0 or motion is None or self.parking_active
+                or self.base_zero_since is None
+                or now - self.base_zero_since < float(p("base_watchdog_grace").value)):
+            self.base_moving_since = None
+            return None
+        translation, turret = motion
+        if (abs(translation) <= speed_limit
+                and abs(turret) <= float(p("base_watchdog_turret_rate").value)):
+            self.base_moving_since = None
+            return None
+        if self.base_moving_since is None:
+            self.base_moving_since = now
+        if now - self.base_moving_since < float(p("base_watchdog_dwell").value):
+            return None
+        return (f"the base is moving ({translation * 1000:+.0f} mm/s, turret "
+                f"{turret:+.3f} rad/s) {now - self.base_zero_since:.1f}s after this node "
+                f"stopped it — a joystick or something below twist_mux is driving it")
+
+    def _watch_retreat(self, now, raw_force):
+        """The retreat force guard, one F/T sample. See retreat_force_rise.
+
+        Latches (force, rise) in ``retreat_force_tripped`` for _retreat_step;
+        a sample at the stamp already folded in changes nothing, so the loop
+        and the wrench callback can both feed it.
+        """
+        p = self.get_parameter
+        rise_limit = float(p("retreat_force_rise").value)
+        if rise_limit <= 0.0:
+            return
+        with self._retreat_lock:
+            if self.retreat_force_tripped is not None:
+                return
+            raw = float(raw_force)
+            if self.retreat_force is None:
+                self.retreat_force = raw
+            else:
+                dt = max(0.0, now - self.retreat_force_stamp)
+                tau = float(p("retreat_force_tau").value)
+                alpha = (1.0 - math.exp(-dt / tau)) if tau > 0.0 else 1.0
+                self.retreat_force += alpha * (raw - self.retreat_force)
+            self.retreat_force_stamp = now
+            if self.retreat_force_min is None or self.retreat_force < self.retreat_force_min:
+                self.retreat_force_min = self.retreat_force
+            rise = self.retreat_force - self.retreat_force_min
+            if rise <= rise_limit:
+                self.retreat_rise_since = None
+                return
+            if self.retreat_rise_since is None:
+                self.retreat_rise_since = now
+            if now - self.retreat_rise_since >= float(p("retreat_force_dwell").value):
+                self.retreat_force_tripped = (self.retreat_force, rise)
 
     def _obstacle_field(self):
         """The cached distance field, rebuilt when a new costmap arrives.
@@ -2335,7 +2494,7 @@ class WholeBodySweepNode(Node):
             if timer is not None:
                 timer.cancel()
                 setattr(self, name, None)
-        self.cmd_vel_pub.publish(Twist())
+        self._publish_base(Twist())
         self._hold_arm(at_measurement=not settled)
         self.u_prev = None
         self.command_stamp = None
@@ -2400,13 +2559,20 @@ class WholeBodySweepNode(Node):
         if self.phase != "sweep" or target <= 0.0 or self.surface.distance is None:
             self._terminate()
             return
-        self.cmd_vel_pub.publish(Twist())        # the base is done moving
+        self._publish_base(Twist())        # the base is done moving
         self.phase = "retreat"
         # The orientation the retreat holds is the one the plate has NOW —
         # not a target from the ranges. Lifting a plate off a wall while
         # re-squaring it is how a corner catches on the way out; the retreat
         # is a translation and nothing else.
         self.retreat_R_hold = None
+        with self._retreat_lock:
+            self.retreat_force = None
+            self.retreat_force_stamp = None
+            self.retreat_force_min = None
+            self.retreat_rise_since = None
+            self.retreat_force_tripped = None
+            self.retreat_fed_by_wrench = False
         self.retreat_deadline = self._now() + float(
             self.get_parameter("retreat_timeout").value)
         self.get_logger().info(
@@ -2537,6 +2703,25 @@ class WholeBodySweepNode(Node):
                 f"Retreat timed out at {self.surface.distance:.2f} m (wanted "
                 f"{target:.2f} m); returning the arm from here.")
             self._begin_return()
+            return
+        # The wrench callback feeds the guard at the F/T rate. Fed here only if
+        # it has not since the last cycle — nothing calls back in the tests.
+        with self._retreat_lock:
+            fed, self.retreat_fed_by_wrench = self.retreat_fed_by_wrench, False
+        if not fed:
+            self._watch_retreat(now, self.press_force)
+        with self._retreat_lock:
+            tripped = self.retreat_force_tripped
+        if tripped is not None:
+            force, rise = tripped
+            why = (f"retreat stopped: the wheel force rose {rise:.0f} N while backing off "
+                   f"({force:+.0f} N now) — something is pushing the plate into the wall")
+            self.get_logger().error(
+                f"{why[0].upper()}{why[1:]}. Holding the arm where it is and handing it back.")
+            previous = self.pending_status or "failed"
+            self.pending_status = (f"failed: {why}" if previous == "succeeded"
+                                   else f"{previous}; {why}")
+            self._terminate()
             return
         T_mount = self._mount_pose()
         base = self._base_pose()
@@ -2697,7 +2882,7 @@ class WholeBodySweepNode(Node):
             self._terminate()
             return
         self._warn_self_collision_slack(solution, [group])
-        self.cmd_vel_pub.publish(Twist())
+        self._publish_base(Twist())
         self._publish(solution.u, n_arm)
         self.get_logger().info(
             f"Returning: worst joint error {worst:.2f} rad", throttle_duration_sec=1.0)
@@ -2727,7 +2912,7 @@ class WholeBodySweepNode(Node):
             return
         wide = np.full(self.u_qp_prev.shape, np.inf)
         lo, hi = self._accel_bounds(-wide, wide, now)
-        self.cmd_vel_pub.publish(Twist())
+        self._publish_base(Twist())
         self._publish(np.clip(np.zeros_like(lo), lo, hi), self.chain.n_joints)
 
     def _warn_self_collision_slack(self, solution, groups):
@@ -2756,6 +2941,15 @@ class WholeBodySweepNode(Node):
             return
         if self.hardware.scaling() < self.min_speed_scaling:
             self._strike(f"execution speed scaled to {self.hardware.scaling():.2f}")
+            return
+        # In every phase too: the retreat and the return are where it has
+        # happened (2026-10-13 17:45 and 15:59, 10-09 19:32).
+        runaway = self._watch_base(now)
+        if runaway:
+            self.get_logger().error(
+                f"Base watchdog: {runaway}. Holding the arm and stopping the sweep.")
+            self.pending_status = f"failed: {runaway}"
+            self._terminate()
             return
         if self.phase == "retreat":
             self._retreat_step()
@@ -3810,7 +4004,7 @@ class WholeBodySweepNode(Node):
             self.obstacle_latched = (resistance, wheel)
             self.obstacle_fast_since = None
             self.obstacle_hit_since = None
-            self.cmd_vel_pub.publish(Twist())
+            self._publish_base(Twist())
 
     def _obstacle_step(self, now, distance):
         """Detect an obstacle and step relieve -> pass -> pressing again.
@@ -4104,7 +4298,7 @@ class WholeBodySweepNode(Node):
         now = self._now()
         if self.holding_since is None:
             self.holding_since = now
-        self.cmd_vel_pub.publish(Twist())
+        self._publish_base(Twist())
         # Not just a hold: the stored velocity goes too, or the stream spends
         # the next few ticks integrating the cycle we have this moment decided
         # not to trust, undoing the hold from underneath it.
@@ -4216,7 +4410,7 @@ class WholeBodySweepNode(Node):
         twist = Twist()
         twist.linear.x, twist.linear.y = float(u[0]), float(u[1])
         twist.angular.z = float(u[2])
-        self.cmd_vel_pub.publish(twist)
+        self._publish_base(twist)
 
         # Reorder from the CHAIN's joints to the CONTROLLER's, which is what
         # goes on the wire, and hand it to the stream rather than putting it
