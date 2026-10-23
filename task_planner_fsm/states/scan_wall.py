@@ -30,6 +30,12 @@ from rclpy.task import Future
 from rclpy.duration import Duration
 import rclpy.time
 from arm_control.srv import SendPosition
+try:
+    # The plane fit wall_parallel_controller aligns the plate with (arm_control's
+    # sensors package): the FSM reads the same tilt to know when it is done.
+    from sensors.wall_alignment_estimator import fit_wall_normal
+except ImportError:      # arm_control not on the path: fall back to waiting it out
+    fit_wall_normal = None
 from ur_msgs.srv import SetForceMode
 from std_srvs.srv import Trigger
 from rcl_interfaces.srv import SetParameters
@@ -319,6 +325,12 @@ class ScanWall(State):
         # pass's approach: how far back the arm demonstrably reaches here, which
         # bounds the retract before an in-place roll (_roll_clearance).
         self._scan_pose_gap = None
+        # Non-blocking waits (were time.sleep on the FSM's only thread).
+        self._align_wait_start = None    # press_align_wait: when it started
+        self._align_stamp = None         # last /distance_sensors frame judged
+        self._align_streak = 0           # consecutive frames within tolerance
+        self._settle_until = None        # sweep_settle deadline
+        self._settled_sweep = None       # _advance_after_sweep args held meanwhile
         # Arm folded for a transit to another reachable segment (FOLDED_POSE);
         # unfolded again once the base has arrived.
         self._arm_folded = False
@@ -1985,6 +1997,54 @@ class ScanWall(State):
         )
         return {"normal": e_n, "along": e_t, "yaw": yaw_err, "ok": not why, "why": why}
 
+    def _plate_aligned(self, ctx):
+        """True once the plate is square to the wall, for press_align_wait.
+
+        Square means the plane fitted to the six ranges -- the same fit
+        wall_parallel_controller corrects with -- is within
+        ``scan_wall_align_tol_deg`` (its 1 deg deadband) on
+        ``scan_wall_align_frames`` (3) consecutive fresh frames, after at least
+        ``scan_wall_align_min_s`` (2 s: the controller's start-up). After
+        ``scan_wall_align_max_s`` (10 s, the old fixed sleep) it goes on
+        regardless, as before; without the fit (arm_control not importable) it
+        waits that long.
+        """
+        node = ctx["node"]
+        elapsed = time.time() - self._align_wait_start
+        min_s = float(ctx.get("scan_wall_align_min_s", 2.0))
+        max_s = float(ctx.get("scan_wall_align_max_s", 10.0))
+        if elapsed >= max_s:
+            node.get_logger().warn(
+                f"[{self.name}] Plate not confirmed square to the wall after "
+                f"{max_s:.0f}s; pressing anyway, as before."
+            )
+            return True
+        if fit_wall_normal is None:
+            return False
+        stamp = ctx.get("plate_distances_stamp")
+        readings = ctx.get("plate_distances")
+        if stamp is None or stamp == self._align_stamp or not readings or len(readings) != 6:
+            return False                       # no new frame since the last look
+        if time.time() - float(stamp) > PLATE_DISTANCE_MAX_AGE_S:
+            return False
+        self._align_stamp = stamp
+        normal, _distance, _n = fit_wall_normal(readings)
+        if normal is None:
+            self._align_streak = 0
+            return False
+        tilt = math.degrees(math.acos(min(1.0, abs(float(normal[2])))))
+        if tilt <= float(ctx.get("scan_wall_align_tol_deg", 1.0)):
+            self._align_streak += 1
+        else:
+            self._align_streak = 0
+        if elapsed >= min_s and self._align_streak >= int(ctx.get("scan_wall_align_frames", 3)):
+            node.get_logger().info(
+                f"[{self.name}] Plate square to the wall ({tilt:.2f} deg) after "
+                f"{elapsed:.1f}s; pressing."
+            )
+            return True
+        return False
+
     def _note_arm_folded(self, ctx, folded):
         """Record whether the arm is folded, here and in ctx (which ArmFolding
         and ArmUnfolding read and write too)."""
@@ -2980,9 +3040,19 @@ class ScanWall(State):
                 return
             if not self._start_wall_alignment(ctx):
                 return
-            node.get_logger().info(f"[{self.name}] Waiting 10s for arm processes to stabilise...")
-            time.sleep(10.0)
+            self._align_wait_start = time.time()
+            self._align_stamp = None
+            self._align_streak = 0
+            self._seg_phase = "press_align_wait"
+            return
 
+        if self._seg_phase == "press_align_wait":
+            # Let the alignment controller square the plate to the wall before
+            # the tare and the press. Was a blind time.sleep(10) that froze the
+            # whole node (timers, sensor callbacks, telemetry, restarts); now a
+            # tick-driven wait that ends as soon as the plate IS square.
+            if not self._plate_aligned(ctx):
+                return
             # Tare the FT sensor now: the arm is settled at the approach pose and
             # nothing is pressing yet, so this is the one moment its reading is a
             # pure no-load bias. Must happen BEFORE force mode, since the contact
@@ -3192,11 +3262,21 @@ class ScanWall(State):
             # alignment controller has to go, so the retraction goal is not fighting
             # its IK stream.
             self._stop_arm_processes(ctx, keep_sensors=True)
-            time.sleep(2)   # delay to avoid errors in the arm goals
+            # A pause before the next arm goal "to avoid errors in the arm goals"
+            # (force mode releasing, the alignment controller's last trajectory
+            # draining). Was a time.sleep(2) on the FSM's only thread.
+            self._settled_sweep = (status == GoalStatus.STATUS_SUCCEEDED, reason,
+                                   seg_start, seg_end, arm_sweep)
+            self._settle_until = time.time() + float(
+                ctx.get("scan_wall_post_sweep_settle_s", 2.0))
+            self._seg_phase = "sweep_settle"
+            return
 
-            return self._advance_after_sweep(
-                ctx, status == GoalStatus.STATUS_SUCCEEDED, reason, seg_start, seg_end,
-                arm_sweep)
+        if self._seg_phase == "sweep_settle":
+            if time.time() < self._settle_until:
+                return
+            args, self._settled_sweep = self._settled_sweep, None
+            return self._advance_after_sweep(ctx, *args)
 
         if self._seg_phase == "xpol_clear":
             # Off the wall before anything rolls. Under force mode the executor
