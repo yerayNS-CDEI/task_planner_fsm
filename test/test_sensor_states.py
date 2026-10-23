@@ -260,6 +260,53 @@ def test_gpr_phase_waits_for_exports_then_gives_up(tmp_path, monkeypatch):
     assert any("no new GPR exports" in msg for _, msg in node.logger.lines)
 
 
+def _spy_gpr_inputs(monkeypatch):
+    """Record the folders the GPR phase looks in, and find nothing there."""
+    from task_planner_fsm.sensors import gpr
+    seen = []
+    monkeypatch.setattr(gpr, "pending_files",
+                        lambda incoming, out_dir: seen.append(list(incoming)) or [])
+    return seen
+
+
+def test_gpr_phase_is_skipped_when_the_probe_is_disabled(tmp_path, monkeypatch):
+    """The 2026-10-22 mission ran with gpr_enabled=False and still processed a
+    2026-09-17 export from the shared inbox as that day's w00_l00_s00."""
+    seen = _spy_gpr_inputs(monkeypatch)
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = {"node": node, "sensor_data_dir": str(tmp_path), "gpr_enabled": False,
+           "current_wall_index": 2}
+    state.on_enter(ctx)
+    _tick_until(state, ctx, "done")
+    assert seen == []
+    assert ctx["data_processed"] is True
+
+
+def test_a_live_mission_reads_only_its_own_gpr_exports(tmp_path, monkeypatch):
+    seen = _spy_gpr_inputs(monkeypatch)
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = {"node": node, "sensor_data_dir": str(tmp_path), "gpr_enabled": True,
+           "current_wall_index": 2}
+    state.on_enter(ctx)
+    _tick_until(state, ctx, "done")
+    assert seen == [[paths.gpr_session_incoming_dir(ctx)]]
+
+
+def test_reprocessing_reads_the_shared_gpr_inbox_too(tmp_path, monkeypatch):
+    """What fsm_node._bootstrap_sensor_processing sets, probe flag or not."""
+    seen = _spy_gpr_inputs(monkeypatch)
+    node = _Node()
+    state = SensorDataProcessing("SensorDataProcessing")
+    ctx = {"node": node, "sensor_data_dir": str(tmp_path), "gpr_enabled": False,
+           "gpr_processing_enabled": True, "gpr_read_shared_inbox": True,
+           "current_wall_index": 2}
+    state.on_enter(ctx)
+    _tick_until(state, ctx, "done")
+    assert seen == [paths.gpr_incoming_dirs(ctx)]
+
+
 # ----------------------------------------------------------------------
 # SendDataToPokeye
 # ----------------------------------------------------------------------

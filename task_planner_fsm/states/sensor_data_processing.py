@@ -125,11 +125,9 @@ class SensorDataProcessing(State):
     def _hyperspectral_processing_enabled(self, ctx):
         """Whether the hyperspectral record is processed at all.
 
-        The counterpart of ``gpr_processing_enabled``, with one deliberate
-        difference: it defaults to the capture flag (``hyperspectral_enabled``,
-        off) instead of to True. The GPR phase looks for exports that have not
-        been processed yet and simply finds none when the probe was off, but
-        this phase processes whatever session directory ctx points at. With the
+        The counterpart of ``gpr_processing_enabled``: both default to their
+        capture flag (here ``hyperspectral_enabled``, off) instead of to True.
+        This phase processes whatever session directory ctx points at. With the
         camera off that can only be an older session -- a bench run from a
         previous day -- whose reflectance and material labels would then be
         published as if this mission had just measured them.
@@ -332,14 +330,32 @@ class SensorDataProcessing(State):
     # ------------------------------------------------------------------
     # Phase 3: GPR
     # ------------------------------------------------------------------
+    def _gpr_processing_enabled(self, ctx):
+        """Whether the GPR exports are processed at all.
+
+        Defaults to the capture flag (``gpr_enabled``, on for the real robot,
+        off in sim -- as ``GprSweep.enabled``), as the hyperspectral phase
+        defaults to ``hyperspectral_enabled``: on 2026-10-22 a mission with the
+        probe off processed a 2026-09-17 export from the shared inbox and tied
+        it to that day's w00_l00_s00. An explicit ``gpr_processing_enabled``
+        wins (fsm_node._bootstrap_sensor_processing sets it for re-processing).
+        """
+        explicit = ctx.get("gpr_processing_enabled")
+        if explicit is not None:
+            return bool(explicit)
+        return bool(ctx.get("gpr_enabled", not bool(ctx.get("sim", False))))
+
     def _run_gpr(self, ctx):
         """Run the hyperbola and line pipelines over new GP8800 exports.
 
         The traces never enter ROS: ScanWall starts and stops the line, pulls
         the export off the app and unpacks it into the session's own
         ``incoming/`` (see ``ScanWall._gpr_export``). Exports can also be
-        copied by hand into the shared ``data/raw/gpr/incoming``, which is read
-        after the session's folder; so this phase waits at most
+        copied by hand into the shared ``data/raw/gpr/incoming``, but that is
+        read (after the session's folder) only when ``gpr_read_shared_inbox``
+        is set, as a re-processing run sets it: line names repeat every
+        mission, so in a live one an old hand-copied ``w00_l00_s00`` would be
+        tied to today's line. This phase waits at most
         ``gpr_wait_timeout_s`` (default 0: process what is already there) and
         never blocks the mission on a file that may not come.
 
@@ -350,12 +366,14 @@ class SensorDataProcessing(State):
         targets in the decision phase.
         """
         node = ctx["node"]
-        if not bool(ctx.get("gpr_processing_enabled", True)):
+        if not self._gpr_processing_enabled(ctx):
             self._advance(ctx, "decision")
             return
 
         if self._job is None:
             incoming = paths.gpr_incoming_dirs(ctx)   # own session first, then the shared inbox
+            if not bool(ctx.get("gpr_read_shared_inbox", False)):
+                incoming = incoming[:1]
             out_dir = paths.gpr_results_dir(ctx)
             pending = gpr.pending_files(incoming, out_dir)
             if not pending:
@@ -368,8 +386,8 @@ class SensorDataProcessing(State):
                         ctx, f"Waiting for GPR exports in {incoming[0]} ({waited:.0f}/{timeout:.0f} s)")
                     return
                 node.get_logger().info(
-                    f"[{self.name}] no new GPR exports in {incoming[0]} or {incoming[1]}; "
-                    f"skipping GPR processing.")
+                    f"[{self.name}] no new GPR exports in "
+                    f"{' or '.join(str(d) for d in incoming)}; skipping GPR processing.")
                 self._advance(ctx, "decision")
                 return
 
@@ -380,10 +398,13 @@ class SensorDataProcessing(State):
                     f"[{self.name}] GPR weights not found at {weights}; running the "
                     f"line pipeline only (see models/README.md).")
                 run_hyp = False
+            if len(incoming) > 1:
+                source = (f"{sum(f['sgy'].startswith(str(incoming[0])) for f in pending)} from "
+                          f"this session, the rest from the shared inbox {incoming[1]}")
+            else:
+                source = f"this session's own, in {incoming[0]}"
             node.get_logger().info(
-                f"[{self.name}] processing {len(pending)} GPR export(s) "
-                f"({sum(f['sgy'].startswith(str(incoming[0])) for f in pending)} from this "
-                f"session, the rest from the shared inbox {incoming[1]})")
+                f"[{self.name}] processing {len(pending)} GPR export(s) ({source})")
             self._job = BackgroundJob(
                 gpr.process_incoming,
                 incoming,
