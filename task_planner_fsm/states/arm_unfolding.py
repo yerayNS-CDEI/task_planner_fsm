@@ -73,7 +73,13 @@ class ArmUnfolding(State):
         #
         # The dashboard play command above has already run: it starts the UR
         # program on the real robot and has nothing to do with arm position.
-        if ctx.get("scan_phase") == 1 and not ctx.get("arm_unfolding_force_unfold", False):
+        #
+        # Only when the arm is KNOWN folded (ArmFolding sets arm_folded): a
+        # checkpoint start or a re-entry with the arm out still unfolds here, so
+        # nothing downstream inherits an arm in an unknown pose.
+        if (ctx.get("scan_phase") == 1
+                and ctx.get("arm_folded") is True
+                and not ctx.get("arm_unfolding_force_unfold", False)):
             node.get_logger().info(
                 f"[{self.name}] Wall scan: leaving the arm folded — ScanWall unfolds "
                 f"it once the base has reached the first segment."
@@ -158,6 +164,7 @@ class ArmUnfolding(State):
         if exec_status is True:
             # Movement completed successfully
             self.movement_done = True
+            ctx["arm_folded"] = False
             ctx["execution_status"] = False  # Reset for next state
             node.get_logger().info(f"[{self.name}] Position unfolded_fsm reached. Movement complete.")
         elif exec_status is False or exec_status is None:

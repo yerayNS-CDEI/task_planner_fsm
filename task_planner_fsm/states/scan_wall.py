@@ -752,6 +752,8 @@ class ScanWall(State):
         ctx["planner_goal_failed"] = False
         self.pose_future = self.position_client.call_async(request)
         self._arm_goal_start = None
+        # Moving: not known folded until a fold settles (ArmUnfolding reads it).
+        ctx["arm_folded"] = False
         # Re-arm so the next named pose checks again: a sweep in between can
         # swap the arm onto a streaming controller or drop the program.
         self._controller_gate.reset()
@@ -1220,6 +1222,9 @@ class ScanWall(State):
             )
             self.pose_reached = True
             self._arm_unfolded = False
+            # Handed over folded (ArmFolding settled it): the first transit and
+            # park need not fold it again.
+            self._arm_folded = ctx.get("arm_folded") is True
 
         # --- Phase 1: send the arm to the unfolded_fsm pose and wait for it. ---
         if not self.pose_reached:
@@ -1493,6 +1498,10 @@ class ScanWall(State):
                 self._begin_park_phase(ctx)
                 return
 
+            if self._fold_for_transit(ctx) and self._arm_folded:
+                # Folded already (handed over folded): straight to the move.
+                self._seg_phase = "transit"
+                return
             if self._fold_for_transit(ctx):
                 self.set_activity(
                     ctx,
@@ -1556,6 +1565,7 @@ class ScanWall(State):
                 self._seg_phase = "transit_clear"
                 return
             self._arm_folded = True
+            ctx["arm_folded"] = True
             self._seg_phase = "transit"
             return
 
@@ -1633,6 +1643,7 @@ class ScanWall(State):
                 self._seg_phase = "transit_clear"
                 return
             self._arm_folded = True
+            ctx["arm_folded"] = True
             self._seg_phase = "park"
             return
 
