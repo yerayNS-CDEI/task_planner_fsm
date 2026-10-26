@@ -2483,6 +2483,10 @@ class ScanWall(State):
                            ("wbc_press_contact_timeout", "press_contact_timeout")):
             if ctx.get(key) is not None:
                 cmd += ["-p", f"{param}:={float(ctx[key])}"]
+        # position (servoj, the node's default) or velocity (speedj). See
+        # wbc/streaming.py for what each one does when the stream stops.
+        if ctx.get("wbc_arm_stream_interface"):
+            cmd += ["-p", f"arm_stream_interface:={ctx['wbc_arm_stream_interface']}"]
 
         node.get_logger().info(
             f"[{self.name}] Whole-body sweep of segment "

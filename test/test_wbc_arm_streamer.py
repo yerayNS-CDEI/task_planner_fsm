@@ -350,6 +350,99 @@ def test_a_restart_keeps_only_the_arm_motion_that_goes_with_the_command():
     assert core.v_out == pytest.approx([0.03, 0.0, 0.0]), "the along-command part, nothing sideways"
 
 
+# ----------------------------------------------------------------------
+# Velocity mode: the same ramp, published as a velocity
+# ----------------------------------------------------------------------
+def _seeded_velocity(**kwargs):
+    return _seeded(mode="velocity", **kwargs)
+
+
+def test_velocity_mode_publishes_the_ramped_velocity_not_a_setpoint():
+    node, core, seq, q = _seeded_velocity(accel=2.0)
+    assert node.publisher.last == [0.0, 0.0, 0.0], "the seed is a stop, not a pose"
+    core.handle(seq(VELOCITY, [0.1, 0.0, -0.2], 0.5, True), 0.0)
+    t = 0.0
+    for _ in range(20):
+        t += DT
+        core.tick(t)
+    assert node.publisher.last == pytest.approx([0.1, 0.0, -0.2])
+    sent = np.array(node.publisher.sent[1:])
+    assert np.abs(np.diff(sent, axis=0)).max() <= 2.0 * DT * 1.01, "reached on the ramp"
+
+
+def test_velocity_mode_does_not_catch_up_after_a_late_tick():
+    """The point of the mode: a late tick in position mode publishes the whole
+    gap's motion at once; here it publishes the same velocity as before."""
+    node, core, seq, q = _seeded_velocity(accel=0.0)
+    core.handle(seq(VELOCITY, [0.3, 0.0, 0.0], 0.5, True), 0.0)
+    core.tick(0.01)
+    core.tick(0.16)                                  # 150 ms late
+    assert node.publisher.last == pytest.approx([0.3, 0.0, 0.0])
+
+
+def test_velocity_mode_ramps_one_tick_at_a_time_after_a_late_tick():
+    """URSim, 2026-10-25: after a 282 ms stall the next tick stepped the
+    velocity by 0.16 rad/s, a jolt. The arm held the old velocity through the
+    gap; there is nothing to catch up."""
+    node, core, seq, q = _seeded_velocity(accel=2.0)
+    core.tick(0.01)
+    core.handle(seq(VELOCITY, [0.4, 0.0, 0.0], 1.0, True), 0.01)
+    core.tick(0.30)                                  # the first tick, 290 ms late
+    assert node.publisher.last == pytest.approx([2.0 * DT, 0.0, 0.0])
+
+
+def test_position_mode_still_integrates_the_whole_late_tick():
+    node, core, seq, q = _seeded(accel=0.0)
+    # On the wall, so the 0.2 rad lead clamp, not the air one, bounds it.
+    core.handle(seq(VELOCITY, [0.4, 0.0, 0.0], 1.0, False), 0.0)
+    core.tick(0.01)
+    core.tick(0.30)
+    assert node.publisher.last[0] == pytest.approx(q[0] + 0.4 * 0.30)
+
+
+def test_velocity_mode_brings_a_stale_velocity_to_rest_then_sends_one_zero():
+    """A velocity controller keeps the last value it got, so going quiet one
+    ramp step short of zero would leave the arm creeping."""
+    node, core, seq, q = _seeded_velocity(accel=2.0)
+    t = 0.0
+    for _ in range(30):
+        core.handle(seq(VELOCITY, [0.4, 0.0, 0.0], 0.05, True), t)
+        t += DT
+        core.tick(t)
+    for _ in range(40):                              # stale from here on
+        t += DT
+        core.tick(t)
+    assert node.publisher.last == [0.0, 0.0, 0.0]
+    sent = np.array(node.publisher.sent)
+    assert np.abs(np.diff(sent, axis=0)).max() <= 2.0 * DT * 1.01, "ramped, not cut"
+    n = len(node.publisher.sent)
+    for _ in range(10):
+        t += DT
+        core.tick(t)
+    assert len(node.publisher.sent) == n, "quiet once the zero is out"
+
+
+def test_velocity_mode_has_no_follow_guard_and_no_lead():
+    node, core, seq, q = _seeded_velocity()
+    core.handle(seq(streamer.RESET, list(q)), 0.0)   # seeds a setpoint it must ignore
+    _stalled_arm(core, seq, q, in_air=True, seconds=0.6)
+    assert core.reanchors == 0
+    assert core.lead() == 0.0
+    assert node.publisher.last == pytest.approx([0.2, 0.0, 0.0]), "still asking"
+
+
+def test_velocity_mode_holds_with_zeros():
+    node, core, seq, q = _seeded_velocity()
+    core.handle(seq(VELOCITY, [0.3, 0.0, 0.0], 0.5, True), 0.0)
+    core.tick(0.01)
+    core.handle(seq(HOLD, list(q)), 0.015)
+    assert node.publisher.last == [0.0, 0.0, 0.0]
+    core.handle(seq(VELOCITY, [0.3, 0.0, 0.0], 0.5, True), 0.02)
+    core.tick(0.03)
+    core.parent_gone()
+    assert node.publisher.last == [0.0, 0.0, 0.0]
+
+
 def test_losing_the_sweep_controller_holds_at_the_arm_and_exits():
     node, core, seq, q = _seeded()
     core.handle(seq(VELOCITY, [0.2, 0.0, 0.0], 1.0, True), 0.0)
@@ -425,6 +518,37 @@ def test_the_streamer_process_ticks_confirms_a_hold_and_exits_when_told():
     finally:
         assert remote.close(2.0)
     assert not remote._alive()
+
+
+class _PublishingLogNode(_LogNode):
+    def __init__(self):
+        super().__init__()
+        self.publisher = _Recorder()
+
+    def create_publisher(self, *_args, **_kwargs):
+        return self.publisher
+
+
+def test_a_velocity_mode_hold_reaches_the_arm_with_the_streamer_dead():
+    """In velocity mode a dead streamer leaves the controller on its last
+    velocity, so the sweep controller's own end has to be able to stop it."""
+    node = _PublishingLogNode()
+    config = dict(node_name="test_arm_streamer_velocity", use_sim_time=False,
+                  joint_states_topic="/test_arm_streamer/joint_states",
+                  stream_rate=RATE, stream_period_max_factor=50.0, follow_lead=0.05,
+                  follow_moving_speed=0.01, follow_ratio=0.3, follow_seconds=0.25,
+                  accel=2.0, air_max_lead=0.1, rt_priority=0)
+    remote = RemoteArmStream(node, JOINTS, topic="/test_arm_streamer/velocity_commands",
+                             config=config, mode="velocity")
+    try:
+        assert remote.controller == "forward_velocity_controller"
+        assert _wait(remote.ready, 30.0), "the process never came up"
+        remote._proc.kill()
+        remote._proc.wait(5.0)
+        remote.hold(None)
+        assert node.publisher.last == [0.0, 0.0, 0.0]
+    finally:
+        remote.close(1.0)
 
 
 def test_the_streamer_process_exits_when_the_sweep_controller_is_gone():

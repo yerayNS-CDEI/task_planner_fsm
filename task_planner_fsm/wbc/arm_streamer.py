@@ -60,6 +60,17 @@ ramps up again from the arm's own velocity; ``air_max_lead`` bounds how far it
 can wind meanwhile. It happened again on 2026-10-08 11:03:33, with setpoints
 arriving on time. Off on the wall: a press holds the plate still against a
 setpoint that leads it by design.
+
+**Velocity mode.** The same stream can drive ``forward_velocity_controller``
+instead: each tick publishes the ramped velocity itself rather than a setpoint
+advanced by it. A late tick then leaves speedj running at the last velocity
+instead of leaving servoj parked on the last setpoint, which is the
+stop-and-jump above. There is no setpoint to lead the arm, so the follow guard
+and the lead clamps do not apply. The price is the failure mode
+``wbc/streaming.py`` chose position for: a stream that stops leaves the arm
+moving. So a stale velocity still ramps to rest and then publishes one zero,
+every hold is a zero, and :class:`RemoteArmStream` also publishes the zero
+itself, so a hold lands even when this process is dead or stuck.
 """
 
 import os
@@ -67,8 +78,10 @@ import signal
 import threading
 
 import numpy as np
+from std_msgs.msg import Float64MultiArray
 
-from .streaming import DEFAULT_CONTROLLER, DEFAULT_TOPIC, POSITION, ArmStream
+from .streaming import DEFAULT_CONTROLLER, DEFAULT_TOPIC, MODES, POSITION, ArmStream
+from .streaming import VELOCITY as VELOCITY_MODE   # VELOCITY here is a pipe message
 
 # Pipe messages, sweep_node -> streamer. Tuples of (kind, seq, *payload); the
 # sequence number is what the acknowledgement echoes.
@@ -101,8 +114,8 @@ class StreamCore:
     def __init__(self, node, joint_names, topic=None, max_lead=0.2, stream_rate=100.0,
                  stream_period_max_factor=50.0, follow_lead=0.05,
                  follow_moving_speed=0.01, follow_ratio=0.3, follow_seconds=0.25,
-                 accel=2.0, air_max_lead=0.1):
-        self.stream = ArmStream(node, joint_names, mode=POSITION, topic=topic,
+                 accel=2.0, air_max_lead=0.1, mode=POSITION):
+        self.stream = ArmStream(node, joint_names, mode=mode, topic=topic,
                                 max_lead=max_lead)
         self.logger = node.get_logger()
         self.n = len(joint_names)
@@ -224,12 +237,23 @@ class StreamCore:
         if stale and self.accel <= 0.0:
             return
 
-        self._ramp(np.zeros(self.n) if stale else self.qdot, dt)
+        # A setpoint must cover the time that passed; a velocity must not. Over
+        # a late tick the arm simply kept the old velocity, so ramping by the
+        # whole gap would step it (0.16 rad/s after a 282 ms stall in URSim).
+        self._ramp(np.zeros(self.n) if stale else self.qdot,
+                   dt if self.stream.mode == POSITION else nominal)
         if stale and float(np.max(np.abs(self.v_out))) <= 1e-9:
-            return                                   # at rest: leave it quiet
+            # At rest: leave it quiet. A setpoint simply stops moving, but a
+            # velocity controller keeps the last value it was sent, and the
+            # ramp's last one was not zero — so velocity mode sends the zero
+            # once first.
+            published = self.stream.published
+            if (self.stream.mode == POSITION or published is None
+                    or not np.any(published)):
+                return
         self.stream.max_lead = (self.air_max_lead if self.in_air and self.air_max_lead > 0.0
                                 else self.max_lead)
-        if not stale:
+        if not stale and self.stream.mode == POSITION:
             self._follow_guard(now)
         self.stream.send(self.v_out, dt, self.q)
 
@@ -298,9 +322,7 @@ class StreamCore:
             f"re-anchoring the stream at the arm (#{self.reanchors}).")
 
     def lead(self):
-        if self.stream.command is None or self.q is None:
-            return 0.0
-        return float(np.max(np.abs(self.stream.command - self.q)))
+        return self.stream.lead(self.q)
 
 
 # ----------------------------------------------------------------------
@@ -334,7 +356,8 @@ def run(conn, status, config):
         follow_ratio=config.get("follow_ratio", 0.3),
         follow_seconds=config["follow_seconds"],
         accel=config.get("accel", 2.0),
-        air_max_lead=config.get("air_max_lead", 0.1))
+        air_max_lead=config.get("air_max_lead", 0.1),
+        mode=config.get("mode", POSITION))
     lock = threading.Lock()
     priority = int(config.get("rt_priority", 0))
     parent = os.getppid()
@@ -473,21 +496,30 @@ class RemoteArmStream:
     the wire.
     """
 
-    def __init__(self, node, joint_names, topic=None, max_lead=0.2, config=None):
+    def __init__(self, node, joint_names, topic=None, max_lead=0.2, config=None,
+                 mode=POSITION):
         import json
         import subprocess
         import sys
         from multiprocessing import shared_memory
         from multiprocessing.connection import Connection
 
+        if mode not in MODES:
+            raise ValueError(f"arm stream mode must be one of {MODES}, got '{mode}'")
         self.node = node
         self.joint_names = list(joint_names)
-        self.mode = POSITION
-        self.topic = topic or DEFAULT_TOPIC[POSITION]
-        self.controller = DEFAULT_CONTROLLER[POSITION]
+        self.mode = mode
+        self.topic = topic or DEFAULT_TOPIC[mode]
+        self.controller = DEFAULT_CONTROLLER[mode]
         self.max_lead = float(max_lead)
+        # Velocity mode only: this end's own way to put a zero on the wire. A
+        # dead or stuck streamer leaves the controller on its last velocity,
+        # and a hold sent down the pipe would never reach it.
+        self._zero_publisher = (node.create_publisher(Float64MultiArray, self.topic, 10)
+                                if mode == VELOCITY_MODE else None)
         config = dict(config or {})
-        config.update(joint_names=self.joint_names, topic=self.topic, max_lead=self.max_lead)
+        config.update(joint_names=self.joint_names, topic=self.topic, max_lead=self.max_lead,
+                      mode=self.mode)
 
         self._shm = shared_memory.SharedMemory(create=True, size=8 * STATUS_SIZE)
         self._status = np.ndarray((STATUS_SIZE,), dtype=np.float64, buffer=self._shm.buf)
@@ -521,7 +553,10 @@ class RemoteArmStream:
             except (BrokenPipeError, EOFError, OSError):
                 self.dead = True
                 self.node.get_logger().error(
-                    "The arm streamer process is gone; the arm is left on its last setpoint.")
+                    "The arm streamer process is gone; the arm is left on its last setpoint."
+                    if self._zero_publisher is None else
+                    "The arm streamer process is gone; only this node's holds can stop "
+                    "the arm now.")
             return self._seq
 
     @staticmethod
@@ -555,6 +590,11 @@ class RemoteArmStream:
 
     def hold(self, q_measured=None):
         self._send(HOLD, self._floats(q_measured))
+        if self._zero_publisher is not None:
+            # Also from here, after the pipe: the streamer may tick once more
+            # before it reads the hold, but its own zero then follows in order.
+            self._zero_publisher.publish(
+                Float64MultiArray(data=[0.0] * len(self.joint_names)))
         return None
 
     def flush(self, timeout=1.0):

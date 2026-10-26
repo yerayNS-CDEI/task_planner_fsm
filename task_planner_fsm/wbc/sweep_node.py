@@ -249,7 +249,7 @@ class WholeBodySweepNode(Node):
         # wbc/arm_streamer.py): in this one the stream shared an interpreter
         # with the solve and reached the arm 24 ms apart at the median and up
         # to ~400 ms at worst, against the 10 ms it was timed for, and the arm
-        # at 100 % stopped and started on every late one. Position mode only;
+        # at 100 % stopped and started on every late one. Either interface;
         # off runs the stream on a timer here, as before (the unit tests do).
         self.declare_parameter("arm_stream_process", True)
         # The streamer's guard for an arm that has stopped following in the air
@@ -1765,8 +1765,7 @@ class WholeBodySweepNode(Node):
             self.create_publisher(
                 MarkerArray, str(p("self_collision_markers_topic").value), 1)
             if bool(p("self_collision_markers").value) else None)
-        self.arm_stream_remote = (bool(p("arm_stream_process").value)
-                                  and str(p("arm_stream_interface").value) == POSITION)
+        self.arm_stream_remote = bool(p("arm_stream_process").value)
         if self.arm_stream_remote:
             # Started here, so it is up by the time wait_until_ready lets the
             # sweep begin: a fresh interpreter takes a second or two to import
@@ -1787,7 +1786,8 @@ class WholeBodySweepNode(Node):
                     follow_seconds=float(p("arm_follow_seconds").value),
                     accel=float(p("arm_stream_accel").value),
                     air_max_lead=float(p("arm_stream_max_lead_air").value),
-                    rt_priority=int(p("arm_streamer_rt_priority").value)))
+                    rt_priority=int(p("arm_streamer_rt_priority").value)),
+                mode=str(p("arm_stream_interface").value))
         else:
             self.arm_stream = ArmStream(
                 self, self.arm_joints,
