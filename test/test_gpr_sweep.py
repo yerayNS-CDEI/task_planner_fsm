@@ -534,3 +534,14 @@ def test_sweep_node_reports_contact_on_the_running_status():
     node._publish_status()
     assert node.status_pub.sent == [
         "running: seated", "running: unseated", "succeeded"]
+
+
+def test_the_sweep_and_the_gpr_travel_track_in_wheel_odom_on_the_robot(scan_wall, tmp_path):
+    """2026-10-23: ICP odometry stalled for 3 s at a sweep start and caught up
+    with a 2.6 cm jump that jolted the arm. On the robot both the sweep and the
+    GPR travel track in the Jetson's wheel_odom; sim keeps odom; a run can set
+    either."""
+    assert scan_wall._wbc_tracking_frame(make_ctx(tmp_path, sim=False)) == "wheel_odom"
+    assert scan_wall._wbc_tracking_frame(make_ctx(tmp_path, sim=True)) == "odom"
+    assert scan_wall._wbc_tracking_frame(
+        make_ctx(tmp_path, sim=False, wbc_tracking_frame="odom")) == "odom"

@@ -2354,6 +2354,25 @@ class ScanWall(State):
             return bool(override)
         return not bool(ctx.get("sim", False))
 
+    def _wbc_tracking_frame(self, ctx):
+        """The frame the whole-body sweep and the GPR travel are tracked in.
+
+        On the robot, wheel_odom: dead-reckoned on the Jetson from the wheel and
+        turret joints (navi_wall wheel_odometry), so the base pose the sweep
+        steers by neither waits on PC2's ICP odometry nor on the link to it.
+        On 2026-10-23 18:07 that ICP pose stopped for 3 s at the start of a
+        sweep and caught up with a 2.6 cm jump that jolted the arm; across the
+        week's sweeps it also jumped 5-30 cm where wheel_odom moved ~1 mm.
+
+        In simulation, odom, as before (no wheel_odometry there unless the
+        omni platform launch runs it). ``ctx["wbc_tracking_frame"]`` overrides
+        either way — ``odom`` is the fallback if wheel_odom is missing.
+        """
+        override = ctx.get("wbc_tracking_frame")
+        if override:
+            return str(override)
+        return "odom" if bool(ctx.get("sim", False)) else "wheel_odom"
+
     def _start_wbc_sweep(self, ctx, seg_start, seg_end):
         """Launch the whole-body sweep for one segment and watch its status.
 
@@ -2405,6 +2424,7 @@ class ScanWall(State):
             # SIM clock or the sweep times out long before the robot has
             # travelled the segment.
             "-p", f"use_sim_time:={'true' if bool(ctx.get('sim', False)) else 'false'}",
+            "-p", f"tracking_frame:={self._wbc_tracking_frame(ctx)}",
         ]
         # The row height is owned by the column, which was set during the
         # pre-approach and does not move during a sweep; passing it keeps the arm
@@ -2501,10 +2521,12 @@ class ScanWall(State):
             speed = float(ctx.get("sweep_crawl_speed", self.SWEEP_CRAWL_SPEED_MS))
         else:
             speed = float(ctx.get("sweep_speed_limit", self.SWEEP_SPEED_LIMIT_MS))
-        # Travel measured in odom, as the WBC sweep tracks it: in localization
-        # each map->odom correction (2-6 cm, ~0.7/s) read as a plate jump and
-        # was dropped, ~1 m of a 7.1 m sweep on 2026-10-22.
-        self._gpr.arm_triggers(ctx, "map", seg_start, seg_end, speed, travel_frame="odom")
+        # Travel measured in the frame the WBC sweep tracks in: in map, each
+        # map->odom correction (2-6 cm, ~0.7/s) read as a plate jump and was
+        # dropped, ~1 m of a 7.1 m sweep on 2026-10-22; in odom, ICP's own
+        # jumps still left 6.4 of 7.08 m (2026-10-23).
+        self._gpr.arm_triggers(ctx, "map", seg_start, seg_end, speed,
+                               travel_frame=self._wbc_tracking_frame(ctx))
 
     def _start_hyperspectral(self, ctx, seg_start, seg_end):
         """Plate seated and about to travel: sample #0 here, then one capture per
