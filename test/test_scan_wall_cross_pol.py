@@ -357,6 +357,8 @@ def test_the_approach_lowers_the_plate_even_at_the_right_standoff(state, node, m
     sent = []
     monkeypatch.setattr(state, "_send_arm_z_goal",
                         lambda ctx, advance, rise=0.0: sent.append((advance, rise)) or True)
+    # A current arm TF pose: the move is placed from it (1842a78).
+    monkeypatch.setattr(state, "_tool0_pose", lambda ctx: (object(), object(), None))
     ctx = ctx_for(node, plate_distances=[0.20] * 3 + [0.20] * 3,
                   plate_distances_stamp=time.time())
     assert state._send_arm_to_clearance(ctx, 0.20) == "skip"
