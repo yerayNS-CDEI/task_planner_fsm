@@ -466,6 +466,55 @@ def test_contact_notes_before_arming_are_ignored(tmp_path, http):
 
 
 # ----------------------------------------------------------------------
+# The travel frame, and what happens without it
+# ----------------------------------------------------------------------
+class _FramedTf(_Tf):
+    """Like _Tf, plus a rotation for frame-to-frame lookups, and a record of
+    which frame each lookup was made in."""
+
+    def __init__(self, known=("map", "odom")):
+        super().__init__()
+        self.known = set(known)
+        self.targets = []
+
+    def can_transform(self, target, *a, **kw):
+        return target in self.known
+
+    def lookup_transform(self, target, source, *a, **kw):
+        if target not in self.known or source not in self.known | {"arm_tool0"}:
+            raise RuntimeError(f"no {target} <- {source}")
+        self.targets.append(target)
+        t = SimpleNamespace(x=self.xyz[0], y=self.xyz[1], z=self.xyz[2])
+        q = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+        return SimpleNamespace(transform=SimpleNamespace(translation=t, rotation=q))
+
+
+def test_travel_is_measured_in_the_travel_frame(tmp_path, http):
+    ctx = make_ctx(tmp_path, tf_buffer=_FramedTf())
+    gpr = GprSweep("ScanWall", None)
+    _begin(gpr, ctx, 0, 0, 0)
+    gpr.arm_triggers(ctx, "map", *SEG, 0.03, travel_frame="odom")
+    ctx["tf_buffer"].targets.clear()
+    _move_to(ctx, 0.0051)
+    assert set(ctx["tf_buffer"].targets) == {"odom"}
+    assert ctx["node"].pub.sent == [1, 2]
+
+
+def test_without_the_travel_frame_it_measures_along_the_segment_frame(tmp_path, http):
+    """Not path length: that random-walks with every sideways jitter."""
+    ctx = make_ctx(tmp_path, tf_buffer=_FramedTf(known=("map",)))
+    gpr = GprSweep("ScanWall", None)
+    _begin(gpr, ctx, 0, 0, 0)
+    gpr.arm_triggers(ctx, "map", *SEG, 0.03, travel_frame="odom")
+    ctx["tf_buffer"].targets.clear()
+    ctx["tf_buffer"].xyz = [0.0, 0.03, 1.0]      # sideways only: no travel
+    ctx["node"].timers[-1]()
+    _move_to(ctx, 0.0051)
+    assert set(ctx["tf_buffer"].targets) == {"map"}
+    assert ctx["node"].pub.sent == [1, 2]
+
+
+# ----------------------------------------------------------------------
 # ScanWall: arm on the sweep node's first "running: seated"
 # ----------------------------------------------------------------------
 class _GprStub:

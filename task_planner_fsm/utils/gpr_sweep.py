@@ -242,6 +242,17 @@ class GprSweep:
         node = ctx["node"]
         ref = str(ctx.get("gpr_trigger_reference_frame") or travel_frame or ref_frame)
         axis = self._axis_in_frame(ctx, ref, ref_frame, self._sweep_axis(seg_start, seg_end))
+        if axis is None and ref != ref_frame and self._sweep_axis(seg_start, seg_end):
+            # The travel frame cannot be related to the segment's (no TF between
+            # them yet): measure in the segment's own frame, along the segment,
+            # rather than fall back to path length, which random-walks with
+            # every sideways jitter.
+            self._log(ctx).warn(
+                f"[{self.name}] GPR triggers: cannot express the sweep direction in "
+                f"'{ref}' (no {ref}<-{ref_frame} transform); measuring in "
+                f"'{ref_frame}' instead.")
+            ref = ref_frame
+            axis = self._axis_in_frame(ctx, ref, ref_frame, self._sweep_axis(seg_start, seg_end))
         if axis is None:
             self._log(ctx).warn(
                 f"[{self.name}] GPR triggers: no sweep direction in '{ref}'; "
