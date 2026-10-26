@@ -273,6 +273,8 @@ class RobotFSMNode(Node):
         initial_state: str = "Initialization",
         scan_phase: Optional[int] = None,
         planner_backend: str = "legacy",
+        launch_stack: bool = True,
+        stop_after: Optional[str] = None,
     ):
         # Auto-declare any parameter passed as an override (e.g. via
         # `--ros-args -p create_map_sweep_axis:=perpendicular` or a launch file),
@@ -285,6 +287,11 @@ class RobotFSMNode(Node):
         self.initial_state = initial_state
         self._stdin_warned = False
         self.planner_backend = str(planner_backend).strip().lower()
+        # False: the robot stack (move_robot.launch.py) is already up in another
+        # terminal; the bootstrap only waits for it instead of launching a second
+        # copy on top of it.
+        self.launch_stack = bool(launch_stack)
+        self._stack_ensured = False
         # Restart (/fsm/restart) bookkeeping.
         self._pending_restart: Optional[Dict] = None
         self._run_index = 1
@@ -354,6 +361,11 @@ class RobotFSMNode(Node):
                 continue
             self.ctx.setdefault(pname, param.value)
             self.get_logger().info(f"[FSM] ctx param override: {pname}={param.value!r}")
+        # Last state to run; its onward transition goes to Finished instead
+        # (StateMachine.step). The flag wins over a same-named param; unset,
+        # the mission runs to its natural end.
+        if stop_after:
+            self.ctx["fsm_stop_after"] = stop_after
 
         # Jetson/PC2 split: -p perception_launcher:=/process_launcher sends the
         # perception half of the stacks this FSM launches to that node's
@@ -985,6 +997,9 @@ class RobotFSMNode(Node):
         )
 
     def _ensure_nav_sim_running(self):
+        if self._stack_ensured:
+            return
+        self._stack_ensured = True
         p = self.ctx.get("_procs", {}).get("nav_sim")
         if p and p.poll() is None:
             self.get_logger().info(f"[FSM] Navigation simulation already running (pid={p.pid}).")
@@ -993,36 +1008,42 @@ class RobotFSMNode(Node):
         sim_value = "true" if self.ctx.get("sim", False) else "false"
         planner_backend = str(self.ctx.get("planner_backend", "legacy")).strip().lower()
         try:
-            start_proc(
-                self.ctx,
-                "nav_sim",
-                [
-                    "ros2",
-                    "launch",
-                    "navi_wall",
-                    "move_robot.launch.py",
-                    f"sim:={sim_value}",
-                    "mode:=full",
-                    "controller_type:=omni",
-                    # The map CreateMap saves (mapping_cmd).
-                    "database_name:=rtabmap",
-                    "headless:=true",
-                    f"use_sim_time:={sim_value}",
-                    "hybrid_sim:=false",
-                    f"planner_backend:={planner_backend}",
-                    # This launch starts wall_detection_node itself, so it must
-                    # write the very file GeometryReconstruction reads back.
-                    f"wall_file_path:={self.ctx['geometry_reconstruction_wall_file_path']}",
-                    # Detector (true) or republisher of the saved walls (false),
-                    # matching what GeometryReconstruction waits for.
-                    f"wall_detection:={'true' if wall_detection_enabled(self.ctx) else 'false'}",
-                    # Push out launch's own SIGKILL deadline so ros2_control survives
-                    # long enough to retract the column on shutdown.
-                    *ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
-                ],
-            )
-            time.sleep(2.0)
-            self.get_logger().info("[FSM] Navigation + localization simulation started by bootstrap.")
+            if not self.launch_stack:
+                self.get_logger().info(
+                    "[FSM] --no-launch-stack: attaching to the robot stack already "
+                    "running; waiting for it to be ready instead of launching it."
+                )
+            else:
+                start_proc(
+                    self.ctx,
+                    "nav_sim",
+                    [
+                        "ros2",
+                        "launch",
+                        "navi_wall",
+                        "move_robot.launch.py",
+                        f"sim:={sim_value}",
+                        "mode:=full",
+                        "controller_type:=omni",
+                        # The map CreateMap saves (mapping_cmd).
+                        "database_name:=rtabmap",
+                        "headless:=true",
+                        f"use_sim_time:={sim_value}",
+                        "hybrid_sim:=false",
+                        f"planner_backend:={planner_backend}",
+                        # This launch starts wall_detection_node itself, so it must
+                        # write the very file GeometryReconstruction reads back.
+                        f"wall_file_path:={self.ctx['geometry_reconstruction_wall_file_path']}",
+                        # Detector (true) or republisher of the saved walls (false),
+                        # matching what GeometryReconstruction waits for.
+                        f"wall_detection:={'true' if wall_detection_enabled(self.ctx) else 'false'}",
+                        # Push out launch's own SIGKILL deadline so ros2_control survives
+                        # long enough to retract the column on shutdown.
+                        *ROBOT_STACK_LAUNCH_SHUTDOWN_ARGS,
+                    ],
+                )
+                time.sleep(2.0)
+                self.get_logger().info("[FSM] Navigation + localization simulation started by bootstrap.")
 
             # Mirror ObjectID's readiness gates. When the FSM is started at a
             # non-initial state this bootstrap path replaces ObjectID, so without
@@ -1284,13 +1305,15 @@ class RobotFSMNode(Node):
     # ------------------------------------------------------------------
     # Restart from Error / Finished (/fsm/restart)
     # ------------------------------------------------------------------
-    RESTART_FIELDS = ("state", "scan_phase")
+    RESTART_FIELDS = ("state", "scan_phase", "stop_after")
 
     def _parse_restart_request(self, data: str) -> Dict:
         """``/fsm/restart`` payload -> request dict. Raises ValueError with the reason.
 
         Either a bare state name (``data: GeometryReconstruction``) or a JSON
-        object with ``state`` and, optionally, ``scan_phase`` (1/2).
+        object with ``state`` and, optionally, ``scan_phase`` (1/2) and
+        ``stop_after`` (a state, or null to run to the end even if --stop-after
+        was given on the command line).
         """
         text = (data or "").strip()
         try:
@@ -1313,6 +1336,8 @@ class RobotFSMNode(Node):
             )
         if request.get("scan_phase") not in (None, 1, 2):
             raise ValueError(f"scan_phase must be 1 or 2, not {request['scan_phase']!r}")
+        if request.get("stop_after") not in (None,) + tuple(FSM_STATE_ORDER):
+            raise ValueError(f"unknown stop_after state {request['stop_after']!r}")
         return request
 
     def restart_callback(self, msg: String):
@@ -1426,6 +1451,12 @@ class RobotFSMNode(Node):
                 f"still be out. Make sure they are clear before {target} moves the base."
             )
         self._reset_ctx_for_restart(target)
+        if "stop_after" in request:
+            if request["stop_after"]:
+                self.ctx["fsm_stop_after"] = request["stop_after"]
+            else:
+                self.ctx.pop("fsm_stop_after", None)
+        self._stack_ensured = False
 
         self._restarting = True
         try:
@@ -1640,6 +1671,20 @@ def main(args=None):
         choices=["legacy", "moveit"],
         help="Planner backend to use when the FSM launches move_robot.launch.py.",
     )
+    parser.add_argument(
+        "--no-launch-stack",
+        action="store_true",
+        help="Do not launch move_robot.launch.py during the bootstrap; the robot "
+             "stack is already running. The bootstrap still waits for it to be ready.",
+    )
+    parser.add_argument(
+        "--stop-after",
+        type=str,
+        default=None,
+        choices=FSM_STATE_ORDER,
+        help="Last state to run: its onward transition goes to Finished instead "
+             "(bench runs that must not carry on to HomePosition).",
+    )
 
     # Use sys.argv if args is None
     argv = args if args is not None else sys.argv[1:]
@@ -1655,6 +1700,8 @@ def main(args=None):
             initial_state=parsed_args.initial_state,
             scan_phase=parsed_args.scan_phase,
             planner_backend=parsed_args.planner_backend,
+            launch_stack=not parsed_args.no_launch_stack,
+            stop_after=parsed_args.stop_after,
         )
     except BootstrapError as exc:
         # Already logged and cleaned up by the bootstrap; exit without a

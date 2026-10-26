@@ -191,6 +191,10 @@ def test_targets_start_at_object_id_and_exclude_the_mapping_and_terminal_states(
     (" ScanWall\n", {"state": "ScanWall"}),
     ({"state": "HomePosition", "scan_phase": 2},
      {"state": "HomePosition", "scan_phase": 2}),
+    ({"state": "ScanWall", "stop_after": "SensorDataProcessing"},
+     {"state": "ScanWall", "stop_after": "SensorDataProcessing"}),
+    ({"state": "ScanWall", "stop_after": None},
+     {"state": "ScanWall", "stop_after": None}),
 ])
 def test_parse_accepts_a_bare_state_or_json(data, expected):
     node = fake_node()
@@ -205,9 +209,9 @@ def test_parse_accepts_a_bare_state_or_json(data, expected):
     "Nope",
     {"state": "ScanWall", "walls": [1]},
     {"state": "ScanWall", "scan_phase": 3},
-    # sensor_implementation options this branch does not have
+    # base-placement option this branch does not have
     {"state": "ScanWall", "wall_source": "in-front"},
-    {"state": "ScanWall", "stop_after": "ScanWall"},
+    {"state": "ScanWall", "stop_after": "Nope"},
     "[1, 2]",
 ])
 def test_parse_refuses_bad_requests(data):
@@ -357,6 +361,23 @@ def test_perform_restart_bootstraps_then_moves_the_machine():
     assert node.initial_state == "ScanWall"
     assert node.graphs == ["ScanWall"]
     assert node._run_index == 2
+
+
+def test_a_restart_sets_or_clears_stop_after_and_rechecks_the_stack():
+    seen = []
+
+    def bootstrap(state, phase):
+        seen.append((node.ctx.get("fsm_stop_after"), node._stack_ensured))
+
+    ctx, baseline, _ = run_ctx()
+    baseline["fsm_stop_after"] = "HomePosition"     # given with --stop-after
+    node = fake_node(ctx=ctx, baseline=baseline, bootstrap=bootstrap)
+    node._stack_ensured = True
+    node._perform_restart({"state": "ScanWall", "stop_after": "SensorDataProcessing"})
+    node._stack_ensured = True
+    node._perform_restart({"state": "ScanWall", "stop_after": None})
+    node._perform_restart({"state": "ScanWall"})
+    assert seen == [("SensorDataProcessing", False), (None, False), ("HomePosition", False)]
 
 
 def test_failed_bootstrap_keeps_the_machine_and_the_stack(monkeypatch):
