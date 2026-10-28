@@ -68,7 +68,10 @@ def state():
 
 
 def ctx_for(node, arm_base_z=MOUNT_Z_COLUMN_DOWN, column=0.0, **overrides):
-    ctx = {"node": node, "sim": True, "tf_buffer": FakeBuffer(arm_base_z)}
+    # One sweep per line: these pin the single-height sizing. Sizing for both
+    # polarization passes is in test_scan_wall_cross_pol.py.
+    ctx = {"node": node, "sim": True, "tf_buffer": FakeBuffer(arm_base_z),
+           "scan_wall_cross_pol": False}
     if column is not None:
         ctx["column_current_height"] = column
     ctx.update(overrides)

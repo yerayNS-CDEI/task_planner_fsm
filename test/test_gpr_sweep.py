@@ -224,6 +224,26 @@ def test_segment_runs_the_gp_api_flow_in_order_against_the_static_probe(tmp_path
     assert (incoming / "w02_l01_s00_m.sgy").is_file()
 
 
+def test_the_two_polarizations_of_a_segment_do_not_overwrite_each_other(tmp_path, http):
+    """Same wall, line and segment twice: without the polarization the second
+    export would unpack over the first under the same key."""
+    ctx = make_ctx(tmp_path)
+    gpr = GprSweep("ScanWall", None)
+    for pol, roll in (("copol", 0.0), ("xpol", -90.0)):
+        assert (gpr.open_measurement(ctx, 2, 1, 0, polarization=pol, plate_roll_deg=roll)
+                or gpr.start_line(ctx, *SEG, "map")) is None
+        gpr.end_segment(ctx)
+
+    names = [body["name"] for m, u, body in http if u.endswith("/measurement/start")]
+    assert names == ["scan_wall line 2 seg 1 copol", "scan_wall line 2 seg 1 xpol"]
+    co, x = _manifest(tmp_path)
+    assert (co["key"], co["polarization"], co["plate_roll_deg"]) == ("w02_l01_s00_copol", "copol", 0.0)
+    assert (x["key"], x["polarization"], x["plate_roll_deg"]) == ("w02_l01_s00_xpol", "xpol", -90.0)
+    incoming = tmp_path / "raw" / "gpr" / "session_test" / "incoming"
+    assert (incoming / "w02_l01_s00_copol_m.sgy").is_file()
+    assert (incoming / "w02_l01_s00_xpol_m.sgy").is_file()
+
+
 def test_a_failed_connect_refuses_the_segment_and_starts_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(gpr_sweep_mod.requests, "request",
                         lambda *a, **kw: _Resp(500, {"error": {"message": "no"}}))
@@ -463,6 +483,55 @@ def test_contact_notes_before_arming_are_ignored(tmp_path, http):
     gpr.note_contact(ctx, False)
     gpr.end_segment(ctx)
     assert "unseated" not in _manifest(tmp_path)[0]
+
+
+# ----------------------------------------------------------------------
+# The travel frame, and what happens without it
+# ----------------------------------------------------------------------
+class _FramedTf(_Tf):
+    """Like _Tf, plus a rotation for frame-to-frame lookups, and a record of
+    which frame each lookup was made in."""
+
+    def __init__(self, known=("map", "odom")):
+        super().__init__()
+        self.known = set(known)
+        self.targets = []
+
+    def can_transform(self, target, *a, **kw):
+        return target in self.known
+
+    def lookup_transform(self, target, source, *a, **kw):
+        if target not in self.known or source not in self.known | {"arm_tool0"}:
+            raise RuntimeError(f"no {target} <- {source}")
+        self.targets.append(target)
+        t = SimpleNamespace(x=self.xyz[0], y=self.xyz[1], z=self.xyz[2])
+        q = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+        return SimpleNamespace(transform=SimpleNamespace(translation=t, rotation=q))
+
+
+def test_travel_is_measured_in_the_travel_frame(tmp_path, http):
+    ctx = make_ctx(tmp_path, tf_buffer=_FramedTf())
+    gpr = GprSweep("ScanWall", None)
+    _begin(gpr, ctx, 0, 0, 0)
+    gpr.arm_triggers(ctx, "map", *SEG, 0.03, travel_frame="odom")
+    ctx["tf_buffer"].targets.clear()
+    _move_to(ctx, 0.0051)
+    assert set(ctx["tf_buffer"].targets) == {"odom"}
+    assert ctx["node"].pub.sent == [1, 2]
+
+
+def test_without_the_travel_frame_it_measures_along_the_segment_frame(tmp_path, http):
+    """Not path length: that random-walks with every sideways jitter."""
+    ctx = make_ctx(tmp_path, tf_buffer=_FramedTf(known=("map",)))
+    gpr = GprSweep("ScanWall", None)
+    _begin(gpr, ctx, 0, 0, 0)
+    gpr.arm_triggers(ctx, "map", *SEG, 0.03, travel_frame="odom")
+    ctx["tf_buffer"].targets.clear()
+    ctx["tf_buffer"].xyz = [0.0, 0.03, 1.0]      # sideways only: no travel
+    ctx["node"].timers[-1]()
+    _move_to(ctx, 0.0051)
+    assert set(ctx["tf_buffer"].targets) == {"map"}
+    assert ctx["node"].pub.sent == [1, 2]
 
 
 # ----------------------------------------------------------------------

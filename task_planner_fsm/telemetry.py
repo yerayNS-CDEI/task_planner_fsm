@@ -3,29 +3,50 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List
 
 
+# Horseshoe layout turned on its side so the graph is TALL rather than WIDE and
+# fits a docked RViz side panel. Nodes are 220x92 in the panel; the columns are
+# spaced 400px (180px gutter for the return edges) and rows 150px (58px of
+# vertical breathing room -- the edge router treats nodes as obstacles inflated
+# by 8px per side, so rows must stay at least ~110px apart).
+#
+# The mapping/perception/navigation chain runs TOP->BOTTOM down the middle
+# column and fans out into the three scan states side by side at the bottom;
+# they converge back into SensorDataProcessing and the return chain runs
+# BOTTOM->TOP up the right column. ArmFolding sits level with
+# WallTargetSelection so the per-target loop-back edge stays short.
+#
+# Error is an isolated sink (no edges are routed to it) that lights up when
+# active; it floats at the top right, clear of the columns. Coordinates are the
+# top-left corner of each node.
 _NODE_POSITIONS = {
-    "Initialization": (40, 40),
-    "CreateMap": (360, 40),
-    "ObjectID": (680, 40),
-    "WallLinesComputation": (1000, 40),
-    "GeometryReconstruction": (1320, 40),
-    "ComputeWallPoints": (1640, 40),
-    "WallTargetSelection": (360, 240),
-    "NavigateToTarget": (680, 240),
-    "ArmUnfolding": (1000, 240),
-    "ScanWall": (1320, 240),
-    "ScanFloor": (1320, 440),
-    "ScanCeiling": (1320, 640),
-    "SensorDataProcessing": (1640, 240),
-    "SendDataToPokeye": (1960, 440),
-    "ArmFolding": (2280, 240),
+    # Middle column (top -> bottom): mapping, perception & navigation
+    "Initialization": (480, 40),
+    "CreateMap": (480, 190),
+    "ObjectID": (480, 340),
+    "WallLinesComputation": (480, 490),
+    "GeometryReconstruction": (480, 640),
+    "ComputeWallPoints": (480, 790),
+    "WallTargetSelection": (480, 940),
+    "NavigateToTarget": (480, 1090),
+    "ArmUnfolding": (480, 1240),
+    # Bottom of the horseshoe: the three scan branches, side by side
+    "ScanFloor": (40, 1390),
+    "ScanWall": (480, 1390),
+    "ScanCeiling": (880, 1390),
+    # Right column (bottom -> top): processing, upload & return
+    "SensorDataProcessing": (880, 1240),
+    "SendDataToPokeye": (880, 1090),
+    "ArmFolding": (880, 940),
+    "HomePosition": (880, 790),
+    "Finished": (880, 640),
+    # Isolated failure sink
+    "Error": (880, 40),
+    # Disabled legacy states; the coordinates below are from the old wide
+    # layout and need redoing if these are ever brought back.
     # "AreasOfInterest": (1320, 440),
     # "WallDiscretization": (1640, 440),
     # "BasePlacement": (1960, 440),
     # "ExhaustiveScan": (1320, 640),
-    "HomePosition": (2280, 440),
-    "Finished": (2280, 640),
-    "Error": (2280, 40),
 }
 
 _DEFAULT_EDGES = [
@@ -104,7 +125,8 @@ def build_fsm_graph_payload(states: Iterable[str]) -> Dict[str, List[Dict[str, A
     nodes = []
     seen = set()
     for index, state in enumerate(states):
-        x, y = _NODE_POSITIONS.get(state, (index * 180, 0))
+        # Unknown states stack in their own column left of the horseshoe.
+        x, y = _NODE_POSITIONS.get(state, (-360, index * 150))
         nodes.append(
             {
                 "id": state,

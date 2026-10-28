@@ -31,6 +31,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/task_planner.launch.py']),
+        ('share/' + package_name + '/rviz', ['rviz/omni_demo.rviz']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -48,5 +49,6 @@ setup(
         'scripts/hyperspectral_bench',
         'scripts/check_sensor_setup',
         'scripts/process_sensor_session',
+        'scripts/omni_demo',
     ],
 )

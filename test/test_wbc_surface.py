@@ -170,6 +170,30 @@ def test_the_orientation_target_faces_the_wall_and_stands_upright():
     assert np.linalg.det(R) == pytest.approx(1.0)
 
 
+def test_a_rolled_target_keeps_the_normal_and_turns_the_plate_about_it():
+    """The cross-polarized pass: -90 deg about the wall normal puts plate +X
+    down (and the GPR, at plate x = -0.08, above the centre)."""
+    m_hat = np.array([0.0, 1.0, 0.0])
+    upright = plate_orientation_target(m_hat)
+    R = plate_orientation_target(m_hat, roll=-np.pi / 2)
+    np.testing.assert_allclose(R[:, 2], m_hat, atol=1e-12)          # still into the wall
+    np.testing.assert_allclose(R[:, 0], -upright[:, 1], atol=1e-12)  # +X now points down
+    np.testing.assert_allclose(R[:, 1], upright[:, 0], atol=1e-12)
+    assert np.linalg.det(R) == pytest.approx(1.0)
+
+
+def test_a_plate_rolled_as_told_has_no_orientation_error_to_undo():
+    """Told the roll, the alignment leaves a rolled plate alone; not told, it
+    sees a 90 deg error — which is the plate being turned back upright."""
+    from task_planner_fsm.wbc.kinematics import rotation_error
+    m_hat = np.array([0.0, 1.0, 0.0])
+    rolled = plate_orientation_target(m_hat, roll=-np.pi / 2)
+    assert np.linalg.norm(rotation_error(rolled, plate_orientation_target(
+        m_hat, roll=-np.pi / 2))) == pytest.approx(0.0, abs=1e-9)
+    assert np.linalg.norm(rotation_error(rolled, plate_orientation_target(
+        m_hat))) == pytest.approx(np.pi / 2)
+
+
 def test_a_vertical_surface_normal_has_no_upright_solution():
     assert plate_orientation_target(np.array([0.0, 0.0, 1.0])) is None
 

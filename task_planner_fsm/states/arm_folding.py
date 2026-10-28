@@ -185,6 +185,8 @@ class ArmFolding(State):
             # Check if all goals are completed
             if self.goals_completed >= self.total_goals:
                 self.movement_done = True
+                # Lets ArmUnfolding and ScanWall rely on the arm being folded.
+                ctx["arm_folded"] = True
                 node.get_logger().info(f"[{self.name}] All folding movements completed.")
             # Note: do NOT call _send_next_goal() here, let next run() cycle handle it
         elif exec_status is False or exec_status is None:
