@@ -1,5 +1,6 @@
 from ..state import State
 from ..utils.wall_geometry import build_wall_data
+from ..utils.wall_selection import auto_lines_z, scan_all_walls
 
 class ComputeWallPoints(State):
     def __init__(self, name):
@@ -74,6 +75,68 @@ class ComputeWallPoints(State):
             )
         return sorted(z_values)
 
+    def _prompt_selection(self, available_walls):
+        """Ask on stdin which walls to scan and at which heights.
+
+        Returns ``(selected 1-based indices, walls_data)``; raises ValueError on
+        bad input so the caller can ask again next tick.
+        """
+        max_walls = len(available_walls)
+        if max_walls == 0:
+            raise ValueError("No walls available to scan.")
+        num_walls = int(input(f">> Number of walls to scan? (1-{max_walls}) ").strip())
+        if num_walls <= 0 or num_walls > max_walls:
+            raise ValueError(f"Number must be between 1 and {max_walls}.")
+
+        indices_raw = input(">> Enter wall indices to scan (e.g. 1 3): ").strip()
+        selected_indices = self._parse_indices(indices_raw)
+
+        if len(selected_indices) != num_walls:
+            raise ValueError(
+                f"You requested {num_walls} wall(s), but provided {len(selected_indices)} indices."
+            )
+
+        if len(set(selected_indices)) != len(selected_indices):
+            raise ValueError("Duplicate wall indices are not allowed.")
+
+        walls_data = []
+        for idx in selected_indices:
+            if idx < 1 or idx > max_walls:
+                raise ValueError(f"Wall index {idx} out of range (1-{max_walls}).")
+            p1, p2 = available_walls[idx - 1][1]
+            outward_normal = available_walls[idx - 1][2]
+            scan_lines_z = self._prompt_wall_lines(idx)
+            walls_data.append(
+                self._build_wall_data(
+                    p1, p2, scan_lines_z=scan_lines_z, outward_normal=outward_normal
+                )
+            )
+        return selected_indices, walls_data
+
+    def _select_all_detected(self, ctx, available_walls):
+        """scan_all_walls: every map-detected wall, none of the predefined
+        fallbacks (they are not in this building), each at scan_all_walls_lines_z.
+        """
+        lines_z = auto_lines_z(ctx)
+        selected_indices = [
+            i for i, (source, _pts, _n) in enumerate(available_walls, 1) if source == "detected"
+        ]
+        if not selected_indices:
+            raise ValueError("no walls were detected in the map")
+        walls_data = []
+        for idx in selected_indices:
+            _source, (p1, p2), outward_normal = available_walls[idx - 1]
+            walls_data.append(
+                self._build_wall_data(
+                    p1, p2, scan_lines_z=lines_z, outward_normal=outward_normal
+                )
+            )
+        ctx["node"].get_logger().info(
+            f"[{self.name}] scan_all_walls: scanning all {len(walls_data)} detected wall(s), "
+            f"lines at z={lines_z}; a wall the robot cannot reach is skipped."
+        )
+        return selected_indices, walls_data
+
     def run(self, ctx):
         node = ctx["node"]
         self.set_activity(ctx, "Computing wall scan points")
@@ -92,41 +155,19 @@ class ComputeWallPoints(State):
                 tag = f"W{i} [map]" if source == "detected" else "[predefined]"
                 print(f"  {i}: {tag} p1={p1}, p2={p2}")
 
-            try:
-                max_walls = len(available_walls)
-                if max_walls == 0:
-                    raise ValueError("No walls available to scan.")
-                num_walls = int(input(f">> Number of walls to scan? (1-{max_walls}) ").strip())
-                if num_walls <= 0 or num_walls > max_walls:
-                    raise ValueError(f"Number must be between 1 and {max_walls}.")
-
-                indices_raw = input(">> Enter wall indices to scan (e.g. 1 3): ").strip()
-                selected_indices = self._parse_indices(indices_raw)
-
-                if len(selected_indices) != num_walls:
-                    raise ValueError(
-                        f"You requested {num_walls} wall(s), but provided {len(selected_indices)} indices."
-                    )
-
-                if len(set(selected_indices)) != len(selected_indices):
-                    raise ValueError("Duplicate wall indices are not allowed.")
-
-                walls_data = []
-                for idx in selected_indices:
-                    if idx < 1 or idx > max_walls:
-                        raise ValueError(f"Wall index {idx} out of range (1-{max_walls}).")
-                    p1, p2 = available_walls[idx - 1][1]
-                    outward_normal = available_walls[idx - 1][2]
-                    scan_lines_z = self._prompt_wall_lines(idx)
-                    walls_data.append(
-                        self._build_wall_data(
-                            p1, p2, scan_lines_z=scan_lines_z, outward_normal=outward_normal
-                        )
-                    )
-
-            except ValueError as e:
-                print(f"[{self.name}] Invalid input: {e}")
-                return
+            if scan_all_walls(ctx):
+                try:
+                    selected_indices, walls_data = self._select_all_detected(ctx, available_walls)
+                except ValueError as e:
+                    # Nobody to ask again: re-prompting would spin here for ever.
+                    return self.fail(ctx, f"scan_all_walls: {e}")
+            else:
+                try:
+                    selected_indices, walls_data = self._prompt_selection(available_walls)
+                except ValueError as e:
+                    print(f"[{self.name}] Invalid input: {e}")
+                    return
+            num_walls = len(walls_data)
 
             self.started = True
 

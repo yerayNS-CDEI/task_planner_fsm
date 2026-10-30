@@ -8,7 +8,9 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import rclpy
-from geometry_msgs.msg import Point, Pose, Quaternion, WrenchStamped
+from geometry_msgs.msg import (
+    Point, Pose, PoseWithCovarianceStamped, Quaternion, WrenchStamped,
+)
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry, OccupancyGrid
 from rclpy.action import ActionClient
@@ -41,6 +43,7 @@ from task_planner_fsm.states import (
     GeometryReconstruction,
     HomePosition,
     Initialization,
+    Localize,
     NavigateToTarget,
     ObjectID,
     WallLinesComputation,
@@ -68,8 +71,11 @@ from task_planner_fsm.states.proc_utils import (
 )
 from task_planner_fsm.states.remote_procs import RemoteProc, SplitProc
 from task_planner_fsm.sensors import paths as sensor_paths
+from task_planner_fsm.states.localize import NEXT_STATE_KEY as LOCALIZE_NEXT_STATE_KEY
 from task_planner_fsm.telemetry import build_fsm_graph_payload, make_json_safe
+from task_planner_fsm.utils import localization
 from task_planner_fsm.utils.wall_geometry import build_wall_data, left_scan_endpoint
+from task_planner_fsm.utils.wall_selection import auto_lines_z, scan_all_walls
 
 FSM_STATE_ORDER = [
     "Initialization",
@@ -181,6 +187,14 @@ NAV_SIM_REQUIRED_START_STATES = {
     if s not in {"Finished", "Error"} | OFFLINE_INITIAL_STATES
 }
 
+# The localization stack loads the saved map and, until rtabmap matches a frame
+# against it, has the robot at the map origin. A start that brings that stack up
+# therefore enters Localize first, which holds the robot still until it is
+# localized (utils/localization.py). Not a start state of its own: it only ever
+# runs in front of one. ObjectID has the same gate built in.
+LOCALIZE_STATE = "Localize"
+LOCALIZATION_GATED_START_STATES = NAV_SIM_REQUIRED_START_STATES
+
 # States a restart (/fsm/restart, from Error or Finished only) may start a new
 # run at. Everything from ObjectID on reuses the robot stack that is already up.
 # Initialization and CreateMap are refused: CreateMap kills the running stack
@@ -217,6 +231,9 @@ RESTART_KEPT_CTX_KEYS = {
     "gpr_trigger_bridge_status",
     "gpr_trigger_bridge_status_stamp",
     "parking_active",
+    # The stack's rtabmap stays localized across runs, and a robot standing
+    # still is not reported again (utils/localization.py).
+    localization.FIX_KEY,
     # Process bookkeeping: the robot stack stays up across runs.
     "_procs",
     "_cleanup_installed",
@@ -389,6 +406,16 @@ class RobotFSMNode(Node):
 
         self.ctx["fsm_run_index"] = self._run_index
 
+        # rtabmap's map matches. Subscribed before the bootstrap launches any
+        # stack: rtabmap publishes them only to an existing subscriber, and not
+        # again while a localized robot stands still. See utils/localization.py.
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            str(self.ctx.get("localization_topic", localization.DEFAULT_TOPIC)),
+            self.localization_pose_callback,
+            10,
+        )
+
         # What a restart resets ctx to: the node hooks, the -p overrides and the
         # wall-detection defaults -- everything that is not the run itself.
         self._ctx_baseline = dict(self.ctx)
@@ -414,6 +441,7 @@ class RobotFSMNode(Node):
                 ScanCeiling("ScanCeiling"),
                 SensorDataProcessing("SensorDataProcessing"),
                 SendDataToPokeye("SendDataToPokeye"),
+                Localize(LOCALIZE_STATE),
                 # AreasOfInterest("AreasOfInterest"),
                 # WallDiscretization("WallDiscretization"),
                 # BasePlacement("BasePlacement"),
@@ -422,7 +450,7 @@ class RobotFSMNode(Node):
                 Finished("Finished"),
                 Error("Error"),
             ],
-            initial_state=initial_state,
+            initial_state=self._gated_start(initial_state),
             ctx=self.ctx,
         )
         self.publish_fsm_graph()
@@ -507,6 +535,10 @@ class RobotFSMNode(Node):
         )
 
     def _safe_input(self, prompt: str) -> str:
+        # scan_all_walls: nobody is there to answer, so every prompt takes its
+        # default -- all walls, the first wall's start as the first target.
+        if scan_all_walls(self.ctx):
+            return ""
         try:
             return input(prompt)
         except EOFError:
@@ -612,6 +644,13 @@ class RobotFSMNode(Node):
         if yaml_path and wall_detection_enabled(self.ctx):
             yaml_path = self._wait_for_fresh_bootstrap_walls(yaml_path)
         raw_walls = self._load_walls_from_yaml(yaml_path) if yaml_path else []
+        if not raw_walls and scan_all_walls(self.ctx):
+            # Scanning every one of the hardcoded walls of some other building,
+            # unattended, is not a fallback.
+            self._abort_bootstrap(
+                f"scan_all_walls: no detected walls in "
+                f"{yaml_path or 'navi_wall rgb_detections dir (not found)'}"
+            )
         if not raw_walls:
             self.get_logger().warn(
                 f"[FSM Bootstrap] No walls from detected_walls.yaml "
@@ -758,7 +797,11 @@ class RobotFSMNode(Node):
 
         Returns a list sorted ascending (bottom first). Accepting the defaults
         (empty input) yields a single line, preserving single-pass behaviour.
+        With scan_all_walls nothing is asked: every wall gets
+        scan_all_walls_lines_z.
         """
+        if scan_all_walls(self.ctx):
+            return auto_lines_z(self.ctx)
         num_lines = self._prompt_int(f">> Wall {wall_idx}: number of horizontal lines", 1, 20, 1)
         default_str = " ".join("0.0" for _ in range(num_lines))
         while True:
@@ -1014,6 +1057,8 @@ class RobotFSMNode(Node):
                     "running; waiting for it to be ready instead of launching it."
                 )
             else:
+                # A new rtabmap: it has not matched the map yet.
+                localization.forget_fix(self.ctx)
                 start_proc(
                     self.ctx,
                     "nav_sim",
@@ -1210,6 +1255,22 @@ class RobotFSMNode(Node):
             self.get_logger().warn(f"[FSM Bootstrap] cleanup after the failure: {exc}")
         raise BootstrapError(reason)
 
+    def _gated_start(self, state: str) -> str:
+        """The state the machine enters first for a run that starts at ``state``.
+
+        Localize, with ``state`` as its next state, when the start brings up the
+        localization stack and the robot is not localized in it yet. A restart
+        on a stack that already localized goes straight to ``state``.
+        """
+        if (
+            state not in LOCALIZATION_GATED_START_STATES
+            or not localization.check_enabled(self.ctx)
+            or localization.is_localized(self.ctx)
+        ):
+            return state
+        self.ctx[LOCALIZE_NEXT_STATE_KEY] = state
+        return LOCALIZE_STATE
+
     def _ensure_nav_client(self):
         if self.ctx.get("nav_client") is None:
             self.ctx["nav_client"] = ActionClient(self, NavigateToPose, "/navigate_to_pose")
@@ -1252,6 +1313,12 @@ class RobotFSMNode(Node):
 
         if initial_state in WALL_DATA_REQUIRED_INITIAL_STATES:
             walls_data = self._prompt_walls_data()
+            if scan_all_walls(self.ctx):
+                self.get_logger().info(
+                    f"[FSM Bootstrap] scan_all_walls: scanning all {len(walls_data)} "
+                    f"wall(s), lines at z={auto_lines_z(self.ctx)}; a wall the robot "
+                    f"cannot reach is skipped."
+                )
             self.ctx["walls_data"] = walls_data
             self.ctx["wall_inward_normals"] = [w["inward_normal"] for w in walls_data]
             self.ctx["wall_ee_rpy_deg"] = [w["ee_rpy_deg"] for w in walls_data]
@@ -1476,7 +1543,7 @@ class RobotFSMNode(Node):
             self._restarting = False
 
         self.initial_state = target
-        self.machine.restart(target, reason=f"restart_run_{self._run_index}")
+        self.machine.restart(self._gated_start(target), reason=f"restart_run_{self._run_index}")
         self.publish_fsm_graph()
 
     def publish_fsm_current(self, state_name: str):
@@ -1498,7 +1565,7 @@ class RobotFSMNode(Node):
         self._publish_json(self.fsm_transition_pub, payload)
 
     def publish_fsm_graph(self):
-        payload = build_fsm_graph_payload(FSM_STATE_ORDER)
+        payload = build_fsm_graph_payload(FSM_STATE_ORDER + [LOCALIZE_STATE])
         payload["initial_state"] = self.initial_state
         self._publish_json(self.fsm_graph_pub, payload)
 
@@ -1566,6 +1633,9 @@ class RobotFSMNode(Node):
             "stamp": stamp,
         }
         self._publish_json(self.fsm_event_pub, payload)
+
+    def localization_pose_callback(self, msg: PoseWithCovarianceStamped):
+        localization.record_fix(self.ctx, msg)
 
     def start_callback(self, msg: Bool):
         self.ctx["start"] = msg.data

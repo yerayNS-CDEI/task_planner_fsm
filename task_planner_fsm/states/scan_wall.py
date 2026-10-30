@@ -35,6 +35,7 @@ from controller_manager_msgs.srv import ListControllers, SwitchController
 # so the net cannot name a controller the sweep would never have displaced.
 from ..wbc.controller_switch import TRAJECTORY_CONTROLLERS as WBC_TRAJECTORY_CONTROLLERS
 from ..utils.controller_ready import TrajectoryControllerGate
+from ..utils.base_pose import base_pose_map
 from ..utils.wall_geometry import sweep_ends
 from std_msgs.msg import String
 from ur_msgs.srv import SetForceMode
@@ -2427,37 +2428,13 @@ class ScanWall(State):
     SWEEP_MAX_YAW_RATE = 0.3          # rad/s cap on the heading hold
     SWEEP_CRAWL_TIMEOUT_PAD_S = 20.0  # grace beyond nominal (dist / speed) before aborting
 
-    # Base frames tried when reading the map-frame base pose (turret_footprint
-    # first: it is the frame the omni Nav2 config drives). Mirrors NavigateToTarget.
-    BASE_FRAMES = ("turret_footprint", "base_footprint", "base_link", "base", "chassis")
-
     def _base_xy_yaw_map(self, ctx):
         """Current base pose (x, y, yaw) in the map frame from TF, or None.
 
         The sweep segments are map-frame, so progress must be measured in map too
         (ctx["base_position"] is the odom frame and would be off by map->odom).
         """
-        tf_buffer = ctx.get("tf_buffer")
-        if tf_buffer is None:
-            return None
-        primary = str(ctx.get("nav_base_frame", "turret_footprint"))
-        frames = (primary,) + tuple(f for f in self.BASE_FRAMES if f != primary)
-        for frame in frames:
-            try:
-                if not tf_buffer.can_transform(
-                    "map", frame, rclpy.time.Time(), Duration(seconds=0.2)
-                ):
-                    continue
-                tf = tf_buffer.lookup_transform(
-                    "map", frame, rclpy.time.Time(), Duration(seconds=0.5)
-                )
-            except Exception:
-                continue
-            t = tf.transform.translation
-            q = tf.transform.rotation
-            yaw = atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-            return float(t.x), float(t.y), yaw
-        return None
+        return base_pose_map(ctx)
 
     def _start_sweep_crawl(self, ctx, target_xy):
         """Begin dragging the base to ``target_xy`` (map-frame base standoff) at a

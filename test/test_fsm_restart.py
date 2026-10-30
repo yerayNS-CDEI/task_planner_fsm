@@ -25,6 +25,7 @@ from task_planner_fsm.fsm_node import (
 )
 from task_planner_fsm.machine import StateMachine
 from task_planner_fsm.state import State
+from task_planner_fsm.utils.localization import FIX_KEY
 from task_planner_fsm.states.wall_target_selection import WallTargetSelection
 
 
@@ -145,6 +146,7 @@ RESTART_METHODS = (
     "_reject_restart",
     "_reset_ctx_for_restart",
     "_perform_restart",
+    "_gated_start",
 )
 
 
@@ -252,6 +254,9 @@ def test_callback_reports_a_bad_request_instead_of_raising():
 # Context reset
 # ---------------------------------------------------------------------------
 
+GOOD_FIX = {"x": 1.0, "y": 2.0, "xy_std": 0.05, "yaw_std": 0.01, "stamp": 100.0}
+
+
 def run_ctx():
     baseline = {
         "start": False,
@@ -283,6 +288,8 @@ def run_ctx():
         "_procs": {"nav_sim": "proc"},
         "_cleanup_installed": True,
         "_cmd_vel_pub": pub,
+        # the stack's rtabmap localized during the previous run
+        FIX_KEY: dict(GOOD_FIX),
     })
     return ctx, baseline, pub
 
@@ -308,6 +315,7 @@ def test_reset_drops_the_run_keeps_live_data_and_handles_in_place():
     assert ctx["_procs"] == {"nav_sim": "proc"}
     assert ctx["_cleanup_installed"] is True
     assert ctx["_cmd_vel_pub"] is pub
+    assert ctx[FIX_KEY] == GOOD_FIX
     assert ctx["fsm_run_index"] == 2
 
 
@@ -363,6 +371,16 @@ def test_perform_restart_bootstraps_then_moves_the_machine():
     assert node._run_index == 2
 
 
+def test_restart_on_a_stack_that_never_localized_waits_in_localize_first():
+    ctx, baseline, _ = run_ctx()
+    del ctx[FIX_KEY]
+    node = fake_node(ctx=ctx, baseline=baseline)
+    node._perform_restart({"state": "ScanWall"})
+    assert node.restarts == ["Localize"]
+    assert node.ctx["localize_next_state"] == "ScanWall"
+    assert node.initial_state == "ScanWall"
+
+
 def test_a_restart_sets_or_clears_stop_after_and_rechecks_the_stack():
     seen = []
 
@@ -409,7 +427,7 @@ def test_stack_not_ready_refuses_the_restart():
 
 
 def test_restart_after_an_arm_state_error_warns():
-    node = fake_node(ctx={"last_state": "ScanWall"}, baseline={})
+    node = fake_node(ctx={"last_state": "ScanWall", FIX_KEY: dict(GOOD_FIX)}, baseline={})
     node._perform_restart({"state": "GeometryReconstruction"})
     assert any(level == "warn" and "arm/column" in text for level, text in node.logger.lines)
     assert node.restarts == ["GeometryReconstruction"]

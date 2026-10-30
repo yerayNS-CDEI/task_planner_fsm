@@ -1,6 +1,8 @@
 from ..state import State
+from ..utils.base_pose import base_pose_map
 from ..utils.wall_geometry import left_scan_endpoint
 import math
+import time
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
@@ -13,11 +15,13 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
         self.scanned_panels_idx = []
         self.step_count = 0
         self.MAX_STEPS = 5
+        self._pose_wait_start = None
 
     def on_enter(self, ctx):
         node = ctx["node"]
         node.get_logger().info(f"[{self.name}] Selecting wall to scan...")
         self.step_count = 0
+        self._pose_wait_start = None
         ctx["target_selected"] = False
         ctx["error_triggered"] = False
         ctx.setdefault("completed_base_indices", [])
@@ -34,6 +38,33 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
     # def odometry_callback(self, msg: Odometry):
     #     pos = msg.pose.pose.position
     #     self.current_position = (pos.x, pos.y)
+
+    # How long to wait for the map-frame pose before giving up.
+    POSE_TIMEOUT_S = 30.0
+
+    def _robot_xy_map(self, ctx):
+        """Robot (x, y) in the map frame, or None while waiting for it.
+
+        The walls and base targets are map-frame. ctx["base_position"] is
+        /rtabmap/odom, off by the whole map->odom correction once rtabmap has
+        relocalized, which made "nearest" pick the wrong wall. No fallback to
+        it: after POSE_TIMEOUT_S without the transform the state fails.
+        """
+        pose = base_pose_map(ctx)
+        if pose is not None:
+            return pose[0], pose[1]
+        now = time.monotonic()
+        if self._pose_wait_start is None:
+            self._pose_wait_start = now
+        waited = now - self._pose_wait_start
+        timeout = float(ctx.get("wall_target_selection_pose_timeout_s", self.POSE_TIMEOUT_S))
+        if waited >= timeout:
+            self.fail(ctx, f"no map -> base transform after {timeout:.0f}s")
+        else:
+            ctx["node"].get_logger().warn(
+                f"[{self.name}] Waiting for the robot's map-frame pose (TF map -> base)..."
+            )
+        return None
 
     def _closest_scan_line(self, walls_data, x, y):
         """Return the wall whose scan line passes closest to (x, y), or None."""
@@ -64,9 +95,8 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
         
         if ctx.get("scan_phase") == 1:
             # Robot position (real or simulated)
-            self.current_position = ctx.get("base_position")
+            self.current_position = self._robot_xy_map(ctx)
             if self.current_position is None:
-                node.get_logger().warn(f"[{self.name}] Waiting for odometry data...")
                 return
             # try:
             #     robot_position = tuple(map(float, input(">> Current robot position (x y z): ").strip().split()))
@@ -77,6 +107,13 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
             #     ctx["error_triggered"] = True
             #     return
             
+            # A start past this state (bootstrap at NavigateToTarget/ScanWall)
+            # scanned the wall it was given without selecting it here; without
+            # this, the next pick could be that same wall again.
+            started_on = ctx.get("current_wall_index")
+            if started_on is not None and started_on not in self.scanned_walls_idx:
+                self.scanned_walls_idx.append(started_on)
+
             # Getting wall data
             walls_data = ctx.get("walls_data", [])
             if not walls_data:
@@ -85,8 +122,7 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
                 return
             
             # Selecting closest wall point
-            robot_x = self.current_position.x
-            robot_y = self.current_position.y
+            robot_x, robot_y = self.current_position
             node.get_logger().warn(f"[{self.name}] Robot  current position: ({robot_x},{robot_y})")
             min_dist = float('inf')
             selected_wall_idx = -1
@@ -140,9 +176,8 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
 
         elif ctx.get("scan_phase") == 2:
             # Robot position (real or simulated)
-            self.current_position = ctx.get("base_position")
+            self.current_position = self._robot_xy_map(ctx)
             if self.current_position is None:
-                node.get_logger().warn(f"[{self.name}] Waiting for odometry data...")
                 return
             # try:
             #     robot_position = tuple(map(float, input(">> Current robot position (x y z): ").strip().split()))
@@ -161,8 +196,7 @@ class WallTargetSelection(State):     # necessari afegir un nou context per sabe
                 return
 
             # Selecting closest point
-            robot_x = self.current_position.x
-            robot_y = self.current_position.y
+            robot_x, robot_y = self.current_position
             node.get_logger().warn(f"[{self.name}] Robot  current position: ({robot_x},{robot_y})")
             min_dist = float('inf')
             selected_col_rank = -1

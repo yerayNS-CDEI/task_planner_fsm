@@ -16,7 +16,9 @@ from typing import Any, Dict, Iterable, List
 # WallTargetSelection so the per-target loop-back edge stays short.
 #
 # Error is an isolated sink (no edges are routed to it) that lights up when
-# active; it floats at the top right, clear of the columns. Coordinates are the
+# active; it floats at the top right, clear of the columns. Localize, the wait
+# for a map fix in front of a start past ObjectID, is isolated the same way on
+# the left: it leads to whichever state the run started at. Coordinates are the
 # top-left corner of each node.
 _NODE_POSITIONS = {
     # Middle column (top -> bottom): mapping, perception & navigation
@@ -41,6 +43,8 @@ _NODE_POSITIONS = {
     "Finished": (880, 640),
     # Isolated failure sink
     "Error": (880, 40),
+    # Isolated entry gate
+    "Localize": (40, 640),
     # Disabled legacy states; the coordinates below are from the old wide
     # layout and need redoing if these are ever brought back.
     # "AreasOfInterest": (1320, 440),
@@ -103,6 +107,7 @@ _GROUPS = {
     "HomePosition": "phase_3",
     "Finished": "terminal",
     "Error": "terminal",
+    "Localize": "shared",
 }
 
 

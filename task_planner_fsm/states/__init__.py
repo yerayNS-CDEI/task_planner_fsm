@@ -1,6 +1,7 @@
 from .initialization import Initialization
 from .create_map import CreateMap
 from .object_id import ObjectID
+from .localize import Localize
 from .wall_lines_computation import WallLinesComputation
 from .geometry_reconstruction import GeometryReconstruction
 from .compute_wall_points import ComputeWallPoints

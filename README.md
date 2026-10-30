@@ -616,6 +616,24 @@ topics and then `collision_ready_timeout` (180 s) for the arm planner's
 collision service; both return as soon as the stack is up, so the budget only
 matters when it is slow.
 
+### Unattended runs: every wall, and no motion before localization
+
+`-p scan_all_walls:=true` (the UI's **Scan all walls** box) answers no wall
+prompts: ComputeWallPoints, or the bootstrap on a direct start, takes every wall
+in `detected_walls.yaml`, each at `scan_all_walls_lines_z` (default `[1.5]`),
+nearest first. A wall the robot cannot get to (no reachable stretch, or the base
+never reaches the standoff) is skipped and the run goes on to the next one; with
+no detected walls at all the run stops instead of scanning the hardcoded ones.
+
+Nothing moves the base before rtabmap has localized the robot in the loaded map.
+ObjectID waits before planning its route, and a start past ObjectID enters the
+`Localize` state first, which hands over to the requested state once the fix on
+`/rtabmap/localization_pose` is good (`localization_max_xy_std` 0.25 m,
+`localization_max_yaw_std` 0.20 rad). After `localization_timeout` (60 s) it
+fails, unless `localization_required:=false`. `localization_check:=false` turns
+the gate off. If the robot stands where the cameras and lidars see nothing the
+map knows, turn it with the joystick while it waits.
+
 ### Restart from Error / Finished (no stack restart)
 
 Once the FSM sits in `Error` or `Finished`, a new run can be started without
