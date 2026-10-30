@@ -7,7 +7,9 @@ turret's current world heading while the turret joint compensates to hold the
 turret (and the arm on it) world-stationary.
 
 Used by ScanWall (square the whole robot to the wall before each segment's
-sweep, turned round for a line that runs turret-backward) and by HomePosition (end the mission aligned, so the next run -- a restart included --
+sweep, turned round for a line that runs turret-backward), by CreateMap (once
+mapping is done, so ObjectID's localization drive starts aligned) and by
+HomePosition (end the mission aligned, so the next run -- a restart included --
 starts from the same chassis/turret angle as a fresh one; the controller follows
 commands poorly once that angle passes ~90 deg).
 
@@ -25,7 +27,8 @@ existed rejects only it and still parks, square.
 Best-effort at every step: a missing service or a failed/rejected call skips
 gracefully, and ``done`` is set when the maneuver finished or was skipped.
 
-ctx knobs, with ``<prefix>`` the owner's (``scan_wall``, ``home_position``):
+ctx knobs, with ``<prefix>`` the owner's (``scan_wall``, ``create_map``,
+``home_position``):
     <prefix>_park_base       false skips parking (benches without the base controller)
     <prefix>_park_grace_s    wait this long for parking_active to go true (5 s);
                              if it never does, the chassis was already aligned

@@ -17,6 +17,13 @@ geometry + navigation are handled by the ``CoverageDriver``, configured from thi
 state's ``create_map_*`` parameters. Gate it off with
 ``create_map_densify_enabled:=False``.
 
+Phase 3 (PARK): turn the chassis back in line with the turret
+(utils/chassis_parking.py). Nav2 steers the turret, so mapping leaves the chassis
+at whatever angle the drive left it, and the base follows the next stack's
+commands poorly once that angle passes ~90 deg -- ObjectID's drive then strays
+off its path, even backwards. Knobs ``create_map_park_base`` / ``_park_grace_s``
+/ ``_park_timeout_s``.
+
 The whole stack is torn down in ``on_exit`` before the FSM moves on.
 """
 
@@ -24,6 +31,7 @@ import shlex
 import time
 
 from ..state import State
+from ..utils.chassis_parking import ChassisParker
 from ..utils.coverage_driver import CoverageConfig, CoverageDriver
 
 from task_planner_fsm.states.proc_utils import (
@@ -44,6 +52,7 @@ class CreateMap(State):
     STARTING = "starting"     # stack launched, waiting for it to be ready
     EXPLORING = "exploring"   # frontier exploration running
     DENSIFY = "densify"       # structured coverage sweep running
+    PARK = "park"             # chassis turning back in line with the turret
     DONE = "done"
     ERROR = "error"
 
@@ -51,11 +60,13 @@ class CreateMap(State):
         super().__init__(name)
         self.phase = self.STARTING
         self.driver = None
+        self._parker = ChassisParker(name, "create_map")
 
     def on_enter(self, ctx):
         node = ctx["node"]
         self.phase = self.STARTING
         self.driver = None
+        self._parker.reset()
         ctx["map_ready"] = False
         ctx["error_triggered"] = False
 
@@ -78,6 +89,7 @@ class CreateMap(State):
         "starting": "Starting the mapping and navigation stack",
         "exploring": "Exploring the environment to build the map",
         "densify": "Refining the map with a coverage sweep",
+        "park": "Parking the chassis in line with the turret",
     }
 
     def run(self, ctx):
@@ -90,6 +102,8 @@ class CreateMap(State):
             self._run_exploring(ctx)
         elif self.phase == self.DENSIFY:
             self._run_densify(ctx)
+        elif self.phase == self.PARK:
+            self._run_park(ctx)
 
     # ------------------------------------------------------------------
     # Phase STARTING: wait for the stack, then launch exploration.
@@ -167,8 +181,7 @@ class CreateMap(State):
             node.get_logger().info(
                 f"[{self.name}] create_map_densify_enabled=False: skipping densification sweep."
             )
-            ctx["map_ready"] = True
-            self.phase = self.DONE
+            self.phase = self.PARK
             return
 
         if not self._start_densify(ctx):
@@ -204,11 +217,19 @@ class CreateMap(State):
             ctx["create_map_waypoints"] = self.driver.generated_waypoints
             ctx["create_map_plan_debug"] = self.driver.last_plan_debug
         if status == CoverageDriver.DONE:
-            ctx["map_ready"] = True
-            self.phase = self.DONE
+            self.phase = self.PARK
         elif status == CoverageDriver.FAILED:
             ctx["error_triggered"] = True
             self.phase = self.ERROR
+
+    # ------------------------------------------------------------------
+    # Phase PARK: chassis in line with the turret while this stack's base
+    # controller is still up, so ObjectID's localization starts aligned.
+    # ------------------------------------------------------------------
+    def _run_park(self, ctx):
+        if self._parker.step(ctx):
+            ctx["map_ready"] = True
+            self.phase = self.DONE
 
     def _build_coverage_config(self, ctx) -> CoverageConfig:
         return CoverageConfig(

@@ -13,8 +13,10 @@ Run with:
 import math
 import types
 
+from task_planner_fsm.states.create_map import CreateMap
 from task_planner_fsm.states.home_position import HomePosition
 from task_planner_fsm.utils.chassis_parking import ChassisParker
+from task_planner_fsm.utils.coverage_driver import CoverageDriver
 
 
 class _Logger:
@@ -219,3 +221,69 @@ def test_home_position_re_entry_parks_again():
                 break
         assert home.check_transition(ctx) == "Finished"
     assert enabled_values(node) == [True, False, True, False]
+
+
+# ---------------------------------------------------------------------------
+# CreateMap: park after mapping, before ObjectID's localization
+# ---------------------------------------------------------------------------
+
+class _ExitedProc:
+    def poll(self):
+        return 0
+
+
+class _DoneDriver:
+    generated_waypoints = None
+
+    def tick(self, ctx):
+        return CoverageDriver.DONE
+
+
+def _create_map_in(phase):
+    """A CreateMap already in ``phase``. on_enter is not called: it kills stale
+    sensor drivers and launches the mapping stack on this machine."""
+    create_map = CreateMap("CreateMap")
+    create_map.phase = phase
+    return create_map
+
+
+def _run_create_map(create_map, ctx, max_ticks=20):
+    for _ in range(max_ticks):
+        create_map.run(ctx)
+        target = create_map.check_transition(ctx)
+        if target:
+            return target
+    return None
+
+
+def test_create_map_parks_after_densify_before_object_id():
+    node = _Node()
+    ctx = {"node": node, "create_map_park_grace_s": 0.0}
+    create_map = _create_map_in(CreateMap.DENSIFY)
+    create_map.driver = _DoneDriver()
+
+    create_map.run(ctx)
+    assert create_map.phase == CreateMap.PARK
+    assert create_map.check_transition(ctx) is None, "must not leave before parking"
+    assert _run_create_map(create_map, ctx) == "ObjectID"
+    assert enabled_values(node) == [True, False]
+    assert target_values(node) == [0.0, 0.0]
+
+
+def test_create_map_parks_when_densify_is_off():
+    node = _Node()
+    ctx = {"node": node, "create_map_park_grace_s": 0.0,
+           "create_map_densify_enabled": False,
+           "_procs": {"explore": _ExitedProc()}}
+    create_map = _create_map_in(CreateMap.EXPLORING)
+    assert _run_create_map(create_map, ctx) == "ObjectID"
+    assert enabled_values(node) == [True, False]
+
+
+def test_create_map_park_opt_out():
+    node = _Node()
+    ctx = {"node": node, "create_map_park_base": False}
+    create_map = _create_map_in(CreateMap.DENSIFY)
+    create_map.driver = _DoneDriver()
+    assert _run_create_map(create_map, ctx) == "ObjectID"
+    assert node.calls == []
