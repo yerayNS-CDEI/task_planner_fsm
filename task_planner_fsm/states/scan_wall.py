@@ -205,12 +205,14 @@ class ScanWall(State):
         # _send_named_pose.
         self._controller_gate = TrajectoryControllerGate()
 
-        # Pre-approach (base fixed): column to line height + unfolded_fsm pose.
+        # Pre-approach (base fixed): unfolded_fsm pose. The column follows the
+        # line's first park (the "column" seg-phase), not the pre-approach.
         self.column = ColumnController(self.name)
         self.position_client = None
         self.pose_sent = False
         self.pose_reached = False
         self.column_commanded = False
+        self.column_done = False
         self.preapproach_done = False
         self.pose_future = None
         self.preapproach_verbose = False
@@ -244,6 +246,8 @@ class ScanWall(State):
         #   transit_clear(_wait)  retract the plate to a safe gap before the base moves
         #   transit(_wait)   slide along the wall to the segment start
         #   park             square the chassis against the wall
+        #   column           column to line height (once per line, arm folded)
+        #   unfold(_wait)    arm out to the scanning pose
         #   sweep_setup      cap the base speed for the sweep
         #   arm_approach(_wait)  extend the arm to scan_wall_plate_offset from the wall
         #   press_prepare    alignment controller + force-mode press
@@ -384,6 +388,7 @@ class ScanWall(State):
         self.pose_sent = False
         self.pose_reached = False
         self.column_commanded = False
+        self.column_done = False
         self.preapproach_done = False
         self.pose_future = None
         self.preapproach_verbose = False
@@ -454,8 +459,8 @@ class ScanWall(State):
                 return
 
         # NOTE: nothing that touches the arm is started here. The distance-sensor
-        # reader comes up at the end of the pre-approach, once the arm is unfolded at
-        # the line height, because every base move from then on is sized by a
+        # reader comes up at the end of the pre-approach, because every base move
+        # from then on is sized by a
         # measured plate clearance (_start_distance_sensors). The
         # wall_parallel_controller and, on the real robot, force_mode start later
         # still — only after the arm's own Z approach has finished, since that node
@@ -1412,22 +1417,63 @@ class ScanWall(State):
         self._seg_phase = "park" if self._arm_folded else "park_fold"
 
     def _after_park_phase(self):
-        """Unfold for the sweep unless the arm is already out — in the pose this
-        pass sweeps in. Out but upright on the cross-polarized pass (no fold
-        before it: parking or folding for transit turned off) still has to go
-        through the unfold, which is where the plate is rolled."""
+        """Set the column for the line once the chassis is parked, then unfold
+        for the sweep unless the arm is already out — in the pose this pass
+        sweeps in. Out but upright on the cross-polarized pass (no fold before
+        it: parking or folding for transit turned off) still has to go through
+        the unfold, which is where the plate is rolled.
+
+        The column moves once per line, after the line's first park and before
+        the unfold: the chassis turns with the column where it was, and the
+        column rises with the arm still folded from the park."""
+        if not self.column_done:
+            self._seg_phase = "column"
+            return
         ready = self._arm_unfolded and self._unfolded_pose == self._scan_pose()
         self._seg_phase = "sweep_setup" if ready else "unfold"
+
+    def _run_column(self, ctx):
+        """Raise/lower the column to the line height. True once it is there."""
+        node = ctx["node"]
+        if not self.column_commanded:
+            target_h = self._column_target_for_line(ctx, self.current_line_z)
+            if target_h is None:
+                # Both inputs arrive on their own topics and normally are already
+                # there, so this is a startup race, not a fault — wait it out
+                # rather than substitute a guess. Bounded, because "waiting for a
+                # transform" is otherwise indistinguishable from a dead TF tree.
+                if self._column_input_deadline is None:
+                    self._column_input_deadline = time.time() + float(
+                        ctx.get("scan_wall_column_input_timeout_s", 20.0))
+                elif time.time() > self._column_input_deadline:
+                    self.fail(ctx, "column height inputs (TF / joint states) never arrived")
+                return False
+            self._column_input_deadline = None
+            node.get_logger().info(
+                f"[{self.name}] Chassis parked; commanding column to {target_h:.3f}m "
+                f"for line z={self.current_line_z:.3f}m."
+            )
+            if not self.column.command(node, ctx, target_h):
+                ctx["error_triggered"] = True
+            self.column_commanded = True
+            return False
+
+        if not self.column.reached_target(node, ctx):
+            if self.column.timed_out(node):
+                node.get_logger().error(f"[{self.name}] Column did not reach target in time.")
+                self.fail(ctx, "column did not reach the target height in time")
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Pre-approach (base fixed)
     # ------------------------------------------------------------------
     def _run_pre_approach(self, ctx):
-        """Reset the arm to the unfolded_fsm scanning pose, then raise/lower the
-        column to the line height. The base does not move during this phase, and
-        the column is only commanded once the arm motion has fully finished.
+        """Reset the arm to the unfolded_fsm scanning pose. The base does not
+        move during this phase. The column is left for the line's first park
+        (the "column" seg-phase), so the chassis turns before it rises.
 
-        Sets self.preapproach_done = True once the arm and column are in position.
+        Sets self.preapproach_done = True once the arm is in position.
         """
         node = ctx["node"]
 
@@ -1438,7 +1484,6 @@ class ScanWall(State):
         # Safe because every path out of "transit_clear" goes through the park,
         # which unfolds after it (see _begin_park_phase). Nothing downstream may
         # assume the arm is out.
-        # The column still moves below: folded is the safest pose to raise it in.
         if not self.pose_reached and self._fold_for_transit(ctx):
             self.current_line_z = self._resolve_current_line_z(ctx)
             node.get_logger().info(
@@ -1513,40 +1558,14 @@ class ScanWall(State):
                     self.preapproach_verbose = True
                 return
 
-        # --- Phase 2: arm motion finished — now move the column. ---
-        if not self.column_commanded:
-            target_h = self._column_target_for_line(ctx, self.current_line_z)
-            if target_h is None:
-                # Both inputs arrive on their own topics and normally are already
-                # there, so this is a startup race, not a fault — wait it out
-                # rather than substitute a guess. Bounded, because "waiting for a
-                # transform" is otherwise indistinguishable from a dead TF tree.
-                if self._column_input_deadline is None:
-                    self._column_input_deadline = time.time() + float(
-                        ctx.get("scan_wall_column_input_timeout_s", 20.0))
-                elif time.time() > self._column_input_deadline:
-                    self.fail(ctx, "column height inputs (TF / joint states) never arrived")
-                return
-            self._column_input_deadline = None
-            node.get_logger().info(
-                f"[{self.name}] Arm settled; commanding column to {target_h:.3f}m "
-                f"for line z={self.current_line_z:.3f}m."
-            )
-            if not self.column.command(node, ctx, target_h):
-                ctx["error_triggered"] = True
-            self.column_commanded = True
-            return
+        # The column is NOT moved here: it waits for the line's first park (the
+        # "column" seg-phase, see _after_park_phase), so the chassis turns before
+        # the column rises.
 
-        if not self.column.reached_target(node, ctx):
-            if self.column.timed_out(node):
-                node.get_logger().error(f"[{self.name}] Column did not reach target in time.")
-                self.fail(ctx, "column did not reach the target height in time")
-            return
-
-        # The arm is out and at line height, so from here on every base move needs a
-        # measured plate clearance — including the very first transit. Bring the
-        # reader up now and leave it up for the whole line; the alignment controller
-        # still waits until the sweep (see _start_wall_alignment).
+        # From here on every base move needs a measured plate clearance —
+        # including the very first transit. Bring the reader up now and leave it
+        # up for the whole line; the alignment controller still waits until the
+        # sweep (see _start_wall_alignment).
         self._start_distance_sensors(ctx)
 
         self.preapproach_done = True
@@ -1578,7 +1597,7 @@ class ScanWall(State):
         # base reaches the segment start and just before the sweep (the "park" seg-phase
         # in _run_scan), so no base repositioning follows the alignment and undoes it.
         if not self.preapproach_done:
-            self.set_activity(ctx, "Moving arm and column to the wall-scanning pose")
+            self.set_activity(ctx, "Moving the arm to the wall-scanning pose")
             self._run_pre_approach(ctx)
             return
 
@@ -1897,6 +1916,21 @@ class ScanWall(State):
             )
             if self._parker.step(ctx):
                 self._after_park_phase()
+            return
+
+        if self._seg_phase == "column":
+            # Once per line, after the park and before the unfold (see
+            # _after_park_phase). The base does not move again until the sweep.
+            self.set_activity(
+                ctx,
+                f"Moving the column to line height at wall segment {seg_no}/{seg_total}",
+                progress_current=seg_no,
+                progress_total=seg_total,
+            )
+            if not self._run_column(ctx):
+                return
+            self.column_done = True
+            self._after_park_phase()
             return
 
         if self._seg_phase == "unfold":

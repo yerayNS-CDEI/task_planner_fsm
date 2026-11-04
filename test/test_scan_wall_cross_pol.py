@@ -42,6 +42,7 @@ def node():
 def state():
     s = ScanWall("ScanWall")
     s.current_line_z = 1.5
+    s.column_done = True   # line height already set; the column phase has its own tests
     return s
 
 

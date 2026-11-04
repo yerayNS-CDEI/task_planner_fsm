@@ -69,6 +69,7 @@ def scan_wall():
         service_is_ready=lambda: True, call_async=lambda req: None)
     state.column = SimpleNamespace(column_min_height_m=0.0, column_max_height_m=0.9)
     state._fold_for_transit = lambda ctx: True
+    state._start_distance_sensors = lambda ctx: True   # no reader process
     return state
 
 

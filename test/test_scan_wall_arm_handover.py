@@ -11,6 +11,8 @@ scanned as garbage. So every path through "park" (and from there the sweep)
 is pinned here, not just the common one.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 rclpy = pytest.importorskip("rclpy")
@@ -33,6 +35,7 @@ def node():
 def state():
     s = ScanWall("ScanWall")
     s.current_line_z = 1.5
+    s.column_done = True   # line height already set; the column phase has its own tests
     return s
 
 
@@ -101,6 +104,36 @@ def test_park_resets_the_parking_cycle_it_is_about_to_run(state, node):
     state._parker._phase = "settle"
     state._begin_park_phase(ctx_for(node))
     assert not state._parker.done and state._parker._phase == "enable"
+
+
+# --------------------------------------------------------- column after park
+#
+# The column moves once per line, after the line's first park and before the
+# unfold: the chassis turns before the column rises, never the other way round.
+
+def test_the_column_follows_the_park(state):
+    state.column_done = False
+    state._arm_unfolded = False
+    state._after_park_phase()
+    assert state._seg_phase == "column", "the arm would unfold before the column moved"
+
+
+def test_the_column_follows_the_unparked_path_too(state, node):
+    """Parking off still goes through the column before the unfold."""
+    state.column_done = False
+    state._arm_folded = True
+    state._begin_park_phase(ctx_for(node, scan_wall_park_base=False))
+    assert state._seg_phase == "column"
+
+
+def test_the_pre_approach_leaves_the_column_alone(state, node):
+    commanded = []
+    state.column = SimpleNamespace(command=lambda *a: commanded.append(a) or True)
+    state._fold_for_transit = lambda ctx: True
+    state._start_distance_sensors = lambda ctx: True
+    state._run_pre_approach(ctx_for(node, arm_folded=True, current_wall_scan_lines=[1.5]))
+    assert state.preapproach_done
+    assert not commanded, "the column rose before the chassis parked"
 
 
 # ------------------------------------------------------- swept-segment memory
