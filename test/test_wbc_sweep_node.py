@@ -3564,3 +3564,24 @@ def test_a_bump_that_loads_the_wheel_more_than_the_wall_is_passed_under_the_limi
     # there too, at ~43 N (31 N with the hard-hit trigger); the robot's
     # 12-25 Hz loop is what turned that margin into 50-75 N.
     assert max(peak) < 0.8 * limit, f"the wheel saw {max(peak):.1f} N"
+
+
+def test_the_retreat_is_announced_before_it_starts():
+    """The FSM clocks the GPR and the camera off this plate, and the retreat
+    moves it off the wall for up to 20 s before "succeeded" is published (18 s
+    of air at the end of the 2026-11-04 18:25 B-scan). It says "retreat" at
+    once, and keeps saying it until the terminal status."""
+    length = 0.3
+    node = _node((WALL_X, 0.0, 0.0), (WALL_X, length, 0.0), retreat_standoff=0.40)
+    robot = _start_state(node.chain)
+    node.q_posture = robot.q.copy()
+    node.row_z = float(robot.tip()[2, 3])
+    published = []
+    node.status_pub.publish = lambda msg: published.append(msg.data)
+
+    _run(node, robot, cycles=4200)
+
+    assert published[-1] == "succeeded"
+    first_retreat = published.index("running: retreat")
+    assert set(published[first_retreat:-1]) == {"running: retreat"}
+    assert node.contact == "retreat"

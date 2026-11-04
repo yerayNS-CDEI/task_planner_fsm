@@ -21,9 +21,15 @@ SEG = ((1.0, 2.0, 1.1), (4.0, 2.0, 1.1))
 
 class _GprStub:
     armed = False
+    clock_stopped = False
 
     def __init__(self):
         self.calls = []
+
+    def stop_clock(self, ctx):
+        self.armed = False
+        self.clock_stopped = True
+        self.calls.append("stop_clock")
 
     def arm_triggers(self, ctx, ref, seg_start, seg_end, speed, travel_frame=None):
         self.armed = True
@@ -57,6 +63,9 @@ class _SamplerStub:
 
     def new_mission(self):
         self.calls.append(("new_mission",))
+
+    def stop_timer(self, ctx):
+        self.calls.append(("stop_timer",))
 
 
 @pytest.fixture
@@ -123,3 +132,30 @@ def test_the_camera_off_costs_nothing(state):
 def test_a_restarted_run_gets_a_new_session(state):
     state.reset_run(_ctx())
     assert state._hs.calls == [("new_mission",)]
+
+
+def test_the_gpr_line_is_recorded_at_the_row_height_not_the_wall_lines():
+    """The segments carry the detected wall line's z (0.23 m on 2026-10-02);
+    the plate swept the row at current_line_z (2.2 m), where the hyperspectral
+    poses -- read off TF -- were. The GPR line record must say the same."""
+    s = ScanWall("ScanWall")
+    wall_seg = ((1.0, 2.0, 0.2307), (4.0, 2.0, 0.2307))
+    s.current_line_z = 2.2
+    start, end = s._at_line_height(*wall_seg)
+    assert start == (1.0, 2.0, 2.2) and end == (4.0, 2.0, 2.2)
+    s.current_line_z = None                 # no row height known: left as it was
+    assert s._at_line_height(*wall_seg) == wall_seg
+
+
+def test_the_retreat_stops_both_clocks_and_nothing_rearms_them(state):
+    """The sweep node reports "running: retreat" when the sweep is done and it
+    starts backing the plate off the wall; the GPR and the camera must not
+    record that, and a stray "seated" during it must not start them again."""
+    ctx = _ctx()
+    _status(state, ctx, "running: seated")
+    _status(state, ctx, "running: retreat")
+    assert state._gpr.calls == ["arm", "stop_clock"]
+    assert state._hs.calls[-1] == ("stop_timer",)
+    _status(state, ctx, "running: seated")
+    assert state._gpr.calls == ["arm", "stop_clock"]
+    assert [c[0] for c in state._hs.calls].count("start_line") == 1

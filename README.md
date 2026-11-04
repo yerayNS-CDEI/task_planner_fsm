@@ -1340,7 +1340,12 @@ supplies the four things the sensor package leaves to software:
 
 - **the frame** — the vendor's `x_m` is metres along the B-scan, so it is put
   on the wall with the scanned line's endpoints from `gpr_lines.jsonl`, the
-  same transform the hyperbola positions already use;
+  same transform the hyperbola positions already use. The line is recorded at
+  the row's height (`current_line_z`), and `x_m = 0` is where the plate seated
+  (`origin_along_m`, metres past `seg_start`; often negative, since the approach
+  seats it before the segment start). The B-scan ends where the sweep does: the
+  sweep node reports `running: retreat` before backing the plate off the wall,
+  and ScanWall stops the GPR triggers and the camera on it;
 - **the exclusion radius** — `pokeye_no_drill_tolerance_m`. ⚠️ The sensor
   package uses 0.10 m along the line for its own decision but defines no
   map-frame safety radius, and the project has not agreed one, so the FSM

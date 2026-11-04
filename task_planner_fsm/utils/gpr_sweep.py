@@ -147,6 +147,9 @@ class GprSweep:
         self._tf_warned = False
         self._ee_frame = None
         self._seated = None           # last contact state note_contact was given
+        # The sweep part of the line is over (the plate is backing off the
+        # wall): no re-arming until the next line. See stop_clock.
+        self._clock_stopped = False
 
     # ------------------------------------------------------------------
     # Switches
@@ -229,6 +232,7 @@ class GprSweep:
         ok, reason = self.bridge_ready(ctx)
         if not ok:
             return reason
+        self._clock_stopped = False
         self._open_record(ctx, seg_start, seg_end, frame, sweep)
         if not self.enabled(ctx):
             return None
@@ -248,6 +252,7 @@ class GprSweep:
         (``gpr_trigger_reference_frame`` overrides both)."""
         if self._record is not None:
             self._record["t_armed_epoch"] = round(time.time(), 3)
+            self._record_origin(ctx, ref_frame, seg_start, seg_end)
         if not self.triggers_enabled(ctx):
             return
         self._stop_timer(ctx, log_summary=False)
@@ -304,6 +309,40 @@ class GprSweep:
             self._log(ctx).warn(
                 f"[{self.name}] GPR triggers: no {ref}->plate transform yet; the d=0 "
                 f"trigger fires on the first pose the sampler gets.")
+
+    def _record_origin(self, ctx, ref_frame, seg_start, seg_end):
+        """Where along the segment the line's d = 0 is, on the line record.
+
+        The plate seats wherever the sweep's approach lands it, not on
+        ``seg_start``: 0.10 m before it on 2026-11-04 18:24 (the sweep node's
+        ``left=1.93m`` on a 1.83 m segment), so every hyperbola placed from
+        ``seg_start`` sat 0.10 m too far along the wall. Only the distance
+        along the segment is kept -- the plate itself is a standoff off the
+        wall, and its xy would pull the hyperbolae off the scanned line.
+        ``gpr.map_transform`` adds it; records without it place d = 0 on
+        ``seg_start`` as before.
+        """
+        axis = self._sweep_axis(seg_start, seg_end)
+        xyz = self._lookup_plate_xyz(ctx, ref_frame, timeout_s=0.2)
+        if axis is None or xyz is None:
+            return
+        along = (xyz[0] - seg_start[0]) * axis[0] + (xyz[1] - seg_start[1]) * axis[1]
+        self._record["origin_along_m"] = round(float(along), 4)
+        self._record["origin_xyz"] = [round(float(v), 4) for v in xyz]
+
+    @property
+    def clock_stopped(self):
+        return self._clock_stopped
+
+    def stop_clock(self, ctx):
+        """The sweep is over but the plate is still moving -- the sweep node
+        backs it off the wall before reporting done. Stop the triggers now,
+        for good on this line: on 2026-11-04 18:25 the 18 s retreat clocked
+        22 more traces (0.11 m of air at the end of the B-scan, and a false
+        hyperbola on it). The line itself stays open; ``end_segment`` stops,
+        exports and closes it when the sweep reports done."""
+        self._clock_stopped = True
+        self._stop_timer(ctx)
 
     def note_contact(self, ctx, seated):
         """Record where along the line the contact came unseated and re-seated.

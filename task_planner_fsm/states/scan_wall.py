@@ -508,6 +508,24 @@ class ScanWall(State):
         """Plate-to-wall gap the approach leaves, m (PLATE_OFFSET_M)."""
         return float(ctx.get("scan_wall_plate_offset", PLATE_OFFSET_M))
 
+    def _at_line_height(self, seg_start, seg_end):
+        """The segment's ends at the height the GPR actually sweeps.
+
+        The segments come from the detected wall line, whose z is the wall's
+        own (near the floor: 0.23 m on 2026-10-02), not the row being swept --
+        the plate goes to ``current_line_z``, and on the rolled pass is raised
+        so the GPR, not the plate centre, sits there (``_plate_rise``). The GPR
+        line record took the segment's z as it was, so every hyperbola, NO_DRILL
+        zone and global-JSON point of a mission sat at the wall line's height
+        instead of the row's (2.2 m that day, where the hyperspectral poses,
+        read off TF, correctly were). Same xy; z is the row.
+        """
+        z = self.current_line_z
+        if z is None:
+            return seg_start, seg_end
+        return ((float(seg_start[0]), float(seg_start[1]), float(z)),
+                (float(seg_end[0]), float(seg_end[1]), float(z)))
+
     def _plate_rise(self):
         """How far to raise the plate centre off the line on this pass, m, so the
         GPR (not the centre) sweeps the line height. 0 upright; -0.08 rolled."""
@@ -2144,8 +2162,9 @@ class ScanWall(State):
             # GPR: start the line on the measurement sweep_setup opened, before
             # anything travels. An open line with no triggers records nothing;
             # the traces start with the triggers (_arm_gpr_triggers).
+            line_start, line_end = self._at_line_height(seg_start, seg_end)
             err = self._gpr.start_line(
-                ctx, seg_start, seg_end, "map",
+                ctx, line_start, line_end, "map",
                 sweep="wbc" if self._wbc_enabled(ctx) else (
                     "crawl" if bool(ctx.get("sweep_use_crawl", False)) else "nav2"))
             if err:
@@ -2886,9 +2905,17 @@ class ScanWall(State):
         Here rather than in the 1 Hz tick, which would put d = 0 up to 4.5 cm
         late at sweep speed."""
         status = str(msg.data)
+        if status == "running: retreat":
+            # The sweep is done and the plate is backing off the wall; the
+            # node reports "succeeded" only once it is clear. Stop both clocks
+            # here so nothing is recorded with the plate in the air.
+            self._gpr.stop_clock(ctx)
+            self._hs.stop_timer(ctx)
+            return
         if status.startswith("running: "):
             seated = status == "running: seated"
-            if seated and not self._gpr.armed and self._seg_phase == "sweep_wait":
+            if (seated and not self._gpr.armed and not self._gpr.clock_stopped
+                    and self._seg_phase == "sweep_wait"):
                 seg_start, seg_end = self._segments[self._seg_idx][:2]
                 self._arm_gpr_triggers(ctx, seg_start, seg_end)
                 self._start_hyperspectral(ctx, seg_start, seg_end)

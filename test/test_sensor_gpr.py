@@ -311,3 +311,12 @@ def test_a_scan_folder_carries_its_acquisition_in_the_delivery_layout(tmp_path):
     assert (folder / "scan.csv").read_text() == "sidecar"
     assert (gpr.HYPERBOLA_DIRNAME, gpr.LINE_DIRNAME) == ("hyperbola", "line")
 
+
+def test_hyperbolae_are_placed_from_where_the_plate_seated():
+    """``origin_along_m`` (ScanWall's record of the scan's d = 0) shifts every
+    x_m along the line; a record without it places d = 0 on seg_start."""
+    line = {"seg_start": [0.0, 0.0, 2.1], "seg_end": [2.0, 0.0, 2.1]}
+    assert gpr.map_transform(line)(0.5) == [0.5, 0.0, 2.1]
+    line["origin_along_m"] = -0.10
+    assert gpr.map_transform(line)(0.5) == [0.4, 0.0, 2.1]
+    assert gpr.map_transform(line)(0.0) == [-0.1, 0.0, 2.1]

@@ -540,6 +540,7 @@ def test_without_the_travel_frame_it_measures_along_the_segment_frame(tmp_path, 
 class _GprStub:
     def __init__(self):
         self.armed = False
+        self.clock_stopped = False
         self.calls = []
 
     def arm_triggers(self, ctx, ref, seg_start, seg_end, speed, travel_frame=None):
@@ -614,3 +615,40 @@ def test_the_sweep_and_the_gpr_travel_track_in_wheel_odom_on_the_robot(scan_wall
     assert scan_wall._wbc_tracking_frame(make_ctx(tmp_path, sim=True)) == "odom"
     assert scan_wall._wbc_tracking_frame(
         make_ctx(tmp_path, sim=False, wbc_tracking_frame="odom")) == "odom"
+
+
+def test_the_line_record_says_where_along_the_segment_d0_is(tmp_path, http):
+    """The plate seats where the approach lands it, not on seg_start (0.10 m
+    before it on 2026-11-04 18:24); hyperbolae are placed from this point."""
+    ctx, gpr = _armed(tmp_path, http)                # seated at x = 0.30
+    gpr.end_segment(ctx)
+    (row,) = _manifest(tmp_path)
+    assert row["origin_along_m"] == pytest.approx(0.30)
+    assert row["origin_xyz"] == [0.3, 0.0, 1.0]
+
+
+def test_a_plate_seated_before_the_segment_start_has_a_negative_origin(tmp_path, http):
+    ctx = make_ctx(tmp_path)
+    gpr = GprSweep("ScanWall", None)
+    _begin(gpr, ctx, 0, 0, 0)
+    ctx["tf_buffer"].xyz = [-0.10, 0.14, 1.0]        # 0.14 m off the wall: ignored
+    gpr.arm_triggers(ctx, "map", *SEG, 0.045)
+    gpr.end_segment(ctx)
+    (row,) = _manifest(tmp_path)
+    assert row["origin_along_m"] == pytest.approx(-0.10)
+
+
+def test_stopping_the_clock_for_the_retreat_ends_the_triggers_for_this_line(tmp_path, http):
+    """The sweep node backs the plate off the wall before reporting done; the
+    18 s retreat of 2026-11-04 18:25 clocked 0.11 m of air onto the B-scan."""
+    ctx, gpr = _armed(tmp_path, http)
+    _move_to(ctx, 0.31)
+    fired = list(ctx["node"].pub.sent)
+    gpr.stop_clock(ctx)
+    assert not gpr.armed and gpr.clock_stopped
+    assert ctx["node"].pub.sent == fired
+    gpr.end_segment(ctx)                             # the line still closes
+    (row,) = _manifest(tmp_path)
+    assert row["trigger_count"] == len(fired)
+    assert _begin(gpr, ctx, 0, 1, 0) is None         # a new line clears it
+    assert not gpr.clock_stopped

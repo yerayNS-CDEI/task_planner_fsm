@@ -1835,8 +1835,9 @@ class WholeBodySweepNode(Node):
         # What the contact is doing, reported to the FSM as a suffix on the
         # running status ("running: seated") so it can clock the GPR off the
         # plate only while the wheel is on the wall: "approach" until the
-        # contact first seats, then "seated" / "unseated". The first "seated"
-        # is the GPR line's d = 0. A sweep with no press holds the standoff
+        # contact first seats, then "seated" / "unseated", and "retreat" once
+        # the sweep is over and the plate backs off the wall (see finish). The
+        # first "seated" is the GPR line's d = 0. A sweep with no press holds the standoff
         # from the start, so it is "seated" throughout. See _set_contact.
         self.contact = "seated"
         if bool(p("press_enabled").value):
@@ -2631,6 +2632,11 @@ class WholeBodySweepNode(Node):
             return
         self._publish_base(Twist())        # the base is done moving
         self.phase = "retreat"
+        # Say so now, not when the retreat ends: the FSM clocks the GPR and the
+        # camera off this plate, and the retreat moves it off the wall. The
+        # contact setters run in the sweep phase only, so this stays.
+        self.contact = "retreat"
+        self._publish_status()
         # The orientation the retreat holds is the one the plate has NOW —
         # not a target from the ranges. Lifting a plate off a wall while
         # re-squaring it is how a corner catches on the way out; the retreat

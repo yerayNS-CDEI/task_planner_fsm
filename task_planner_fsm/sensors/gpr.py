@@ -180,8 +180,11 @@ def match_files_to_lines(files, lines):
 # ----------------------------------------------------------------------
 # Geo-referencing
 # ----------------------------------------------------------------------
-def scan_to_map(x_m, seg_start, seg_end):
-    """Point ``x_m`` metres along the scan, from ``seg_start`` towards ``seg_end``.
+def scan_to_map(x_m, seg_start, seg_end, origin_along_m=0.0):
+    """Point ``x_m`` metres along the scan, on the line ``seg_start`` ->
+    ``seg_end``, counted from ``origin_along_m`` metres past ``seg_start``:
+    where the plate seated and the scan's d = 0 is (negative when it seated
+    before the segment start).
 
     Straight-line sweep along the wall; the plate's z is the segment's. The
     GPR antenna offset from the plate TCP is not applied here (unknown yet).
@@ -193,18 +196,22 @@ def scan_to_map(x_m, seg_start, seg_end):
     if norm < 1e-6:
         return [round(float(v), 4) for v in start]
     unit = np.array([axis[0] / norm, axis[1] / norm, 0.0])
-    return [round(float(v), 4) for v in start + unit * float(x_m)]
+    return [round(float(v), 4) for v in start + unit * (float(origin_along_m) + float(x_m))]
 
 
 def map_transform(line):
     """``x_m -> [x, y, z]`` for a scanned line, or None when it has no geometry.
 
     One place decides whether a scan can be placed on the wall at all, so the
-    compact detections and the NO_DRILL constraints can never disagree about it.
+    compact detections, the NO_DRILL constraints and the global JSON can never
+    disagree about it. ``origin_along_m`` is where ScanWall saw the plate seat
+    (the scan's d = 0); a record from before it was kept places d = 0 on
+    ``seg_start``.
     """
     if not line or not line.get("seg_start") or not line.get("seg_end"):
         return None
-    return lambda x_m: scan_to_map(x_m, line["seg_start"], line["seg_end"])
+    origin = float(line.get("origin_along_m") or 0.0)
+    return lambda x_m: scan_to_map(x_m, line["seg_start"], line["seg_end"], origin)
 
 
 def _compact_hyperbolae(result, line):
