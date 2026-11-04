@@ -128,8 +128,8 @@ def _has(module):
     return True
 
 
-@pytest.mark.skipif(not (_has("xgboost") and paths.hsi_model_path().is_file()),
-                    reason="needs xgboost and models/hsi/classifier.joblib")
+@pytest.mark.skipif(not (_has("torch") and paths.hsi_model_path().is_file()),
+                    reason="needs torch and models/hsi/classifier.joblib")
 def test_the_real_classifier_runs_end_to_end_on_a_synthetic_session(tmp_path):
     """Smoke test of the vendored pipeline over our CSV shape. Flat spectra are
     not a material, so the verdicts are expected to be rejections -- the point
@@ -147,55 +147,29 @@ def test_the_real_classifier_runs_end_to_end_on_a_synthetic_session(tmp_path):
     assert (tmp_path / "out" / hsi.SAMPLES_FILENAME).is_file()
 
 
-@pytest.mark.skipif(_has("xgboost"), reason="only meaningful without xgboost")
+@pytest.mark.skipif(_has("torch"), reason="only meaningful without torch")
 def test_a_missing_classifier_stack_is_one_clear_error(tmp_path):
     _write_reflectance(tmp_path / hp.REFLECTANCE_FILENAME,
                        [(1, 0, 0, 0, hp.ACCEPTED, None, None, 0.5)])
     model = tmp_path / "classifier.joblib"
     model.write_bytes(b"x")
-    with pytest.raises(VendorUnavailable, match="xgboost"):
+    with pytest.raises(VendorUnavailable, match="torch"):
         hsi.classify_session(tmp_path, tmp_path / "out", model)
 
 
 # ----------------------------------------------------------------------
 # Where the classifier runs
 # ----------------------------------------------------------------------
-class _FakeXGB:
-    """Quacks like an XGBClassifier: the two attributes _place_models keys on."""
-
-    def __init__(self):
-        self.params = {"device": "cuda"}
-
-    def get_booster(self):
-        return None
-
-    def set_params(self, **kw):
-        self.params.update(kw)
+def test_the_runtime_config_carries_the_torch_device(tmp_path):
+    """Benjamin's classifier picks CUDA whenever torch sees it; ``hsi_device``
+    reaches it through the vendor config's ``torch_device``."""
+    path = hsi.write_runtime_config(tmp_path / "c.json", tmp_path / "m.joblib", 0.8, "cpu")
+    assert json.loads(path.read_text())["torch_device"] == "cpu"
 
 
-def test_models_loaded_inside_the_block_are_pinned_to_the_device(tmp_path, monkeypatch):
-    """The delivered bundle carries device="cuda"; on a machine whose xgboost
-    has no kernels for its GPU every predict dies. The vendored pipeline loads
-    the bundle itself, so the loader is wrapped for the duration of the call."""
-    import joblib
-    bundle = {"model": _FakeXGB(), "scaler": object(), "wl": [1, 2, 3]}
-    monkeypatch.setattr(joblib, "load", lambda *a, **kw: bundle)
-    original = joblib.load
-
-    with hsi.models_on("cpu"):
-        loaded = joblib.load("whatever.joblib")
-        assert loaded is bundle
-        assert loaded["model"].params["device"] == "cpu"
-    assert joblib.load is original                     # restored afterwards
-
-
-def test_an_empty_device_leaves_the_model_as_pickled(monkeypatch):
-    import joblib
-    bundle = {"model": _FakeXGB()}
-    monkeypatch.setattr(joblib, "load", lambda *a, **kw: bundle)
-    with hsi.models_on(""):
-        joblib.load("x")
-    assert bundle["model"].params["device"] == "cuda"
+def test_an_empty_device_lets_the_classifier_choose(tmp_path):
+    path = hsi.write_runtime_config(tmp_path / "c.json", tmp_path / "m.joblib", 0.8, "")
+    assert json.loads(path.read_text())["torch_device"] == "auto"
 
 
 def test_the_default_device_is_the_cpu():

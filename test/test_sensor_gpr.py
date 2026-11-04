@@ -293,3 +293,21 @@ def test_the_summary_is_written_per_scan_like_the_registry(tmp_path, monkeypatch
 
 
 # ScanWall's manifest rows are GprSweep's on this branch: test/test_gpr_sweep.py.
+
+
+def test_a_scan_folder_carries_its_acquisition_in_the_delivery_layout(tmp_path):
+    """The .sgy + .csv sit next to hyperbola/ and line/, so the global JSON's
+    data pointer stays valid when the processed session is sent on."""
+    raw = tmp_path / "incoming"
+    raw.mkdir()
+    (raw / "scan.sgy").write_bytes(b"segy")
+    (raw / "scan.csv").write_text("sidecar")
+    scan = {"sgy": str(raw / "scan.sgy"), "csv": str(raw / "scan.csv"), "stem": "scan"}
+    entry = gpr.process_scan(scan, {"key": "w02_l00_s00"}, tmp_path / "out", tmp_path / "w.pt",
+                             run_hyperbolae=False, run_lines=False)
+    folder = tmp_path / "out" / "w02_l00_s00"
+    assert entry["out_dir"] == str(folder)
+    assert (folder / "scan.sgy").read_bytes() == b"segy"
+    assert (folder / "scan.csv").read_text() == "sidecar"
+    assert (gpr.HYPERBOLA_DIRNAME, gpr.LINE_DIRNAME) == ("hyperbola", "line")
+

@@ -2,7 +2,7 @@
 # All repository paths are relative to this file. Runtime output paths are configurable.
 
 paths:
-  output_dir: ../outputs
+  output_dir: ../../../test_output   # GPR/test_output; each scan goes to <root>/<scan>/hyperbola
   tahzeeb_dir: ../tahzeeb_original
   weights: ../models/best.pt
   tahzeeb_config: ../tahzeeb_original/config.yaml
@@ -40,6 +40,10 @@ inference:
   model_type: maskrcnn
   backbone: resnet101
   confidence_threshold: 0.25
+  # cpu by default: on the lab PC torch sees CUDA but cuDNN fails to load
+  # ("Cannot load symbol cudnnCreate") and the process dies. null = auto (CUDA if available).
+  # DISCOVER FSM integration: null on the robot. The Jetson's CUDA works and runs a
+  # scan in ~20 s instead of ~80 s on its CPU, with the same detections.
   device: null
   save_masks: true
   # Load the 241 MB model once for all gain tiles, then split detections back by gain.
@@ -61,14 +65,21 @@ consensus:
 # compatibility with the MIP/digital-twin workflow. gpr_result.json remains the robot API.
 tahzeeb_final_export:
   enabled: true
-  run_visualization: true
+  run_visualization: false
   # Optional explicit element type for 03_quantify. Leave null unless known externally.
   # Examples: floor_slab, partition_pladur, brick_wall, retaining_wall, wall.
   element_type_override: null
 
 outputs:
-  save_json: true
-  save_csv: true
-  save_excel: true
-  save_final_image: true
+  # Keep the deliverables folder intentionally minimal.
+  save_robot_json: true       # gpr_result.json: internal robot/POKEYE result (the returned dict)
+  save_raw_image: true        # gpr_bscan_raw.png: B-scan as acquired, before any processing
+  save_processed_image: true  # gpr_bscan_processed.png: after GPRTools filters, nothing drawn on it
+  save_mask_image: true       # gpr_segmentation_masks.png: Mask R-CNN masks + scores
+  save_final_image: true      # gpr_final_detections.png: masks + hyperbola fits + apexes
+  # Copy the .sgy + Screening Eagle .csv into this branch's folder. Off by default:
+  # GPR/run_gpr.py copies them once per scan, next to hyperbola/ and line/.
+  copy_input_files: false
   visualization_gain_db: 40
+  # Intermediate tiles/masks/fits are deleted after a successful run (true = keep for debugging).
+  keep_workspace: false

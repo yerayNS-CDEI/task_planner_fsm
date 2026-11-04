@@ -1,0 +1,8 @@
+{
+  "output_filename": "gpr_hyperspectral.json",
+  "path_mode": "relative",
+  "wall_material": "",
+  "layer_material": "unknown",
+  "velocity_sigma_floor_m_ns": 0.005,
+  "discrete_object_type": "hyperbola"
+}

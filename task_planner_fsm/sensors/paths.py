@@ -200,6 +200,12 @@ def pokeye_results_dir(ctx=None) -> Path:
     return processed_dir(ctx) / "pokeye"
 
 
+def global_json_path(ctx=None) -> Path:
+    """The GPR + hyperspectral part of the global JSON for Tecnalia. At the
+    session root, because its data pointers reach into ``gpr/`` and ``hsi/``."""
+    return processed_dir(ctx) / "gpr_hyperspectral.json"
+
+
 # ----------------------------------------------------------------------
 # Models
 # ----------------------------------------------------------------------
@@ -221,3 +227,4 @@ HYPERBOLA_PROJECT = GPR_PROJECT / "Hyperbola_Segmentation"
 LINE_PROJECT = GPR_PROJECT / "Line_Segmentation"
 HSI_PROJECT = VENDOR_DIR / "hsi_pipeline"
 POKEYE_PROJECT = VENDOR_DIR / "pokeye_decision_pipeline"
+GLOBAL_JSON_PROJECT = VENDOR_DIR / "global_json_pipeline"

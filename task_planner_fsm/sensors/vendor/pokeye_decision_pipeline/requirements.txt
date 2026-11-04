@@ -1,1 +1,1 @@
-# No third-party dependencies required for the decision layer.
+# POKEYE decision layer: Python standard library only (Python >= 3.9).

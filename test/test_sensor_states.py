@@ -95,10 +95,12 @@ def _has(module):
 
 
 def _synthetic_session(data_dir, n_per_line=40, lines=2, bad=(0.5, 0.7)):
-    """A raw session with smooth spectra everywhere except a noisy patch."""
+    """A raw session with smooth spectra everywhere except a featureless patch.
+
+    Featureless, not noisy: Benjamin's v2 classifier rejects a flat spectrum
+    but scores a noisy one as Poor quality and classifies it anyway."""
     ctx = {"sensor_data_dir": str(data_dir), "sensor_session_id": "20260101_000000"}
     session = hp.new_session_dir(ctx)
-    rng = np.random.default_rng(1)
     gds = np.full(hp.SPECTRUM_LENGTH, 100.0)
     grf = np.full(hp.SPECTRUM_LENGTH, 1100.0)
     hp.save_calibration(session, gds, gds, grf, grf, {})
@@ -112,8 +114,8 @@ def _synthetic_session(data_dir, n_per_line=40, lines=2, bad=(0.5, 0.7)):
             r_v = 0.55 + 0.1 * np.sin(wl_v / 80.0)
             r_n = 0.7 - 0.0002 * (wl_n - 1000.0)
             if bad[0] <= x <= bad[1]:
-                r_v = r_v + rng.normal(0, 0.3, hp.SPECTRUM_LENGTH)
-                r_n = r_n + rng.normal(0, 0.3, hp.SPECTRUM_LENGTH)
+                r_v = np.full(hp.SPECTRUM_LENGTH, 0.5)
+                r_n = np.full(hp.SPECTRUM_LENGTH, 0.5)
             vis = (gds + r_v * (grf - gds)).clip(0, 65535).astype(int)
             nir = (gds + r_n * (grf - gds)).clip(0, 65535).astype(int)
             metrics.record_trigger()
@@ -139,8 +141,8 @@ def _tick_until(state, ctx, phase, limit_s=60.0):
 # ----------------------------------------------------------------------
 # SensorDataProcessing with the real classifier
 # ----------------------------------------------------------------------
-@pytest.mark.skipif(not (_has("xgboost") and paths.hsi_model_path().is_file()),
-                    reason="needs xgboost and models/hsi/classifier.joblib")
+@pytest.mark.skipif(not (_has("torch") and paths.hsi_model_path().is_file()),
+                    reason="needs torch and models/hsi/classifier.joblib")
 def test_processing_state_classifies_decides_and_clusters_off_the_tick(tmp_path):
     session = _synthetic_session(tmp_path)
     node = _Node()
@@ -153,8 +155,8 @@ def test_processing_state_classifies_decides_and_clusters_off_the_tick(tmp_path)
         "sensor_data_dir": str(tmp_path),
         "current_wall_index": 2,
         "gpr_processing_enabled": False,
-        # No GPR at all, so no wall stretch is drillable under the project rule;
-        # this test is about the classify -> cluster chain, screened separately.
+        # No GPR at all: without this, every request would stop at the GPR
+        # clearance check before the HSI policy is even visible.
         "pokeye_require_gpr_coverage": False,
     }
     state.on_enter(ctx)
@@ -176,19 +178,32 @@ def test_processing_state_classifies_decides_and_clusters_off_the_tick(tmp_path)
 
     _tick_until(state, ctx, "done")
     assert ctx["data_processed"] is True
-    assert ctx["drilling_required"] is True
-    targets = ctx["pokeye_targets"]
-    # One noisy patch per line, 40 cm apart vertically: one target each.
-    assert len(targets) == 2
-    assert all(t["wall_index"] == 2 for t in targets)
-    assert all(t["reason"] == "HSI_QUALITY_REJECTED" for t in targets)
-    assert all(5.5 <= t["position"][0] <= 5.7 for t in targets)
-    assert state.check_transition(ctx) == "SendDataToPokeye"
+    # A featureless spectrum is a sensor problem, not a material doubt: the
+    # POKEYE package does not send it (policy v2), so nothing is drilled.
+    with open(ctx["pokeye_decisions_json"]) as handle:
+        decisions = json.load(handle)["decisions"]
+    rejected = [d for d in decisions if d["hsi_evidence"]["status"] == "quality_rejected"]
+    assert rejected and all(d["reason"] == "HSI_QUALITY_REJECTED" for d in rejected)
+    assert not any(d["pokeye_required"] for d in rejected)
+    assert ctx["pokeye_targets"] == [] and ctx["drilling_required"] is False
+    assert state.check_transition(ctx) == "ArmFolding"
 
     processed = tmp_path / "processed" / "session_20260101_000000"
     assert (processed / "hsi" / "samples.csv").is_file()
     assert (processed / "pokeye" / "targets.json").is_file()
     assert ctx["sensor_results_dir"] == str(processed)
+
+    # The global JSON: one element for the wall, every spectrum on the map.
+    assert ctx["global_json_path"] == str(processed / "gpr_hyperspectral.json")
+    with open(ctx["global_json_path"]) as handle:
+        doc = json.load(handle)
+    [block] = doc["wall_02"]
+    measurements = block["hyperspectral_camera"]["measurements"]
+    assert len(measurements) == 80
+    assert measurements[0]["point_coordinates"]["x"]["value"] == 5.0
+    assert measurements[0]["row"] == 1 and measurements[0]["timestamp"]
+    assert block["hyperspectral_camera"]["data_pointer_csv"] == "hsi/reflectance.csv"
+    assert block["continuous_gpr"] == [] and block["discrete_gpr"] == []
 
 
 def test_processing_state_skips_classification_when_the_model_is_missing(tmp_path):
@@ -256,7 +271,7 @@ def test_gpr_phase_waits_for_exports_then_gives_up(tmp_path, monkeypatch):
     assert state._phase == "gpr"        # waiting
     time.sleep(0.06)
     state.run(ctx)
-    assert state._phase == "decision"
+    assert state._phase == "global_json"
     assert any("no new GPR exports" in msg for _, msg in node.logger.lines)
 
 
@@ -426,12 +441,14 @@ def _scan_entry(key, line, x_m=None):
                     "position": {"x_m": x_m, "x_cm": x_m * 100},
                     "depth": {"depth_cm": 5.0},
                     "robustness": {"confidence_mean": 0.9}}] if x_m is not None else [])
+    result = {"status": "ok", "hyperbola_detected": bool(detections),
+              "n_valid_detections": len(detections), "detections": detections,
+              "calibration": {"scan_distance_m": 2.0}}
     constraints = no_drill.constraints_from_result(
-        {"hyperbola_detected": bool(detections),
-         "n_valid_detections": len(detections), "detections": detections},
-        to_map=gpr.map_transform(line), source_key=key)
+        result, to_map=gpr.map_transform(line), source_key=key)
+    hyperbolae = dict(gpr._compact_hyperbolae(result, line), status="ok")
     return {"key": key, "line": line, "associated": line is not None,
-            "no_drill": constraints}
+            "hyperbolae": hyperbolae, "no_drill": constraints}
 
 
 def _write_gpr_summary(tmp_path, entries):
@@ -444,7 +461,7 @@ def _write_gpr_summary(tmp_path, entries):
 
 
 def _scanned_line(wall=2):
-    return {"key": "w02_l00_s00", "wall_index": wall,
+    return {"key": "w02_l00_s00", "wall_index": wall, "line_idx": 0, "seg_idx": 0,
             "seg_start": [5.0, 3.0, 1.0], "seg_end": [7.0, 3.0, 1.0]}
 
 
@@ -470,13 +487,22 @@ def _decision_ctx(tmp_path, node, **extra):
     return ctx
 
 
-def _hsi_double(x0=5.55, n=6, wall=2):
-    """Flagged samples in a patch, as the classifier would have left them."""
-    return {"confidence_threshold": 0.8, "samples": [
+def _hsi_double(x0=5.55, n=6, wall=2, n_good=20):
+    """Flagged samples in a patch on the scanned line (map x 5.0 + travel), as
+    the classifier would have left them, among confident ones elsewhere so
+    the patch stays a point request and not the package's wall request."""
+    flagged = [
         {"seq": i, "wall_index": wall, "line_idx": 0, "seg_idx": 0, "frame": "map",
+         "travel_m": round(x0 + 0.02 * i - 5.0, 4),
          "pose": [x0 + 0.02 * i, 3.0, 1.0], "pose_map": [x0 + 0.02 * i, 3.0, 1.0],
          "status": "low_confidence", "detected": False, "material": None,
-         "confidence": 0.4, "reason": "below threshold"} for i in range(n)]}
+         "confidence": 0.4, "reason": "below threshold"} for i in range(n)]
+    good = [
+        {"seq": 1000 + i, "wall_index": wall, "line_idx": 0, "seg_idx": 0, "frame": "map",
+         "travel_m": 1.9, "pose": [6.9, 3.0, 1.0], "pose_map": [6.9, 3.0, 1.0],
+         "status": "detected", "detected": True, "material": "gypsum",
+         "confidence": 0.95, "reason": None} for i in range(n_good)]
+    return {"confidence_threshold": 0.8, "samples": flagged + good}
 
 
 def test_the_decision_phase_drops_a_target_sitting_on_a_hyperbola(tmp_path):
@@ -494,8 +520,13 @@ def test_the_decision_phase_drops_a_target_sitting_on_a_hyperbola(tmp_path):
     assert ctx["data_processed"] is True
     assert ctx["drilling_required"] is False
     assert ctx["pokeye_targets"] == []
-    [blocked] = ctx["pokeye_blocked_targets"]
-    assert blocked["blocked_by"]["source_detection_id"] == "H001"
+    # Blocked point by point by the package, before any target exists.
+    with open(ctx["pokeye_decisions_json"]) as handle:
+        decisions = json.load(handle)["decisions"]
+    flagged = [d for d in decisions if d["hsi_evidence"]["status"] == "low_confidence"]
+    assert {d["decision"] for d in flagged} == {"BLOCKED_BY_GPR"}
+    assert all(d["gpr_check"]["nearest_hyperbola"]["id"] == "w02_l00_s00:H001" for d in flagged)
+    assert ctx["pokeye_blocked_targets"] == []
     assert len(ctx["pokeye_no_drill_zones"]) == 1
     assert ctx["pokeye_no_drill_zones"][0]["position"] == [5.6, 3.0, 1.0]
     assert state.check_transition(ctx) == "ArmFolding"
@@ -632,8 +663,12 @@ def test_a_wall_no_gpr_line_scanned_yields_no_targets(tmp_path):
     assert ctx["drilling_required"] is False
     assert ctx["pokeye_targets"] == []
     assert ctx["pokeye_scanned_lines"] == []
-    assert ctx["pokeye_blocked_targets"][0]["blocked_by"]["reason"] == \
-        "NOT_ON_A_SCANNED_GPR_LINE"
+    # The package already refuses each point: no GPR result clears its line.
+    with open(ctx["pokeye_decisions_json"]) as handle:
+        decisions = json.load(handle)["decisions"]
+    assert {d["reason"] for d in decisions if d["hsi_evidence"]["status"] == "low_confidence"} \
+        == {"GPR_CLEARANCE_UNKNOWN"}
+    assert ctx["pokeye_blocked_targets"] == []
     assert any("nothing on it may be drilled" in msg
                for level, msg in node.logger.lines if level == "warn")
     assert state.check_transition(ctx) == "ArmFolding"

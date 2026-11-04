@@ -3,8 +3,8 @@ import sys
 
 root = Path(__file__).resolve().parent
 checks = {
-    "Benjamin predict.py": root / "benjamin_original" / "predict.py",
-    "classifier.joblib": root / "benjamin_original" / "classifier.joblib",
+    "Benjamin classifier.py (v2)": root / "benjamin_original" / "classifier.py",
+    "classifier.joblib (v2)": root / "benjamin_original" / "classifier.joblib",
     "integration config": root / "hsi_integration" / "config.json",
 }
 failed = False
@@ -13,7 +13,7 @@ for name, path in checks.items():
     print(f"{'OK' if ok else 'MISSING':7s} {name}: {path.relative_to(root)}")
     failed |= not ok
 
-for module in ["pandas", "numpy", "scipy", "sklearn", "xgboost", "joblib"]:
+for module in ["pandas", "numpy", "scipy", "sklearn", "torch", "matplotlib", "joblib"]:
     try:
         __import__(module)
         print(f"OK      python module: {module}")

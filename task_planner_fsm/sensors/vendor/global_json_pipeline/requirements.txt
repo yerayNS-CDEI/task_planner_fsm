@@ -1,0 +1,3 @@
+# The JSON builder uses only the standard library; running the sensor pipelines needs theirs.
+-r ../GPR/requirements.txt
+-r ../Hyperspectral/requirements.txt

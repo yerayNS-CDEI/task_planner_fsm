@@ -28,11 +28,14 @@ calibration:
   epsilon_r_assumed: 6.0
   epsilon_r_basis: "representative concrete relative permittivity; assumed, not sensor-measured"
   c_m_per_ns: 0.299792458
-  # Time-zero has priority over the line detector. Any detected line before
-  # time-zero is snapped exactly to time-zero (robot coordinate = 0).
-  clamp_before_time_zero: true
+  # Small tolerance for rendering/sample quantisation around the time-zero row.
+  time_zero_depth_tolerance_samples: 1.0
 
 outputs:
-  output_dir: outputs
-  save_annotated_image: true
-  save_time_zero_overlay: true
+  # Default root when no output folder is given; each scan goes to <root>/<scan>/line.
+  output_dir: ../../test_output
+  # Deliverables: line_bscan_raw.png, line_bscan_processed.png, line_bscan_depth.png and
+  # line_result.json (internal robot/POKEYE JSON). The global JSON is built by FULL PIPELINE/Global JSON.
+  save_raw_image: true        # line_bscan_raw.png: B-scan as acquired, before any processing
+  save_processed_image: true  # line_bscan_processed.png: gain-only image seen by Berta's detector
+  save_depth_figure: true     # line_bscan_depth.png: B-scan with depth axis, lines and result table

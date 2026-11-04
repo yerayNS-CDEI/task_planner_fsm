@@ -2,11 +2,14 @@
 
 Three layers, deliberately separate:
 
-1. **Decision** -- the sensor team's ``decide_pokeye`` applied to every
-   classified sample, unchanged. Policy v2 keeps the v1 trigger rule: the
-   hyperspectral result alone decides, ``low_confidence`` / ``quality_rejected``
-   ask for POKEYE, ``detected`` does not, and a malformed message is ``HOLD``
-   (never an action). GPR still does not vote.
+1. **Decision** -- the sensor team's ``decide_pokeye`` (FULL PIPELINE, policy
+   v2), called once per wall with that wall's GPR hyperbola results, unchanged.
+   Only ``low_confidence`` asks for POKEYE; ``detected`` and
+   ``quality_rejected`` (a sensor problem, not a material doubt) do not, and a
+   malformed verdict is ``NO_ACTION``. A wall that is mostly low-confidence
+   gets **one** request for the whole wall. A requested point within 0.10 m of
+   a hyperbola on its own line is ``BLOCKED_BY_GPR``, and one whose line has no
+   analysed GPR result is ``NO_ACTION`` (``GPR_CLEARANCE_UNKNOWN``).
 
 2. **Aggregation** -- ours. A wall sweep yields hundreds of samples a few
    centimetres apart, so "one drill per flagged sample" is not a target list,
@@ -14,14 +17,14 @@ Three layers, deliberately separate:
    map frame, small clusters are dropped as noise, each surviving cluster
    becomes one target at its centroid, targets closer than a minimum spacing
    are merged, and the count per wall is capped. Every knob is a ctx param.
+   The package's wall request is already one point by design, so it is kept
+   whatever the cluster-size floor.
 
-3. **Screening** -- the other half of policy v2, in :mod:`.no_drill`. What GPR
-   does have is a veto: a target sitting on a detected hyperbola is dropped
-   before it is ever offered, whatever asked for it. A blocked target is kept
-   with the hyperbola that vetoed it rather than quietly disappearing.
-
-``HOLD`` decisions are counted and logged but never drilled: an unreadable
-verdict is a reason to look at the data, not to put a hole in the wall.
+3. **Screening** -- in :mod:`.no_drill`, in the map frame, on the finished
+   targets: a cluster centroid is not any one of the points the package
+   checked, so the hyperbola veto and the scanned-line rule are applied again
+   where the drill would actually go. A blocked target is kept with the
+   hyperbola that vetoed it rather than quietly disappearing.
 
 No ROS. Pure numpy for the clustering so it runs on the Jetson without sklearn.
 """
@@ -38,6 +41,10 @@ from . import import_vendor
 REQUESTED_ACTION = "MATERIAL_IDENTIFICATION"
 DECISIONS_FILENAME = "decisions.json"
 TARGETS_FILENAME = "targets.json"
+CONFIG_FILENAME = "pokeye_config.json"
+
+# The package's reason for its single request on a mostly low-confidence wall.
+WALL_REQUEST_REASON = "HSI_LOW_CONFIDENCE_WALL"
 
 
 @dataclass
@@ -64,23 +71,33 @@ class ClusterParams:
 
 
 # ----------------------------------------------------------------------
-# Layer 1: the vendor decision, per sample
+# Layer 1: the vendor decision, one call per wall
 # ----------------------------------------------------------------------
-def _hsi_message(sample, confidence_threshold):
-    """The single-measurement payload ``decide_pokeye`` documents."""
+def _hsi_sample(sample, index):
+    """One entry of the ``hsi_result.json`` ``samples`` list the package reads.
+
+    ``Wall_Index`` groups the wall rule; ``Line_Idx`` / ``Seg_Idx`` pick the GPR
+    result of the sample's line; ``Travel_m`` is compared with its hyperbolae.
+    """
     return {
+        "sample_index": index,
         "detected": bool(sample.get("detected")),
         "material": sample.get("material"),
         "confidence": sample.get("confidence"),
         "status": sample.get("status"),
         "reason": sample.get("reason"),
-        "confidence_threshold": float(confidence_threshold),
-        "sample_index": sample.get("seq"),
+        "metadata": {
+            "Seq": sample.get("seq"),
+            "Wall_Index": sample.get("wall_index"),
+            "Line_Idx": sample.get("line_idx"),
+            "Seg_Idx": sample.get("seg_idx"),
+            "Travel_m": sample.get("travel_m"),
+        },
     }
 
 
 def _target_context(sample):
-    """Software-owned metadata, passed through the decision untouched."""
+    """Software-owned metadata, attached to each decision for the clustering."""
     pose_map = sample.get("pose_map")
     if pose_map is None and sample.get("frame") == "map":
         pose_map = sample.get("pose")
@@ -89,41 +106,113 @@ def _target_context(sample):
         "wall_index": sample.get("wall_index"),
         "line_idx": sample.get("line_idx"),
         "seg_idx": sample.get("seg_idx"),
+        "travel_m": sample.get("travel_m"),
         "frame_id": "map" if pose_map is not None else sample.get("frame"),
         "position": pose_map if pose_map is not None else sample.get("pose"),
         "located": pose_map is not None,
     }
 
 
-def decide_samples(samples, confidence_threshold, config_path=None):
-    """Run ``decide_pokeye`` on every sample. Returns the decisions, in order.
+def gpr_lines_for_wall(gpr_results, wall_index):
+    """The wall's GPR hyperbola results in the list form ``decide_pokeye`` takes.
 
-    No ``gpr_result=`` is passed even though v2 accepts one. It would attach an
-    identical copy of the wall's drilling constraints to each of several
-    thousand per-sample decisions, and it cannot change any of them -- the
-    constraints are built once per scan in :mod:`.gpr` and applied once to the
-    finished targets. The trigger stays exactly what the sensor team wrote.
+    ``[{"line_idx", "seg_idx", "gpr_result"}]``, one per scanned line, built
+    from the compact entries of ``gpr_summary.json``. A line swept once per
+    polarization has two scans: their hyperbolae are pooled (a reflector in
+    either one blocks), and the line counts as analysed only if both were --
+    the package treats anything but ``status: ok`` as clearance unknown.
     """
-    pokeye = import_vendor("pokeye_decision")
-    decisions = []
-    for sample in samples:
-        decision = pokeye.decide_pokeye(
-            _hsi_message(sample, confidence_threshold),
-            config_path=str(config_path) if config_path else None,
-            target_context=_target_context(sample),
-        )
-        decisions.append(decision)
+    by_line = {}
+    for entry in (gpr_results or {}).get("entries", []) or []:
+        line = entry.get("line") or {}
+        if line.get("wall_index") != wall_index or line.get("line_idx") is None:
+            continue
+        key = (line.get("line_idx"), line.get("seg_idx"))
+        merged = by_line.setdefault(key, {
+            "scan_id": [], "status": "ok", "detections": [], "scan_distance_m": None})
+        merged["scan_id"].append(entry.get("key"))
+        hyp = entry.get("hyperbolae")
+        if not hyp or hyp.get("status", "ok") != "ok":
+            merged["status"] = "not_analysed"
+            continue
+        length = hyp.get("scan_distance_m")
+        if length is not None:
+            merged["scan_distance_m"] = max(float(length), merged["scan_distance_m"] or 0.0)
+        for det in hyp.get("detections", []):
+            merged["detections"].append({
+                "id": f"{entry.get('key')}:{det.get('id')}",
+                "position": {"x_m": det.get("x_m")},
+            })
+    return [{
+        "line_idx": line_idx,
+        "seg_idx": seg_idx,
+        "gpr_result": {
+            "scan_id": "+".join(str(k) for k in m["scan_id"]),
+            "status": m["status"],
+            "calibration": {"scan_distance_m": m["scan_distance_m"]},
+            "detections": m["detections"],
+        },
+    } for (line_idx, seg_idx), m in sorted(by_line.items(), key=lambda kv: str(kv[0]))]
+
+
+def runtime_config(out_dir, require_gpr_clearance=True):
+    """The package's ``config.json`` with the FSM's GPR-clearance switch.
+
+    ``require_gpr_clearance`` follows ``pokeye_require_gpr_coverage``: off only
+    for bring-up and simulation, where there are no exports to clear anything.
+    Every other value stays the sensor team's.
+    """
+    pokeye_decision = import_vendor("pokeye_decision")
+    cfg = pokeye_decision.decision.load_config(None)
+    cfg["require_gpr_clearance"] = bool(require_gpr_clearance)
+    path = Path(out_dir) / CONFIG_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as handle:
+        json.dump(cfg, handle, indent=2)
+    return path
+
+
+def decide_samples(samples, confidence_threshold, gpr_results=None, config_path=None):
+    """Run ``decide_pokeye`` over the samples, one batch per wall. Returns the
+    per-sample decisions in input order, each with its ``target_context``.
+
+    Per wall because the package matches GPR lines by ``Line_Idx`` /
+    ``Seg_Idx`` only: two walls in one call would pair a sample with another
+    wall's line of the same index. ``gpr_results`` is the cumulative
+    ``gpr_summary.json`` (or what this pass produced); None means no GPR.
+    """
+    pokeye_decision = import_vendor("pokeye_decision")
+    by_wall = {}
+    for i, sample in enumerate(samples):
+        by_wall.setdefault(sample.get("wall_index"), []).append(i)
+
+    decisions = [None] * len(samples)
+    for wall, indices in by_wall.items():
+        hsi_batch = {
+            "confidence_threshold": float(confidence_threshold),
+            "samples": [_hsi_sample(samples[i], i) for i in indices],
+        }
+        gpr_lines = gpr_lines_for_wall(gpr_results, wall) if gpr_results else None
+        result = pokeye_decision.decide_pokeye(
+            hsi_batch, gpr_result=gpr_lines or None,
+            config_path=str(config_path) if config_path else None)
+        for i, decision in zip(indices, result["decisions"]):
+            decision["target_context"] = _target_context(samples[i])
+            decisions[i] = decision
     return decisions
 
 
 def decision_stats(decisions):
     counts = Counter(d.get("decision") for d in decisions)
-    reasons = Counter(d.get("reason") for d in decisions if d.get("pokeye_required"))
+    reasons = Counter(d.get("reason") for d in decisions
+                      if d.get("reason") != "HSI_CONFIDENT_CLASSIFICATION")
     return {
         "n": len(decisions),
         "n_pokeye_required": sum(1 for d in decisions if d.get("pokeye_required")),
         "n_no_action": counts.get("NO_ACTION", 0),
-        "n_hold": counts.get("HOLD", 0),
+        "n_blocked_by_gpr": counts.get("BLOCKED_BY_GPR", 0),
+        "n_wall_requests": sum(1 for d in decisions if d.get("pokeye_required")
+                               and d.get("reason") == WALL_REQUEST_REASON),
         "reasons": dict(reasons),
     }
 
@@ -253,7 +342,8 @@ def cluster_targets(decisions, params=None, wall_index=None):
         for label in np.unique(labels):
             idx = np.nonzero(labels == label)[0]
             stats["n_clusters"] += 1
-            if len(idx) < params.min_samples:
+            wall_request = any(members[i].get("reason") == WALL_REQUEST_REASON for i in idx)
+            if len(idx) < params.min_samples and not wall_request:
                 stats["n_clusters_too_small"] += 1
                 continue
             wall_targets.append(_make_target(wall, [members[i] for i in idx], points[idx]))

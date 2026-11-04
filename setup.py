@@ -23,8 +23,10 @@ setup(
         'task_planner_fsm.sensors.vendor.hsi_pipeline.hsi_integration': ['*.json'],
         'task_planner_fsm.sensors.vendor.pokeye_decision_pipeline': ['*.md', '*.txt'],
         'task_planner_fsm.sensors.vendor.pokeye_decision_pipeline.pokeye_decision': ['*.json'],
-        'task_planner_fsm.sensors.vendor.pokeye_decision_pipeline.examples': ['*.json'],
-        'task_planner_fsm.sensors.vendor.pokeye_decision_pipeline.example_outputs': ['*.json'],
+        'task_planner_fsm.sensors.vendor.pokeye_decision_pipeline.test_data': ['*.json'],
+        'task_planner_fsm.sensors.vendor.global_json_pipeline': ['*.md', '*.txt'],
+        'task_planner_fsm.sensors.vendor.global_json_pipeline.global_json': ['*.json'],
+        'task_planner_fsm.sensors.vendor.hsi_pipeline.benjamin_original': ['*.txt'],
     },
     data_files=[
         ('share/ament_index/resource_index/packages',

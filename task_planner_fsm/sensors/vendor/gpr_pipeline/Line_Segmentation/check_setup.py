@@ -17,14 +17,12 @@ for name, path in checks.items():
     print(f"{'OK' if exists else 'MISSING':7s} {name}: {path}")
     ok = ok and exists
 
-try:
-    import cv2  # noqa
-    import numpy  # noqa
-    import yaml  # noqa
-    import obspy  # noqa
-    print("OK      Python dependencies: cv2, numpy, yaml, obspy")
-except Exception as e:
-    print(f"MISSING Python dependency: {e}")
-    ok = False
+for module in ("cv2", "numpy", "scipy", "matplotlib", "PIL", "yaml", "obspy"):
+    try:
+        __import__(module)
+        print(f"OK      python module: {module}")
+    except Exception as e:
+        print(f"MISSING python module: {module} ({e})")
+        ok = False
 
 raise SystemExit(0 if ok else 2)

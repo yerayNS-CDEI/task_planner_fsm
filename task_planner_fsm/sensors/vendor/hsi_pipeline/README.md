@@ -1,105 +1,121 @@
-# DISCOVER — Hyperspectral material-classification pipeline (v2)
+# Hyperspectral — material classification (Benjamin v2)
 
-This folder is the integration package for task **(2)** of the OLIWALL sensor pipeline.
-It preserves Benjamin's classifier and `predict.py` unchanged and adds only a thin adapter/output layer for the robot software.
+Classifies the material of each VIS-NIR spectrum measured by the robot and returns
+material, confidence and spectral quality.
 
-## Scope
+```text
+Hyperspectral/
+├── README.md, requirements.txt
+├── codes/
+│   ├── run_hsi_pipeline.py      # CLI
+│   ├── check_setup.py
+│   ├── benjamin_original/       # Benjamin v2, unchanged: classifier.py + classifier.joblib (+ SOURCE_MANIFEST.txt)
+│   └── hsi_integration/         # DISCOVER layer: input adapter, robot JSON, figures, config.json
+├── test_data/                   # one real robot session
+└── test_output/                 # outputs of the test session
+```
 
-Input acquisition -> format/wavelength adaptation -> Benjamin quality filter + SNV+D1 + scaler + XGBoost -> material/confidence outputs.
+## Pipeline
 
-This package does **not** implement ROS2 transport. The Python function returns a plain `dict` that the software team can serialize into its own ROS2 message/service/action interface.
+```text
+acquisition (robot session reflectance.csv | LENZ .xls | CSV)
+→ format adapter (decimal commas, VIS_/NIR_ prefixes, keep Sample rows)
+→ Benjamin v2: quality filter → resampling to the model grid (per sensor, no interpolation across the gap)
+  → SG smoothing + SNV + 1st derivative → StandardScaler → segmented 1D-CNN (PyTorch)
+→ material / confidence / 0-100 spectral quality
+```
+
+Classes: brick, cementitious, ceramic, gypsum, metal, polymer, wood. Confidence
+threshold **0.80** (`codes/hsi_integration/config.json`, keep it in sync with POKEYE).
 
 ## Accepted input
 
-### 1. Real spectrometer export (`.xls`)
-
-The supplied example `Data_18_06_2026.xls` is **not a binary Excel workbook**. It is a tab-separated text export with comma decimal separators. The pipeline reads that format directly; no manual conversion to Excel/CSV is required.
-
-It may contain `Sample`, `Reference`, `Dark Reference` and `Dark Sample` rows. Only rows whose `Measure Type` is `Sample` are sent to the material classifier. Reference/dark rows are acquisition/calibration records and are counted in `input_diagnostics.json`, not classified as materials.
-
-### 2. CSV
-
-A CSV with one spectrum per row is also accepted.
-
-## Wavelength-grid adaptation
-
-The real sensor export contains 512 wavelength columns. Benjamin's classifier bundle stores the exact 450 wavelengths used during training (400.43–1648 nm, VIS + SWIR).
-
-The integration layer maps the input spectrum to those exact 450 model wavelengths **inside each sensor segment separately**. No interpolation is performed across the VIS/SWIR gap. Missing source values are not silently bridged: a target value is interpolated only when both neighbouring source bands exist.
-
-This is an input-format/grid adapter only. It intentionally does **not** replace Benjamin's cleaning logic. His original `predict.py` remains authoritative for:
-
-- zero -> missing value handling;
-- incomplete-segment rejection;
-- residual missing-value interpolation;
-- reflectance clipping/physical limits;
-- spike and excessive-noise rejection;
-- SNV + first derivative;
-- StandardScaler;
-- XGBoost classification.
-
-## Run
-
-From the package root:
-
-```bash
-pip install -r requirements.txt
-python check_setup.py
-python run_hsi_pipeline.py "path/to/Data_18_06_2026.xls"
-```
-
-Optional output directory:
-
-```bash
-python run_hsi_pipeline.py "path/to/input.xls" --output-dir "outputs/my_scan"
-```
+1. **Robot acquisition session** — `session_<date>_<time>/` with `reflectance.csv` (pass the
+   folder or the file). One row per trigger: `Seq`, `Timestamp`, wall/line/segment/trigger,
+   `Travel_m`, pose (`Map_X/Y/Z`, `Frame`), acquisition `Status`/`Reason`, spectra
+   `VIS_<nm>` / `NIR_<nm>`. Reflectance is computed by the acquisition software as
+   `(sample − dark) / (white − dark)` per channel with the session's `calibration.json`;
+   sessions without `reflectance.csv` (raw counts only) are not supported.
+2. **LENZ export (`.xls`)** — tab-separated text with comma decimals; only `Measure Type = Sample`
+   rows are classified (reference/dark rows are only counted).
+3. **CSV** with one spectrum per row and numeric wavelength (nm) column names.
 
 ## Outputs
 
-For each run:
-
 ```text
-outputs/<input_stem>/
-├── classification_results.csv   # detailed result for every Sample row
-├── hsi_result.json              # dict/JSON intended for software / ROS2 mapping
-├── summary.json                 # compact counts by status/material
-├── input_diagnostics.json       # format, rows, bands and adapter diagnostics
-└── run_manifest.json            # input/model/config/output traceability
+test_output/<session>/
+├── reflectance.csv                  # acquisition CSV with the raw data, unmodified copy of the input
+├── hsi_classification_summary.csv   # inference results, one row per spectrum
+├── spectra/spectrum_00001.png …     # one image per spectrum (Benjamin's figure)
+├── hsi_material_overview.png        # summary: one panel per result, its spectra overlaid
+└── hsi_result.json                  # internal robot/POKEYE JSON
 ```
 
-`classification_results.csv` contains Benjamin's `clase_predicha`, `confianza`, quality-filter result and `prediccion_final`, plus available input metadata.
+- `hsi_classification_summary.csv`: `row` (1-based), `source_row` (row in the input file),
+  `material`, `confidence`, `quality`, `quality_grade`.
+- `hsi_material_overview.png` groups spectra by Benjamin's verdict: each material,
+  `UNDETERMINED` (below the threshold) and `NOT EVALUABLE` (quality filter).
+- `spectra/` takes ~0.2 s per spectrum; switch it off with `outputs.save_spectrum_images: false`.
+- The **global JSON for Tecnalia** (`hyperspectral_camera` block) is built by `FULL PIPELINE/Global JSON/`.
 
-## ROS2-facing Python API
-
-```python
-from hsi_integration import run_hyperspectral_pipeline
-
-result = run_hyperspectral_pipeline("scan.xls")
-```
-
-For each spectrum the relevant operational fields are:
+### `hsi_result.json` (robot/POKEYE)
 
 ```python
 {
-    "detected": True,
-    "material": "gypsum",
-    "confidence": 0.994,
-    "status": "detected"
+    "sensor": "hyperspectral", "input_file": "reflectance.csv",
+    "classifier": {"author": "Benjamin", "version": "v2", ...},
+    "confidence_threshold": 0.8, "input_summary": {...},
+    "n_samples": 16, "n_detected": 14,
+    "samples": [{
+        "sample_index": 0, "source_row": 1,
+        "detected": True, "material": "metal", "confidence": 0.9999,
+        "status": "detected",              # detected | low_confidence | quality_rejected
+        "reason": None,
+        "spectrum_quality": 100.0, "spectrum_quality_grade": "High",
+        "metadata": {"Seq": "1", "Timestamp": "...", "Travel_m": "0.0", "Frame": "map",
+                     "Map_X": "-9.0631", "Map_Y": "-7.78062", "Map_Z": "1.50015", "Status": "accepted"}
+    }]
 }
 ```
 
-If quality is insufficient, `detected=False`, `material=None`, and `status` is `quality_rejected`. If the spectrum is valid but the maximum class probability is below the configured threshold, `status` is `low_confidence`.
+| Benjamin | `status` |
+|---|---|
+| material shown | `detected` |
+| `UNDETERMINED` | `low_confidence` |
+| `NOT EVALUABLE` | `quality_rejected` (`reason` = Benjamin's reason) |
 
-The default confidence threshold is **0.80** and is configurable in `hsi_integration/config.json`.
+`metadata.Status` is the **acquisition** status of the robot software, not the
+classification `status`. With exactly one sample, `detected / material / confidence /
+status / reason` are also copied to the top level (single-measurement payload for POKEYE).
 
-## Validation with the supplied real file
+## Run
 
-The package was executed end-to-end on `Data_18_06_2026.xls`:
+```bash
+pip install -r requirements.txt
+cd codes
+python check_setup.py
+python run_hsi_pipeline.py ../test_data/session_20261002_131059  # -> Hyperspectral/test_output/<session>/
+python run_hsi_pipeline.py path/to/measurement.xls --output-dir out/
+```
 
-- 6,530 total acquisition rows;
-- 6,475 `Sample` rows sent to the classifier;
-- 55 reference/dark rows excluded from material classification;
-- 5,353 samples passed Benjamin's quality filter;
-- 4,680 samples were accepted above the 0.80 confidence threshold.
+```python
+from hsi_integration import run_hyperspectral_pipeline
+result = run_hyperspectral_pipeline("path/to/session", output_dir="path/to/folder")
+```
 
-As a sanity check only, the example file contains descriptive `Label` values. For labels that map unambiguously to one of the model classes (`gypsum`, `brick`, `ceramic`, `cementitious`, `polymer`), **98.4% of the accepted predictions matched the material encoded in the label**. This is a validation of this example run, not a claim of general model accuracy.
+- The model bundle was saved with **scikit-learn 1.9.0**.
+- Inference runs on CPU (`torch_device` in `config.json`; on the lab PC CUDA is detected
+  but cuDNN fails to load).
+
+## Test
+
+`test_data/session_20261002_131059` (robot session, 2026-10-02, 16 spectra, no
+ground-truth label): 14 detected (12 polymer, 2 metal), 1 low_confidence (0.78),
+1 quality_rejected (flat spectrum; the acquisition software had already marked it
+`rejected_stability`, VIS underexposed). POKEYE is requested for 2 spectra.
+
+The LENZ `.xls` path was checked with 120 spectra of `dataset_LENZ.csv` rewritten as a
+LENZ-style export: results identical to Benjamin's `classifier.py` run standalone.
+
+Benjamin v1 (XGBoost, `predict.py`) is kept only in
+`CODES - Benjamin (Hyperspectral, material classification)/v1`.

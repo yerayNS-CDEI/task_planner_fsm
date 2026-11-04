@@ -1,22 +1,41 @@
 from __future__ import annotations
 
+import importlib.util
 import json
-import sys
-import tempfile
+import shutil
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from .input_adapter import prepare_input_for_benjamin
+from .figures import save_material_overview, save_spectrum_images
+from .input_adapter import prepare_input_for_benjamin, resolve_input
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BENJAMIN_DIR = PROJECT_ROOT / "benjamin_original"
-if str(BENJAMIN_DIR) not in sys.path:
-    sys.path.insert(0, str(BENJAMIN_DIR))
 
-from predict import predecir  # noqa: E402
+ROBOT_JSON = "hsi_result.json"
+OVERVIEW_PNG = "hsi_material_overview.png"
+SUMMARY_CSV = "hsi_classification_summary.csv"
+SPECTRA_DIR = "spectra"
+# Files written by the v1 integration; removed so the output folder only holds current deliverables.
+LEGACY_OUTPUTS = ("classification_results.csv", "summary.json", "input_diagnostics.json",
+                  "run_manifest.json")
+
+_benjamin = None
+
+
+def _load_benjamin():
+    """Import Benjamin's unchanged classifier.py under a unique module name."""
+    global _benjamin
+    if _benjamin is None:
+        spec = importlib.util.spec_from_file_location("benjamin_hsi_classifier",
+                                                      BENJAMIN_DIR / "classifier.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _benjamin = module
+    return _benjamin
 
 
 def _json_value(v: Any):
@@ -45,144 +64,114 @@ def run_hyperspectral_pipeline(
     output_dir: str | Path | None = None,
     config_path: str | Path | None = None,
 ) -> dict:
-    """Run the DISCOVER HSI material classifier.
+    """Run the DISCOVER HSI material classifier (Benjamin v2, 1D-CNN).
 
-    Accepted input includes Benjamin-style CSV files and the real text-based .xls
-    export produced by the spectrometer software. The returned dict is deliberately
-    transport-agnostic so the software team can map it onto its ROS2 interface.
+    Accepted input: a robot acquisition session (folder or its reflectance.csv),
+    the text-based .xls export of the LENZ software, or a CSV with spectra.
+    The returned dict is the robot-internal result (consumed by the POKEYE decision)
+    and is also written as hsi_result.json.
     """
     cfg = load_config(config_path)
-    input_path = Path(input_path).resolve()
-    if not input_path.exists():
-        raise FileNotFoundError(input_path)
+    input_path, input_name = resolve_input(input_path)
 
     model_path = PROJECT_ROOT / cfg["model_path"]
     if not model_path.exists():
         raise FileNotFoundError(model_path)
 
     if output_dir is None:
-        output_dir = PROJECT_ROOT / cfg.get("output_root", "outputs") / input_path.stem
+        output_dir = PROJECT_ROOT / cfg.get("output_root", "../test_output") / input_name
     else:
         output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    prepared, diagnostics = prepare_input_for_benjamin(input_path, model_path)
-    diagnostics_path = output_dir / "input_diagnostics.json"
-    diagnostics_path.write_text(json.dumps(diagnostics, indent=2, ensure_ascii=False), encoding="utf-8")
+    bj = _load_benjamin()
+    device = cfg.get("torch_device", "cpu")
+    if device != "auto":
+        bj.TORCH_DEVICE = bj.torch.device(device)
 
-    detailed_csv = output_dir / "classification_results.csv"
     threshold = float(cfg.get("confidence_threshold", 0.8))
     keep_columns = cfg.get("keep_columns", [])
 
-    # Benjamin's original function currently accepts a CSV path. The adapted file
-    # is therefore written only to a temporary directory and is not an operational output.
-    with tempfile.TemporaryDirectory(prefix="hsi_prepared_") as tmp:
-        prepared_csv = Path(tmp) / "prepared_input.csv"
-        prepared.to_csv(prepared_csv, index=False)
-        df_results = predecir(
-            csv_path=str(prepared_csv),
-            model_path=str(model_path),
-            confianza_minima=threshold,
-            output_path=str(detailed_csv),
-            columnas_a_conservar=keep_columns,
-        )
+    prepared, source_rows, input_summary = prepare_input_for_benjamin(input_path)
+    bundle = bj.load_bundle(model_path)
+    an = bj.Analysis(prepared, bundle, threshold)
 
     samples = []
-    for idx, row in df_results.reset_index(drop=True).iterrows():
-        quality = str(row.get("filtro_calidad", ""))
-        final_prediction = str(row.get("prediccion_final", ""))
-        confidence = _json_value(row.get("confianza"))
-
-        if quality != "OK":
-            detected = False
-            material = None
-            status = "quality_rejected"
-            reason = quality
-        elif final_prediction == "no se ha podido detectar":
-            detected = False
-            material = None
-            status = "low_confidence"
+    for i in range(len(an.valid)):
+        confidence = _json_value(an.conf[i])
+        quality = an.quality[i]
+        if not an.valid[i]:
+            detected, material, status, reason = False, None, "quality_rejected", str(an.reasons[i])
+        elif an.conf[i] < threshold:
+            detected, material, status = False, None, "low_confidence"
             reason = f"confidence below threshold {threshold:.3f}"
         else:
-            detected = True
-            material = final_prediction
-            status = "detected"
-            reason = None
+            detected, material, status, reason = True, str(an.material[i]), "detected", None
 
         metadata = {}
         for col in keep_columns:
-            if col in row.index:
-                value = _json_value(row[col])
-                if value is not None:
+            if col in prepared.columns:
+                value = _json_value(prepared.at[i, col])
+                if value not in (None, ""):
                     metadata[col] = value
 
         samples.append({
-            "sample_index": int(idx),
+            "sample_index": i,
+            "source_row": int(source_rows[i]),
             "detected": detected,
             "material": material,
             "confidence": confidence,
             "status": status,
             "reason": reason,
+            "spectrum_quality": round(float(quality["score"]), 1),
+            "spectrum_quality_grade": quality["grade"],
             "metadata": metadata,
         })
 
-    # Compact structure intended to be reused by the ROS2 integration layer.
-    ros2_result = {
+    # Robot-internal result (POKEYE input). The global JSON for Tecnalia is built
+    # from this file by FULL PIPELINE/Global JSON.
+    robot_result = {
         "sensor": "hyperspectral",
         "input_file": input_path.name,
+        "classifier": {
+            "author": "Benjamin",
+            "version": "v2",
+            "pipeline_version": bundle.get("pipeline_version"),
+            "feature_set": bundle.get("feat"),
+            "classes": [str(c) for c in bundle["le"].classes_],
+        },
         "confidence_threshold": threshold,
+        "input_summary": input_summary,
         "n_samples": len(samples),
         "n_detected": sum(int(s["detected"]) for s in samples),
         "samples": samples,
     }
     if len(samples) == 1:
-        ros2_result.update({
-            "detected": samples[0]["detected"],
-            "material": samples[0]["material"],
-            "confidence": samples[0]["confidence"],
-            "status": samples[0]["status"],
-            "reason": samples[0]["reason"],
-        })
+        robot_result.update({k: samples[0][k] for k in
+                             ("detected", "material", "confidence", "status", "reason")})
 
-    result_json = output_dir / "hsi_result.json"
-    result_json.write_text(json.dumps(ros2_result, indent=2, ensure_ascii=False), encoding="utf-8")
+    # ── Deliverables
+    for name in LEGACY_OUTPUTS:
+        (output_dir / name).unlink(missing_ok=True)
 
-    status_counts = pd.Series([s["status"] for s in samples]).value_counts().to_dict() if samples else {}
-    detected_materials = pd.Series(
-        [s["material"] for s in samples if s["detected"]], dtype="object"
-    ).value_counts().to_dict() if any(s["detected"] for s in samples) else {}
-    summary = {
-        "n_samples": len(samples),
-        "n_detected": ros2_result["n_detected"],
-        "status_counts": {str(k): int(v) for k, v in status_counts.items()},
-        "detected_material_counts": {str(k): int(v) for k, v in detected_materials.items()},
-    }
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    (output_dir / ROBOT_JSON).write_text(
+        json.dumps(robot_result, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    run_manifest = {
-        "input_file": str(input_path),
-        # DISCOVER FSM integration: the model may live outside this project
-        # (task_planner_fsm/models/hsi); record it as given in that case.
-        "model": (str(model_path.relative_to(PROJECT_ROOT))
-                  if model_path.is_relative_to(PROJECT_ROOT) else str(model_path)),
-        "confidence_threshold": threshold,
-        "input_adapter": {
-            "detected_format": diagnostics["detected_format"],
-            "source_band_count": diagnostics["source_band_count"],
-            "model_band_count": diagnostics["model_band_count"],
-            "excluded_non_sample_rows": diagnostics["excluded_non_sample_rows"],
-        },
-        "outputs": {
-            "detailed_csv": detailed_csv.name,
-            "ros2_compatible_json": result_json.name,
-            "summary": "summary.json",
-            "input_diagnostics": diagnostics_path.name,
-        },
-    }
-    (output_dir / "run_manifest.json").write_text(
-        json.dumps(run_manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    summary = an.summary()
+    summary.insert(1, "source_row", source_rows)
+    summary.to_csv(output_dir / SUMMARY_CSV, index=False, encoding="utf-8-sig")
 
-    return ros2_result
+    raw_copy = output_dir / input_path.name
+    if raw_copy.resolve() != input_path:
+        shutil.copy2(input_path, raw_copy)
+
+    out_cfg = cfg.get("outputs", {})
+    dpi = int(out_cfg.get("image_dpi", 100))
+    save_material_overview(bj, an, output_dir / OVERVIEW_PNG, dpi)
+    spectra_dir = output_dir / SPECTRA_DIR
+    if spectra_dir.exists():
+        shutil.rmtree(spectra_dir)
+    if out_cfg.get("save_spectrum_images", True):
+        save_spectrum_images(bj, an, spectra_dir, dpi)
+
+    return robot_result

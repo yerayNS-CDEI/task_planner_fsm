@@ -2,7 +2,8 @@
 
 The same code the FSM state runs, minus ROS, in the foreground: reflectance
 pass, DISCOVER material classification, GPR pipelines over the incoming
-exports, POKEYE decisions, target clustering and the GPR NO_DRILL screening. For re-processing a mission
+exports, the global JSON (GPR + hyperspectral part), POKEYE decisions, target
+clustering and the GPR NO_DRILL screening. For re-processing a mission
 after the fact (a retrained model, a tuned clustering radius), for testing the
 sensor stack on a machine without the robot, and for the Jetson timing work.
 
@@ -25,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from .sensors import VendorUnavailable, gpr, hsi, no_drill, paths, pokeye
+from .sensors import VendorUnavailable, global_json, gpr, hsi, no_drill, paths, pokeye
 from .utils import hyperspectral_processing as hp
 
 
@@ -151,6 +152,7 @@ def main(argv=None):
 
     # 2) classification
     samples = []
+    hsi_result = None
     threshold = args.threshold
     if session_dir is None:
         log.info("hsi: skipped (no hyperspectral record)")
@@ -161,6 +163,7 @@ def main(argv=None):
                                           paths.hsi_model_path(ctx), threshold, logger=log,
                                           device=args.hsi_device)
             samples = result["samples"]
+            hsi_result = result
             log.info(f"hsi: {result['n_classified']} spectra classified in "
                      f"{time.monotonic() - t0:.1f} s")
             for wall, bucket in sorted(result["by_wall"].items(),
@@ -185,16 +188,26 @@ def main(argv=None):
         except VendorUnavailable as exc:
             log.warn(f"gpr: skipped ({exc})")
 
-    # 4) what GPR allows: the forbidden points, and the only scanned region
+    # 4) the global JSON for Tecnalia (GPR + hyperspectral part)
+    gpr_results = gpr.load_summary(paths.gpr_results_dir(ctx))
+    if gpr_results or samples:
+        try:
+            gstats = global_json.build_document(
+                paths.global_json_path(ctx), gpr_results=gpr_results, hsi=hsi_result)
+            log.info(f"global json: {gstats['path']}")
+            log.info(f"  {global_json.describe(gstats)}")
+        except VendorUnavailable as exc:
+            log.warn(f"global json: skipped ({exc})")
+
+    # 5) what GPR allows: the forbidden points, and the only scanned region
     zones, lines, zstats = [], [], {}
     require_coverage = not args.no_gpr_coverage_required
     line_tolerance = no_drill.line_tolerance_from_ctx(ctx)
     try:
         tolerance = no_drill.tolerance_from_ctx(ctx)
-        results = gpr.load_summary(paths.gpr_results_dir(ctx))
         zones, zstats = no_drill.zones_from_gpr(
-            results, tolerance_m=tolerance, wall_index=args.wall)
-        lines, line_stats = no_drill.scanned_lines_from_gpr(results, wall_index=args.wall)
+            gpr_results, tolerance_m=tolerance, wall_index=args.wall)
+        lines, line_stats = no_drill.scanned_lines_from_gpr(gpr_results, wall_index=args.wall)
         zstats.update(line_stats)
         if require_coverage:
             log.info(f"no-drill: drillable only within {line_tolerance} m of "
@@ -216,10 +229,13 @@ def main(argv=None):
     except VendorUnavailable as exc:
         log.warn(f"no-drill: skipped ({exc})")
 
-    # 5) decision + targets, screened against those zones
+    # 6) decision + targets, screened against those zones
     if samples:
         try:
-            decisions = pokeye.decide_samples(samples, threshold)
+            config = pokeye.runtime_config(paths.pokeye_results_dir(ctx),
+                                           require_gpr_clearance=require_coverage)
+            decisions = pokeye.decide_samples(samples, threshold, gpr_results=gpr_results,
+                                              config_path=config)
             params = pokeye.ClusterParams.from_ctx(ctx)
             targets, stats = pokeye.cluster_targets(decisions, params, wall_index=args.wall)
             targets, blocked, screen_stats = no_drill.screen_targets(
@@ -233,8 +249,9 @@ def main(argv=None):
                 paths.pokeye_results_dir(ctx), decisions, targets, stats,
                 zones=zones, blocked=blocked)
             ds = pokeye.decision_stats(decisions)
-            log.info(f"pokeye: {ds['n_pokeye_required']}/{ds['n']} samples require POKEYE, "
-                     f"{ds['n_hold']} hold -> {stats['n_targets']} target(s) "
+            log.info(f"pokeye: {ds['n_pokeye_required']}/{ds['n']} samples require POKEYE "
+                     f"({ds['n_wall_requests']} wall request(s)), {ds['n_blocked_by_gpr']} "
+                     f"blocked by GPR -> {stats['n_targets']} target(s) "
                      f"(radius {params.radius_m} m, min {params.min_samples} samples, "
                      f"spacing {params.min_spacing_m} m, cap {params.max_targets_per_wall})")
             log.info(f"  {pokeye.describe_targets(targets)}")

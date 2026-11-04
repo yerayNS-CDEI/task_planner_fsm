@@ -1,0 +1,30 @@
+{
+  "status": "ok",
+  "scan_id": "synthetic_example",
+  "hyperbola_detected": true,
+  "n_valid_detections": 2,
+  "calibration": {
+    "scan_distance_m": 5.0
+  },
+  "detections": [
+    {
+      "id": "H001",
+      "position": {
+        "x_m": 1.0
+      },
+      "depth": {
+        "depth_cm": 6.0
+      }
+    },
+    {
+      "id": "H002",
+      "position": {
+        "x_m": 2.5
+      },
+      "depth": {
+        "depth_cm": 6.0
+      }
+    }
+  ],
+  "note": "Synthetic GPR hyperbola result for the POKEYE decision tests (same keys as gpr_result.json)."
+}

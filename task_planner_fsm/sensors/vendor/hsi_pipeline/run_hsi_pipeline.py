@@ -9,7 +9,7 @@ from hsi_integration.pipeline import run_hyperspectral_pipeline
 
 def main() -> int:
     p = argparse.ArgumentParser(description="DISCOVER hyperspectral material-classification pipeline")
-    p.add_argument("input", help="Sensor export (.xls text export) or CSV containing spectra")
+    p.add_argument("input", help="Robot session folder (with reflectance.csv), LENZ .xls text export or CSV containing spectra")
     p.add_argument("--output-dir", default=None, help="Optional output directory")
     p.add_argument("--config", default=None, help="Optional integration config JSON")
     args = p.parse_args()

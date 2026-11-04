@@ -710,11 +710,14 @@ def test_the_processing_state_walks_its_phases_without_blocking(rig):
     assert ctx["hyperspectral_processed"] is True
     assert ctx["hyperspectral_totals"][hp.ACCEPTED] == 9
     # Reflectance done -> classification (skipped: no model) -> GPR (disabled)
-    # -> decision. Nothing was classified, so POKEYE is not required and the
-    # state is done: no mock service is consulted on a real-robot run.
+    # -> global JSON (nothing to write) -> decision. Nothing was classified, so
+    # POKEYE is not required and the state is done: no mock service is
+    # consulted on a real-robot run.
     assert state._phase == "hsi_classify"
     state.run(ctx)
     assert state._phase == "gpr"
+    state.run(ctx)
+    assert state._phase == "global_json"
     state.run(ctx)
     assert state._phase == "decision"
     state.run(ctx)
@@ -736,6 +739,8 @@ def test_the_processing_state_skips_hyperspectral_when_nothing_was_recorded(tmp_
     state.run(ctx)
     assert state._phase == "gpr"
     state.run(ctx)
+    assert state._phase == "global_json"
+    state.run(ctx)
     assert state._phase == "decision"
     state.run(ctx)
     assert state._phase == "done"
@@ -751,6 +756,6 @@ def test_the_processing_state_keeps_the_mock_service_in_simulation(tmp_path):
     ctx = {"node": _Node(_Client()), "sim": True, "sensor_data_dir": str(tmp_path),
            "gpr_processing_enabled": False}
     state.on_enter(ctx)
-    for _ in range(3):
+    for _ in range(4):                  # hyperspectral, gpr, global_json, decision
         state.run(ctx)
     assert state._phase == "external"

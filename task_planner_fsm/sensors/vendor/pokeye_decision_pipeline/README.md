@@ -1,53 +1,58 @@
 # DISCOVER — OLIWALL -> POKEYE decision layer (v2)
 
-Task **(3)**. This package has two deliberately separate responsibilities:
-
-1. **Decide whether HSI requires POKEYE material identification.**
-2. **Convert detected GPR hyperbolae into NO-DRILL constraints** that POKEYE must respect whenever it drills, including externally requested **RANDOM** drilling.
-
-## Important scope rule
-
-**GPR does not trigger POKEYE.** The decision `pokeye_required` is still based only on the HSI result.
-
-A GPR hyperbola has a different role: if a hyperbola is detected at a horizontal GPR position, that position is returned as **NO_DRILL**, because the reflector may correspond to metal/rebar/pipe/cable or another subsurface object that should not be drilled blindly.
-
-## HSI trigger policy
+Task **(3)**. This package decides whether POKEYE should be requested from the **hyperspectral (HSI) result**, and makes sure POKEYE never acts **where the GPR detected a hyperbola**.
 
 ```text
-HSI detected with confidence >= threshold -> NO_ACTION
-HSI low_confidence                     -> SEND_TO_POKEYE
-HSI quality_rejected                   -> SEND_TO_POKEYE
-invalid/inconsistent HSI message       -> HOLD
+Pokeye Decision/
+├── README.md, requirements.txt
+├── codes/
+│   ├── run_pokeye_decision.py   # CLI
+│   ├── test_decision.py         # unit tests (no files needed)
+│   ├── check_setup.py
+│   └── pokeye_decision/         # decision.py + config.json
+├── test_data/                   # HSI examples (single points and whole walls) + a synthetic GPR result
+└── test_output/                 # their decisions + the decision on the real HSI test session
 ```
 
-## GPR drilling policy
+Python standard library only (`requirements.txt` is empty on purpose).
 
-```text
-GPR hyperbola detected at x -> NO_DRILL at that GPR-local position
-No hyperbola                -> no GPR-derived forbidden position
-```
+## Policy v2
 
-This constraint applies independently of why POKEYE is drilling. In particular, **RANDOM drilling must also avoid all GPR hyperbola locations**.
+| HSI result | GPR at that point | Decision | `requested_action` |
+|---|---|---|---|
+| `detected`, confidence ≥ 0.80 | (not checked) | `NO_ACTION` | `NONE` |
+| `quality_rejected` | (not checked) | `NO_ACTION` (`HSI_QUALITY_REJECTED`) | `NONE` |
+| `low_confidence`, isolated in its wall | no hyperbola | `SEND_TO_POKEYE` (`HSI_LOW_CONFIDENCE`) | `MATERIAL_IDENTIFICATION` |
+| `low_confidence`, most of the wall | no hyperbola | **one** `SEND_TO_POKEYE` for the wall (`HSI_LOW_CONFIDENCE_WALL`); the other points `NO_ACTION` (`COVERED_BY_WALL_REQUEST`) | `MATERIAL_IDENTIFICATION` once |
+| `low_confidence` | hyperbola within 0.10 m | `BLOCKED_BY_GPR` (`GPR_HYPERBOLA_AT_TARGET`) | `NONE` |
+| `low_confidence` | cannot be verified (no GPR result, no position, outside the scan) | `NO_ACTION` (`GPR_CLEARANCE_UNKNOWN`) | `NONE` |
+| malformed / inconsistent | — | `NO_ACTION` (`INVALID_HSI_RESULT`, `decision_valid=false`) | `NONE` |
 
-### Coordinate warning
+- **Quality rejected** is a sensor problem (bad spectrum), not a doubt about the material, so it does not request POKEYE.
+- **Wall rule.** A wall is one acquisition (`metadata.Wall_Index`). Among its classified points (`detected` + `low_confidence`; `quality_rejected` excluded), if the share of `low_confidence` is ≥ `wall_low_confidence_ratio` (0.5) and there are at least `wall_min_low_confidence` (2) of them, only **one** POKEYE request is sent for the wall. It goes to the least confident point that GPR allows; if that point is on a hyperbola, the next one is used. If every low-confidence point is on a hyperbola, the wall gets no request. Otherwise (isolated low confidence, e.g. 1/10) POKEYE is requested at each of those points.
+- **GPR rule.** The HSI point position along the line (`metadata.Travel_m`, or `position_along_scan_m`) is compared with each hyperbola `position.x_m` of the GPR `gpr_result.json` for the same line. Within `gpr_exclusion_radius_m` (0.10 m) the point is blocked. Both positions must share the same origin and direction along the line; that pairing is the software team's responsibility.
+- **Safety default.** `require_gpr_clearance: true`: without GPR evidence that the point is free of hyperbolas, POKEYE is not sent (`NO_ACTION`, `GPR_CLEARANCE_UNKNOWN`). Set it to `false` only if POKEYE may act without GPR.
+- The wall rule needs the whole wall at once (`hsi_result.json` with `samples`). A single message only gets the point rule.
 
-The GPR horizontal coordinate is **local to the B-scan / scan path**. It is not a robot/world coordinate. The software team must transform the local GPR position to the robot/global frame using the scan pose, GPR extrinsics and scan direction.
+All values are in `codes/pokeye_decision/config.json`.
 
-The sensor package intentionally does **not** invent a safety radius around a hyperbola. The project must agree a spatial tolerance/exclusion radius and software must apply it after coordinate transformation. `arc_half_width_m` is included only as diagnostic geometry and is **not** a validated drilling safety radius.
+## ROS2 boundary
+
+This package does **not** implement ROS2 topics/messages. The software team can deserialize its HSI and GPR messages into Python dicts, call the function below, then serialize the returned dict into its preferred ROS2 interface.
 
 ## Python API
 
 ```python
 from pokeye_decision import decide_pokeye
 
-decision = decide_pokeye(
-    hsi_result=hsi_msg,
-    gpr_result=gpr_result,       # optional gpr_result.json content
-    target_context=target_context,
-)
+decision = decide_pokeye(hsi_result, gpr_result=gpr_result)
 ```
 
-A typical output is:
+- `hsi_result`: one HSI message, or the full `hsi_result.json` from `../Hyperspectral` (batch: one decision per sample, grouped by wall).
+- `gpr_result`: the `gpr_result.json` of the hyperbola branch for that line, or, for a wall with several GPR lines, a list `[{"line_idx": "0", "seg_idx": "0", "gpr_result": {...}}, ...]` matched against the HSI `metadata.Line_Idx/Seg_Idx`.
+- `target_context` (optional): opaque metadata copied to the output; this package does not invent coordinates or navigation commands.
+
+Single result:
 
 ```python
 {
@@ -57,64 +62,48 @@ A typical output is:
     "reason": "HSI_LOW_CONFIDENCE",
     "requested_action": "MATERIAL_IDENTIFICATION",
     "hsi_evidence": {...},
-    "drilling_constraints": {
-        "coordinate_frame": "gpr_scan_local",
-        "n_no_drill_positions": 2,
-        "no_drill_positions": [
-            {
-                "source_detection_id": "H001",
-                "instruction": "NO_DRILL",
-                "reason": "GPR_HYPERBOLA_DETECTED",
-                "x_m": 0.55,
-                "x_cm": 55.0,
-                "x_relative": 0.31,
-                "depth_cm_approx": 4.2
-            }
-        ],
-        "requires_coordinate_transform": True,
-        "requires_exclusion_tolerance_definition": True,
-        "exclusion_tolerance_m": None
-    }
+    "gpr_check": {"status": "clear", "position_along_scan_m": 3.0,
+                  "nearest_hyperbola": {"id": "H002", "x_m": 2.5, "distance_m": 0.5}, ...}
 }
 ```
 
-A confident HSI classification can still return `pokeye_required=false` while carrying GPR drilling constraints. This is intentional: POKEYE may later be requested for another reason, including RANDOM drilling.
+Batch result: `decisions[]` (one per sample, with `wall_index`), `walls[]` (`aggregation` = `wall` / `point`, `requested_sample_indices`), and counters `n_pokeye_required`, `n_blocked_by_gpr`, `n_not_verifiable` (GPR clearance unknown or invalid HSI).
 
-## ROS2 boundary
-
-ROS2 is not implemented here. Recommended integration is:
-
-1. deserialize the HSI result into a Python `dict`;
-2. optionally provide the latest associated `gpr_result.json` / GPR dict;
-3. call `decide_pokeye(...)`;
-4. publish the HSI decision and the transformed NO-DRILL constraints using project-defined ROS2 interfaces.
-
-The software layer owns measurement/pose association and coordinate transforms.
-
-## CLI
+## CLI / JSON test
 
 ```bash
+cd codes
 python check_setup.py
 python test_decision.py
-python run_pokeye_decision.py examples/hsi_low_confidence.json \
-    --gpr-json examples/gpr_hyperbolas.json
+python run_pokeye_decision.py ../test_data/hsi_low_confidence.json --gpr ../test_data/gpr_hyperbola_example.json
+python run_pokeye_decision.py ../test_data/hsi_wall_mostly_low_confidence.json --gpr ../test_data/gpr_hyperbola_example.json
+python run_pokeye_decision.py ../../Hyperspectral/test_output/session_20261002_131059/hsi_result.json \
+       --gpr ../../GPR/test_output/scan_wall_line_1_seg_1_20261008_110058_012/hyperbola/gpr_result.json \
+       --output ../test_output/session_20261002_131059/pokeye_decision.json
 ```
 
-Default output:
+Default CLI output (when `--output` is omitted): `Pokeye Decision/test_output/<input_name>/pokeye_decision.json`.
 
-```text
-outputs/<input_name>/pokeye_decision.json
-```
+| Test input (`--gpr gpr_hyperbola_example.json`, hyperbolas at 1.0 and 2.5 m) | Result |
+|---|---|
+| `hsi_detected` | `NO_ACTION` |
+| `hsi_quality_rejected` | `NO_ACTION` |
+| `hsi_low_confidence` (3.0 m) | `SEND_TO_POKEYE` |
+| `hsi_low_confidence_on_hyperbola` (2.52 m) | `BLOCKED_BY_GPR` |
+| `hsi_wall_mostly_low_confidence` (8/10 low) | 1 request (sample 1; the least confident, sample 5, is on a hyperbola) |
+| `hsi_wall_one_low_confidence` (1/9 low + 1 quality rejected) | 1 request at sample 6 |
 
-## Main fields
+Real HSI session (16 spectra): 1 `low_confidence` (sample 5, 2.51 m) and 1 `quality_rejected` (sample 15) -> no POKEYE request. The `low_confidence` point is `BLOCKED_BY_GPR` by hyperbola H008 (2.50 m) of the 2026-10-08 GPR scan. **That HSI/GPR pairing is only illustrative**: the two acquisitions are not from the same line.
 
-- `pokeye_required`: whether HSI requests POKEYE.
-- `decision`: `NO_ACTION`, `SEND_TO_POKEYE`, or `HOLD`.
-- `requested_action`: currently `MATERIAL_IDENTIFICATION`, `NONE`, or `HOLD`.
-- `drilling_constraints.no_drill_positions[]`: GPR-derived local positions where drilling is forbidden.
-- `drilling_constraints.constraint_valid`: whether the GPR constraint payload could be interpreted.
-- `target_context`: optional opaque metadata passed through from software.
+## Output meanings
+
+- `pokeye_required`: `true` only for `SEND_TO_POKEYE`.
+- `decision`: `NO_ACTION`, `SEND_TO_POKEYE`, or `BLOCKED_BY_GPR`.
+- `reason`: machine-readable reason (see the table above).
+- `requested_action`: `MATERIAL_IDENTIFICATION` or `NONE`.
+- `hsi_evidence`: HSI material/confidence/status copied into the decision for traceability.
+- `gpr_check`: `status` (`clear` / `blocked` / `unknown`), point position, nearest hyperbola and distance.
 
 ## Confidence threshold
 
-Default HSI threshold: `0.80`. If the HSI message contains `confidence_threshold`, that value takes precedence so the decision layer remains synchronized with HSI.
+By default the decision threshold is `0.80`, matching the current HSI integration. If the HSI message includes `confidence_threshold`, that value takes precedence so the two components remain synchronized.

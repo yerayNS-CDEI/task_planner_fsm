@@ -1,11 +1,10 @@
 """Hyperspectral material classification over a recorded sweep.
 
 The sweep's ``reflectance.csv`` (written by ``SessionProcessor``) already *is*
-the classifier's input: the sensor export the pipeline was built for carries
-512 bands at 325.3-792.6 nm and 991-1707 nm, which are exactly the FSM's
-``vis_wavelengths()`` / ``nir_wavelengths()`` axes, and the reflectance formula
-is the same one. All that differs is the header -- ``VIS_325.3`` where the
-pipeline wants a float-parseable ``325.3`` -- and the metadata we need back.
+the classifier's input: Benjamin's v2 model (a 1D-CNN) reads the robot
+session format directly, ``VIS_``/``NIR_`` headers included, and resamples
+onto its own wavelength grid. The adapter still writes its own copy, to drop
+the rows that never got a reflectance and to carry back the metadata we need.
 
 So the adapter is thin:
 
@@ -20,10 +19,10 @@ Everything here is a blocking function meant to run inside a
 :class:`~task_planner_fsm.sensors.background_job.BackgroundJob`; no ROS.
 """
 
-import contextlib
 import csv
 import json
 import os
+import shutil
 from pathlib import Path
 
 from ..utils import hyperspectral_processing as hp
@@ -104,9 +103,11 @@ def build_input_csv(reflectance_csv, input_csv):
         # so it comes back inside each result sample and lets us assert the join.
         writer.writerow(["Counter"] + [name.split("_", 1)[1] for _, name in spectral])
 
+        data_row = 0
         for row in reader:
             if not row:
                 continue
+            data_row += 1
             status = row[col["Status"]] if "Status" in col else ""
             if status == hp.REJECTED_CALIBRATION:
                 continue
@@ -115,10 +116,19 @@ def build_input_csv(reflectance_csv, input_csv):
             get = lambda name: row[col[name]] if name in col and col[name] < len(row) else None  # noqa: E731
             metadata.append({
                 "seq": _int_or_none(seq),
+                # 1-based data row in reflectance.csv: what the global JSON
+                # points at, since input.csv skips rows.
+                "reflectance_row": data_row,
+                "timestamp": get("Timestamp") or None,
                 "wall_index": _int_or_none(get("Wall_Index")),
                 "line_idx": _int_or_none(get("Line_Idx")),
                 "seg_idx": _int_or_none(get("Seg_Idx")),
                 "trigger_idx": _int_or_none(get("Trigger_Idx")),
+                # Plate travel from the segment start, as a GPR hyperbola's
+                # x_m on that line is (the sensors' offsets on the plate are
+                # not applied, as in gpr.scan_to_map): the POKEYE package
+                # compares the two.
+                "travel_m": _float_or_none(get("Travel_m")),
                 "frame": get("Frame") or None,
                 "pose": _xyz({k: get(k) for k in ("X", "Y", "Z")}, ("X", "Y", "Z")),
                 "pose_map": _xyz({k: get(k) for k in ("Map_X", "Map_Y", "Map_Z")},
@@ -132,13 +142,14 @@ def build_input_csv(reflectance_csv, input_csv):
 # ----------------------------------------------------------------------
 # Step 2: runtime config
 # ----------------------------------------------------------------------
-def write_runtime_config(config_path, model_path, confidence_threshold):
-    """The vendor config with our model location and threshold.
+def write_runtime_config(config_path, model_path, confidence_threshold, device=""):
+    """The vendor config with our model location, threshold and device.
 
     Their ``config.json`` points at ``benjamin_original/classifier.joblib``,
     which is not shipped (see ``models/README.md``). ``model_path`` may be
     absolute: the pipeline joins it onto its project root with ``pathlib``,
-    which yields the absolute path unchanged.
+    which yields the absolute path unchanged. An empty ``device`` becomes the
+    vendor's ``"auto"`` (CUDA when torch sees it).
     """
     vendor_cfg = paths.HSI_PROJECT / "hsi_integration" / "config.json"
     cfg = {}
@@ -148,6 +159,7 @@ def write_runtime_config(config_path, model_path, confidence_threshold):
     cfg["model_path"] = str(Path(model_path).resolve())
     cfg["confidence_threshold"] = float(confidence_threshold)
     cfg["keep_columns"] = ["Counter"]
+    cfg["torch_device"] = device or "auto"
     config_path = Path(config_path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with open(config_path, "w") as handle:
@@ -200,8 +212,8 @@ def summarize_by_wall(samples):
 
 
 def write_samples_csv(samples, path):
-    fields = ["seq", "wall_index", "line_idx", "seg_idx", "trigger_idx", "frame",
-              "x", "y", "z", "map_x", "map_y", "map_z",
+    fields = ["seq", "timestamp", "wall_index", "line_idx", "seg_idx", "trigger_idx",
+              "travel_m", "frame", "x", "y", "z", "map_x", "map_y", "map_z",
               "fsm_status", "status", "detected", "material", "confidence", "reason"]
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -212,8 +224,8 @@ def write_samples_csv(samples, path):
             pose = s.get("pose") or [None, None, None]
             pose_map = s.get("pose_map") or [None, None, None]
             writer.writerow([
-                s.get("seq"), s.get("wall_index"), s.get("line_idx"), s.get("seg_idx"),
-                s.get("trigger_idx"), s.get("frame"),
+                s.get("seq"), s.get("timestamp"), s.get("wall_index"), s.get("line_idx"),
+                s.get("seg_idx"), s.get("trigger_idx"), s.get("travel_m"), s.get("frame"),
                 *pose, *pose_map,
                 s.get("fsm_status"), s.get("status"), s.get("detected"),
                 s.get("material"), s.get("confidence"), s.get("reason"),
@@ -224,47 +236,11 @@ def write_samples_csv(samples, path):
 # ----------------------------------------------------------------------
 # The whole thing
 # ----------------------------------------------------------------------
-# Where the XGBoost classifier runs. The delivered bundle was saved with
-# device="cuda" and keeps that on load, but the pip xgboost wheel on the Jetson
-# is a CUDA build without kernels for the Orin (sm_87): every predict_proba
-# died with cudaErrorNoKernelImageForDevice. The model is ~4 ms per hundred
-# spectra on the CPU, so nothing is lost by pinning it there.
+# Where the 1D-CNN runs: the vendor config's ``torch_device``, which Benjamin's
+# classifier would otherwise set to CUDA whenever torch sees it. The model is
+# ~100 kB and a session is a few dozen spectra, so the GPU buys nothing worth
+# taking it from the GPR's Mask R-CNN; the delivered config pins the CPU too.
 DEFAULT_DEVICE = "cpu"
-
-
-def _place_models(obj, device):
-    """Set ``device`` on every XGBoost model inside a loaded joblib object."""
-    if isinstance(obj, dict):
-        for value in obj.values():
-            _place_models(value, device)
-    elif hasattr(obj, "get_booster") and hasattr(obj, "set_params"):
-        obj.set_params(device=device)
-    return obj
-
-
-@contextlib.contextmanager
-def models_on(device):
-    """Force every model ``joblib.load`` returns inside the block onto ``device``.
-
-    The vendored pipeline loads the bundle itself, deep in the original
-    ``predict.py``, and offers no hook for the device; wrapping the loader
-    for the duration of the call is the one seam that leaves that code
-    untouched. Empty/None leaves the models as pickled.
-    """
-    import joblib
-    if not device:
-        yield
-        return
-    original = joblib.load
-
-    def load(*args, **kwargs):
-        return _place_models(original(*args, **kwargs), device)
-
-    joblib.load = load
-    try:
-        yield
-    finally:
-        joblib.load = original
 
 
 def classify_session(session_dir, out_dir, model_path,
@@ -272,8 +248,8 @@ def classify_session(session_dir, out_dir, model_path,
                      device=DEFAULT_DEVICE):
     """Classify every spectrum of a processed session. Blocking.
 
-    ``device`` is where XGBoost predicts (``hsi_device`` in ctx; see
-    DEFAULT_DEVICE for why it is the CPU).
+    ``device`` is the torch device the classifier runs on (``hsi_device`` in
+    ctx; see DEFAULT_DEVICE for why it is the CPU, empty for CUDA-if-present).
 
     Returns::
 
@@ -302,9 +278,9 @@ def classify_session(session_dir, out_dir, model_path,
         raise FileNotFoundError(
             f"HSI classifier not found at {model_path} (see models/README.md)")
 
-    # The classifier bundle unpickles into xgboost objects; fail here, in one
-    # line, rather than inside joblib.
-    require("joblib", "xgboost", "sklearn", "scipy", "pandas")
+    # The classifier bundle unpickles into a torch model plus sklearn scaler
+    # and label encoder; fail here, in one line, rather than inside joblib.
+    require("joblib", "torch", "sklearn", "scipy", "pandas", "matplotlib")
 
     input_csv = out_dir / INPUT_FILENAME
     metadata = build_input_csv(reflectance_csv, input_csv)
@@ -314,6 +290,7 @@ def classify_session(session_dir, out_dir, model_path,
         "samples": [],
         "by_wall": {},
         "input_csv": str(input_csv),
+        "reflectance_csv": None,
         "hsi_result_json": None,
         "samples_csv": None,
         "confidence_threshold": float(confidence_threshold),
@@ -323,13 +300,13 @@ def classify_session(session_dir, out_dir, model_path,
             logger.warn("HSI: the session has no spectra to classify")
         return result
 
-    config_path = write_runtime_config(out_dir / CONFIG_FILENAME, model_path, confidence_threshold)
+    config_path = write_runtime_config(out_dir / CONFIG_FILENAME, model_path,
+                                       confidence_threshold, device)
 
-    # Imported here, not at module load: this is where xgboost/joblib are needed.
+    # Imported here, not at module load: this is where torch/joblib are needed.
     hsi_integration = import_vendor("hsi_integration")
-    with models_on(device):
-        hsi_result = hsi_integration.run_hyperspectral_pipeline(
-            str(input_csv), output_dir=str(out_dir), config_path=str(config_path))
+    hsi_result = hsi_integration.run_hyperspectral_pipeline(
+        str(input_csv), output_dir=str(out_dir), config_path=str(config_path))
 
     samples = join_results(metadata, hsi_result)
     result["samples"] = samples
@@ -337,6 +314,12 @@ def classify_session(session_dir, out_dir, model_path,
     result["by_wall"] = summarize_by_wall(samples)
     result["hsi_result_json"] = str(out_dir / "hsi_result.json")
     result["samples_csv"] = write_samples_csv(samples, out_dir / SAMPLES_FILENAME)
+    # The acquisition the global JSON's ``row`` numbers refer to, next to the
+    # results so the processed session carries it when sent on.
+    reflectance_copy = out_dir / hp.REFLECTANCE_FILENAME
+    if reflectance_copy.resolve() != reflectance_csv.resolve():
+        shutil.copy2(reflectance_csv, reflectance_copy)
+    result["reflectance_csv"] = str(reflectance_copy)
     with open(out_dir / SUMMARY_FILENAME, "w") as handle:
         json.dump({str(k): v for k, v in result["by_wall"].items()}, handle, indent=2)
     return result

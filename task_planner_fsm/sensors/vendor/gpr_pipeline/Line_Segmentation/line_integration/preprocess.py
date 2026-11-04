@@ -67,6 +67,22 @@ def prepare_gain_only_bscan(
     scan_distance_m = meta.get("trace_distance")
     if corrected_tw_ns is None:
         raise ValueError("GPRTools could not recover the corrected time window from the GP8800 CSV")
+    # The line detector's plotting stage also requires a valid horizontal span.
+    # Validate before the gain-only image is rendered to avoid huge/invalid PNGs.
+    try:
+        distance = float(scan_distance_m)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(
+            f"Invalid trace_distance={scan_distance_m!r} in sidecar {sidecar}. "
+            "A positive scan distance in metres is required."
+        ) from exc
+    if not np.isfinite(distance) or distance <= 0:
+        raise ValueError(
+            f"Invalid trace_distance={distance!r} m in sidecar {sidecar}. "
+            "Please correct the recorded scan distance; it must be positive. "
+            "The B-scan cannot be calibrated with zero distance."
+        )
+    scan_distance_m = distance
 
     expected_tw = cfg.get("calibration", {}).get("expected_corrected_time_window_ns")
     if expected_tw is not None and abs(float(corrected_tw_ns) - float(expected_tw)) > 1e-6:
@@ -139,4 +155,31 @@ def prepare_gain_only_bscan(
         "detection_preprocessing": [f"gain({gain_db:g}dB)"],
         "time_zero_applied_to_detection_image": False,
         "background_removal_applied": False,
+        # In-memory only (figures); never serialized.
+        "raw_matrix": raw,
+        "gain_matrix": gain_matrix,
     }
+
+
+def render_raw_bscan(sgy_path: Path, raw: np.ndarray, output_path: Path, cfg: dict[str, Any]) -> Path:
+    """B-scan exactly as acquired (no gain, no time-zero), same renderer/settings as the detector image."""
+    from GPRTools.plotters.plot_bscan import plot_bscan
+
+    plot_cfg = cfg.get("preprocessing", {}).get("plot", {})
+    plot_bscan(
+        self=None,
+        M=raw,
+        applied_edits=[],
+        base_name=output_path.name,
+        base_dir=str(output_path.parent),
+        save=True,
+        plot_scale=float(plot_cfg.get("plot_scale", 8.0)),
+        aspect_ratio=plot_cfg.get("aspect_ratio"),
+        plot_colormap=str(plot_cfg.get("colormap", "gray")),
+        plot_axes=bool(plot_cfg.get("axes", False)),
+        overwrite=True,
+        loader_type="SEGY",
+        src_file_path=str(sgy_path),
+        render_upsample=float(plot_cfg.get("render_upsample", 3.0)),
+    )
+    return output_path

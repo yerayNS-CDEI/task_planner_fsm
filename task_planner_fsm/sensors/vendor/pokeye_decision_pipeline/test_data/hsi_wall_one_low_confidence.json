@@ -1,0 +1,167 @@
+{
+  "sensor": "hyperspectral",
+  "confidence_threshold": 0.8,
+  "n_samples": 10,
+  "samples": [
+    {
+      "sample_index": 0,
+      "detected": true,
+      "material": "gypsum",
+      "confidence": 0.97,
+      "status": "detected",
+      "reason": null,
+      "metadata": {
+        "Seq": "1",
+        "Wall_Index": "0",
+        "Line_Idx": "0",
+        "Seg_Idx": "0",
+        "Travel_m": "0.000",
+        "Frame": "map"
+      }
+    },
+    {
+      "sample_index": 1,
+      "detected": true,
+      "material": "gypsum",
+      "confidence": 0.97,
+      "status": "detected",
+      "reason": null,
+      "metadata": {
+        "Seq": "2",
+        "Wall_Index": "0",
+        "Line_Idx": "0",
+        "Seg_Idx": "0",
+        "Travel_m": "0.500",
+        "Frame": "map"
+      }
+    },
+    {
+      "sample_index": 2,
+      "detected": true,
+      "material": "gypsum",
+      "confidence": 0.97,
+      "status": "detected",
+      "reason": null,
+      "metadata": {
+        "Seq": "3",
+        "Wall_Index": "0",
+        "Line_Idx": "0",
+        "Seg_Idx": "0",
+        "Travel_m": "1.000",
+        "Frame": "map"
+      }
+    },
+    {
+      "sample_index": 3,
+      "detected": true,
+      "material": "gypsum",
+      "confidence": 0.97,
+      "status": "detected",
+      "reason": null,
+      "metadata": {
+        "Seq": "4",
+        "Wall_Index": "0",
+        "Line_Idx": "0",
+        "Seg_Idx": "0",
+        "Travel_m": "1.500",
+        "Frame": "map"
+      }
+    },
+    {
+      "sample_index": 4,
+      "detected": true,
+      "material": "gypsum",
+      "confidence": 0.97,
+      "status": "detected",
+      "reason": null,
+      "metadata": {
+        "Seq": "5",
+        "Wall_Index": "0",
+        "Line_Idx": "0",
+        "Seg_Idx": "0",
+        "Travel_m": "2.000",
+        "Frame": "map"
+      }
+    },
+    {
+      "sample_index": 5,
+      "detected": true,
+      "material": "gypsum",
+      "confidence": 0.97,
+      "status": "detected",
+      "reason": null,
+      "metadata": {
+        "Seq": "6",
+        "Wall_Index": "0",
+        "Line_Idx": "0",
+        "Seg_Idx": "0",
+        "Travel_m": "2.500",
+        "Frame": "map"
+      }
+    },
+    {
+      "sample_index": 6,
+      "detected": false,
+      "material": null,
+      "confidence": 0.74,
+      "status": "low_confidence",
+      "reason": "confidence below threshold 0.800",
+      "metadata": {
+        "Seq": "7",
+        "Wall_Index": "0",
+        "Line_Idx": "0",
+        "Seg_Idx": "0",
+        "Travel_m": "3.000",
+        "Frame": "map"
+      }
+    },
+    {
+      "sample_index": 7,
+      "detected": true,
+      "material": "gypsum",
+      "confidence": 0.97,
+      "status": "detected",
+      "reason": null,
+      "metadata": {
+        "Seq": "8",
+        "Wall_Index": "0",
+        "Line_Idx": "0",
+        "Seg_Idx": "0",
+        "Travel_m": "3.500",
+        "Frame": "map"
+      }
+    },
+    {
+      "sample_index": 8,
+      "detected": false,
+      "material": null,
+      "confidence": null,
+      "status": "quality_rejected",
+      "reason": "flat spectrum (no spectral contrast)",
+      "metadata": {
+        "Seq": "9",
+        "Wall_Index": "0",
+        "Line_Idx": "0",
+        "Seg_Idx": "0",
+        "Travel_m": "4.000",
+        "Frame": "map"
+      }
+    },
+    {
+      "sample_index": 9,
+      "detected": true,
+      "material": "gypsum",
+      "confidence": 0.97,
+      "status": "detected",
+      "reason": null,
+      "metadata": {
+        "Seq": "10",
+        "Wall_Index": "0",
+        "Line_Idx": "0",
+        "Seg_Idx": "0",
+        "Travel_m": "4.500",
+        "Frame": "map"
+      }
+    }
+  ]
+}

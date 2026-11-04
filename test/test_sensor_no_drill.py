@@ -1,9 +1,10 @@
-"""GPR hyperbolae as NO_DRILL constraints (POKEYE decision policy v2).
+"""GPR hyperbolae as NO_DRILL constraints in the map frame.
 
-Two things are being checked, and they are not the same thing: that the vendor
-policy is applied as delivered (a hyperbola forbids drilling, and never asks
-for it), and that the three pieces the sensor package refuses to supply -- the
-map frame, the exclusion radius, the rejection -- do what the FSM claims.
+The FSM builds these itself since the FULL PIPELINE delivery dropped
+``build_gpr_drilling_constraints``: what is checked is that every hyperbola
+becomes a zone, and that the map frame, the exclusion radius and the rejection
+do what the FSM claims -- including on top of the POKEYE package's own
+along-the-line block.
 """
 
 import json
@@ -13,10 +14,28 @@ import pytest
 from task_planner_fsm.sensors import gpr, no_drill, paths, pokeye
 
 
+# The earlier delivery's example, in gpr_result.json's field names. Kept as
+# the FSM's own fixture now that the constraint builder is FSM code.
+GPR_RESULT = {
+    "status": "ok",
+    "hyperbola_detected": True,
+    "n_valid_detections": 2,
+    "calibration": {"scan_distance_m": 2.0},
+    "detections": [
+        {"id": "H001", "type": "hyperbola",
+         "position": {"x_m": 0.55, "x_cm": 55.0, "x_relative": 0.31},
+         "depth": {"depth_cm": 4.2}, "geometry": {"arc_half_width_m": 0.12},
+         "robustness": {"confidence_mean": 0.93}},
+        {"id": "H002", "type": "hyperbola",
+         "position": {"x_m": 1.12, "x_cm": 112.0, "x_relative": 0.63},
+         "depth": {"depth_cm": 7.8}, "geometry": {"arc_half_width_m": 0.10},
+         "robustness": {"confidence_mean": 0.88}},
+    ],
+}
+
+
 def _vendor_gpr_result():
-    """The delivered example, which is the contract for the field names."""
-    with open(paths.POKEYE_PROJECT / "examples" / "gpr_hyperbolas.json") as handle:
-        return json.load(handle)
+    return json.loads(json.dumps(GPR_RESULT))
 
 
 def _line(wall=2, start=(0.0, 0.0, 1.0), end=(2.0, 0.0, 1.0)):
@@ -70,6 +89,12 @@ def test_a_scan_with_no_hyperbola_is_a_valid_constraint_with_nothing_in_it():
                         "detections": []}, line=_line())
     assert out["constraint_valid"] is True
     assert out["n_no_drill_positions"] == 0
+
+
+def test_a_failed_hyperbola_result_is_invalid_not_empty():
+    out = _constraints({"status": "error", "detections": []}, line=_line())
+    assert out["constraint_valid"] is False
+    assert out["message"]
 
 
 def test_a_result_the_vendor_cannot_read_is_marked_invalid_not_empty():
@@ -334,47 +359,72 @@ def test_unplaceable_hyperbolae_only_veto_when_the_mission_asks_for_it():
 
 
 # ----------------------------------------------------------------------
-# End to end, against the real vendor policy
+# End to end, with the real POKEYE package
 # ----------------------------------------------------------------------
 def _flagged(seq, x, wall=2):
-    return {"seq": seq, "wall_index": wall, "line_idx": 0, "seg_idx": 0,
+    return {"seq": seq, "wall_index": wall, "line_idx": 0, "seg_idx": 0, "travel_m": x,
             "frame": "map", "pose": [x, 0.0, 1.0], "pose_map": [x, 0.0, 1.0],
             "status": "low_confidence", "detected": False, "material": None,
             "confidence": 0.4, "reason": "below threshold"}
 
 
-def test_hsi_asks_for_a_drill_where_gpr_saw_a_pipe_and_the_drill_does_not_happen():
-    """The whole point of policy v2 in one run: the two sensors disagree about
-    the same place, and the constraint wins without changing the decision."""
-    samples = [_flagged(i, 0.50 + 0.02 * i) for i in range(5)]        # around x = 0.54
-    decisions = pokeye.decide_samples(samples, 0.8)
-    assert all(d["pokeye_required"] for d in decisions)
+def _good(n, wall=2):
+    """Confident spectra elsewhere on the wall, so the flagged patch stays a
+    point request rather than the package's one-per-wall request."""
+    return [{"seq": 1000 + i, "wall_index": wall, "line_idx": 0, "seg_idx": 0,
+             "travel_m": 1.9, "frame": "map", "pose": [1.9, 3.0, 1.0],
+             "pose_map": [1.9, 3.0, 1.0], "status": "detected", "detected": True,
+             "material": "gypsum", "confidence": 0.95, "reason": None} for i in range(n)]
 
-    targets, _ = pokeye.cluster_targets(decisions, wall_index=2)
-    assert len(targets) == 1
 
-    # The delivered example puts H001 at x = 0.55 m along a scan that starts at
-    # the origin -- right on top of the target HSI just asked for.
-    results = {"entries": [_entry(line=_line(), constraints=_constraints(line=_line()))]}
+def _scanned_wall():
+    """One analysed line along x with the example's two hyperbolae, as a
+    gpr_summary.json entry: compact hyperbolae for the POKEYE package, placed
+    NO_DRILL constraints for the map screen."""
+    line = _line()
+    hyp = dict(gpr._compact_hyperbolae(_vendor_gpr_result(), line), status="ok")
+    entry = _entry(line=line, constraints=_constraints(line=line))
+    entry["line"] = dict(line, line_idx=0, seg_idx=0)
+    entry["hyperbolae"] = hyp
+    return {"entries": [entry]}
+
+
+def _screened(samples, results):
+    decisions = pokeye.decide_samples(samples, 0.8, gpr_results=results)
+    targets, stats = pokeye.cluster_targets(decisions, wall_index=2)
     zones, zstats = no_drill.zones_from_gpr(results, tolerance_m=0.15, wall_index=2)
     lines, _ = no_drill.scanned_lines_from_gpr(results, wall_index=2)
-    allowed, blocked, _ = no_drill.screen_targets(targets, zones, lines,
-                                                  unlocated=zstats["n_unlocated"])
+    allowed, blocked, screen_stats = no_drill.screen_targets(
+        targets, zones, lines, unlocated=zstats["n_unlocated"])
+    return decisions, targets, allowed, blocked, zones, stats, screen_stats
+
+
+def test_hsi_asks_for_a_drill_where_gpr_saw_a_pipe_and_the_package_refuses():
+    """The two sensors disagree about the same place: H001 sits at x = 0.55 m,
+    right under the low-confidence patch, and the package blocks each point."""
+    samples = [_flagged(i, 0.50 + 0.02 * i) for i in range(5)] + _good(20)
+    decisions, targets, *_ = _screened(samples, _scanned_wall())
+    assert all(d["decision"] == "BLOCKED_BY_GPR" for d in decisions[:5])
+    assert decisions[0]["gpr_check"]["nearest_hyperbola"]["id"].endswith("H001")
+    assert targets == []
+
+
+def test_the_map_screen_catches_a_centroid_the_point_check_let_through():
+    """Every point is more than the package's 0.10 m from H001 along the line,
+    so each one is sent; their centroid is within the FSM's 0.15 m zone."""
+    samples = [_flagged(i, 0.66 + 0.02 * i) for i in range(3)] + _good(20)   # 0.66 .. 0.70
+    decisions, targets, allowed, blocked, *_ = _screened(samples, _scanned_wall())
+    assert all(d["decision"] == "SEND_TO_POKEYE" for d in decisions[:3])
+    assert len(targets) == 1
     assert allowed == []
-    assert len(blocked) == 1
     assert blocked[0]["blocked_by"]["source_detection_id"] == "H001"
-    # The HSI decision is untouched: GPR vetoed the hole, it did not un-flag the wall.
-    assert all(d["pokeye_required"] for d in decisions)
+    assert blocked[0]["blocked_by"]["distance_m"] == pytest.approx(0.13, abs=1e-6)
 
 
 def test_the_written_targets_file_explains_the_missing_target(tmp_path):
-    samples = [_flagged(i, 0.50 + 0.02 * i) for i in range(5)]
-    decisions = pokeye.decide_samples(samples, 0.8)
-    targets, stats = pokeye.cluster_targets(decisions, wall_index=2)
-    results = {"entries": [_entry(line=_line(), constraints=_constraints(line=_line()))]}
-    zones, _ = no_drill.zones_from_gpr(results, wall_index=2)
-    lines, _ = no_drill.scanned_lines_from_gpr(results, wall_index=2)
-    allowed, blocked, screen_stats = no_drill.screen_targets(targets, zones, lines)
+    samples = [_flagged(i, 0.66 + 0.02 * i) for i in range(3)] + _good(20)
+    decisions, _, allowed, blocked, zones, stats, screen_stats = _screened(
+        samples, _scanned_wall())
     stats["no_drill"] = screen_stats
     _, targets_path = pokeye.write_outputs(
         tmp_path, decisions, allowed, stats, zones=zones, blocked=blocked)

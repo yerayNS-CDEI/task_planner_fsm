@@ -1,164 +1,95 @@
-# DISCOVER / OLIWALL - GPR Line Segmentation (Task 1b)
+# GPR — Line segmentation (Berta)
 
-This folder integrates Berta's horizontal-line detector with the shared `../GPRTools` package and converts the detected vertical image coordinates into approximate centimetres using a time-zero reference and an assumed relative permittivity of `epsilon_r = 6`.
+Detects horizontal lines (layers, faces) in a Proceq GP8800 B-scan and returns their
+depth below the front face.
 
-## Key rule: detect first, then redefine coordinates from time-zero
+Normally run through `GPR/codes/run_gpr.py`, which runs this branch and the hyperbola branch on
+the same scan. It can also be run on its own (see *Run*).
 
-The B-scan passed to Berta is generated with **gain only** (default `40 dB`). No time-zero crop and no background removal are applied before line detection.
+## Contents
 
-Time-zero is estimated independently on the raw matrix. Only **after** Berta has detected the lines do we redefine the coordinate system:
+| Path | What it is |
+|---|---|
+| `berta_original/line_segmentation.py` | Berta's detector, **unchanged**. A new version from her can replace this file. |
+| `line_integration/` | DISCOVER integration layer: preprocessing, time-zero merge, depth conversion, figures. |
+| `config.yaml` | Gain, time-zero method, assumed εr, rendering and outputs. |
+| `run_line_pipeline.py` | CLI for this branch only. |
+| `check_setup.py` | Checks code and dependencies. |
 
-```text
-robot y = 0  <=>  time-zero
-robot y = 100 <=> last raw sample
-```
+Shared preprocessing comes from `GPR/codes/GPRTools/` (not duplicated here). Dependencies: `GPR/requirements.txt`.
 
-```text
-raw SEGY + sidecar CSV
-        |
-        +--> gain 40 dB only --> full B-scan --> Berta line detector
-        |
-        +--> time-zero estimation only
-                                  |
-                                  +--> merge AFTER detection
-                                         |
-                                         +--> rebase coordinates: T0 = 0
-                                         +--> clamp any pre-T0 line to T0
-                                         +--> convert to approximate cm
-```
-
-### Time-zero priority rule
-
-If Berta detects a line **before** the time-zero sample, that line is moved to time-zero for all robot-facing outputs:
+## Pipeline: detect before cropping at time-zero
 
 ```text
-corrected_sample = max(detected_sample, time_zero_sample)
+raw .sgy + .csv
+   ├─> gain 40 dB only ──> full B-scan ──> Berta line detector
+   └─> time-zero estimated on the raw data (index only, the detector image is not cropped)
+                                        └─> merged after detection ──> two-way time, depth (cm)
 ```
 
-Therefore negative depth is never reported. The original Berta coordinate is retained only in diagnostic/audit fields.
-
-With the B-scan convention used by GPRTools (`0` at the top and time increasing downwards), a line at sample 35 with time-zero at sample 40 is snapped to sample 40. A line at sample 40 with time-zero at sample 35 is already after time-zero and remains at sample 40.
-
-## Physical conversion
-
-GPRTools applies the Proceq-confirmed correction from exported `16 ns` to an effective `12 ns` window.
+The detector sees the whole gain-only B-scan, so a shallow line cannot be cropped away
+before detection. Time-zero is then used only to convert image rows into depth.
 
 ```text
-v = c / sqrt(epsilon_r)
-epsilon_r = 6.0
-depth = v * two_way_time / 2
+v = c / sqrt(εr)      εr = 6.0 (assumed, concrete)      depth = v · two_way_time / 2
 ```
 
-`epsilon_r = 6` is an **assumption representative of concrete**, not a measured material property.
+The 12 ns window (GP8800 16 ns − 4 ns, confirmed by Proceq) is applied by GPRTools.
 
-Important interpretation:
+## Outputs
 
-- `position_relative`: robot-facing `0..100` coordinate **after time-zero correction**.
-- `depth_cm_approx`: approximate line-centre depth after time-zero.
-- `thickness_cm_approx`: depth-equivalent extent of the detected dark band; **not validated physical object/material thickness**.
-- `distance_to_next_cm_approx`: recomputed between corrected line centres, after any T0 snapping.
-- `position_relative_original`: original Berta coordinate on the complete untrimmed B-scan, kept only for audit/debugging.
+With `run_gpr.py` they go to `GPR/test_output/<scan>/line/`, next to the scan's
+`.sgy` + `.csv`:
 
-## Shared folder layout
+| File | Content |
+|---|---|
+| `line_bscan_raw.png` | B-scan **as acquired** (no gain, no time-zero), nothing drawn on it. |
+| `line_bscan_processed.png` | B-scan **after processing** (gain 40 dB only): exactly the image Berta's detector sees, nothing drawn on it. |
+| `line_bscan_depth.png` | Final figure in the layout of Tahzeeb's v2 `bscan_figure.py`: B-scan with **depth below the front face [cm]** on the left axis, front face (time-zero, purple) and every line (orange, with its band); beside it the averaged trace with each line's id and depth and two-way time on the right axis; below, the line table and a card (time-zero, assumed speed, gain, record, scan length). No text on the radargram. |
+| `line_result.json` | **Internal robot/POKEYE JSON**: the `dict` returned by `run_line_pipeline()`. |
 
-```text
-GPR_DISCOVER_PIPELINE_v4/
-├── GPRTools/
-├── Hyperbola_Segmentation/
-└── Line_Segmentation/
-```
+- The **global JSON for Tecnalia** (both GPR branches + HSI) is built by `FULL PIPELINE/Global JSON/`.
+- The depth figure shows from just above time-zero to the deepest line plus half its
+  depth (at least 2 ns). A line above time-zero is drawn red and dashed.
+- Each file can be switched off in `config.yaml` (`outputs.save_*`).
+- Intermediate files are deleted after a successful run.
 
-Berta's supplied `line_segmentation.py` remains unchanged in `berta_original/`. All DISCOVER/GPR integration logic lives in `line_integration/`.
-
-## Input
-
-A GP8800 non-mesh SEGY file and its sidecar CSV with the same basename:
-
-```text
-scan.sgy
-scan.csv
-```
-
-## Run
-
-```bash
-pip install -r requirements.txt
-python check_setup.py
-python run_line_pipeline.py "path/to/scan.sgy"
-```
-
-## Robot / ROS2-facing use
-
-```python
-from line_integration import run_line_pipeline
-result = run_line_pipeline("path/to/scan.sgy")
-```
-
-Relevant structure:
+### `line_result.json` (robot/POKEYE)
 
 ```python
 {
     "detected": True,
-    "n_lines": 2,
-    "lines": [
-        {
-            "id": "L001",
-            "position_relative": 0.0,       # relative to T0, not to original image
-            "depth_cm_approx": 0.0,
-            "snapped_to_time_zero": True,
-            "position_relative_original": 5.7,
-            "confidence": 0.91
-        }
-    ],
-    "time_zero_reference": {
-        "robot_relative_coordinate": 0.0,
-        "has_priority_over_line_detector": True
-    }
+    "n_lines": 1,
+    "lines": [{
+        "id": "L001",
+        "position_relative": 10.4,          # 0..100 over the full B-scan
+        "depth_cm_approx": 1.4,             # from time-zero; null if clearly above it
+        "thickness_cm_approx": 1.8,         # radar band extent, NOT a validated thickness
+        "distance_to_next_cm_approx": None,
+        "twt_from_time_zero_ns": 0.24,
+        "confidence": 0.98,
+        "before_time_zero_reference": False,
+        ...                                 # Berta's original fields, kept for traceability
+    }],
+    "source": {...}, "time_zero_reference": {...}, "depth_calibration": {...}, "files": {...}
 }
 ```
 
-## Outputs
+A ±1-sample tolerance around time-zero is treated as 0 cm.
 
-```text
-outputs/<scan>/
-├── 01_gain_only/
-├── 02_line_detection/        # original Berta detections
-├── 03_time_zero_merge/       # corrected/T0-rebased robot interpretation
-├── results_finales.csv
-├── resultados_resumen.csv
-├── resultados_lineas.csv
-├── line_result.json
-├── preprocessing_manifest.json
-└── run_manifest.json
-```
-
-`results_finales.csv` now exposes `posicion_lineas_relativa` in the **time-zero-rebased coordinate system**. Berta's original coordinate is kept separately as `posicion_lineas_relativa_original_berta`.
-
-## v4 recursive batch mode
-
-The CLI now accepts either one SEGY file or a directory:
+## Run
 
 ```bash
-python run_line_pipeline.py "path/to/scan.sgy"
-python run_line_pipeline.py "path/to/acquisitions" --output "path/to/results"
+pip install -r ../../requirements.txt     # GPR/requirements.txt
+python check_setup.py
+python run_line_pipeline.py path/to/scan.sgy                  # -> GPR/test_output/<scan>/line/
+python run_line_pipeline.py path/to/scan.sgy --output out/    # exact output folder
 ```
-
-For directory input, all `.sgy` / `.segy` files are found recursively. Each scan needs its
-same-basename `.csv` sidecar. The folder hierarchy is preserved under the batch output
-root, and one failed/missing scan does not stop the rest.
-
-Batch-level files:
-
-```text
-batch_summary.csv
-batch_summary.json
-```
-
-Python API:
 
 ```python
-from line_integration import run_line_batch
-summary = run_line_batch("path/to/acquisitions", output_root="path/to/results")
+from line_integration import run_line_pipeline
+result = run_line_pipeline("scan.sgy", output_dir="path/to/folder")
 ```
 
-The original `run_line_pipeline()` single-scan API remains available.
+The `scan.csv` sidecar must sit next to the `.sgy`. Scans whose sidecar has
+`trace_distance = 0` are rejected with a `ValueError`.

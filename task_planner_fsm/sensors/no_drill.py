@@ -1,11 +1,12 @@
 """GPR hyperbolae as places POKEYE must not drill.
 
-POKEYE v2 splits the sensor team's package in two. The trigger half is
-unchanged and still HSI-only: ``low_confidence`` / ``quality_rejected`` ask for
-a destructive check, ``detected`` does not, GPR does not vote. The new half is
-a *constraint*: a hyperbola in the B-scan is a reflector -- rebar, a pipe, a
-cable -- so wherever it sits, nobody drills. That holds whatever sent POKEYE
-there, including a RANDOM target the FSM never chose.
+The sensor team's POKEYE package (FULL PIPELINE, policy v2) decides from the
+HSI result whether POKEYE is needed and already refuses a point that sits on a
+hyperbola of its own line (see :mod:`.pokeye`). That check is one-dimensional
+and only covers the HSI requests. A hyperbola in the B-scan is a reflector --
+rebar, a pipe, a cable -- so wherever it sits, nobody drills, whatever sent
+POKEYE there, including a RANDOM target the FSM never chose. This module turns
+every hyperbola into a map-frame NO_DRILL zone for exactly that.
 
 The project rule is two-sided, and the second side is the stronger one:
 
@@ -19,18 +20,20 @@ The project rule is two-sided, and the second side is the stronger one:
 Note the asymmetry: the first rule needs a hyperbola to fire, the second fires
 on the absence of data. With no GPR at all, nothing is drillable.
 
-The vendor builds the constraint, this module makes it usable, because three
-things the delivered package refuses to invent are ours (README_SOFTWARE_TEAM
-v3, section 4):
+The earlier delivery built the NO_DRILL positions itself
+(``build_gpr_drilling_constraints``); the FULL PIPELINE one dropped it, so
+:func:`constraints_from_result` now reads them straight off the hyperbola
+detections, in the same shape. Three things the sensor package leaves to the
+software are ours:
 
 1. **The frame.** ``x_m`` is metres along the B-scan, not a map coordinate. It
    only becomes a place once the scanned line's endpoints are applied -- which
    ScanWall recorded in the GPR manifest and only the FSM knows.
 2. **The tolerance.** A hyperbola is a point; a drill bit and a segmentation
    apex both have width. The sensor package states outright that
-   ``arc_half_width_m`` is diagnostic geometry and *not* a safety radius, and
-   leaves the exclusion radius to the project. :data:`DEFAULT_TOLERANCE_M` is
-   an FSM placeholder, not an approved figure -- see the note there.
+   ``arc_half_width_m`` is diagnostic geometry and *not* a safety radius. Its
+   own decision uses 0.10 m along the line; :data:`DEFAULT_TOLERANCE_M` is the
+   FSM's map-frame radius, wider on purpose -- see the note there.
 3. **The rejection.** Screening a candidate drill position against the zones
    before it is executed.
 
@@ -48,10 +51,9 @@ from collections import Counter
 
 import numpy as np
 
-from . import import_vendor
-
-# Provisional. The sensor package will not define an exclusion radius and the
-# project has not yet agreed one, so the FSM applies its own until it does:
+# Provisional. The sensor package's own decision blocks a point within 0.10 m
+# of a hyperbola along its line (``gpr_exclusion_radius_m``), but the project
+# has not agreed a map-frame radius, so the FSM applies its own until it does:
 # generous enough to cover the apex-localisation error of the segmentation plus
 # a drill bit, small enough not to veto a wall. It is a placeholder for a
 # number that has to come from the safety discussion, NOT a validated figure --
@@ -83,21 +85,78 @@ NO_DRILL_UNLOCATED = "GPR_NO_DRILL_POSITION_NOT_LOCATED"
 # ----------------------------------------------------------------------
 # The vendor constraint, placed on the wall
 # ----------------------------------------------------------------------
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _positions_from_detections(gpr_result):
+    """One NO_DRILL position per hyperbola, in scan-local metres.
+
+    Field for field what ``build_gpr_drilling_constraints`` returned before
+    the FULL PIPELINE delivery dropped it. A detection with no horizontal
+    location cannot become a constraint and is skipped, not guessed.
+    """
+    positions = []
+    for i, det in enumerate(gpr_result.get("detections") or []):
+        if not isinstance(det, dict):
+            continue
+        if str(det.get("type", "hyperbola")).strip().lower() not in ("hyperbola", ""):
+            continue
+        pos = det.get("position") if isinstance(det.get("position"), dict) else {}
+        depth = det.get("depth") if isinstance(det.get("depth"), dict) else {}
+        robustness = det.get("robustness") if isinstance(det.get("robustness"), dict) else {}
+        geometry = det.get("geometry") if isinstance(det.get("geometry"), dict) else {}
+        x_m = _as_float(pos.get("x_m"))
+        x_cm = _as_float(pos.get("x_cm"))
+        if x_m is None and x_cm is not None:
+            x_m = x_cm / 100.0
+        x_relative = _as_float(pos.get("x_relative"))
+        if x_m is None and x_relative is None:
+            continue
+        positions.append({
+            "source_detection_id": det.get("id", f"H{i + 1:03d}"),
+            "reason": NO_DRILL_HYPERBOLA,
+            "instruction": "NO_DRILL",
+            "x_m": x_m,
+            "x_cm": None if x_m is None else x_m * 100.0,
+            "x_relative": x_relative,
+            "depth_cm_approx": _as_float(depth.get("depth_cm")),
+            "confidence": _as_float(robustness.get("confidence_mean", det.get("confidence"))),
+            "diagnostic_arc_half_width_m": _as_float(geometry.get("arc_half_width_m")),
+        })
+    return positions
+
+
 def constraints_from_result(gpr_result, to_map=None, source_key=None):
-    """Vendor NO_DRILL positions for one scan, each carried into the map frame.
+    """NO_DRILL positions for one scan, each carried into the map frame.
 
     ``gpr_result`` is the raw dict from ``gpr_integration.run_gpr_pipeline``
-    (the same content as its ``gpr_result.json``), handed to the delivered
-    ``build_gpr_drilling_constraints`` untouched so the policy stays the sensor
-    team's. ``to_map`` maps a scan-local ``x_m`` onto the wall and returns
-    ``[x, y, z]``; without it -- an export that matched no scanned line -- the
-    positions stay local and are marked ``located: False``.
+    (the same content as its ``gpr_result.json``). ``to_map`` maps a
+    scan-local ``x_m`` onto the wall and returns ``[x, y, z]``; without it --
+    an export that matched no scanned line -- the positions stay local and are
+    marked ``located: False``.
+
+    A result that is not a readable hyperbola result is ``constraint_valid:
+    False``, never an empty constraint: the scan was not analysed, and that
+    must not read as "analysed and clean".
     """
-    pokeye_decision = import_vendor("pokeye_decision")
-    vendor = pokeye_decision.build_gpr_drilling_constraints(gpr_result)
+    if not isinstance(gpr_result, dict):
+        message = "No GPR hyperbola result." if gpr_result is None else "GPR result is not an object."
+        return {"source_key": source_key, "constraint_valid": False, "hyperbola_detected": False,
+                "n_no_drill_positions": 0, "n_located": 0, "no_drill_positions": [],
+                "message": message}
+    if not isinstance(gpr_result.get("detections", []), list) or (
+            gpr_result.get("status") not in (None, "ok")):
+        return {"source_key": source_key, "constraint_valid": False, "hyperbola_detected": False,
+                "n_no_drill_positions": 0, "n_located": 0, "no_drill_positions": [],
+                "message": (f"GPR hyperbola result is not usable (status "
+                            f"{gpr_result.get('status')!r}).")}
 
     positions = []
-    for entry in vendor.get("no_drill_positions", []):
+    for entry in _positions_from_detections(gpr_result):
         placed = dict(entry)
         position_map = None
         x_m = entry.get("x_m")
@@ -113,13 +172,12 @@ def constraints_from_result(gpr_result, to_map=None, source_key=None):
 
     return {
         "source_key": source_key,
-        "constraint_valid": bool(vendor.get("constraint_valid")),
-        "hyperbola_detected": bool(vendor.get("hyperbola_detected", False)),
+        "constraint_valid": True,
+        "hyperbola_detected": bool(gpr_result.get("hyperbola_detected", bool(positions))),
         "n_no_drill_positions": len(positions),
         "n_located": sum(1 for p in positions if p["located"]),
         "no_drill_positions": positions,
-        # Kept verbatim so a constraint the vendor could not interpret says why.
-        "message": vendor.get("message"),
+        "message": None,
     }
 
 

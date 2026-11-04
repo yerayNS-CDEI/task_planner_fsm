@@ -20,12 +20,16 @@ horizontal-line segmentation. Their ``x_m`` is local to the scan; with the
 matched line's segment endpoints it becomes a map-frame point. Depth stays as
 the pipelines report it (approximate, epsilon_r = 6 assumed).
 
-Each hyperbola result is also handed to the POKEYE package, which turns it into
-NO_DRILL constraints (policy v2). They are attached to the entry as
-``no_drill``, already carried onto the wall by the same transform, because this
-is the only point in the mission where the raw ``gpr_result`` and the scanned
-line's endpoints are both in hand. GPR still does not send POKEYE anywhere --
-see ``no_drill.py`` for what the constraint then does.
+Each hyperbola also becomes a NO_DRILL position (``no_drill.py``), attached to
+the entry as ``no_drill`` and already carried onto the wall by the same
+transform, because this is the only point in the mission where the raw
+``gpr_result`` and the scanned line's endpoints are both in hand. GPR still
+does not send POKEYE anywhere; the POKEYE package reads the compact
+hyperbolae back to keep its requests off them (``pokeye.py``).
+
+Each scan's folder follows the delivery's layout -- the ``.sgy`` + ``.csv``
+next to ``hyperbola/`` and ``line/`` -- which is what the global JSON
+(``global_json.py``) is built from.
 
 Files already processed in this session are remembered in
 ``processed_files.json`` so the state, which runs after every wall, does not
@@ -34,6 +38,7 @@ redo earlier walls. Blocking functions for a BackgroundJob; no ROS.
 
 import json
 import os
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -45,6 +50,11 @@ from .manifest import read_gpr_lines
 
 REGISTRY_FILENAME = "processed_files.json"
 SUMMARY_FILENAME = "gpr_summary.json"
+# Per scan, the FULL PIPELINE delivery's own layout (GPR/test_output/<scan>/):
+# the acquisition next to one folder per branch. The global JSON builder reads
+# exactly this.
+HYPERBOLA_DIRNAME = "hyperbola"
+LINE_DIRNAME = "line"
 
 
 # ----------------------------------------------------------------------
@@ -224,6 +234,8 @@ def _compact_hyperbolae(result, line):
 
 
 def _compact_lines(result):
+    # A line the detector put above time-zero has no depth (None), not 0: the
+    # FULL PIPELINE delivery stopped snapping it onto the surface.
     return {
         "detected": bool(result.get("detected")),
         "n": int(result.get("n_lines", 0)),
@@ -233,7 +245,7 @@ def _compact_lines(result):
             "thickness_cm": ln.get("thickness_cm_approx"),
             "distance_to_next_cm": ln.get("distance_to_next_cm_approx"),
             "confidence": ln.get("confidence"),
-            "snapped_to_time_zero": ln.get("snapped_to_time_zero"),
+            "before_time_zero": ln.get("before_time_zero_reference"),
         } for ln in result.get("lines", [])],
     }
 
@@ -241,6 +253,23 @@ def _compact_lines(result):
 # ----------------------------------------------------------------------
 # Running the pipelines
 # ----------------------------------------------------------------------
+def copy_acquisition(scan, scan_dir):
+    """Put the ``.sgy`` and its sidecar ``.csv`` next to the results.
+
+    The global JSON points at the B-scan it describes, and a processed session
+    sent on to a partner must carry it: the raw folder stays on the robot. A
+    few hundred kB per line. Returns the copied ``.sgy`` path.
+    """
+    scan_dir = Path(scan_dir)
+    sgy = Path(scan["sgy"])
+    copied = scan_dir / sgy.name
+    for src in (sgy, Path(scan["csv"])):
+        dst = scan_dir / src.name
+        if src.is_file() and dst.resolve() != src.resolve():
+            shutil.copy2(src, dst)
+    return str(copied)
+
+
 def process_scan(scan, line, out_dir, weights_path, logger=None,
                  run_hyperbolae=True, run_lines=True):
     """Both pipelines over one scan. Never raises for a pipeline failure: the
@@ -248,6 +277,11 @@ def process_scan(scan, line, out_dir, weights_path, logger=None,
     key = (line or {}).get("key") or scan["stem"]
     scan_dir = Path(out_dir) / key
     scan_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        copy_acquisition(scan, scan_dir)
+    except OSError as exc:
+        if logger is not None:
+            logger.warn(f"GPR: could not copy {scan['sgy']} next to its results: {exc}")
     entry = {
         "key": key,
         "sgy": scan["sgy"],
@@ -264,11 +298,12 @@ def process_scan(scan, line, out_dir, weights_path, logger=None,
         try:
             gpr_integration = import_vendor("gpr_integration")
             result = gpr_integration.run_gpr_pipeline(
-                scan["sgy"], output_dir=str(scan_dir / "hyperbolae"),
+                scan["sgy"], output_dir=str(scan_dir / HYPERBOLA_DIRNAME),
                 weights_path=str(weights_path))
             entry["hyperbolae"] = _compact_hyperbolae(result, line)
-            # The POKEYE package owns the NO_DRILL policy; the raw result goes
-            # to it unchanged, and only the frame is ours to supply.
+            entry["hyperbolae"]["status"] = result.get("status", "ok")
+            # Every hyperbola becomes a NO_DRILL position, carried onto the
+            # wall while the scanned line's endpoints are at hand.
             entry["no_drill"] = no_drill.constraints_from_result(
                 result, to_map=map_transform(line), source_key=key)
         except BaseException as exc:            # noqa: BLE001 -- recorded per scan
@@ -280,7 +315,7 @@ def process_scan(scan, line, out_dir, weights_path, logger=None,
         try:
             line_integration = import_vendor("line_integration")
             result = line_integration.run_line_pipeline(
-                scan["sgy"], output_dir=str(scan_dir / "lines"))
+                scan["sgy"], output_dir=str(scan_dir / LINE_DIRNAME))
             entry["lines"] = _compact_lines(result)
         except BaseException as exc:            # noqa: BLE001
             entry["errors"]["lines"] = f"{type(exc).__name__}: {exc}"
@@ -339,7 +374,7 @@ def process_incoming(incoming, manifest_path, out_dir, weights_path,
     hyperbolae_skipped = None
     if run_hyperbolae:
         try:
-            require("torch", "torchvision", "pandas", "openpyxl")
+            require("torch", "torchvision", "pandas")
         except VendorUnavailable as exc:
             hyperbolae_skipped = str(exc)
             run_hyperbolae = False

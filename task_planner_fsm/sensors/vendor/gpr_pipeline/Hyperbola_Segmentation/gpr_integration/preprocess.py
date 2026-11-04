@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 # GPRTools is shared at the parent project level:
-# GPR_DISCOVER_PIPELINE_v4/GPRTools
+# GPR_DISCOVER_robot_pipeline/GPRTools
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -21,6 +21,34 @@ from GPRTools.loaders.segy_loader import SegyLoader
 from GPRTools.plotters.plot_bscan import plot_bscan
 
 from .utils import gain_token, json_dump, portable_scan_stem, scan_element_id
+
+
+def render_raw_bscan(sgy_path: Path, output_path: Path, cfg: dict[str, Any]) -> Path:
+    """Render the B-scan exactly as acquired (no time-zero, background removal or gain).
+
+    Uses the same GPRTools renderer and plot settings as the processed images, so the
+    two pictures differ only by the processing.
+    """
+    plot_cfg = cfg["preprocessing"].get("plot", {})
+    raw = SegyLoader(str(sgy_path)).load_matrix()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_bscan(
+        self=None,
+        M=np.asarray(raw, dtype=np.float64),
+        applied_edits=[],
+        base_name=output_path.name,
+        base_dir=str(output_path.parent),
+        save=True,
+        plot_scale=float(plot_cfg.get("plot_scale", 2.0)),
+        aspect_ratio=plot_cfg.get("aspect_ratio"),
+        plot_colormap=str(plot_cfg.get("colormap", "gray")),
+        plot_axes=bool(plot_cfg.get("axes", False)),
+        overwrite=True,
+        loader_type="SEGY",
+        src_file_path=str(sgy_path),
+        render_upsample=float(plot_cfg.get("render_upsample")),
+    )
+    return output_path
 
 
 def preprocess_segy(
@@ -56,6 +84,22 @@ def preprocess_segy(
     corrected_time_window_ns = meta.get("time_window")
     if scan_distance_m is None or corrected_time_window_ns is None:
         raise ValueError("GPRTools could not recover scan distance and corrected time window from the sidecar CSV")
+    # Avoid plotting an invalid horizontal distance: otherwise GPRTools can
+    # generate a multi-gigapixel PNG (Pillow DecompressionBombError).
+    try:
+        distance = float(scan_distance_m)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(
+            f"Invalid trace_distance={scan_distance_m!r} in sidecar {sidecar}. "
+            "A positive scan distance in metres is required."
+        ) from exc
+    if not np.isfinite(distance) or distance <= 0:
+        raise ValueError(
+            f"Invalid trace_distance={distance!r} m in sidecar {sidecar}. "
+            "Please correct the recorded scan distance; it must be positive. "
+            "The B-scan cannot be calibrated with zero distance."
+        )
+    scan_distance_m = distance
 
     expected = cfg.get("metadata", {}).get("expected_corrected_time_window_ns")
     if expected is not None and abs(float(corrected_time_window_ns) - float(expected)) > 1e-6:

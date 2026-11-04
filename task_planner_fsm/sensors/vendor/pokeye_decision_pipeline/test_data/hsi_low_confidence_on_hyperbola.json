@@ -1,0 +1,18 @@
+{
+  "sensor": "hyperspectral",
+  "confidence_threshold": 0.8,
+  "sample_index": 243,
+  "detected": false,
+  "material": null,
+  "confidence": 0.7848,
+  "status": "low_confidence",
+  "reason": "confidence below threshold 0.800",
+  "metadata": {
+    "Seq": "244",
+    "Wall_Index": "0",
+    "Line_Idx": "0",
+    "Seg_Idx": "0",
+    "Travel_m": "2.520",
+    "Frame": "map"
+  }
+}

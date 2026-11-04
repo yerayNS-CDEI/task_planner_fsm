@@ -1,0 +1,18 @@
+{
+  "sensor": "hyperspectral",
+  "confidence_threshold": 0.8,
+  "sample_index": 2,
+  "detected": true,
+  "material": "gypsum",
+  "confidence": 0.994,
+  "status": "detected",
+  "reason": null,
+  "metadata": {
+    "Seq": "3",
+    "Wall_Index": "0",
+    "Line_Idx": "0",
+    "Seg_Idx": "0",
+    "Travel_m": "1.500",
+    "Frame": "map"
+  }
+}

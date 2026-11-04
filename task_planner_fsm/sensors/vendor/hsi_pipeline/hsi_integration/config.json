@@ -1,6 +1,15 @@
 {
   "confidence_threshold": 0.8,
-  "output_root": "outputs",
+  "output_root": "../test_output",
   "model_path": "benjamin_original/classifier.joblib",
-  "keep_columns": ["Measure Type", "Date", "Time", "Label", "Class", "Counter"]
+  "torch_device": "cpu",
+  "keep_columns": [
+    "Measure Type", "Date", "Time", "Label", "Class", "Counter",
+    "Seq", "Timestamp", "Wall_Index", "Line_Idx", "Seg_Idx", "Trigger_Idx", "Travel_m",
+    "Frame", "Map_X", "Map_Y", "Map_Z", "Status", "Reason"
+  ],
+  "outputs": {
+    "save_spectrum_images": true,
+    "image_dpi": 100
+  }
 }

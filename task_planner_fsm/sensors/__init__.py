@@ -6,14 +6,15 @@ about ROS, robot poses or the FSM; the modules here supply that:
 
     hsi.py      the recorded sweep reflectance -> material per sample
     gpr.py      exported GP8800 scans -> hyperbolae/lines, mapped onto the wall
-    pokeye.py   per-sample decisions -> clustered drilling targets
+    pokeye.py   per-wall decisions (HSI + GPR) -> clustered drilling targets
     no_drill.py GPR hyperbolae -> map-frame zones no drill target may enter
+    global_json.py  GPR + HSI results -> the global JSON for Tecnalia, on the map
     paths.py    the one place that knows where data and models live
     manifest.py the GPR line record ScanWall writes while sweeping
     background_job.py  run a pipeline off the FSM tick
 
 Importing this package is cheap on purpose. The heavy dependencies (torch,
-obspy, xgboost) are only pulled in by :func:`import_vendor`, from inside the
+obspy, sklearn) are only pulled in by :func:`import_vendor`, from inside the
 processing state, so an FSM without them installed still boots and merely
 reports the sensor phases as unavailable.
 """
@@ -34,6 +35,7 @@ _VENDOR_ROOTS = (
     paths.LINE_PROJECT,         # line_integration
     paths.HSI_PROJECT,          # hsi_integration
     paths.POKEYE_PROJECT,       # pokeye_decision
+    paths.GLOBAL_JSON_PROJECT,  # global_json
 )
 
 
@@ -115,7 +117,7 @@ def require(*module_names):
     """Fail early with :class:`VendorUnavailable` if a dependency is missing.
 
     The vendored packages import their heavy dependencies lazily (torch when
-    the model is loaded, xgboost when joblib unpickles the classifier), so a
+    the model is loaded, sklearn when joblib unpickles the classifier), so a
     successful ``import_vendor`` proves nothing. The adapters call this before
     starting work so a missing library is reported as one clear line, not as
     a traceback from deep inside a pipeline.

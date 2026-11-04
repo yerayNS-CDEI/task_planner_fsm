@@ -1233,9 +1233,10 @@ whether POKEYE has to drill, using the pipelines delivered by the sensor team
 
 ```
 hyperspectral  reflectance.csv from the raw sweep record (batched per tick)
-hsi_classify   Benjamin's XGBoost material classifier over the whole session (background thread)
+hsi_classify   Benjamin's v2 (1D-CNN) material classifier over the whole session (background thread)
 gpr            hyperbola + line segmentation over new GP8800 exports (background thread)
-decision       decide_pokeye() per sample -> clustered drill targets, screened against what GPR allows
+global_json    gpr_hyperspectral.json for Tecnalia, one element per wall, map coordinates filled in
+decision       decide_pokeye() per wall with its GPR lines -> clustered drill targets, screened against what GPR allows
 external       legacy /sensor_data_processing mock (simulation only)
 ```
 
@@ -1273,13 +1274,13 @@ data/raw/hyperspectral/session_<stamp>/   raw_samples.jsonl, calibration.json, r
 data/raw/gpr/incoming/                    hand-copied <name>.sgy + <name>.csv exports (re-processing only)
 data/raw/gpr/session_<stamp>/gpr_lines.jsonl   one row per GPR line (ScanWall)
 data/raw/gpr/session_<stamp>/incoming/    this mission's exports, unpacked by ScanWall
-data/processed/session_<stamp>/{hsi,gpr,pokeye}/
-models/hsi/classifier.joblib              27 MB, models/gpr/best.pt  241 MB
+data/processed/session_<stamp>/{hsi,gpr,pokeye}/, gpr_hyperspectral.json
+models/hsi/classifier.joblib              117 kB, models/gpr/best.pt  241 MB
 ```
 
 **Setup**: `pip install -r requirements-sensors.txt`, copy the two model files,
 then `ros2 run task_planner_fsm check_sensor_setup`. Without torch/obspy the
-GPR phase is skipped with a warning; without xgboost the HSI phase is. The
+GPR phase is skipped with a warning; without torch/sklearn the HSI phase is. The
 classifier bundle was pickled with numpy ≥ 2; on ROS Humble's numpy 1.24 the
 adapter aliases `numpy._core` so it still loads (`sensors/__init__.py`).
 
@@ -1290,18 +1291,35 @@ and a GPR-only session skips the reflectance and classification steps;
 `--no-drill-tolerance`, `--scanned-line-tolerance`, `--block-on-unlocated`
 and `--no-gpr-coverage-required` set the drilling constraint policy there.
 
-**POKEYE targets**: per-sample decisions (policy v2 keeps the v1 trigger, HSI
-only: `low_confidence` / `quality_rejected` → POKEYE, `detected` → none,
-malformed → HOLD; GPR does not vote) are clustered per wall in the map frame:
-single linkage within `pokeye_cluster_radius_m` (0.15), clusters below
-`pokeye_cluster_min_samples` (3) dropped, one target per cluster at its
-centroid, targets closer than `pokeye_min_target_spacing_m` (0.30) merged, at
-most `pokeye_max_targets_per_wall` (5). HOLDs are logged, never drilled.
+**Global JSON** (`gpr_hyperspectral.json` at the session root, rebuilt every
+pass): the sensor team's builder (`Global JSON` in FULL PIPELINE) per wall —
+`continuous_gpr` per B-scan with its wall layers, `discrete_gpr` per
+hyperbola, `hyperspectral_camera` per spectrum — with the fields it leaves to
+the robot filled in: B-scan ends and hyperbola apexes in the map frame (along
+the scanned segment, antenna offset not applied), and each spectrum's
+timestamp and map pose. Data pointers are relative to the file and stay inside
+the session folder (`gpr/<key>/*.sgy`, `hsi/reflectance.csv`), so the folder
+can be sent as is. Scans that matched no line go under `unassociated`, without
+coordinates.
 
-**Where POKEYE may drill** (POKEYE policy v2, `sensors/no_drill.py`): GPR
-still never sends POKEYE anywhere, but it decides where a drill is allowed, in
-two rules. A target must satisfy both, and so must a RANDOM location POKEYE
-picks for itself:
+**POKEYE targets**: the sensor team's `decide_pokeye` (FULL PIPELINE policy
+v2) runs once per wall with that wall's GPR lines. Only `low_confidence`
+requests POKEYE — at the point, or **once for the whole wall** when ≥ 50 % of
+it is low-confidence; `detected`, `quality_rejected` and malformed verdicts
+never do. A requested point within 0.10 m (along its line) of a hyperbola is
+`BLOCKED_BY_GPR`, and one whose line has no analysed GPR result is not sent
+(`GPR_CLEARANCE_UNKNOWN`). The requests are then clustered per wall in the map
+frame: single linkage within `pokeye_cluster_radius_m` (0.15), clusters below
+`pokeye_cluster_min_samples` (3) dropped (a wall request is always kept), one
+target per cluster at its centroid, targets closer than
+`pokeye_min_target_spacing_m` (0.30) merged, at most
+`pokeye_max_targets_per_wall` (5).
+
+**Where POKEYE may drill** (`sensors/no_drill.py`): GPR never sends POKEYE
+anywhere, but it decides where a drill is allowed, in two rules, applied again
+in the map frame to the finished targets (a cluster centroid is not any of the
+points the package checked). A target must satisfy both, and so must a RANDOM
+location POKEYE picks for itself:
 
 1. **On a scanned line.** Only the GPR lines of the wall that were swept *and*
    analysed are drillable. Anywhere else nothing is known about what is behind
@@ -1316,15 +1334,16 @@ Note the asymmetry: rule 2 needs a detection to fire, rule 1 fires on the
 target.** That is the point of rule 1; `pokeye_require_gpr_coverage:=false`
 restores the old behaviour for simulation and bring-up.
 
-The vendor builds rule 2's constraint. The FSM supplies the four things the
-sensor package deliberately leaves to software:
+The FSM builds rule 2's constraint from the hyperbola detections (the
+delivery's `build_gpr_drilling_constraints` was dropped in FULL PIPELINE) and
+supplies the four things the sensor package leaves to software:
 
 - **the frame** — the vendor's `x_m` is metres along the B-scan, so it is put
   on the wall with the scanned line's endpoints from `gpr_lines.jsonl`, the
   same transform the hyperbola positions already use;
 - **the exclusion radius** — `pokeye_no_drill_tolerance_m`. ⚠️ The sensor
-  package refuses to define one (`arc_half_width_m` is diagnostic geometry, not
-  a safety radius) and the project has not agreed one either, so the FSM
+  package uses 0.10 m along the line for its own decision but defines no
+  map-frame safety radius, and the project has not agreed one, so the FSM
   applies a **placeholder of 0.15 m** and warns on every wall that uses it;
 - **the width of a scanned line** — `pokeye_scanned_line_tolerance_m`, how far
   off a swept segment a target may sit and still count as covered by it.
@@ -1354,9 +1373,9 @@ at all.
 
 **Parameters** (ctx / ROS params): `sensor_data_dir`, `sensor_models_dir`,
 `sensor_results_dir`, `hsi_model_path`, `hsi_confidence_threshold` (0.8),
-`hsi_device` (`cpu`: the delivered bundle says `cuda`, but the pip xgboost on
-the Jetson has no kernels for the Orin and the model is milliseconds on the
-CPU anyway),
+`hsi_device` (`cpu`: torch device of the 117 kB HSI 1D-CNN; a session is a
+few dozen spectra, so the GPU is left to the GPR's Mask R-CNN; empty = CUDA if
+present),
 `hyperspectral_enabled`, `hyperspectral_processing_enabled`,
 `gpr_processing_enabled`, `gpr_incoming_dir`, `gpr_weights_path`,
 `gpr_wait_timeout_s` (0), `gpr_run_hyperbolae`, `gpr_run_lines`,

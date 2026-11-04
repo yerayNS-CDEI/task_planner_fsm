@@ -3,21 +3,23 @@
 Runs as a small phase machine rather than one blocking pass, because the
 tenants have very different shapes and costs:
 
-    hyperspectral -> hsi_classify -> gpr -> decision -> [external] -> done
+    hyperspectral -> hsi_classify -> gpr -> global_json -> decision -> [external] -> done
 
 ``hyperspectral`` is the reflectance pass over the sweep's raw record, pumped a
 batch per tick (thousands of samples, cheap each); it is skipped unless the
 camera was enabled for the sweep (``hyperspectral_enabled``), so a mission run
 without it never re-publishes an older session's spectra. ``hsi_classify`` runs the
-DISCOVER material classifier over that reflectance -- one XGBoost call over
-the whole session, seconds -- in a background thread. ``gpr`` runs the
-delivered hyperbola and line segmentation over whatever GP8800 exports have
-reached ``data/raw/gpr/incoming`` (Mask R-CNN: minutes on a CPU), also in a
-background thread. ``decision`` applies the sensor team's POKEYE policy to
-every classified sample, clusters the flagged ones into a handful of drill
-targets for the wall just scanned, and drops any target the GPR does not
-allow (POKEYE policy v2: GPR never sends POKEYE anywhere, but it forbids
-drilling on a hyperbola, and forbids drilling anywhere it has not scanned). ``external`` is the old
+DISCOVER material classifier (Benjamin v2, a 1D-CNN) over that reflectance --
+one call over the whole session, seconds -- in a background thread. ``gpr``
+runs the delivered hyperbola and line segmentation over whatever GP8800
+exports have reached ``data/raw/gpr/incoming`` (Mask R-CNN: ~20 s a line on
+the Jetson's GPU), also in a background thread. ``global_json`` writes the
+GPR + hyperspectral part of the global JSON for Tecnalia, one element per
+wall, with the robot's coordinates filled in. ``decision`` applies the sensor
+team's POKEYE policy wall by wall, with that wall's GPR hyperbolae, clusters
+the requests into a handful of drill targets for the wall just scanned, and
+drops any target the GPR does not allow (a hyperbola forbids drilling where
+it is, and nothing may be drilled where no GPR line was scanned). ``external`` is the old
 /sensor_data_processing mock, kept only for simulation runs with no sensor data
 so the FSM still exercises SendDataToPokeye there.
 
@@ -36,7 +38,7 @@ import time
 
 from example_interfaces.srv import SetBool
 
-from ..sensors import VendorUnavailable, gpr, hsi, no_drill, paths, pokeye
+from ..sensors import VendorUnavailable, global_json, gpr, hsi, no_drill, paths, pokeye
 from ..sensors.background_job import BackgroundJob
 from ..state import State
 from ..utils import hyperspectral_processing as hp
@@ -48,7 +50,8 @@ class SensorDataProcessing(State):
     # samples do not take minutes of ticking.
     HYPERSPECTRAL_BATCH = 25
 
-    PHASES = ("hyperspectral", "hsi_classify", "gpr", "decision", "external", "done")
+    PHASES = ("hyperspectral", "hsi_classify", "gpr", "global_json", "decision",
+              "external", "done")
 
     def __init__(self, name):
         super().__init__(name)
@@ -264,8 +267,8 @@ class SensorDataProcessing(State):
         """Classify every spectrum of the session with Benjamin's classifier.
 
         One call over the whole reflectance.csv, in a background thread: the
-        model is loaded once and XGBoost is vectorised, so the whole session
-        costs seconds -- but seconds we still do not spend inside a tick.
+        model is loaded once and batched, so the whole session costs seconds
+        -- but seconds we still do not spend inside a tick.
 
         The whole session, not just this wall, because the record spans the
         mission and the classifier is cheap; the decision phase then narrows to
@@ -367,7 +370,7 @@ class SensorDataProcessing(State):
         """
         node = ctx["node"]
         if not self._gpr_processing_enabled(ctx):
-            self._advance(ctx, "decision")
+            self._advance(ctx, "global_json")
             return
 
         if self._job is None:
@@ -388,7 +391,7 @@ class SensorDataProcessing(State):
                 node.get_logger().info(
                     f"[{self.name}] no new GPR exports in "
                     f"{' or '.join(str(d) for d in incoming)}; skipping GPR processing.")
-                self._advance(ctx, "decision")
+                self._advance(ctx, "global_json")
                 return
 
             weights = paths.gpr_weights_path(ctx)
@@ -428,7 +431,7 @@ class SensorDataProcessing(State):
                 f"[{self.name}] GPR processing skipped: {job.error}")
             if level == "error":
                 node.get_logger().debug(job.traceback)
-            self._advance(ctx, "decision")
+            self._advance(ctx, "global_json")
             return
 
         self._gpr = job.result
@@ -443,10 +446,40 @@ class SensorDataProcessing(State):
         )
         for entry in self._gpr["entries"]:
             node.get_logger().info(f"[{self.name}]   {gpr.describe_entry(entry)}")
+        self._advance(ctx, "global_json")
+
+    # ------------------------------------------------------------------
+    # Phase 4: the global JSON for Tecnalia
+    # ------------------------------------------------------------------
+    def _run_global_json(self, ctx):
+        """Write ``gpr_hyperspectral.json`` at the session root.
+
+        From the cumulative GPR summary and this pass's classification, so it
+        always covers the whole mission so far. Only JSON is read and written
+        -- milliseconds, so it runs inside the tick. Non-fatal like every
+        sensor phase: the inputs stay on disk and ``process_sensor_session``
+        rebuilds it offline.
+        """
+        node = ctx["node"]
+        gpr_results = gpr.load_summary(paths.gpr_results_dir(ctx)) or self._gpr
+        if not gpr_results and not (self._hsi and self._hsi.get("samples")):
+            self._advance(ctx, "decision")
+            return
+        try:
+            stats = global_json.build_document(
+                paths.global_json_path(ctx), gpr_results=gpr_results, hsi=self._hsi)
+        except VendorUnavailable as exc:
+            node.get_logger().warn(f"[{self.name}] global JSON skipped: {exc}")
+        except Exception as exc:                # noqa: BLE001
+            node.get_logger().error(f"[{self.name}] global JSON failed: {exc}")
+        else:
+            ctx["global_json_path"] = stats["path"]
+            node.get_logger().info(
+                f"[{self.name}] global JSON {stats['path']}: {global_json.describe(stats)}")
         self._advance(ctx, "decision")
 
     # ------------------------------------------------------------------
-    # Phase 4: the POKEYE decision
+    # Phase 5: the POKEYE decision
     # ------------------------------------------------------------------
     def _use_mock(self, ctx):
         """Whether the legacy /sensor_data_processing service decides instead.
@@ -536,8 +569,8 @@ class SensorDataProcessing(State):
         return zones, lines, stats, True
 
     def _run_decision(self, ctx):
-        """Per-sample POKEYE decisions, clustered into targets for this wall,
-        then screened against the GPR hyperbolae."""
+        """POKEYE decisions wall by wall, clustered into targets for this
+        wall, then screened against the GPR hyperbolae in the map frame."""
         node = ctx["node"]
         if self._use_mock(ctx):
             self._advance(ctx, "external")
@@ -560,7 +593,12 @@ class SensorDataProcessing(State):
         try:
             threshold = float((self._hsi or {}).get(
                 "confidence_threshold", hsi.DEFAULT_CONFIDENCE_THRESHOLD))
-            decisions = pokeye.decide_samples(samples, threshold)
+            gpr_results = gpr.load_summary(paths.gpr_results_dir(ctx)) or self._gpr
+            config = pokeye.runtime_config(
+                paths.pokeye_results_dir(ctx),
+                require_gpr_clearance=bool(ctx.get("pokeye_require_gpr_coverage", True)))
+            decisions = pokeye.decide_samples(
+                samples, threshold, gpr_results=gpr_results, config_path=config)
             params = pokeye.ClusterParams.from_ctx(ctx)
             targets, stats = pokeye.cluster_targets(decisions, params, wall_index=wall_index)
             # The veto goes on after the clustering, not before: a target is
@@ -592,8 +630,9 @@ class SensorDataProcessing(State):
         dstats = pokeye.decision_stats(decisions)
         node.get_logger().info(
             f"[{self.name}] POKEYE decisions over {dstats['n']} samples: "
-            f"{dstats['n_pokeye_required']} require POKEYE, {dstats['n_no_action']} "
-            f"no action, {dstats['n_hold']} hold"
+            f"{dstats['n_pokeye_required']} require POKEYE "
+            f"({dstats['n_wall_requests']} for a whole wall), {dstats['n_no_action']} "
+            f"no action, {dstats['n_blocked_by_gpr']} blocked by a GPR hyperbola"
             + (f" ({', '.join(f'{k} x{v}' for k, v in dstats['reasons'].items())})"
                if dstats["reasons"] else "")
         )
@@ -624,7 +663,7 @@ class SensorDataProcessing(State):
         self._advance(ctx, "done")
 
     # ------------------------------------------------------------------
-    # Phase 5 (fallback): the external mock service
+    # Phase 6 (fallback): the external mock service
     # ------------------------------------------------------------------
     def _run_external(self, ctx):
         """Call /sensor_data_processing and take its verdict (simulation only)."""

@@ -28,10 +28,15 @@ raw/
   gpr/session_<stamp>/incoming/    the zips unpacked: <key>_<name>.sgy/.csv/.json --
                                    what SensorDataProcessing runs on for this mission
 processed/session_<stamp>/
-  hsi/       input.csv, hsi_result.json, classification_results.csv, samples.csv
+  hsi/       reflectance.csv (copy), input.csv, hsi_result.json, hsi_classification_summary.csv, samples.csv,
+             hsi_material_overview.png, spectra/ (one PNG per spectrum)
   gpr/       gpr_summary.json, processed_files.json (+ NO_DRILL constraints per scan)
-  gpr/<key>/ gpr_result.json, line_result.json + the pipelines' audit files
-  pokeye/    decisions.json, targets.json (accepted + blocked, with the reason), pokeye_request.json
+  gpr/<key>/            <name>.sgy + <name>.csv (copy of the export)
+  gpr/<key>/hyperbola/  gpr_result.json, gpr_data.json (MIP) + B-scan/mask/detection PNGs
+  gpr/<key>/line/       line_result.json + raw/processed/depth B-scan PNGs
+  pokeye/    decisions.json, targets.json (accepted + blocked, with the reason),
+             pokeye_config.json (the package config as run), pokeye_request.json
+  gpr_hyperspectral.json   global JSON for Tecnalia (GPR + HSI), one element per wall
 ```
 
 The `<stamp>` is shared by `raw/` and `processed/` for one mission.

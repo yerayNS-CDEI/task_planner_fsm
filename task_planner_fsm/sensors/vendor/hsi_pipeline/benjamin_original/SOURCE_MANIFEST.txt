@@ -1,0 +1,5 @@
+classifier.py        Benjamin v2 (VIS-NIR 1D-CNN classifier + spectral quality index + figure). Preserved unchanged.
+classifier.joblib    Benjamin v2 model bundle (CNN1D, StandardScaler, LabelEncoder, wavelength grid, preprocessing config). Saved with scikit-learn 1.9.0.
+requirements.txt     Benjamin v2 requirements, as supplied.
+Source: CODES - Benjamin (Hyperspectral, material classification)/v2 (received 2026-11-02).
+The previous v1 (XGBoost, predict.py) is kept only in CODES - Benjamin (Hyperspectral, material classification)/v1.

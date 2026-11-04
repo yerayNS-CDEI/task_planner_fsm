@@ -38,13 +38,14 @@ pillow
 matplotlib
 opencv-python
 
-# GPR (GPRTools SEGY reader, Tahzeeb Mask R-CNN, audit workbook)
+# GPR (GPRTools SEGY reader, Tahzeeb Mask R-CNN)
 obspy
 torch
 torchvision
-openpyxl
 
-# hyperspectral (Benjamin's XGBoost bundle)
+# hyperspectral (Benjamin's v2 1D-CNN bundle: torch above, plus the sklearn
+# scaler/label encoder). The delivery asks for scikit-learn==1.9.0, the version
+# the bundle was saved with; 1.7 loads it with an InconsistentVersionWarning and
+# gives the same results on the delivered test session.
 scikit-learn
-xgboost
 joblib

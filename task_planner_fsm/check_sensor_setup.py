@@ -18,8 +18,8 @@ from .sensors import VendorUnavailable, import_vendor, paths
 
 _MODULES = {
     "shared": ["numpy", "pandas", "scipy", "yaml", "PIL", "matplotlib", "cv2"],
-    "hsi": ["sklearn", "xgboost", "joblib"],
-    "gpr": ["obspy", "torch", "torchvision", "openpyxl"],
+    "hsi": ["sklearn", "torch", "joblib"],
+    "gpr": ["obspy", "torch", "torchvision"],
 }
 
 
@@ -35,7 +35,8 @@ def _check_module(name):
 # the vendor folder imports fine and then fails at the first wall, so the
 # version is checked by the function that has to be there, not by a number.
 _VENDOR_ENTRY_POINTS = {
-    "pokeye_decision": ("decide_pokeye", "build_gpr_drilling_constraints"),
+    "pokeye_decision": ("decide_pokeye",),
+    "global_json": ("build_element", "dumps_compact", "load_config"),
     "hsi_integration": ("run_hyperspectral_pipeline",),
     "line_integration": ("run_line_pipeline",),
     "gpr_integration": ("run_gpr_pipeline",),
@@ -79,7 +80,8 @@ def main(argv=None):
 
     print("\n== Vendored pipelines ==")
     vendor_ok = {}
-    for name in ("pokeye_decision", "hsi_integration", "line_integration", "gpr_integration"):
+    for name in ("pokeye_decision", "hsi_integration", "line_integration", "gpr_integration",
+                 "global_json"):
         ok, detail = _check_vendor(name)
         vendor_ok[name] = ok
         line(ok, name, detail)

@@ -1,6 +1,8 @@
-pandas
-numpy
-scipy
-scikit-learn
-xgboost
-joblib
+# Hyperspectral material classification (Benjamin v2). Tested versions in comments (Python 3.11).
+numpy>=2.0            # 2.4.2
+pandas>=2.2           # 3.0.1
+scipy>=1.13           # 1.17.1
+matplotlib>=3.8       # 3.10.8
+torch>=2.2            # 2.8.0
+scikit-learn==1.9.0   # the model bundle was saved with 1.9.0
+joblib>=1.3           # 1.6.0
