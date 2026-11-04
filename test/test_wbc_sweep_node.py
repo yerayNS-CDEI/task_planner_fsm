@@ -18,7 +18,7 @@ import pytest
 
 rclpy = pytest.importorskip("rclpy")
 
-from geometry_msgs.msg import Twist  # noqa: E402
+from geometry_msgs.msg import Twist, WrenchStamped  # noqa: E402
 from std_msgs.msg import Float64  # noqa: E402
 
 from task_planner_fsm.wbc.admittance import PRESS, SEEK                 # noqa: E402
@@ -3335,6 +3335,101 @@ def test_a_steady_corner_load_torque_is_not_an_obstacle():
                            torque=lambda c: 4.5 if c >= 100 else 1.0, cycles=300)
     assert float(node.get_parameter("obstacle_torque").value) == 0.0, "off by default"
     assert node.obstacle_events == 0
+
+
+# ------------------------------------------------- the torque limit's window
+#
+# 2026-11-04: two lines ended on 8.3 and 8.9 Nm with +5.4 and -3.8 N on the
+# wheel. The bag of the next line: the press held 1.5-3.5 Nm, and the F/T
+# spiked to 8.7 Nm for ~40 ms at first contact, every other sample. The limit
+# read one raw sample; it reads the median of press_torque_window now.
+
+def _ft_sample(node, clock, fz=0.0, tx=0.0, ty=0.0):
+    """One /force_torque_sensor_broadcaster/wrench sample, 10 ms after the last."""
+    clock.advance(0.01)
+    msg = WrenchStamped()
+    msg.wrench.force.z, msg.wrench.torque.x, msg.wrench.torque.y = fz, tx, ty
+    node._on_wrench(msg)
+
+
+def _torque_node():
+    node = _press_node(press_tare_seconds=0.0)
+    node.wrench_bias = np.zeros(5)
+    return node, _install_clock(node)
+
+
+def test_a_contact_spike_does_not_hold_the_torque_limit():
+    node, clock = _torque_node()
+    limit = float(node.get_parameter("press_torque_limit").value)
+    raw_peak = held_peak = 0.0
+    for i in range(40):
+        spike = 20 <= i < 28 and i % 2 == 0            # 13:27:28, as bagged
+        _ft_sample(node, clock, fz=+14.9 if spike else -12.0,
+                   tx=-6.25 if spike else 1.6, ty=6.0 if spike else 1.0)
+        raw_peak = max(raw_peak, node.plate_torque)
+        held_peak = max(held_peak, node._held_torque(clock())[0])
+    assert raw_peak > limit, "the spike is over the limit sample by sample"
+    assert held_peak < 3.0, f"held {held_peak:.1f} Nm on a 40 ms spike"
+
+
+def test_a_torque_that_stays_trips_the_limit_within_the_window():
+    node, clock = _torque_node()
+    limit = float(node.get_parameter("press_torque_limit").value)
+    for _ in range(20):
+        _ft_sample(node, clock, fz=-10.0, tx=2.0)
+    for n in range(1, 21):
+        _ft_sample(node, clock, fz=-30.0, tx=9.0)
+        if node._held_torque(clock())[0] > limit:
+            break
+    assert n <= 6, f"took {n * 10} ms of a steady 9 Nm"
+
+
+def test_the_held_wheel_force_is_from_the_same_samples():
+    """Not the press's filtered force, which lags: the failure text pairs the
+    torque with the force that went with it."""
+    node, clock = _torque_node()
+    for _ in range(10):
+        _ft_sample(node, clock, fz=-30.0, tx=9.0)
+    torque, wheel = node._held_torque(clock())
+    assert torque == pytest.approx(9.0)
+    assert wheel == pytest.approx(30.0)
+
+
+def test_the_torque_fault_says_corner_only_when_the_force_can_make_it():
+    node, _ = _torque_node()
+    assert "corner, not the face" in node._torque_fault(9.0, 30.0, 8.0)   # 30 cm lever
+    for wheel in (5.4, -3.8):                                             # 11-04's two
+        text = node._torque_fault(8.9, wheel, 8.0)
+        assert "corner, not the face" not in text
+        assert "side or edge" in text
+
+
+def test_the_torque_limit_reads_the_window_in_the_loop():
+    """Through _control_step: spikes on the F/T between cycles leave the line
+    running; the same torque held ends it."""
+    def run(held):
+        node = _press_node(press_tare_seconds=0.0)
+        robot = _start_state_along_wall(node.chain, gap=PLATE_STANDOFF - 0.00025, tilt=0.0)
+        node.q_posture = robot.q.copy()
+        node.row_z = float(robot.tip()[2, 3])
+        node.wrench_bias = np.zeros(5)
+
+        def on_cycle(cycle):
+            # Two F/T samples per 50 Hz cycle; the second is a 9 Nm spike every
+            # tenth cycle, or every one when the torque is held.
+            for k in range(2):
+                hot = cycle >= 100 and (held or (k == 1 and cycle % 10 == 0))
+                node._torque_samples.append(
+                    (node._now() - 0.01 * (1 - k),
+                     np.array([-node.press_force, 9.0 if hot else 1.0, 0.0])))
+
+        _press_run(node, robot, cycles=200, on_cycle=on_cycle)
+        return node
+
+    assert run(held=False).pending_status in (None, "succeeded")
+    held = run(held=True)
+    assert held.pending_status.startswith("failed: plate torque 9.0 Nm held over 100 ms"), (
+        held.pending_status)
 
 
 def test_the_force_trigger_is_watched_at_the_ft_rate():

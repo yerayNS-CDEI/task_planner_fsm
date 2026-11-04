@@ -47,6 +47,7 @@ import math
 import signal
 import threading
 import time
+from collections import deque
 
 import numpy as np
 import rclpy
@@ -446,6 +447,22 @@ class WholeBodySweepNode(Node):
         # under the force limit. Above this the reading itself is no longer
         # to be trusted, whatever the force says.
         self.declare_parameter("press_torque_limit", 8.0)        # Nm, |T_xy|
+        # Judged on the MEDIAN of the F/T samples over this window, not on one
+        # sample. On 2026-11-04 two lines ended on 8.3 and 8.9 Nm with +5.4 and
+        # -3.8 N on the wheel; the bag of the next (successful) line shows why:
+        # the press held 1.5-3.5 Nm (2.4 Nm at most over any 100 ms), but at
+        # first contact the F/T jumped to 8.7 Nm for ~40 ms, every other
+        # sample, and to 18 Nm / 65 N at the start of the return, 59 cm off
+        # the wall. One raw sample against the limit lands on such a spike
+        # whenever a cycle happens to. A 50 ms median still read 7.6 Nm on it.
+        # The cost is ~50 ms more on a torque that keeps climbing; the force
+        # limit and the obstacle triggers do not wait for it.
+        self.declare_parameter("press_torque_window", 0.10)      # s
+        # The furthest a press on the plate's face can sit from the point the
+        # torque is reported about: a corner caster, 27 cm from the plate's
+        # centre, seen from wrench_reference_point 8 cm off it. More torque
+        # than the wheel force times this is not a corner load.
+        self.declare_parameter("press_torque_corner_lever", 0.35)  # m
         # Lateral load on the plate, N, above which the plate is being TWISTED
         # or DRAGGED rather than pressed: rotation stops, and in SEEK so does
         # the approach. press_force_limit watches the normal only, and the
@@ -1549,6 +1566,11 @@ class WholeBodySweepNode(Node):
         self.wrench = np.zeros(5)
         self.wrench_bias = None
         self._wrench_tare = []
+        # The raw F/T samples of the last moments, (stamp, [Fz, Tx, Ty]), for
+        # the torque limit (_held_torque). Filled at the F/T's rate by
+        # _on_wrench on the io thread, read by the control loop: hence the lock.
+        self._torque_samples = deque(maxlen=256)
+        self._torque_lock = threading.Lock()
         # The lateral load against that tare, this cycle: (force resisting the
         # travel N, vertical force N, |T_xy| Nm), or None before the tare.
         self.lateral = None
@@ -2092,6 +2114,8 @@ class WholeBodySweepNode(Node):
         self.wrench = np.array([msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z,
                                 msg.wrench.torque.x, msg.wrench.torque.y], dtype=float)
         self.wrench_stamp = self._now()
+        with self._torque_lock:
+            self._torque_samples.append((self.wrench_stamp, self.wrench[2:].copy()))
         self._watch_obstacle(self.wrench_stamp)
         if self.phase == "retreat":
             self._watch_retreat(self.wrench_stamp, self.press_force)
@@ -3182,14 +3206,11 @@ class WholeBodySweepNode(Node):
             # Against the free-air tare once there is one: the plate's own
             # weight puts ~1-4 Nm on the sensor with nothing touching (it was
             # 3-4 Nm of an 8 Nm limit before the payload was recalibrated).
-            torque_now = self.lateral[2] if self.lateral is not None else self.plate_torque
-            if self.press.state != TARE and torque_limit > 0.0 and torque_now > torque_limit:
-                self.finish(
-                    "failed",
-                    f"plate torque {torque_now:.1f} Nm exceeded the {torque_limit:.0f} Nm "
-                    f"limit with {self.press.force:+.1f} N on the wheel: the load is on a "
-                    f"corner, not the face")
-                return
+            if self.press.state != TARE and torque_limit > 0.0:
+                torque_now, wheel_now = self._held_torque(now)
+                if torque_now > torque_limit:
+                    self.finish("failed", self._torque_fault(torque_now, wheel_now, torque_limit))
+                    return
             if bool(p("obstacle_handling").value) and not self._obstacle_step(now, distance):
                 return
             if self.press.stalled:
@@ -3980,6 +4001,37 @@ class WholeBodySweepNode(Node):
         f_world = R_plate @ np.array([d[0], d[1], 0.0])
         return (-float(f_world @ t_hat), float(f_world[2]),
                 float(math.hypot(d[3], d[4])), float(math.hypot(d[0], d[1])))
+
+    def _held_torque(self, now):
+        """(|T_xy| Nm, wheel force N) held over the last press_torque_window.
+
+        Both the median of the raw F/T samples against the free-air tare, so
+        the torque and the force are from the same moments (the press's own
+        force is filtered and lags). Without a tare or buffered samples, this
+        cycle's single reading, as before.
+        """
+        window = float(self.get_parameter("press_torque_window").value)
+        with self._torque_lock:
+            recent = [s for t, s in self._torque_samples if now - t <= window]
+        if self.wrench_bias is None or not recent:
+            torque = self.lateral[2] if self.lateral is not None else self.plate_torque
+            return float(torque), float(self.press.force)
+        d = np.asarray(recent) - np.asarray(self.wrench_bias, dtype=float)[2:]
+        return float(np.median(np.hypot(d[:, 1], d[:, 2]))), float(np.median(-d[:, 0]))
+
+    def _torque_fault(self, torque, wheel, limit):
+        """The failure text for the torque limit: a corner only when the wheel
+        force could make that torque from a corner of the plate."""
+        p = self.get_parameter
+        window = float(p("press_torque_window").value)
+        lever = float(p("press_torque_corner_lever").value)
+        head = (f"plate torque {torque:.1f} Nm held over {window * 1000:.0f} ms exceeded "
+                f"the {limit:.0f} Nm limit with {wheel:+.1f} N on the wheel")
+        if wheel > 0.0 and torque <= wheel * lever:
+            return head + ": the load is on a corner, not the face"
+        return head + (f": more torque than a press on the plate can make (a corner "
+                       f"{lever * 100:.0f} cm out needs {torque / lever:.0f} N), so the load "
+                       f"is on the plate's side or edge, or the F/T reading is bad")
 
     def _side_load(self, drag):
         """The side load the seating rules read, N.
