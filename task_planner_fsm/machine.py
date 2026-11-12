@@ -17,7 +17,8 @@ from task_planner_fsm.states.proc_utils import install_global_cleanup
 WALL_FILE_NAMES = {False: "detected_walls.yaml", True: "detected_walls_sim.yaml"}
 
 # States the machine never leaves on its own; the only way out is a restart
-# (StateMachine.restart, requested on /fsm/restart).
+# (StateMachine.restart, requested on /fsm/restart). A skip (/fsm/skip) is
+# refused from them.
 TERMINAL_STATES = frozenset({"Error", "Finished"})
 
 
@@ -397,6 +398,69 @@ class StateMachine:
         self.ctx["fsm_initial_state"] = target_state
         self.ctx["last_state"] = None
         self.ctx["is_initial_entry"] = True
+        self._state_enter_time_monotonic = time.monotonic()
+        try:
+            self._enter_current_state({"from": previous_state, "reason": reason})
+        except Exception:
+            self._handle_unhandled_exception()
+
+    def skip_to(self, target_state: str, reason: str = "operator_skip", prepare=None):
+        """Leave the running state now and enter ``target_state``.
+
+        The operator's skip (/fsm/skip): the current state's ``on_exit`` runs
+        as on any transition, but its ``check_transition`` is not consulted,
+        and the states in between never run. ``prepare(target)`` runs after
+        ``on_exit`` and before the target is entered -- it synthesizes the ctx
+        the skipped states would have produced, and returns the state to
+        actually enter (Localize in front of the target, or the target). It
+        runs after ``on_exit`` so the old state has released what it held
+        (CreateMap's mapping stack) before the target's stack is brought up.
+
+        Unlike a restart the run's ctx is kept. If ``on_exit`` or ``prepare``
+        raises, the old state is already half torn down, so the machine goes
+        to Error rather than back into it.
+        """
+        previous_state = self.current_state.name
+        if previous_state in TERMINAL_STATES:
+            raise RuntimeError(
+                f"skip is not allowed from '{previous_state}'; use a restart"
+            )
+        if target_state not in self.states:
+            raise ValueError(f"Unknown state '{target_state}'")
+
+        node = self.ctx["node"]
+        self._publish_event(
+            "skipped",
+            state_name=previous_state,
+            summary=f"Skip: {previous_state} -> {target_state}",
+            details={"to": target_state, "reason": reason},
+            level="warn",
+        )
+        enter_state = target_state
+        try:
+            self.current_state.on_exit(self.ctx)
+            if prepare is not None:
+                enter_state = prepare(target_state)
+            if enter_state not in self.states:
+                raise ValueError(f"Unknown state '{enter_state}'")
+        except Exception as exc:
+            if "Error" not in self.states:
+                raise
+            cause = str(exc) or type(exc).__name__
+            summary = f"Skip {previous_state} -> {target_state} failed: {cause}"
+            node.get_logger().error(f"[FSM] {summary}\n" + traceback.format_exc())
+            self.ctx["fsm_error_summary"] = summary
+            enter_state, reason = "Error", f"skip_failed:{reason}"
+
+        # A failure flagged by the state we left must not fail the target.
+        self.ctx["error_triggered"] = False
+        self.ctx.pop("error_reason", None)
+        self.ctx["last_state"] = previous_state
+        self._publish_transition(previous_state, enter_state, reason)
+        self.current_state = self.states[enter_state]
+        self._retried_current_state = False
+        self.ctx.get("_fsm_status", {}).pop("progress", None)
+        self.ctx["is_initial_entry"] = False
         self._state_enter_time_monotonic = time.monotonic()
         try:
             self._enter_current_state({"from": previous_state, "reason": reason})
