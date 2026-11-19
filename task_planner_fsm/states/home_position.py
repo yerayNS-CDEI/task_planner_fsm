@@ -83,7 +83,7 @@ class HomePosition(State):
             goal_handle = self._send_goal_future.result()
             if not goal_handle.accepted:
                 node.get_logger().warn(f"[{self.name}] Navigation goal was rejected!")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "Nav2 rejected the navigation goal home")
                 return
             node.get_logger().info(f"[{self.name}] Goal accepted. Waiting for result...")
             self._get_result_future = goal_handle.get_result_async()

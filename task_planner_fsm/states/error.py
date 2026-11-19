@@ -6,15 +6,16 @@ class Error(State):
 
     def on_enter(self, ctx):
         prev = ctx.get("last_state", "unknown")
-        print(f"[Error] An error occurred while executing the state {prev}")
-        
-        if prev == "NavigateToTarget":
-            print("[Error] Navigation failed. The robot could not reach the target after several attempts..")
-        elif prev == "ScanWall":
-            print("[Error] Failed to analyze walls.")
+        # The machine already logged the failure as an ERROR (and published it
+        # on /fsm/event); this only says where the run stopped, at INFO so the
+        # UI's error list does not count the same failure twice.
+        summary = ctx.get("fsm_error_summary") or f"{prev} failed"
+        node = ctx.get("node")
+        message = f"[Error] Run stopped: {summary}. Send /fsm/restart to start again."
+        if node is not None:
+            node.get_logger().info(message)
         else:
-            print("[Error] Unexpected error.")
-        
+            print(message)
         ctx["fatal"] = True
 
     def run(self, ctx):

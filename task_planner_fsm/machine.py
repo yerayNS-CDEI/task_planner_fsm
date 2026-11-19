@@ -1,5 +1,6 @@
 import os
 import shutil
+import sys
 import time
 import traceback
 from task_planner_fsm.states.proc_utils import install_global_cleanup
@@ -186,6 +187,11 @@ class StateMachine:
         Shared by the first entry, every transition and a restart, so the three
         publish the same status/event sequence.
         """
+        # A failure's cause and context are what this entry of the state
+        # logged, not what the previous state (or attempt) did.
+        logbook = self.ctx.get("fsm_logbook")
+        if logbook is not None:
+            logbook.mark()
         self.current_state.on_enter(self.ctx)
         self.ctx["is_initial_entry"] = False
         self._set_state_status(
@@ -274,21 +280,58 @@ class StateMachine:
             except Exception as exc:
                 self.ctx["node"].get_logger().warn(f"[FSM] Failed to publish event: {exc}")
 
-    def _resolve_error_transition(self, reason: str):
+    def _failure_details(self, reason: str, cause: str, cause_source: str, attempt: int,
+                         traceback_text: str = ""):
+        """The ``details`` of a retry/error event: enough to tell why the state
+        failed without digging through the console."""
+        details = {
+            "reason": reason,
+            "cause": cause,
+            # "fail": the state said why; "log": its last error line;
+            # "exception": the exception that escaped it; "": nothing known.
+            "cause_source": cause_source,
+            "attempt": attempt,
+            "max_attempts": 2,
+            "time_in_state_s": round(
+                max(0.0, time.monotonic() - self._state_enter_time_monotonic), 1
+            ),
+            "recent_logs": [],
+        }
+        logbook = self.ctx.get("fsm_logbook")
+        if logbook is not None:
+            details["recent_logs"] = logbook.since_mark(limit=15)
+        if traceback_text:
+            details["traceback"] = traceback_text
+        return details
+
+    def _resolve_error_transition(self, reason: str, *, exception_cause: str = "",
+                                  traceback_text: str = ""):
         node = self.ctx["node"]
         state_name = self.current_state.name
 
         # States describe the concrete cause via self.fail(ctx, reason) /
         # ctx["error_reason"]; fold it into the human-readable text and clear it
-        # so a later, unrelated failure can't reuse a stale reason.
+        # so a later, unrelated failure can't reuse a stale reason. Most failure
+        # paths only log the cause and set error_triggered; their last logged
+        # error stands in for it then.
         detail = self.ctx.pop("error_reason", None)
-        cause = str(detail).strip() if detail else ""
+        cause, cause_source = "", ""
+        if exception_cause:
+            cause, cause_source = exception_cause, "exception"
+        elif detail and str(detail).strip():
+            cause, cause_source = str(detail).strip(), "fail"
+        else:
+            logbook = self.ctx.get("fsm_logbook")
+            logged = logbook.last_error() if logbook is not None else None
+            if logged:
+                cause, cause_source = logged, "log"
         because = f" due to {cause}" if cause else ""
 
         if state_name == "Error" or "Error" not in self.states:
             return "Error", "error_fallback"
 
         if not self._retried_current_state:
+            details = self._failure_details(reason, cause, cause_source, 1, traceback_text)
             self._retried_current_state = True
             self.ctx["error_triggered"] = False
             summary = f"{state_name} failed{because}; retrying once"
@@ -307,11 +350,12 @@ class StateMachine:
                 "retry",
                 state_name=state_name,
                 summary=summary,
-                details={"reason": reason, "cause": cause},
+                details=details,
                 level="warn",
             )
             return state_name, f"retry_once:{reason}"
 
+        details = self._failure_details(reason, cause, cause_source, 2, traceback_text)
         summary = f"{state_name} failed{because}; going to Error"
         # Handed to the Error state so the panel keeps showing the cause instead
         # of the generic "Entered Error" that the transition would otherwise set.
@@ -331,7 +375,7 @@ class StateMachine:
             "error",
             state_name=state_name,
             summary=summary,
-            details={"reason": reason, "cause": cause},
+            details=details,
             level="error",
         )
         self._retried_current_state = False
@@ -406,19 +450,27 @@ class StateMachine:
     def _handle_unhandled_exception(self):
         """Report the exception being handled and take the retry/Error path."""
         node = self.ctx["node"]
+        tb_text = traceback.format_exc()
+        exc_type, exc, _ = sys.exc_info()
+        if exc_type is not None:
+            message = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+            exception_cause = f"{exc_type.__name__}: {message}" if message else exc_type.__name__
+        else:
+            exception_cause = "unhandled exception"
         node.get_logger().error(
-            f"[FSM] Unhandled exception in state '{self.current_state.name}':\n"
-            + traceback.format_exc()
+            f"[FSM] Unhandled exception in state '{self.current_state.name}':\n" + tb_text
         )
         self._publish_event(
             "exception",
             state_name=self.current_state.name,
             summary=f"Unhandled exception in {self.current_state.name}",
-            details={"traceback": traceback.format_exc()},
+            details={"traceback": tb_text},
             level="error",
         )
         self.ctx["error_triggered"] = True
-        next_state, transition_reason = self._resolve_error_transition("Unhandled exception")
+        next_state, transition_reason = self._resolve_error_transition(
+            "Unhandled exception", exception_cause=exception_cause, traceback_text=tb_text
+        )
         if next_state and next_state in self.states:
             self._apply_transition(next_state, transition_reason)
 

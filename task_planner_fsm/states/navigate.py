@@ -64,7 +64,7 @@ class NavigateToTarget(State):
         try:
             if not rclpy.ok():
                 node.get_logger().warn(f"[{self.name}] ROS no está OK; abortando on_enter.")
-                ctx["error_triggered"] = True
+                self.fail(ctx, "ROS is shutting down (rclpy not ok)")
                 return
 
             # Action clients

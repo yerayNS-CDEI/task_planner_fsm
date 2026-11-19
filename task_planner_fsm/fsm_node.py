@@ -25,6 +25,7 @@ import tf2_ros
 from rclpy.duration import Duration
 from std_msgs.msg import Bool, Float32MultiArray, String
 
+from task_planner_fsm.failure_log import RecordingLogger, StateLogBook
 from task_planner_fsm.machine import (
     TERMINAL_STATES,
     StateMachine,
@@ -301,6 +302,11 @@ class RobotFSMNode(Node):
             "robot_fsm_node",
             automatically_declare_parameters_from_overrides=True,
         )
+        # Every WARN/ERROR this node logs (the states log through it) also goes
+        # into a log book, so a failure that only logged its cause still
+        # reaches /fsm/event and the panel with it (failure_log.py).
+        self.fsm_logbook = StateLogBook()
+        self._recording_logger = RecordingLogger(super().get_logger().name, self.fsm_logbook)
         self.initial_state = initial_state
         self._stdin_warned = False
         self.planner_backend = str(planner_backend).strip().lower()
@@ -364,6 +370,7 @@ class RobotFSMNode(Node):
             "set_fsm_status": self.set_fsm_status,
             "publish_fsm_status": self.publish_fsm_status,
             "publish_fsm_event": self.publish_fsm_event,
+            "fsm_logbook": self.fsm_logbook,
             "tf_buffer": self.tf_buffer,
         }
 
@@ -1633,6 +1640,11 @@ class RobotFSMNode(Node):
             "stamp": stamp,
         }
         self._publish_json(self.fsm_event_pub, payload)
+
+    def get_logger(self):
+        """The node's logger, recording WARN and above into ``fsm_logbook``."""
+        recording = getattr(self, "_recording_logger", None)
+        return recording if recording is not None else super().get_logger()
 
     def localization_pose_callback(self, msg: PoseWithCovarianceStamped):
         localization.record_fix(self.ctx, msg)

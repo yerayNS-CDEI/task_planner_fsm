@@ -173,7 +173,7 @@ class CreateMap(State):
         ctx.get("_procs", {}).pop("explore", None)
 
         if rc != 0:
-            ctx["error_triggered"] = True
+            self.fail(ctx, f"exploration launch exited with code {rc}")
             self.phase = self.ERROR
             return
 
@@ -208,7 +208,7 @@ class CreateMap(State):
 
     def _run_densify(self, ctx):
         if self.driver is None:
-            ctx["error_triggered"] = True
+            self.fail(ctx, "densification sweep has no coverage driver")
             self.phase = self.ERROR
             return
 
