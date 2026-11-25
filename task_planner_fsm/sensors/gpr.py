@@ -17,7 +17,9 @@ module keeps the fewest assumptions it can:
 
 Per scan both delivered pipelines run: hyperbola segmentation (Mask R-CNN) and
 horizontal-line segmentation. Their ``x_m`` is local to the scan; with the
-matched line's segment endpoints it becomes a map-frame point. Depth stays as
+matched line's record (the plate's seated pose ``origin_xyz`` and the sweep
+direction) it becomes a ``map`` point on the wall surface (``wall_frame.py``).
+Depth stays as
 the pipelines report it (approximate, epsilon_r = 6 assumed).
 
 Each hyperbola also becomes a NO_DRILL position (``no_drill.py``), attached to
@@ -37,6 +39,7 @@ redo earlier walls. Blocking functions for a BackgroundJob; no ROS.
 """
 
 import json
+import logging
 import os
 import shutil
 import zipfile
@@ -45,8 +48,10 @@ from pathlib import Path
 import numpy as np
 
 from . import VendorUnavailable, import_vendor, require
-from . import no_drill
+from . import no_drill, wall_frame
 from .manifest import read_gpr_lines
+
+_LOG = logging.getLogger(__name__)
 
 REGISTRY_FILENAME = "processed_files.json"
 SUMMARY_FILENAME = "gpr_summary.json"
@@ -180,42 +185,50 @@ def match_files_to_lines(files, lines):
 # ----------------------------------------------------------------------
 # Geo-referencing
 # ----------------------------------------------------------------------
-def scan_to_map(x_m, seg_start, seg_end, origin_along_m=0.0):
-    """Point ``x_m`` metres along the scan, on the line ``seg_start`` ->
-    ``seg_end``, counted from ``origin_along_m`` metres past ``seg_start``:
-    where the plate seated and the scan's d = 0 is (negative when it seated
-    before the segment start).
+def scan_to_map(x_m, seg_start, seg_end, origin_along_m=0.0, origin_xyz=None):
+    """Point ``x_m`` metres along the scan, in ``map``.
 
-    Straight-line sweep along the wall; the plate's z is the segment's. The
-    GPR antenna offset from the plate TCP is not applied here (unknown yet).
+    With ``origin_xyz`` -- the plate seated on the wall, the scan's d = 0 --
+    the point is on the wall surface: ``origin_xyz + unit * x_m`` in x/y, the
+    row height ``seg_start[2]`` in z. Without it, the old placement on the
+    planned line ``seg_start -> seg_end`` (~0.6 m into the room), counted from
+    ``origin_along_m`` metres past ``seg_start``. See :mod:`.wall_frame`.
+
+    The GPR antenna offset from the plate TCP (~8 cm along the wall) is not
+    applied here.
     """
-    start = np.asarray(seg_start, dtype=float)
-    end = np.asarray(seg_end, dtype=float)
-    axis = end - start
-    norm = float(np.linalg.norm(axis[:2]))
-    if norm < 1e-6:
-        return [round(float(v), 4) for v in start]
-    unit = np.array([axis[0] / norm, axis[1] / norm, 0.0])
-    return [round(float(v), 4) for v in start + unit * (float(origin_along_m) + float(x_m))]
+    return wall_frame.scan_to_map(x_m, seg_start, seg_end, origin_along_m, origin_xyz)
 
 
-def map_transform(line):
+def map_transform(line, logger=None):
     """``x_m -> [x, y, z]`` for a scanned line, or None when it has no geometry.
 
-    One place decides whether a scan can be placed on the wall at all, so the
+    One place decides whether and where a scan sits on the wall, so the
     compact detections, the NO_DRILL constraints and the global JSON can never
-    disagree about it. ``origin_along_m`` is where ScanWall saw the plate seat
-    (the scan's d = 0); a record from before it was kept places d = 0 on
-    ``seg_start``.
+    disagree about it. Positions are on the wall surface, from the plate's
+    seated pose ``origin_xyz`` (ScanWall's record of the scan's d = 0). A
+    record without it falls back to the planned scan line, ~0.6 m off the
+    wall, with a warning; ``wall_frame.reference(line)`` tells which.
     """
-    if not line or not line.get("seg_start") or not line.get("seg_end"):
+    to_map = wall_frame.transform(line)
+    if to_map is None:
         return None
-    origin = float(line.get("origin_along_m") or 0.0)
-    return lambda x_m: scan_to_map(x_m, line["seg_start"], line["seg_end"], origin)
+    if wall_frame.wall_origin(line) is None:
+        message = (f"GPR line {line.get('key', '?')}: no origin_xyz (seated plate pose) in "
+                   f"its record; its positions are placed on the planned scan line, "
+                   f"~0.6 m off the wall, not on the wall surface.")
+        if logger is not None:
+            logger.warn(message)
+        else:
+            _LOG.warning(message)
+    return to_map
 
 
-def _compact_hyperbolae(result, line):
-    to_map = map_transform(line)
+def _compact_hyperbolae(result, line, to_map=None):
+    """``to_map`` is ``map_transform(line)``, passed in so a scan's transform
+    (and its no-origin warning) is built once; built here when omitted."""
+    if to_map is None:
+        to_map = map_transform(line)
     dets = []
     for d in result.get("detections", []):
         pos = d.get("position", {})
@@ -233,6 +246,8 @@ def _compact_hyperbolae(result, line):
             entry["position_map"] = to_map(pos["x_m"])
         dets.append(entry)
     return {
+        "frame": wall_frame.MAP_FRAME,
+        "reference": wall_frame.reference(line) if to_map is not None else None,
         "detected": bool(result.get("hyperbola_detected")),
         "n": int(result.get("n_valid_detections", len(dets))),
         "detections": dets,
@@ -307,12 +322,14 @@ def process_scan(scan, line, out_dir, weights_path, logger=None,
             result = gpr_integration.run_gpr_pipeline(
                 scan["sgy"], output_dir=str(scan_dir / HYPERBOLA_DIRNAME),
                 weights_path=str(weights_path))
-            entry["hyperbolae"] = _compact_hyperbolae(result, line)
+            to_map = map_transform(line, logger)
+            entry["hyperbolae"] = _compact_hyperbolae(result, line, to_map)
             entry["hyperbolae"]["status"] = result.get("status", "ok")
             # Every hyperbola becomes a NO_DRILL position, carried onto the
             # wall while the scanned line's endpoints are at hand.
             entry["no_drill"] = no_drill.constraints_from_result(
-                result, to_map=map_transform(line), source_key=key)
+                result, to_map=to_map, source_key=key,
+                reference=wall_frame.reference(line))
         except BaseException as exc:            # noqa: BLE001 -- recorded per scan
             entry["errors"]["hyperbolae"] = f"{type(exc).__name__}: {exc}"
             if logger is not None:
