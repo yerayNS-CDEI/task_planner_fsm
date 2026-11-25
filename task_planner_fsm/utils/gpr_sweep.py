@@ -316,11 +316,12 @@ class GprSweep:
         The plate seats wherever the sweep's approach lands it, not on
         ``seg_start``: 0.10 m before it on 2026-11-04 18:24 (the sweep node's
         ``left=1.93m`` on a 1.83 m segment), so every hyperbola placed from
-        ``seg_start`` sat 0.10 m too far along the wall. Only the distance
-        along the segment is kept -- the plate itself is a standoff off the
-        wall, and its xy would pull the hyperbolae off the scanned line.
-        ``gpr.map_transform`` adds it; records without it place d = 0 on
-        ``seg_start`` as before.
+        ``seg_start`` sat 0.10 m too far along the wall. ``origin_xyz`` is
+        the plate pressed on the wall, and GPR positions are placed from it
+        (``sensors/wall_frame.py``: ``origin_xyz + unit * x_m``), on the wall
+        surface rather than on the planned line ~0.6 m into the room.
+        ``origin_along_m`` is the same point's distance along the planned
+        segment; records without ``origin_xyz`` fall back to the planned line.
         """
         axis = self._sweep_axis(seg_start, seg_end)
         xyz = self._lookup_plate_xyz(ctx, ref_frame, timeout_s=0.2)

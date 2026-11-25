@@ -42,14 +42,21 @@ position and therefore cannot block anything. Those are counted and reported
 rather than quietly dropped; ``block_on_unlocated`` turns them into a veto on
 the whole wall for a mission that would rather stop than guess.
 
+Every position here -- zone centres and scanned lines -- is on the wall
+surface in ``map``, where the HSI samples (and so the clustered targets) are:
+both are placed from the plate's seated pose (:mod:`.wall_frame`). A line
+record without that pose falls back to the planned scan line ~0.6 m into the
+room and is labelled ``reference: planned_scan_line``.
+
 Pure geometry and policy: no ROS, no import of :mod:`.gpr` (which calls in
-here), and the map transform arrives as a callable so this module never has to
-know how a scan sits on a wall.
+here), and the hyperbola transform arrives as a callable.
 """
 
 from collections import Counter
 
 import numpy as np
+
+from . import wall_frame
 
 # Provisional. The sensor package's own decision blocks a point within 0.10 m
 # of a hyperbola along its line (``gpr_exclusion_radius_m``), but the project
@@ -63,9 +70,11 @@ DEFAULT_TOLERANCE_M = 0.15
 
 # How far off a scanned line a target may sit and still count as covered by it.
 # Also provisional, and for a concrete reason: the GPR antenna's offset from the
-# plate TCP is not known yet and so is not applied when a scan is placed on the
-# wall (see ``gpr.scan_to_map``), and a cluster centroid drifts from the samples
-# it was built from. 0.25 m absorbs both and reaches exactly halfway to the next
+# plate TCP (~8 cm along the wall) is not applied when a scan is placed on the
+# wall (see ``wall_frame.scan_to_map``), and a cluster centroid drifts from the
+# samples it was built from. Lines and targets are both on the wall surface, so
+# the distance is the in-wall one -- before the lines were moved onto the wall
+# they sat ~0.6 m into the room and no target was ever within reach. 0.25 m absorbs both and reaches exactly halfway to the next
 # line of a 0.5 m sweep, so consecutive bands meet without overlapping. Tighten
 # it to leave an honest unscanned gap between lines -- refusing more is the safe
 # direction for a rule whose whole point is not to claim knowledge we lack.
@@ -130,14 +139,16 @@ def _positions_from_detections(gpr_result):
     return positions
 
 
-def constraints_from_result(gpr_result, to_map=None, source_key=None):
+def constraints_from_result(gpr_result, to_map=None, source_key=None, reference=None):
     """NO_DRILL positions for one scan, each carried into the map frame.
 
     ``gpr_result`` is the raw dict from ``gpr_integration.run_gpr_pipeline``
     (the same content as its ``gpr_result.json``). ``to_map`` maps a
     scan-local ``x_m`` onto the wall and returns ``[x, y, z]``; without it --
     an export that matched no scanned line -- the positions stay local and are
-    marked ``located: False``.
+    marked ``located: False``. ``reference`` (``wall_frame.reference(line)``)
+    says whether ``to_map`` lands on the wall surface or, for a line record
+    without the plate's seated pose, on the planned scan line.
 
     A result that is not a readable hyperbola result is ``constraint_valid:
     False``, never an empty constraint: the scan was not analysed, and that
@@ -167,6 +178,7 @@ def constraints_from_result(gpr_result, to_map=None, source_key=None):
                 position_map = None
         placed["position_map"] = position_map
         placed["frame_id"] = MAP_FRAME if position_map else LOCAL_FRAME
+        placed["reference"] = reference if position_map else None
         placed["located"] = position_map is not None
         positions.append(placed)
 
@@ -192,6 +204,25 @@ def tolerance_from_ctx(ctx):
     if value in (None, ""):
         return DEFAULT_TOLERANCE_M
     return float(value)
+
+
+def _zone_position(position, line):
+    """``(position_map, reference)`` of a placed NO_DRILL position.
+
+    A position with no ``reference`` comes from a summary written before
+    positions were put on the wall: it sits on the planned scan line, while
+    :func:`scanned_lines_from_gpr` (recomputed from the line record) and the
+    HSI targets are on the wall. Such a position is placed again from its
+    ``x_m`` and the line record, so a mission resumed across the change does
+    not screen wall targets against zones 0.6 m into the room.
+    """
+    reference = position.get("reference")
+    if reference is None:
+        to_map = wall_frame.transform(line)
+        if to_map is not None and position.get("x_m") is not None:
+            return to_map(float(position["x_m"])), wall_frame.reference(line)
+        return position["position_map"], wall_frame.REFERENCE_SCAN_LINE
+    return position["position_map"], reference
 
 
 def zones_from_gpr(gpr_results, tolerance_m=DEFAULT_TOLERANCE_M, wall_index=None):
@@ -240,6 +271,7 @@ def zones_from_gpr(gpr_results, tolerance_m=DEFAULT_TOLERANCE_M, wall_index=None
             if not position.get("located"):
                 stats["n_unlocated"] += 1
                 continue
+            where, reference = _zone_position(position, entry.get("line"))
             zones.append({
                 "zone_id": f"{entry.get('key', 'scan')}_{position.get('source_detection_id', '?')}",
                 "source_key": entry.get("key"),
@@ -247,7 +279,8 @@ def zones_from_gpr(gpr_results, tolerance_m=DEFAULT_TOLERANCE_M, wall_index=None
                 "reason": position.get("reason", "GPR_HYPERBOLA_DETECTED"),
                 "instruction": "NO_DRILL",
                 "frame_id": MAP_FRAME,
-                "position": position["position_map"],
+                "reference": reference,
+                "position": where,
                 "radius_m": float(tolerance_m),
                 "wall_index": scan_wall,
                 "x_m_scan_local": position.get("x_m"),
@@ -277,8 +310,10 @@ def scanned_lines_from_gpr(gpr_results, wall_index=None):
     as unknown as one that never happened, so it does not qualify and is
     counted separately.
 
-    Returned as map-frame segments, because that is what both the screening
-    here and POKEYE's own RANDOM target picking need.
+    Returned as map-frame segments on the wall surface (the planned segment
+    moved onto the plate's seated pose, :func:`wall_frame.wall_segment`),
+    because that is what both the screening here and POKEYE's own RANDOM
+    target picking need, and where the targets are.
     """
     lines = []
     stats = {"n_scans": 0, "n_lines": 0, "n_not_analysed": 0, "n_unplaced": 0}
@@ -296,12 +331,14 @@ def scanned_lines_from_gpr(gpr_results, wall_index=None):
         if not constraints or not constraints.get("constraint_valid"):
             stats["n_not_analysed"] += 1
             continue
+        seg_start, seg_end = wall_frame.wall_segment(line)
         lines.append({
             "line_id": entry.get("key") or line.get("key"),
             "wall_index": scan_wall,
             "frame_id": MAP_FRAME,
-            "seg_start": [float(v) for v in line["seg_start"]],
-            "seg_end": [float(v) for v in line["seg_end"]],
+            "reference": wall_frame.reference(line),
+            "seg_start": seg_start,
+            "seg_end": seg_end,
             "n_hyperbolae": constraints.get("n_no_drill_positions", 0),
         })
     stats["n_lines"] = len(lines)

@@ -320,3 +320,66 @@ def test_hyperbolae_are_placed_from_where_the_plate_seated():
     line["origin_along_m"] = -0.10
     assert gpr.map_transform(line)(0.5) == [0.4, 0.0, 2.1]
     assert gpr.map_transform(line)(0.0) == [-0.1, 0.0, 2.1]
+
+
+# ----------------------------------------------------------------------
+# On the wall surface, from the plate's seated pose
+# ----------------------------------------------------------------------
+# The planned line runs 0.6 m into the room (y = 0.6) parallel to the wall
+# (y = 0); the plate seated on the wall 0.3 m along it, a little above the row.
+_WALL_LINE = {"key": "w00_l00_s00", "seg_start": [0.0, 0.6, 1.0], "seg_end": [2.0, 0.6, 1.0],
+              "origin_along_m": 0.3, "origin_xyz": [0.3, 0.0, 1.02]}
+
+
+class _Log:
+    def __init__(self):
+        self.warnings = []
+
+    def warn(self, msg, **kwargs):
+        self.warnings.append(msg)
+
+
+def test_with_a_seated_plate_the_scan_is_placed_on_the_wall():
+    """``origin_xyz + unit * x_m`` in x/y, the row height in z: on the wall,
+    not on the planned line 0.6 m into the room."""
+    log = _Log()
+    to_map = gpr.map_transform(_WALL_LINE, log)
+    assert to_map(0.0) == [0.3, 0.0, 1.0]
+    assert to_map(0.5) == [0.8, 0.0, 1.0]
+    assert to_map(-0.1) == [0.2, 0.0, 1.0]
+    assert log.warnings == []
+    assert gpr.scan_to_map(0.5, [0, 0.6, 1.0], [2, 0.6, 1.0], 0.3, [0.3, 0.0, 1.02]) == [0.8, 0.0, 1.0]
+
+
+def test_without_a_seated_plate_the_scan_falls_back_to_the_planned_line_and_warns(monkeypatch):
+    line = {k: v for k, v in _WALL_LINE.items() if k != "origin_xyz"}
+    log = _Log()
+    to_map = gpr.map_transform(line, log)
+    assert to_map(0.5) == [0.8, 0.6, 1.0]
+    assert len(log.warnings) == 1 and "w00_l00_s00" in log.warnings[0]
+    # Without a ROS logger the warning still goes to the module's own.
+    module_log = []
+    monkeypatch.setattr(gpr._LOG, "warning", module_log.append)
+    gpr.map_transform(line)
+    assert len(module_log) == 1 and "origin_xyz" in module_log[0]
+
+
+def test_the_lisbon_line_puts_dgpr_001_on_the_wall():
+    """session_20261113_154030, w00_l00_s00: H001 at x = 1.0846 m was logged at
+    (-2.572, 1.845) on the planned line; the plate-on-wall placement computed
+    offline puts it at (-2.302, 2.430)."""
+    line = {"seg_start": [-3.8875, 2.4513, 2.7], "seg_end": [0.9091, 0.2404, 2.7],
+            "origin_along_m": 0.3637, "origin_xyz": [-3.2874, 2.8845, 2.7006]}
+    assert gpr.map_transform(line)(1.0846) == pytest.approx([-2.302, 2.430, 2.70], abs=2e-3)
+    del line["origin_xyz"]
+    assert gpr.map_transform(line)(1.0846) == pytest.approx([-2.572, 1.845, 2.70], abs=2e-3)
+
+
+def test_compact_hyperbolae_say_where_their_positions_are():
+    result = {"detections": [{"id": "H001", "position": {"x_m": 0.5}}]}
+    out = gpr._compact_hyperbolae(result, _WALL_LINE)
+    assert (out["frame"], out["reference"]) == ("map", "wall_surface")
+    assert out["detections"][0]["position_map"] == [0.8, 0.0, 1.0]
+    old = {k: v for k, v in _WALL_LINE.items() if k != "origin_xyz"}
+    assert gpr._compact_hyperbolae(result, old)["reference"] == "planned_scan_line"
+    assert gpr._compact_hyperbolae(result, None)["reference"] is None

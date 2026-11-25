@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from task_planner_fsm.sensors import gpr, no_drill, paths, pokeye
+from task_planner_fsm.sensors import gpr, no_drill, paths, pokeye, wall_frame
 
 
 # The earlier delivery's example, in gpr_result.json's field names. Kept as
@@ -51,7 +51,8 @@ def _entry(key="w02_l00_s00", line=None, constraints=None):
 def _constraints(result=None, line=None, key="w02_l00_s00"):
     result = _vendor_gpr_result() if result is None else result
     return no_drill.constraints_from_result(
-        result, to_map=gpr.map_transform(line), source_key=key)
+        result, to_map=gpr.map_transform(line), source_key=key,
+        reference=wall_frame.reference(line))
 
 
 # ----------------------------------------------------------------------
@@ -436,3 +437,58 @@ def test_the_written_targets_file_explains_the_missing_target(tmp_path):
     assert saved["drilling_constraints"]["n_no_drill_zones"] == 2
     assert saved["drilling_constraints"]["coordinate_frame"] == "map"
     assert saved["stats"]["no_drill"]["n_blocked"] == 1
+
+
+# ----------------------------------------------------------------------
+# Zones and scanned lines on the wall surface
+# ----------------------------------------------------------------------
+def _seated_line(wall=2):
+    """Planned 0.6 m into the room (y = 0.6); the plate seated on the wall
+    (y = 0) 0.2 m along it."""
+    line = _line(wall, start=(0.0, 0.6, 1.0), end=(2.0, 0.6, 1.0))
+    line.update(origin_along_m=0.2, origin_xyz=[0.2, 0.0, 1.0])
+    return line
+
+
+def test_zones_and_scanned_lines_sit_on_the_wall_with_the_hsi_targets():
+    """Before, zones and lines were on the planned line 0.6 m off the wall,
+    while targets come from the HSI poses on it: every target was 'not on a
+    scanned line', and no zone could ever reach one."""
+    line = _seated_line()
+    results = {"entries": [_entry(line=line, constraints=_constraints(line=line))]}
+    zones, _ = no_drill.zones_from_gpr(results, wall_index=2)
+    lines, _ = no_drill.scanned_lines_from_gpr(results, wall_index=2)
+
+    assert zones[0]["position"] == [0.75, 0.0, 1.0]      # 0.2 + 0.55 along, on the wall
+    assert zones[0]["reference"] == "wall_surface"
+    assert lines[0]["seg_start"] == [0.0, 0.0, 1.0]
+    assert lines[0]["seg_end"] == [2.0, 0.0, 1.0]
+    assert lines[0]["reference"] == "wall_surface"
+
+    # An HSI target on the wall on top of H001 is refused for the hyperbola,
+    # one further along the same line is drillable.
+    assert no_drill.refusal([0.78, 0.0, 1.0], zones, lines)["reason"] == no_drill.NO_DRILL_HYPERBOLA
+    assert no_drill.is_drillable([1.6, 0.0, 1.0], zones, lines)
+
+
+def test_a_line_without_a_seated_plate_stays_on_the_planned_line_and_says_so():
+    line = _line(start=(0.0, 0.6, 1.0), end=(2.0, 0.6, 1.0))
+    results = {"entries": [_entry(line=line, constraints=_constraints(line=line))]}
+    zones, _ = no_drill.zones_from_gpr(results)
+    lines, _ = no_drill.scanned_lines_from_gpr(results)
+    assert zones[0]["position"] == [0.55, 0.6, 1.0]
+    assert zones[0]["reference"] == "planned_scan_line"
+    assert (lines[0]["seg_start"], lines[0]["reference"]) == ([0.0, 0.6, 1.0], "planned_scan_line")
+
+
+def test_zones_from_a_summary_written_before_the_change_are_placed_on_the_wall():
+    """Such a summary stored its positions on the planned line and no
+    ``reference``; its line record already had the seated plate pose."""
+    line = _seated_line()
+    legacy = no_drill.constraints_from_result(
+        _vendor_gpr_result(), to_map=lambda x: [x, 0.6, 1.0], source_key="w02_l00_s00")
+    for position in legacy["no_drill_positions"]:
+        del position["reference"]
+    zones, _ = no_drill.zones_from_gpr({"entries": [_entry(line=line, constraints=legacy)]})
+    assert zones[0]["position"] == [0.75, 0.0, 1.0]
+    assert zones[0]["reference"] == "wall_surface"

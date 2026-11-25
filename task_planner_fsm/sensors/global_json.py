@@ -9,9 +9,12 @@ value only the robot knows as ``null``. This module is the robot side:
 * **Elements.** One per wall, keyed ``wall_00``, ``wall_01``... A scan that
   matched no scanned line goes under ``unassociated``.
 * **GPR coordinates.** The B-scan start/end and each hyperbola apex, in the
-  map frame, by the same ``x_m`` -> wall transform the NO_DRILL zones use
-  (``gpr.map_transform``: along the scanned segment, GPR antenna offset not
-  applied). A scan with no line geometry keeps ``null``.
+  map frame on the wall surface, by the same ``x_m`` -> wall transform the
+  NO_DRILL zones use (``gpr.map_transform``: from the plate's seated pose
+  along the sweep direction, GPR antenna offset not applied). A scan with no
+  line geometry keeps ``null``; one whose record lacks the seated pose falls
+  back to the planned scan line ~0.6 m off the wall (and logs a warning).
+  The agreed schema has no field to say which, so none is added here.
 * **HSI fields.** Each measurement's timestamp and map pose, from the sweep
   record, and ``row`` / ``data_pointer_csv`` re-pointed at the session's
   ``reflectance.csv`` -- the acquisition with the poses -- instead of the
