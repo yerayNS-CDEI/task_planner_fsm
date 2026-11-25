@@ -8,7 +8,6 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import rclpy
-from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import (
     Point, Pose, PoseWithCovarianceStamped, Quaternion, WrenchStamped,
 )
@@ -218,23 +217,6 @@ RESTART_REDETECT_STATES = set(
 # A restart after an Error in one of them warns (see _perform_restart).
 RESTART_ARM_STATES = {"ArmUnfolding", "ScanWall", "ArmFolding", "ScanFloor", "ScanCeiling"}
 
-# States the operator's skip (/fsm/skip) may jump to: the same as a restart's.
-SKIP_TARGET_STATES = RESTART_TARGET_STATES
-
-# States a skip refuses to leave. Error/Finished take a restart instead.
-# Localize holds the robot still because, until rtabmap matches the map, the
-# stack has it at the map origin: skipping it would drive on a wrong pose.
-SKIP_REFUSED_SOURCE_STATES = TERMINAL_STATES | {LOCALIZE_STATE}
-
-# Nav2 actions whose goals a skip cancels before it leaves the state. Most
-# states do not cancel their goal in on_exit (ObjectID's coverage route,
-# NavigateToTarget), so without this the robot would keep driving to the
-# skipped state's waypoint.
-SKIP_CANCEL_NAV_ACTIONS = ("/navigate_to_pose", "/navigate_through_poses")
-
-# FSM ticks (1 s each) a skip waits for Nav2 to confirm the cancel.
-SKIP_CANCEL_WAIT_TICKS = 3
-
 # ctx written by the subscriptions, not by a run. Kept over a restart: the
 # values are live, and the costmap is latched and would not be sent again.
 RESTART_KEPT_CTX_KEYS = {
@@ -330,9 +312,6 @@ class RobotFSMNode(Node):
         # Restart (/fsm/restart) bookkeeping.
         self._pending_restart: Optional[Dict] = None
         self._run_index = 1
-        # Operator skip (/fsm/skip) bookkeeping.
-        self._pending_skip: Optional[Dict] = None
-        self._skipping = False
 
         # NOTE: Do NOT set use_sim_time=True here!
         # The FSM timer must run on wall time even in simulation mode,
@@ -482,14 +461,6 @@ class RobotFSMNode(Node):
         # the robot stack. JSON in a String, like the /fsm/* telemetry; see
         # restart_callback.
         self.create_subscription(String, "/fsm/restart", self.restart_callback, 10)
-        # Leave the running state now and jump to a later one; see skip_callback.
-        self.create_subscription(String, "/fsm/skip", self.skip_callback, 10)
-        # Created now, not on the first skip: a fresh client has not discovered
-        # its server yet, and the skip would find no Nav2 to cancel.
-        self._skip_cancel_clients = {
-            action: self.create_client(CancelGoal, f"{action}/_action/cancel_goal")
-            for action in SKIP_CANCEL_NAV_ACTIONS
-        }
         self.create_subscription(Odometry, "/rtabmap/odom", self.odometry_callback, 10)
         self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
         self.create_subscription(Bool, "/execution_status", self.execution_status_callback, 10)
@@ -1274,9 +1245,8 @@ class RobotFSMNode(Node):
         On a restart nothing is stopped: the robot stack belongs to the session,
         not to the run, and the restart is only refused (see _perform_restart).
         """
-        if getattr(self, "_restarting", False) or getattr(self, "_skipping", False):
-            action = "restarting" if getattr(self, "_restarting", False) else "skipping"
-            self.get_logger().error(f"[FSM Bootstrap] {reason}; not {action} the FSM.")
+        if getattr(self, "_restarting", False):
+            self.get_logger().error(f"[FSM Bootstrap] {reason}; not restarting the FSM.")
             raise BootstrapError(reason)
         self.get_logger().error(f"[FSM Bootstrap] {reason}; not starting the FSM.")
         try:
@@ -1478,12 +1448,10 @@ class RobotFSMNode(Node):
         )
 
     def _tick(self):
-        """FSM timer: run a pending restart or skip, then step the machine."""
+        """FSM timer: run a pending restart, then step the machine."""
         request, self._pending_restart = self._pending_restart, None
         if request is not None:
             self._perform_restart(request)
-        if self._pending_skip is not None and not self._advance_skip():
-            return   # held while Nav2 cancels the skipped state's goal
         self.machine.step()
 
     def _reset_ctx_for_restart(self, target_state: str):
@@ -1577,176 +1545,6 @@ class RobotFSMNode(Node):
         self.initial_state = target
         self.machine.restart(self._gated_start(target), reason=f"restart_run_{self._run_index}")
         self.publish_fsm_graph()
-
-    # ------------------------------------------------------------------
-    # Operator skip (/fsm/skip)
-    # ------------------------------------------------------------------
-    def _parse_skip_request(self, data: str) -> str:
-        """``/fsm/skip`` payload -> target state. Raises ValueError with the reason.
-
-        A bare state name (``data: GeometryReconstruction``) or a JSON object
-        ``{"state": "GeometryReconstruction"}``.
-        """
-        text = (data or "").strip()
-        try:
-            request = json.loads(text)
-        except ValueError:
-            request = text
-        if isinstance(request, dict):
-            unknown = sorted(set(request) - {"state"})
-            if unknown:
-                raise ValueError(f"unknown field(s) {unknown}; valid: state")
-            request = request.get("state")
-        if not isinstance(request, str) or request not in SKIP_TARGET_STATES:
-            raise ValueError(
-                f"cannot skip to {request!r}; valid: {', '.join(SKIP_TARGET_STATES)}"
-            )
-        return request
-
-    def skip_callback(self, msg: String):
-        """Queue a skip; the FSM tick runs it (see _advance_skip).
-
-        Like a restart it is only validated here, and like a restart it waits
-        for the running state's run() to return: a state blocked inside run()
-        is not interrupted.
-        """
-        try:
-            target = self._parse_skip_request(msg.data)
-        except ValueError as exc:
-            self._reject_skip(str(exc))
-            return
-        current = self.machine.current_state.name
-        if current in TERMINAL_STATES:
-            self._reject_skip(f"the FSM is in {current}; use a restart instead")
-            return
-        if current in SKIP_REFUSED_SOURCE_STATES:
-            self._reject_skip(f"{current} cannot be skipped: the robot is not localized yet")
-            return
-        if target == current:
-            self._reject_skip(f"the FSM is already in {target}")
-            return
-        if self._pending_skip is not None:
-            self._reject_skip(f"a skip to {self._pending_skip['state']} is already pending")
-            return
-        self._pending_skip = {"from": current, "state": target}
-        self.get_logger().warn(
-            f"[FSM] Skip {current} -> {target} requested; running it on the next tick."
-        )
-
-    def _reject_skip(self, reason: str, *, level: str = "warn"):
-        log = self.get_logger().error if level == "error" else self.get_logger().warn
-        log(f"[FSM] Skip refused: {reason}")
-        self.publish_fsm_event(
-            "skip_rejected",
-            summary=f"Skip refused: {reason}",
-            details={"reason": reason},
-            level=level,
-        )
-
-    def _cancel_nav_goals(self) -> List:
-        """Ask Nav2 to cancel ALL its goals; returns the pending cancel futures.
-
-        An all-zero CancelGoal request (no goal id, no stamp) cancels every goal
-        of the action server, whoever sent it. A server that is not up is skipped.
-        """
-        futures = [
-            client.call_async(CancelGoal.Request())
-            for client in self._skip_cancel_clients.values()
-            if client.service_is_ready()
-        ]
-        if futures:
-            self.get_logger().info("[FSM] Skip: cancelling the Nav2 goals first.")
-        return futures
-
-    def _advance_skip(self) -> bool:
-        """Drive a pending skip. False while the machine must stay held.
-
-        First tick: cancel every Nav2 goal and hold the machine, so the state
-        being skipped cannot send its next waypoint once its goal is cancelled.
-        A later tick (once Nav2 answered, or after SKIP_CANCEL_WAIT_TICKS):
-        leave the state.
-        """
-        skip = self._pending_skip
-        current = self.machine.current_state.name
-        if current != skip["from"]:
-            self._pending_skip = None
-            self._reject_skip(f"the FSM left {skip['from']} for {current} before the skip ran")
-            return True
-        if "cancels" not in skip:
-            skip["cancels"] = self._cancel_nav_goals()
-            skip["waited"] = 0
-            if skip["cancels"]:
-                return False
-        elif (
-            not all(f.done() for f in skip["cancels"])
-            and skip["waited"] < SKIP_CANCEL_WAIT_TICKS
-        ):
-            skip["waited"] += 1
-            return False
-        self._pending_skip = None
-        self._perform_skip(skip)
-        return True
-
-    def _perform_skip(self, skip: Dict):
-        source, target = skip["from"], skip["state"]
-        self.get_logger().warn(
-            f"[FSM] Skipping {source} -> {target}: the states in between do not run. "
-            f"Nav2 goals were cancelled; an arm motion already sent is not stopped."
-        )
-        # Re-check the stack: the skipped state may have been the one to start it.
-        self._stack_ensured = False
-        self.machine.skip_to(
-            target,
-            reason="operator_skip",
-            prepare=lambda t: self._prepare_skip_target(source, t),
-        )
-
-    def _prepare_skip_target(self, source: str, target: str) -> str:
-        """Fill in the ctx the skipped states would have left; returns the
-        state to enter (Localize in front of ``target``, or ``target``).
-
-        Runs inside StateMachine.skip_to, after the source state's on_exit.
-        The run's ctx is kept: only what is missing is synthesized, the same
-        way a checkpoint start does it. Raises when the stack is not ready;
-        the machine then goes to Error.
-        """
-        self.ctx["error_triggered"] = False
-        self.ctx["start"] = True
-        order = FSM_STATE_ORDER
-        object_id = order.index("ObjectID")
-        if source in order and order.index(source) <= object_id < order.index(target):
-            # ObjectID's detection did not run (or was cut short): read the
-            # walls already on disk instead of waiting for this run's.
-            self.ctx["geometry_reconstruction_require_fresh_walls"] = False
-            self.get_logger().info(
-                "[FSM] Skip past ObjectID: using the walls already saved in "
-                f"{self.ctx.get('geometry_reconstruction_wall_file_path')}."
-            )
-
-        if target in WALL_DATA_REQUIRED_INITIAL_STATES and not self.ctx.get("walls_data"):
-            # ComputeWallPoints is skipped too: same wall prompt as a checkpoint start.
-            initial = self.ctx.get("fsm_initial_state")
-            self._skipping = True
-            try:
-                self._bootstrap_context_for_initial_state(target, None)
-            finally:
-                self._skipping = False
-                self.ctx["fsm_initial_state"] = initial
-        else:
-            if (
-                target in PHASE1_TARGET_REQUIRED_INITIAL_STATES
-                and self.ctx.get("scan_phase", 1) == 1
-                and not self.ctx.get("target_scan_wall")
-            ):
-                self._prompt_phase1_target()
-            if target in NAV_SIM_REQUIRED_START_STATES:
-                self._ensure_nav_sim_running()
-            if target in NAV_CLIENT_BOOTSTRAP_STATES:
-                self._ensure_nav_client()
-
-        if self.ctx.get("error_triggered"):
-            raise RuntimeError("the robot stack is not ready")
-        return self._gated_start(target)
 
     def publish_fsm_current(self, state_name: str):
         msg = String()
